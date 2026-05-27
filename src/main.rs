@@ -183,21 +183,17 @@ fn main() -> Result<()> {
     let drm_init = drm::open_display(&mut session, &drm_path).context("DRM device init failed")?;
     let drm::DrmInit {
         device: drm_device,
-        surface: drm_surface,
         fd: drm_fd,
         notifier: drm_notifier,
-        mode: drm_mode,
+        outputs: drm_outputs,
     } = drm_init;
 
-    let mut renderer =
-        render::Renderer::new(drm_fd, drm_surface, drm_mode, config.misc.wallpaper.clone())
-            .context("render pipeline init failed")?;
+    let mut renderer = render::Renderer::new(drm_fd, drm_outputs, config.misc.wallpaper.clone())
+        .context("render pipeline init failed")?;
 
-    info!("phase: rendering initial frame to prime the swapchain");
-    renderer
-        .render_and_queue()
-        .context("initial frame render failed")?;
-    info!("initial frame queued for scanout");
+    info!("phase: priming swapchains (one initial frame per output)");
+    renderer.render_initial().context("initial render failed")?;
+    info!("all outputs primed for scanout");
 
     info!("phase: initialising xkbcommon keyboard");
     let keyboard =
@@ -428,12 +424,13 @@ fn wire_event_sources(
     handle
         .insert_source(drm_notifier, |event, _meta, state| match event {
             smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                if let Err(err) = state.renderer.render_and_queue() {
-                    // Don't kill the event loop on a render hiccup — log
-                    // and let the next vblank try again. A persistent
-                    // failure manifests as a frozen frame, which is at
-                    // least recoverable via Super+Shift+E.
-                    warn!(error = %err, ?crtc, "render_and_queue failed on vblank");
+                if let Err(err) = state.renderer.render_for_crtc(crtc) {
+                    // Don't kill the event loop on a render hiccup —
+                    // log and let the next vblank try again. A
+                    // persistent failure on one CRTC freezes that
+                    // output but leaves the others (and the exit
+                    // hotkey) responsive.
+                    warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
                 }
             }
             smithay::backend::drm::DrmEvent::Error(err) => {

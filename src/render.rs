@@ -1,80 +1,76 @@
-//! GBM + EGL + GLES2 render pipeline with vblank-driven page-flipping.
+//! GBM + EGL + GLES2 render pipeline with vblank-driven page-flipping
+//! across multiple outputs.
 //!
-//! Built on top of a `DrmSurface` acquired by [`crate::drm`]. Maintains
-//! a double-buffered scanout via smithay's `GbmBufferedSurface` and
-//! renders through `GlesRenderer`. Each frame is currently just a
-//! clear-to-a-time-varying hue — proof that the render loop is alive
-//! and pacing with the display's vblank. Real compositing (cursor,
-//! client surfaces) layers on top of this same pipeline.
+//! A single EGL context + GLES renderer + GBM allocator is shared by
+//! every output on a given GPU. Each output has its own
+//! `GbmBufferedSurface` (its own swapchain + page-flip cadence) and
+//! is rendered independently when *its* CRTC reports vblank. Outputs
+//! sit in a virtual layout — by default left-to-right at `y=0` in
+//! connector enumeration order; Lua config will override per-output
+//! positions in milestone 3c.
 //!
-//! Render loop shape:
-//!
-//! ```text
-//! startup ────▶ render_and_queue ──┐
-//!                                  │
-//!  vblank ────▶ render_and_queue ──┤
-//!                                  ▼
-//!                              queue_buffer ──▶ kernel ──▶ scanout ──▶ vblank ──▶ …
-//! ```
-//!
-//! `render_and_queue` is called once at startup and again on every
-//! `DrmEvent::VBlank`. The first call kicks the cycle off (no pending
-//! frame to ack), each subsequent call acks the previous frame via
-//! `frame_submitted` before rendering and queuing the next.
+//! Cursor coordinates live in absolute virtual-layout space. On each
+//! per-output render we translate to output-local coordinates and
+//! draw the cursor only when the hotspot falls within that output's
+//! rectangle.
 
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::drm::{DrmDeviceFd, DrmSurface, GbmBufferedSurface};
+use smithay::backend::drm::{DrmDeviceFd, GbmBufferedSurface};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
 use smithay::backend::renderer::{Bind as _, Color32F, Frame as _, Renderer as _};
-use smithay::reexports::drm::control::Mode;
+use smithay::reexports::drm::control::crtc;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::Wallpaper;
+use crate::drm::DrmOutput;
 
-/// Render pipeline for one display: GBM allocator, EGL context, GLES
-/// renderer, and the buffered surface that page-flips on vblank.
-pub struct Renderer {
-    /// Holds the `DrmSurface` and a swapchain of GBM buffers that get
-    /// scanned out in turn.
-    surface: GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
-    /// GLES2 renderer; owns the `EGLContext` we render through.
-    gles: GlesRenderer,
-    /// Output dimensions in physical pixels — passed to `render` so
-    /// the renderer knows the viewport size.
-    output_size: Size<i32, Physical>,
-    /// Background pattern painted before the cursor each frame.
-    /// Owned (not borrowed) so live config reloads can swap it via
-    /// a setter later without churn here.
-    wallpaper: Wallpaper,
-    /// Cursor hotspot position in physical pixels, advanced by
-    /// [`Self::on_pointer_motion`] and read each frame to position
-    /// the cursor sprite. Stored as `f64` so libinput's sub-pixel
-    /// deltas accumulate without integer rounding losses; truncated
-    /// to `i32` only at the draw call.
-    cursor_x: f64,
-    cursor_y: f64,
-}
-
-/// Side length of the cursor sprite in physical pixels. The cursor
+/// Side length of the cursor sprite in physical pixels. The sprite
 /// is a right-triangle with apex at the hotspot, so this is also
 /// the bounding-box width and height.
 const CURSOR_SIZE: i32 = 24;
 
+/// Renderer for every connected output on a single GPU.
+pub struct Renderer {
+    /// Shared GLES2 renderer; owns the EGL context.
+    gles: GlesRenderer,
+    /// One swapchain + framebuffer chain per output.
+    outputs: Vec<OutputRender>,
+    /// Bounding box of the virtual layout, anchored at `(0, 0)`.
+    /// Used to clamp the cursor.
+    layout_bounds: Size<i32, Physical>,
+    /// Cursor hotspot in **absolute** virtual-layout coordinates.
+    /// Each per-output render translates to local coords by
+    /// subtracting that output's `position`.
+    cursor_x: f64,
+    cursor_y: f64,
+    /// Wallpaper drawn under the cursor on every output.
+    wallpaper: Wallpaper,
+}
+
+/// One output's render state: swapchain, dimensions, and position in
+/// the virtual layout.
+struct OutputRender {
+    name: String,
+    crtc: crtc::Handle,
+    surface: GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
+    /// Output dimensions in physical pixels (from its DRM mode).
+    size: Size<i32, Physical>,
+    /// Top-left of this output in absolute virtual-layout coords.
+    position: Point<i32, Physical>,
+}
+
 impl Renderer {
-    /// Wire GBM + EGL + GLES on top of an already-modeset `DrmSurface`.
-    /// Consumes the surface — from here on it lives inside the
-    /// `GbmBufferedSurface`. `drm_fd` is the same fd the DRM device was
-    /// opened on; it gets cloned (cheap, Arc-backed) into a `GbmDevice`
-    /// for the EGL display and into the `GbmAllocator` for scanout
-    /// buffers.
+    /// Build the shared EGL/GLES context plus one `GbmBufferedSurface`
+    /// per output. Outputs are placed left-to-right at `y=0` in the
+    /// order the DRM layer enumerated them; the cursor is initialised
+    /// at the centre of the first output so it's immediately visible.
     pub fn new(
         drm_fd: DrmDeviceFd,
-        drm_surface: DrmSurface,
-        mode: Mode,
+        drm_outputs: Vec<DrmOutput>,
         wallpaper: Wallpaper,
     ) -> Result<Self> {
         info!("phase: opening GBM device");
@@ -84,11 +80,12 @@ impl Renderer {
         info!("phase: opening EGL display from GBM device");
         #[allow(
             unsafe_code,
-            reason = "EGLDisplay::new is unsafe because the GbmDevice it stores must outlive the display. gbm::Device's clone is Arc-backed (DrmDeviceFd is Clone), and the cloned handle lives inside EGLDisplay for its entire lifetime — we never free or invalidate the underlying gbm_device while EGLDisplay references it."
+            reason = "EGLDisplay::new requires the GbmDevice to outlive the display. \
+                      gbm::Device's Clone is Arc-backed; the cloned device lives \
+                      inside EGLDisplay for its full lifetime — the underlying \
+                      gbm_device stays valid until EGLDisplay drops."
         )]
-        // SAFETY: see #[allow] above. The cloned GbmDevice is owned by
-        // EGLDisplay and its underlying gbm_device is Arc-managed so it
-        // stays valid until EGLDisplay drops.
+        // SAFETY: see #[allow] above.
         let egl_display =
             unsafe { EGLDisplay::new(gbm_device.clone()) }.context("EGLDisplay::new failed")?;
         info!("EGL display opened");
@@ -100,10 +97,11 @@ impl Renderer {
         info!("phase: creating GLES renderer");
         #[allow(
             unsafe_code,
-            reason = "GlesRenderer::new requires the EGLContext to be used from a single thread (it calls make_current internally and assumes that's safe). The compositor is single-threaded and the Renderer never crosses threads — we own the EGLContext exclusively from here on."
+            reason = "GlesRenderer::new requires single-threaded use of the EGLContext. \
+                      The compositor is single-threaded and the Renderer never \
+                      crosses threads."
         )]
-        // SAFETY: see #[allow]. EGLContext is moved into GlesRenderer
-        // and stays on this thread for the lifetime of the renderer.
+        // SAFETY: see #[allow].
         let gles = unsafe { GlesRenderer::new(egl_context) }.context("GlesRenderer::new failed")?;
         info!("GLES renderer created");
 
@@ -113,112 +111,184 @@ impl Renderer {
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
         );
 
-        info!("phase: creating GBM buffered surface (swapchain + modeset)");
+        info!("phase: building per-output GBM buffered surfaces");
         let renderer_formats = gles.egl_context().dmabuf_render_formats().clone();
-        let surface = GbmBufferedSurface::new(
-            drm_surface,
-            allocator,
-            &[Fourcc::Xrgb8888],
-            renderer_formats,
-        )
-        .context("GbmBufferedSurface::new failed (no compatible scanout format?)")?;
-        info!("GBM buffered surface ready");
+        let mut outputs = Vec::with_capacity(drm_outputs.len());
+        // Running cursor for the left-to-right layout. `max_height`
+        // captures the tallest output so the layout bounding box is
+        // (sum_widths, max_height).
+        let mut layout_x: i32 = 0;
+        let mut layout_max_h: i32 = 0;
 
-        let (w, h) = mode.size();
+        for drm_output in drm_outputs {
+            let (mode_w, mode_h) = drm_output.mode.size();
+            let size = Size::<i32, Physical>::new(i32::from(mode_w), i32::from(mode_h));
+            let position = Point::<i32, Physical>::from((layout_x, 0));
+
+            let surface = GbmBufferedSurface::new(
+                drm_output.surface,
+                allocator.clone(),
+                &[Fourcc::Xrgb8888],
+                renderer_formats.clone(),
+            )
+            .with_context(|| {
+                format!(
+                    "GbmBufferedSurface::new failed for {} (no compatible scanout format?)",
+                    drm_output.name
+                )
+            })?;
+
+            info!(
+                output = %drm_output.name,
+                pos_x = layout_x,
+                pos_y = 0,
+                width = size.w,
+                height = size.h,
+                "output swapchain ready"
+            );
+
+            outputs.push(OutputRender {
+                name: drm_output.name,
+                crtc: drm_output.crtc,
+                surface,
+                size,
+                position,
+            });
+
+            layout_x = layout_x.saturating_add(size.w);
+            layout_max_h = layout_max_h.max(size.h);
+        }
+
+        let layout_bounds = Size::<i32, Physical>::new(layout_x, layout_max_h);
+        info!(
+            outputs = outputs.len(),
+            layout_w = layout_bounds.w,
+            layout_h = layout_bounds.h,
+            "render layout finalised"
+        );
+
+        // Cursor starts at the centre of the first output. `unwrap`
+        // is safe because `drm::open_display` errors out if there are
+        // zero outputs.
+        let first = outputs
+            .first()
+            .expect("Renderer::new given empty outputs vec");
+        let cursor_x = f64::from(first.position.x) + f64::from(first.size.w) / 2.0;
+        let cursor_y = f64::from(first.position.y) + f64::from(first.size.h) / 2.0;
+
         Ok(Self {
-            surface,
             gles,
-            output_size: Size::new(i32::from(w), i32::from(h)),
+            outputs,
+            layout_bounds,
+            cursor_x,
+            cursor_y,
             wallpaper,
-            // Start the cursor at the centre of the output rather
-            // than (0, 0) so it's immediately visible after the
-            // first paint without needing pointer movement.
-            cursor_x: f64::from(w) / 2.0,
-            cursor_y: f64::from(h) / 2.0,
         })
     }
 
-    /// Advance the cursor hotspot by libinput-reported relative
-    /// deltas (already acceleration-adjusted by libinput), clamping
-    /// to the output rectangle so it can't run off-screen. Called
-    /// once per `InputEvent::PointerMotion`.
+    /// Render every output's initial frame to prime its swapchain.
+    /// Called once at startup before the event loop runs; thereafter
+    /// each output's frames are driven by its own vblank events.
+    pub fn render_initial(&mut self) -> Result<()> {
+        for idx in 0..self.outputs.len() {
+            self.render_output(idx)
+                .with_context(|| format!("initial render of output #{idx} failed"))?;
+        }
+        Ok(())
+    }
+
+    /// Render the output driven by `crtc`, in response to its vblank.
+    pub fn render_for_crtc(&mut self, crtc: crtc::Handle) -> Result<()> {
+        let idx = self
+            .outputs
+            .iter()
+            .position(|o| o.crtc == crtc)
+            .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
+        self.render_output(idx)
+    }
+
+    /// Advance the cursor hotspot by libinput-reported deltas, clamped
+    /// to the virtual layout's bounding box.
     pub fn on_pointer_motion(&mut self, dx: f64, dy: f64) {
-        let max_x = f64::from(self.output_size.w);
-        let max_y = f64::from(self.output_size.h);
+        let max_x = f64::from(self.layout_bounds.w);
+        let max_y = f64::from(self.layout_bounds.h);
         self.cursor_x = (self.cursor_x + dx).clamp(0.0, max_x);
         self.cursor_y = (self.cursor_y + dy).clamp(0.0, max_y);
     }
 
-    /// Render one frame and queue it for scanout. Called once at
-    /// startup to prime the swapchain, and again on every
-    /// `DrmEvent::VBlank` to keep the cycle going. The `frame_submitted`
-    /// up-front is a no-op on the first call (no pending frame yet) and
-    /// the ack for the previous frame on every subsequent call.
-    pub fn render_and_queue(&mut self) -> Result<()> {
-        let _ = self
+    /// Render one output's frame: wallpaper, then cursor sprite if
+    /// the global hotspot falls within this output's rectangle.
+    fn render_output(&mut self, idx: usize) -> Result<()> {
+        // Pull everything we need before the GLES bind borrows
+        // `self.gles`. After that point we can still read other
+        // fields of `self` (split borrows) but it's clearer to
+        // localise.
+        let cursor_x = self.cursor_x;
+        let cursor_y = self.cursor_y;
+        let wallpaper = self.wallpaper.clone();
+
+        let output = &mut self.outputs[idx];
+        let output_size = output.size;
+        let output_pos = output.position;
+        let output_name = output.name.clone();
+
+        // No-op on the first call (no pending fb), the ack of the
+        // previous frame's flip thereafter.
+        let _ = output
             .surface
             .frame_submitted()
-            .context("GbmBufferedSurface::frame_submitted failed")?;
+            .with_context(|| format!("frame_submitted failed for {output_name}"))?;
 
-        let (mut dmabuf, _age) = self
+        let (mut dmabuf, _age) = output
             .surface
             .next_buffer()
-            .context("GbmBufferedSurface::next_buffer failed")?;
+            .with_context(|| format!("next_buffer failed for {output_name}"))?;
 
-        // Build the cursor draw: a right-triangle with apex at the
-        // hotspot. We pass the bounding box as `dst` and a per-row
-        // stripe list as the damage to `draw_solid`. Each damage rect's
-        // `loc` is **relative to `dst.loc`** — `GlesFrame::draw_solid`
-        // computes the final vertex as `dst.loc + damage.loc` and
-        // clamps damage to the local `0..dst.size` range first. So
-        // stripe[row] lives at (0, row), not at the absolute cursor
-        // position. (Got this wrong on the first pass and the cursor
-        // was invisible — every stripe got clamped to a zero-size rect.)
-        //
-        // Truncation `as i32` is bounded: `cursor_x`/`cursor_y` are
-        // clamped to `output_size` (i32) on every motion event.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "cursor coords are clamped to output_size (i32) in on_pointer_motion, so truncation is bounded and intentional"
-        )]
-        let cursor_origin =
-            Point::<i32, Physical>::from((self.cursor_x as i32, self.cursor_y as i32));
-        let cursor_bbox = Rectangle::new(cursor_origin, Size::new(CURSOR_SIZE, CURSOR_SIZE));
-        // Row `n` is `n+1` pixels wide, anchored at the left edge of
-        // the bbox: row 0 is a single pixel at the apex (top-left,
-        // which is also the hotspot), row CURSOR_SIZE-1 is the full
-        // base. The result is a top-left-pointing arrow silhouette.
-        let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..CURSOR_SIZE)
-            .map(|row| Rectangle::new(Point::from((0, row)), Size::new(row + 1, 1)))
-            .collect();
+        // Cursor in this output's local coord space (subtract the
+        // output's origin). Bounds check on the hotspot — if the
+        // hotspot is off this output, don't draw the cursor here at
+        // all. Sprite may still partially overflow the output's
+        // bottom-right edge; that's clipped by GLES viewport.
+        let cursor_local_x = cursor_x - f64::from(output_pos.x);
+        let cursor_local_y = cursor_y - f64::from(output_pos.y);
+        let cursor_in_bounds = cursor_local_x >= 0.0
+            && cursor_local_y >= 0.0
+            && cursor_local_x < f64::from(output_size.w)
+            && cursor_local_y < f64::from(output_size.h);
 
-        // The sync point from `Frame::finish` is handed to
-        // `queue_buffer` so the kernel waits for GPU completion
-        // before scanning out — otherwise we'd race the page flip
-        // against the GL submission and see tearing or stale frames.
         let sync = {
             let mut target = self
                 .gles
                 .bind(&mut dmabuf)
-                .context("GlesRenderer::bind dmabuf failed")?;
+                .with_context(|| format!("GlesRenderer::bind failed for {output_name}"))?;
             let mut frame = self
                 .gles
-                .render(&mut target, self.output_size, Transform::Normal)
-                .context("GlesRenderer::render begin failed")?;
-            draw_wallpaper(&mut frame, &self.wallpaper, self.output_size)?;
-            frame
-                .draw_solid(
-                    cursor_bbox,
-                    &cursor_damage,
-                    Color32F::new(1.0, 1.0, 1.0, 1.0),
-                )
-                .context("Frame::draw_solid (cursor) failed")?;
+                .render(&mut target, output_size, Transform::Normal)
+                .with_context(|| format!("GlesRenderer::render failed for {output_name}"))?;
+
+            draw_wallpaper(&mut frame, &wallpaper, output_size)?;
+
+            if cursor_in_bounds {
+                // Truncation `as i32` is bounded: cursor coords are
+                // clamped to layout_bounds (i32), and local coords
+                // here are within that minus a positive offset.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "cursor coords are clamped to layout_bounds (i32) in on_pointer_motion, so this truncation is bounded"
+                )]
+                let local_origin =
+                    Point::<i32, Physical>::from((cursor_local_x as i32, cursor_local_y as i32));
+                draw_cursor(&mut frame, local_origin)?;
+            }
+
             frame.finish().context("Frame::finish failed")?
         };
 
-        self.surface
+        output
+            .surface
             .queue_buffer(Some(sync), None, ())
-            .context("GbmBufferedSurface::queue_buffer failed")?;
+            .with_context(|| format!("queue_buffer failed for {output_name}"))?;
+        debug!(output = %output_name, "frame queued for scanout");
         Ok(())
     }
 }
@@ -243,8 +313,6 @@ fn draw_wallpaper(
                 .context("Frame::draw_solid (wallpaper solid) failed")?;
         }
         Wallpaper::VerticalGradient { top, bottom } => {
-            // u8 iteration: 256 stripes, and f32::from(u8) /
-            // i32::from(u8) are both exact (no clippy cast warnings).
             const STRIPE_COUNT: i32 = 256;
             let height = output_size.h;
             for stripe in 0u8..=u8::MAX {
@@ -275,5 +343,25 @@ fn draw_wallpaper(
             }
         }
     }
+    Ok(())
+}
+
+/// Draw the 24×24 white right-triangle cursor with its apex at
+/// `local_origin` (top-left of the bbox = hotspot). Damage stripes
+/// are anchored at `(0, row)` relative to `dst.loc` — see the long
+/// note in milestone 2c about `Frame::draw_solid`'s damage-coordinate
+/// semantics.
+fn draw_cursor(frame: &mut GlesFrame<'_, '_>, local_origin: Point<i32, Physical>) -> Result<()> {
+    let cursor_bbox = Rectangle::new(local_origin, Size::new(CURSOR_SIZE, CURSOR_SIZE));
+    let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..CURSOR_SIZE)
+        .map(|row| Rectangle::new(Point::from((0, row)), Size::new(row + 1, 1)))
+        .collect();
+    frame
+        .draw_solid(
+            cursor_bbox,
+            &cursor_damage,
+            Color32F::new(1.0, 1.0, 1.0, 1.0),
+        )
+        .context("Frame::draw_solid (cursor) failed")?;
     Ok(())
 }

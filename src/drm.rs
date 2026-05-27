@@ -1,11 +1,13 @@
-//! DRM/KMS device + surface initialisation.
+//! DRM/KMS device + per-output surface initialisation.
 //!
-//! Opens the DRM device via libseat, finds the first connected output
-//! and its preferred mode, picks a compatible CRTC, and creates a
-//! `DrmSurface` bound to that combination. The actual *rendering*
-//! happens in [`crate::render`], which consumes the surface to build a
-//! GBM-backed GLES render pipeline on top.
+//! Opens the DRM device via libseat, enumerates *every* connected
+//! output (not just the first one), picks a compatible CRTC for each
+//! while tracking which ones have already been assigned, and creates
+//! a `DrmSurface` per output. The renderer in [`crate::render`]
+//! consumes the surface vec to build a single GBM-backed GLES
+//! pipeline shared across outputs.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
@@ -18,38 +20,44 @@ use smithay::reexports::drm::control::{
 };
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
-use tracing::info;
+use tracing::{info, warn};
 
-/// Everything the caller needs to wire DRM into calloop and hand off
-/// to the renderer.
+/// Top-level result of [`open_display`]. Holds the master-claim
+/// device, the fd (Arc-backed; clone for additional owners), the
+/// calloop notifier, and one [`DrmOutput`] per connected output.
 pub struct DrmInit {
-    /// The DRM master claim. Held by the caller so the master claim
-    /// outlives the surface and the renderer's swapchain.
     pub device: DrmDevice,
-    /// The bound CRTC + connector + mode tuple. Consumed by the
-    /// renderer to build a GBM swapchain over it.
-    pub surface: DrmSurface,
-    /// Refcounted file-descriptor handle (Arc-backed). Cloned where
-    /// additional owners are needed (GBM allocator, EGL display).
     pub fd: DrmDeviceFd,
-    /// Calloop event source for vblank and device errors. Caller
-    /// inserts into the event loop.
     pub notifier: DrmDeviceNotifier,
-    /// The mode we picked. Renderer needs its size for the framebuffer
-    /// dimensions; the caller logs it.
+    pub outputs: Vec<DrmOutput>,
+}
+
+/// One physical output's worth of DRM resources.
+pub struct DrmOutput {
+    /// Kernel connector name (`"HDMI-A-1"`, `"DP-1"`, `"eDP-1"`, …),
+    /// formatted via drm-rs's `connector::Info` Display impl. This
+    /// is the stable identifier the user puts in Lua config to
+    /// target a specific output.
+    pub name: String,
+    /// CRTC driving this surface. Vblank events arrive tagged with
+    /// the CRTC, so the renderer uses this to look up which output
+    /// to re-render.
+    pub crtc: crtc::Handle,
+    /// CRTC + connector + mode tuple, consumed by the renderer to
+    /// build a GBM swapchain over this output.
+    pub surface: DrmSurface,
+    /// Mode in use. Renderer reads its size for framebuffer
+    /// dimensions; the user-facing name is just the connector.
     pub mode: Mode,
 }
 
-/// Open the DRM device at `path` through `session`, find the first
-/// connected output, its preferred mode and a compatible CRTC, and
-/// create a `DrmSurface` bound to that combination. The caller hands
-/// [`DrmInit::surface`] to [`crate::render::Renderer::new`] to build
-/// the rendering pipeline.
+/// Open the DRM device at `path` through `session`, enumerate every
+/// connected output, and bind a `DrmSurface` to each. Returns an
+/// error only if literally no outputs could be brought up; a
+/// connector that fails individually (no compatible free CRTC,
+/// no modes, query error) is logged and skipped.
 pub fn open_display(session: &mut LibSeatSession, path: &Path) -> Result<DrmInit> {
     info!(path = %path.display(), "phase: opening DRM device via libseat");
-    // libseat's `open` ignores the flags argument internally, but the
-    // trait signature requires one. RDWR | NONBLOCK matches what other
-    // smithay-based compositors pass.
     let owned_fd = session
         .open(path, OFlags::RDWR | OFlags::NONBLOCK)
         .context("libseat refused to open the DRM device")?;
@@ -57,9 +65,6 @@ pub fn open_display(session: &mut LibSeatSession, path: &Path) -> Result<DrmInit
     info!("DRM fd acquired");
 
     info!("phase: initialising DrmDevice");
-    // `disable_connectors = false`: don't reset anything until the
-    // renderer is ready to paint, so the screen doesn't flash to
-    // black between fd-acquire and the first frame.
     let (mut device, notifier) =
         DrmDevice::new(fd.clone(), false).context("DrmDevice::new failed")?;
     info!(atomic = device.is_atomic(), "DrmDevice initialised");
@@ -69,47 +74,96 @@ pub fn open_display(session: &mut LibSeatSession, path: &Path) -> Result<DrmInit
         .context("failed to read DRM resource handles")?;
 
     info!("phase: enumerating connectors");
-    let (conn_handle, conn_info, mode) = find_connected_output_and_mode(&device, &resources)?;
-    let (mode_w, mode_h) = mode.size();
-    info!(
-        connector = ?conn_handle,
-        interface = ?conn_info.interface(),
-        width = mode_w,
-        height = mode_h,
-        refresh = mode.vrefresh(),
-        "found connected output and selected its mode"
-    );
+    let mut outputs = Vec::new();
+    let mut used_crtcs: HashSet<crtc::Handle> = HashSet::new();
 
-    let crtc_handle = pick_compatible_crtc(&device, &conn_info, &resources)
-        .context("no CRTC compatible with the chosen connector")?;
-    info!(crtc = ?crtc_handle, "selected CRTC");
+    for &conn_handle in resources.connectors() {
+        let conn_info = match device.get_connector(conn_handle, false) {
+            Ok(info) => info,
+            Err(err) => {
+                warn!(?err, ?conn_handle, "failed to query connector — skipping");
+                continue;
+            }
+        };
+        if conn_info.state() != connector::State::Connected {
+            continue;
+        }
+        let name = conn_info.to_string();
 
-    let surface = device
-        .create_surface(crtc_handle, mode, &[conn_handle])
-        .context("DrmDevice::create_surface failed")?;
-    info!(legacy = surface.is_legacy(), "DRM surface bound");
+        let Some(mode) = pick_preferred_mode(&conn_info) else {
+            warn!(connector = %name, "connector reports no modes — skipping");
+            continue;
+        };
+        let (mode_w, mode_h) = mode.size();
+
+        let Some(crtc) = pick_unused_crtc(&device, &conn_info, &resources, &used_crtcs) else {
+            warn!(
+                connector = %name,
+                "no unused CRTC compatible with this connector — skipping"
+            );
+            continue;
+        };
+        used_crtcs.insert(crtc);
+
+        let surface = device
+            .create_surface(crtc, mode, &[conn_handle])
+            .with_context(|| format!("DrmDevice::create_surface failed for {name}"))?;
+        info!(
+            connector = %name,
+            crtc = ?crtc,
+            width = mode_w,
+            height = mode_h,
+            refresh = mode.vrefresh(),
+            legacy = surface.is_legacy(),
+            "output bound"
+        );
+
+        outputs.push(DrmOutput {
+            name,
+            crtc,
+            surface,
+            mode,
+        });
+    }
+
+    if outputs.is_empty() {
+        anyhow::bail!("no connected outputs with available CRTCs — nothing to drive");
+    }
+    info!(count = outputs.len(), "all connected outputs bound");
 
     Ok(DrmInit {
         device,
-        surface,
         fd,
         notifier,
-        mode,
+        outputs,
     })
 }
 
-/// Find a CRTC that can drive `connector`. Prefer the encoder/CRTC
-/// pair the firmware/previous owner already left configured — that
-/// avoids an unnecessary remap — otherwise fall back to the first
-/// CRTC the kernel says is compatible.
-fn pick_compatible_crtc(
+/// Pick the connector's preferred mode if the EDID advertises one,
+/// falling back to the first advertised mode.
+fn pick_preferred_mode(conn: &connector::Info) -> Option<Mode> {
+    conn.modes()
+        .iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .copied()
+        .or_else(|| conn.modes().first().copied())
+}
+
+/// Find a CRTC that (a) can drive `conn` and (b) isn't already in
+/// `used`. Prefers the kernel's existing encoder/CRTC pair when it's
+/// both compatible and still free — that avoids an unnecessary
+/// remap. Falls back to iterating the connector's possible encoders
+/// and filtering their possible CRTCs against `used`.
+fn pick_unused_crtc(
     device: &DrmDevice,
     conn: &connector::Info,
     resources: &drm::control::ResourceHandles,
+    used: &HashSet<crtc::Handle>,
 ) -> Option<crtc::Handle> {
     if let Some(encoder_handle) = conn.current_encoder()
         && let Ok(encoder) = device.get_encoder(encoder_handle)
         && let Some(crtc) = encoder.crtc()
+        && !used.contains(&crtc)
     {
         return Some(crtc);
     }
@@ -118,36 +172,8 @@ fn pick_compatible_crtc(
         let encoder = device.get_encoder(encoder_handle).ok()?;
         resources
             .filter_crtcs(encoder.possible_crtcs())
-            .first()
+            .iter()
+            .find(|c| !used.contains(c))
             .copied()
     })
-}
-
-/// Find the first connected output and pick its preferred mode
-/// (falling back to the first advertised mode if no `PREFERRED` flag
-/// is set). Returns the connector handle, its [`connector::Info`]
-/// (the caller needs it for [`pick_compatible_crtc`] which walks the
-/// encoder list off it), and the chosen mode.
-fn find_connected_output_and_mode(
-    device: &DrmDevice,
-    resources: &drm::control::ResourceHandles,
-) -> Result<(connector::Handle, connector::Info, drm::control::Mode)> {
-    let (handle, info) = resources
-        .connectors()
-        .iter()
-        .find_map(|&h| {
-            let info = device.get_connector(h, false).ok()?;
-            (info.state() == connector::State::Connected).then_some((h, info))
-        })
-        .context("no connected outputs on this DRM device")?;
-
-    let mode = info
-        .modes()
-        .iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .copied()
-        .or_else(|| info.modes().first().copied())
-        .context("connector reports no modes")?;
-
-    Ok((handle, info, mode))
 }
