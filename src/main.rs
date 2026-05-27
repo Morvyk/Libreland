@@ -389,8 +389,12 @@ fn wire_event_sources(
     handle
         .insert_source(libinput_backend, |event, (), state| {
             log_input_event(&event);
-            if let InputEvent::Keyboard { event: ke } = &event {
-                state.handle_key(ke);
+            match &event {
+                InputEvent::Keyboard { event: ke } => state.handle_key(ke),
+                InputEvent::PointerMotion { event: pm } => {
+                    state.renderer.on_pointer_motion(pm.dx(), pm.dy());
+                }
+                _ => {}
             }
         })
         .map_err(|e| anyhow::anyhow!("failed to insert libinput source: {e}"))?;

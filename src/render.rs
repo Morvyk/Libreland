@@ -32,7 +32,7 @@ use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Bind as _, Color32F, Frame as _, Renderer as _};
 use smithay::reexports::drm::control::Mode;
-use smithay::utils::{Physical, Rectangle, Size, Transform};
+use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 use tracing::info;
 
 /// Render pipeline for one display: GBM allocator, EGL context, GLES
@@ -49,7 +49,19 @@ pub struct Renderer {
     /// Wall-clock origin for the hue animation. Fixed at startup so
     /// the cycle is stable across runs (modulo wall-clock skew).
     start: Instant,
+    /// Cursor hotspot position in physical pixels, advanced by
+    /// [`Self::on_pointer_motion`] and read each frame to position
+    /// the cursor sprite. Stored as `f64` so libinput's sub-pixel
+    /// deltas accumulate without integer rounding losses; truncated
+    /// to `i32` only at the draw call.
+    cursor_x: f64,
+    cursor_y: f64,
 }
+
+/// Side length of the cursor sprite in physical pixels. The cursor
+/// is a right-triangle with apex at the hotspot, so this is also
+/// the bounding-box width and height.
+const CURSOR_SIZE: i32 = 24;
 
 impl Renderer {
     /// Wire GBM + EGL + GLES on top of an already-modeset `DrmSurface`.
@@ -112,7 +124,23 @@ impl Renderer {
             gles,
             output_size: Size::new(i32::from(w), i32::from(h)),
             start: Instant::now(),
+            // Start the cursor at the centre of the output rather
+            // than (0, 0) so it's immediately visible after the
+            // first paint without needing pointer movement.
+            cursor_x: f64::from(w) / 2.0,
+            cursor_y: f64::from(h) / 2.0,
         })
+    }
+
+    /// Advance the cursor hotspot by libinput-reported relative
+    /// deltas (already acceleration-adjusted by libinput), clamping
+    /// to the output rectangle so it can't run off-screen. Called
+    /// once per `InputEvent::PointerMotion`.
+    pub fn on_pointer_motion(&mut self, dx: f64, dy: f64) {
+        let max_x = f64::from(self.output_size.w);
+        let max_y = f64::from(self.output_size.h);
+        self.cursor_x = (self.cursor_x + dx).clamp(0.0, max_x);
+        self.cursor_y = (self.cursor_y + dy).clamp(0.0, max_y);
     }
 
     /// Render one frame and queue it for scanout. Called once at
@@ -145,6 +173,33 @@ impl Renderer {
         // gets coloured every frame.
         let full_damage = [Rectangle::<i32, Physical>::from_size(self.output_size)];
 
+        // Build the cursor draw: a right-triangle with apex at the
+        // hotspot. We pass the bounding box as `dst` and a per-row
+        // stripe list as the damage to `draw_solid`. Each damage rect's
+        // `loc` is **relative to `dst.loc`** — `GlesFrame::draw_solid`
+        // computes the final vertex as `dst.loc + damage.loc` and
+        // clamps damage to the local `0..dst.size` range first. So
+        // stripe[row] lives at (0, row), not at the absolute cursor
+        // position. (Got this wrong on the first pass and the cursor
+        // was invisible — every stripe got clamped to a zero-size rect.)
+        //
+        // Truncation `as i32` is bounded: `cursor_x`/`cursor_y` are
+        // clamped to `output_size` (i32) on every motion event.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to output_size (i32) in on_pointer_motion, so truncation is bounded and intentional"
+        )]
+        let cursor_origin =
+            Point::<i32, Physical>::from((self.cursor_x as i32, self.cursor_y as i32));
+        let cursor_bbox = Rectangle::new(cursor_origin, Size::new(CURSOR_SIZE, CURSOR_SIZE));
+        // Row `n` is `n+1` pixels wide, anchored at the left edge of
+        // the bbox: row 0 is a single pixel at the apex (top-left,
+        // which is also the hotspot), row CURSOR_SIZE-1 is the full
+        // base. The result is a top-left-pointing arrow silhouette.
+        let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..CURSOR_SIZE)
+            .map(|row| Rectangle::new(Point::from((0, row)), Size::new(row + 1, 1)))
+            .collect();
+
         // The sync point from `Frame::finish` is handed to
         // `queue_buffer` so the kernel waits for GPU completion
         // before scanning out — otherwise we'd race the page flip
@@ -161,6 +216,13 @@ impl Renderer {
             frame
                 .clear(Color32F::new(r, g, b, 1.0), &full_damage)
                 .context("Frame::clear failed")?;
+            frame
+                .draw_solid(
+                    cursor_bbox,
+                    &cursor_damage,
+                    Color32F::new(1.0, 1.0, 1.0, 1.0),
+                )
+                .context("Frame::draw_solid (cursor) failed")?;
             frame.finish().context("Frame::finish failed")?
         };
 
