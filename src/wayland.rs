@@ -30,7 +30,7 @@ use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource as _};
-use smithay::utils::Serial;
+use smithay::utils::{SERIAL_COUNTER, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
@@ -90,15 +90,23 @@ pub fn init(display: &Display<State>, config: &Config) -> Result<WaylandInit> {
     let mut seat_state = SeatState::<State>::new();
     let mut seat = seat_state.new_wl_seat(&dh, "seat0");
 
-    // Capabilities. Default XkbConfig means xkbcommon system
-    // defaults (matches `crate::keyboard::Keyboard::new("")`).
+    // Capabilities. Use the configured keyboard layout so the keymap
+    // smithay ships to clients matches the one our own xkbcommon
+    // wrapper (`crate::keyboard::Keyboard`) uses for hotkey matching —
+    // otherwise compositor-level binds and the focused client would
+    // see different keysyms on non-`us` layouts.
+    //
     // repeat_delay/rate from Config — clamped to i32 because
     // smithay's add_keyboard takes signed ints (negative values are
     // invalid; saturating downward to i32::MAX is harmless for
     // values that are already absurdly large).
+    let xkb = XkbConfig {
+        layout: &config.input.keyboard_layout,
+        ..XkbConfig::default()
+    };
     let repeat_delay = i32::try_from(config.input.repeat_delay).unwrap_or(i32::MAX);
     let repeat_rate = i32::try_from(config.input.repeat_rate).unwrap_or(i32::MAX);
-    seat.add_keyboard(XkbConfig::default(), repeat_delay, repeat_rate)
+    seat.add_keyboard(xkb, repeat_delay, repeat_rate)
         .context("seat.add_keyboard failed")?;
     seat.add_pointer();
 
@@ -227,9 +235,18 @@ impl XdgShellHandler for State {
         info!(surface = ?surface.wl_surface().id(), "wayland: new xdg_toplevel");
         // Mandatory: clients hang waiting for an initial configure
         // before they start drawing. The default configure carries
-        // no size, which means "you decide" — fine for 4a since
-        // we're not rendering the result anyway.
+        // no size, which means "you decide" — fine for 4c since
+        // window placement / explicit sizing arrives in 4d.
         surface.send_configure();
+        // Promote the new toplevel to keyboard focus immediately so
+        // the user can type into it without first clicking. A proper
+        // focus model (click-to-focus / focus-follows-mouse) lands
+        // in 4d alongside window management; for 4c the rule is just
+        // "most recently mapped wins".
+        let wl_surface = surface.wl_surface().clone();
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -255,6 +272,19 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: xdg_toplevel destroyed");
+        // Clear keyboard focus only if the destroyed surface was
+        // actually focused — otherwise leave whatever is focused
+        // alone (it might be a different live toplevel). 4d will
+        // pick a sensible replacement instead of dropping to None.
+        if let Some(kbd) = self.seat.get_keyboard() {
+            let was_focused = kbd
+                .current_focus()
+                .as_ref()
+                .is_some_and(|f| f == surface.wl_surface());
+            if was_focused {
+                kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
+            }
+        }
     }
 }
 

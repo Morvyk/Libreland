@@ -5,10 +5,11 @@
 //! from [`config::Config`]), set up a GBM + EGL + GLES render loop on
 //! every connected output, paint each vblank with the configured
 //! wallpaper plus a mouse-following cursor sprite, route key events
-//! through xkbcommon, and host a minimal Wayland frontend — clients can
-//! connect, query the seat and outputs, and create `xdg_toplevel`s
-//! whose lifecycle reaches the log. Compositing client buffers and
-//! routing input to them are 4b / 4c milestones.
+//! through xkbcommon, host a minimal Wayland frontend that composites
+//! every live `xdg_toplevel` between wallpaper and cursor, and forward
+//! pointer + keyboard events to the focused client. Window placement /
+//! focus model are still the 4d milestone — surfaces stack at the
+//! virtual origin and the most-recently-mapped toplevel takes focus.
 //!
 //! Run on a free virtual terminal (e.g. Ctrl+Alt+F2), `cargo run`, then
 //! type and move the pointer. Press `Super+Shift+E` to exit. Once DRM
@@ -25,12 +26,14 @@
 use anyhow::{Context as _, Result};
 use smithay::backend::drm::DrmDevice;
 use smithay::backend::input::{
-    InputEvent, KeyState, KeyboardKeyEvent as _, PointerButtonEvent as _,
+    Event as _, InputEvent, KeyState, KeyboardKeyEvent as _, PointerButtonEvent as _,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
+use smithay::input::keyboard::FilterResult;
+use smithay::input::pointer::{ButtonEvent, MotionEvent};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
@@ -39,6 +42,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -116,13 +120,10 @@ pub(crate) struct State {
     pub(crate) shm_state: ShmState,
     /// `wl_seat` substate; tracks all seats on the compositor.
     pub(crate) seat_state: SeatState<State>,
-    /// The single seat we currently advertise. Kept for input
-    /// forwarding in 4c (looking up `KeyboardHandle` /
-    /// `PointerHandle`).
-    #[allow(
-        dead_code,
-        reason = "held for input forwarding in milestone 4c; reachable via seat_state today"
-    )]
+    /// The single seat we currently advertise. The input-forwarding
+    /// paths in [`State::handle_key`], [`State::forward_pointer_motion`]
+    /// and [`State::forward_pointer_button`] reach `KeyboardHandle` /
+    /// `PointerHandle` through this field on every event.
     pub(crate) seat: Seat<State>,
     /// `xdg_wm_base` + `xdg_surface` + `xdg_toplevel` substate.
     pub(crate) xdg_shell_state: XdgShellState,
@@ -148,10 +149,17 @@ pub(crate) struct LoopData {
 impl State {
     /// Feed a key event through xkbcommon to get its layout-aware
     /// keysym + effective modifier mask, log the result at debug,
-    /// and fire whichever `config.binds.bindings` entry matches the
-    /// press (keysym AND every required modifier present, extras
-    /// tolerated). First match wins. Release events don't fire
-    /// actions but still update xkb's internal modifier state.
+    /// and decide whether it fires a compositor-level binding or
+    /// gets forwarded to the focused Wayland client.
+    ///
+    /// Smithay's `KeyboardHandle::input` is always called so its
+    /// internal modifier tracking stays in sync (even on
+    /// intercepted presses) and so `wl_keyboard.modifiers` events
+    /// reach the client correctly. The filter returns
+    /// `Intercept(action)` for hotkey hits (which we then
+    /// dispatch and *don't* forward), `Forward` otherwise.
+    /// Releases never match bindings but still need to flow through
+    /// for modifier release + `wl_keyboard.key` forwarding.
     fn handle_key(&mut self, event: &LibinputKeyEvent) {
         let pressed = matches!(event.state(), KeyState::Pressed);
         let result = self.keyboard.process(event.key_code(), pressed);
@@ -163,24 +171,93 @@ impl State {
             "key processed through xkb"
         );
 
-        if !pressed {
+        let matched_action = if pressed {
+            self.config
+                .binds
+                .bindings
+                .iter()
+                .find(|b| result.keysym == b.keysym && result.has_all_mods(b.mods))
+                .map(|b| b.action)
+        } else {
+            None
+        };
+
+        let key_code = event.key_code();
+        let key_state = event.state();
+        let time = event.time_msec();
+        let serial = SERIAL_COUNTER.next_serial();
+        let Some(kbd) = self.seat.get_keyboard() else {
             return;
-        }
-
-        // Find the matching binding's action first so the borrow on
-        // `self.config.binds` ends before we dispatch — `Action` is
-        // `Copy`, so this is a cheap byte-copy out.
-        let matched = self
-            .config
-            .binds
-            .bindings
-            .iter()
-            .find(|b| result.keysym == b.keysym && result.has_all_mods(b.mods))
-            .map(|b| b.action);
-
-        if let Some(action) = matched {
+        };
+        let action = kbd.input::<config::Action, _>(
+            self,
+            key_code,
+            key_state,
+            serial,
+            time,
+            |_data, _mods, _keysym| {
+                matched_action.map_or(FilterResult::Forward, FilterResult::Intercept)
+            },
+        );
+        if let Some(action) = action {
             self.dispatch_action(action);
         }
+    }
+
+    /// Forward the current cursor location to the focused client as
+    /// a `wl_pointer.motion` event (plus enter/leave handled by
+    /// smithay if focus changed). 4c pins every toplevel at the
+    /// origin, so focus = first live toplevel and surface-local
+    /// coordinates equal compositor-space coordinates; 4d will pick
+    /// focus via hit-testing and translate per window position.
+    fn forward_pointer_motion(&mut self, time: u32) {
+        let (cx, cy) = self.renderer.cursor_pos();
+        let location = Point::<f64, Logical>::from((cx, cy));
+        let focus = self.xdg_shell_state.toplevel_surfaces().first().map(|t| {
+            (
+                t.wl_surface().clone(),
+                Point::<f64, Logical>::from((0.0, 0.0)),
+            )
+        });
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Forward a pointer button press/release to the focused client.
+    /// `button` is the raw evdev button code (`BTN_LEFT = 0x110`, …)
+    /// which is exactly what `wl_pointer.button` carries.
+    fn forward_pointer_button(
+        &mut self,
+        button: u32,
+        state: smithay::backend::input::ButtonState,
+        time: u32,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
     }
 
     /// Run a bound action. Single-armed today; grows as we add more
@@ -622,6 +699,11 @@ fn wire_event_sources(
                 InputEvent::Keyboard { event: ke } => data.state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {
                     data.state.renderer.on_pointer_motion(pm.dx(), pm.dy());
+                    data.state.forward_pointer_motion(pm.time_msec());
+                }
+                InputEvent::PointerButton { event: pb } => {
+                    data.state
+                        .forward_pointer_button(pb.button_code(), pb.state(), pb.time_msec());
                 }
                 InputEvent::DeviceAdded { mut device } => {
                     apply_input_config(&mut device, &data.state.config.input);

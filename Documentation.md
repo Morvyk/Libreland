@@ -31,17 +31,23 @@ Pre-alpha. Each `cargo run` currently:
    client buffer as a GLES texture and drawing it through smithay's
    surface render-element pipeline. After each output is queued for
    scanout, drains the surface tree's `wl_callback` queue so clients
-   know to draw the next frame. **Input routing to the focused
-   client (4c) and window placement / focus / stacking (4d) are
-   still to come** — every window currently pins to `(0, 0)` of the
-   virtual layout.
-7. Sits in the calloop event loop until an `Exit` action runs.
+   know to draw the next frame.
+7. Forwards pointer motion + button events to the focused client
+   through `wl_pointer.motion` / `wl_pointer.button` (plus
+   smithay-driven `enter`/`leave`), and forwards keyboard keys —
+   including modifier tracking — through `wl_keyboard.key` /
+   `wl_keyboard.modifiers`. Compositor-level hotkeys (see
+   `config.binds`) are filtered out of forwarding so e.g. typing in
+   a focused client can't accidentally trigger them. The most
+   recently mapped toplevel takes keyboard focus; clicks don't yet
+   shift focus, and every window stacks at `(0, 0)` — proper window
+   placement / focus / stacking lands in **4d**.
+8. Sits in the calloop event loop until an `Exit` action runs.
 
 All user-tunable behaviour lives in a single `Config` struct (see
 [Configuration](#configuration)).
 
-Still to come: input routing to focused clients (4c), window
-management (4d).
+Still to come: window management (4d).
 
 ## Configuration
 

@@ -242,6 +242,13 @@ impl Renderer {
         self.cursor_y = (self.cursor_y + dy).clamp(0.0, max_y);
     }
 
+    /// Current cursor hotspot in absolute virtual-layout coordinates.
+    /// Exposed for input routing — the seat needs to compute the
+    /// surface-local pointer position for `wl_pointer.motion` events.
+    pub fn cursor_pos(&self) -> (f64, f64) {
+        (self.cursor_x, self.cursor_y)
+    }
+
     /// Render one output's frame: wallpaper, then every client
     /// surface positioned in this output's local space, then the
     /// cursor sprite on top if its hotspot falls in this output.
