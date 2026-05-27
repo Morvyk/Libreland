@@ -8,13 +8,18 @@ Pre-alpha. Each `cargo run` currently:
 
 1. Opens a libseat session, enumerates input devices via udev + libinput,
    and logs every event that flows through (keys, pointer motion, buttons).
-2. Opens the first DRM card, finds the first connected output, allocates
-   a dumb framebuffer matching its preferred mode, paints it cornflower
-   blue, and commits a static modeset — proof we own the display.
-3. Sits in the calloop event loop until you press `Super+Shift+E`.
+2. Opens the first DRM card, picks the first connected output and its
+   preferred mode, then sets up a **GBM + EGL + GLES2 render pipeline**
+   over it (via smithay's `GbmBufferedSurface`).
+3. Renders a vblank-paced hue cycle to the display: the screen sweeps
+   red → yellow → green → cyan → blue → magenta → red, full cycle every
+   8 seconds. Each frame is fsync'd through the GPU before scanout, so
+   timing should be tearing-free.
+4. Sits in the calloop event loop until you press `Super+Shift+E`.
 
-Still to come: a real renderer (pixman or GBM+EGL), page-flipping,
-multi-output, Wayland protocol handling, and the Lua config layer.
+Still to come: cursor sprite tracking pointer motion, xkbcommon
+keyboard handling, multi-output, Wayland protocol handling
+(`wl_compositor` / `xdg_shell` / clients), and the Lua config layer.
 
 ## Keybindings
 

@@ -1,13 +1,13 @@
 //! Libreland: a Wayland compositor in pure Rust, configured in Lua.
 //!
 //! Binary entry point. Current scope: open a libseat session, enumerate
-//! input devices through udev + libinput, paint a solid colour to the
-//! first connected display via DRM/KMS, and stay in the calloop event
-//! loop until the exit hotkey fires.
+//! input devices through udev + libinput, set up a GBM + EGL + GLES
+//! render loop on the first connected display, and paint each vblank
+//! with a wall-clock hue cycle until the exit hotkey fires.
 //!
 //! Run on a free virtual terminal (e.g. Ctrl+Alt+F2), `cargo run`, then
 //! type and move the pointer. Press `Super+Shift+E` to exit. Once DRM
-//! sets the mode the kernel TTY console can't repaint that VT — that's
+//! takes the mode the kernel TTY console can't repaint that VT — that's
 //! expected, not a freeze — and your shell prompt reappears when we
 //! exit and the seat is handed back to logind.
 //! Configure log output with `RUST_LOG`; the default is
@@ -18,12 +18,13 @@
 //! (e.g. after a freeze that needs recovering from another TTY).
 
 use anyhow::{Context as _, Result};
+use smithay::backend::drm::DrmDevice;
 use smithay::backend::input::{
     InputEvent, KeyState, KeyboardKeyEvent as _, Keycode, PointerButtonEvent as _,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session as _;
-use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::reexports::calloop::{EventLoop, LoopSignal};
 use smithay::reexports::input::Libinput;
@@ -37,6 +38,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod drm;
+mod render;
 
 // Smithay returns keycodes as X11 keycodes (evdev code + 8); see
 // `(self.key() + 8).into()` in the LibinputInputBackend impl. Applying
@@ -47,13 +49,6 @@ const KEY_RIGHTSHIFT: Keycode = Keycode::new(54 + 8);
 const KEY_LEFTMETA: Keycode = Keycode::new(125 + 8);
 const KEY_RIGHTMETA: Keycode = Keycode::new(126 + 8);
 const KEY_E: Keycode = Keycode::new(18 + 8);
-
-/// XRGB8888 colour painted to the framebuffer at startup. Cornflower
-/// blue is the classic "graphics-hello-world" tone — bright enough to
-/// confirm we own the display from across the room, and visually
-/// distinct enough that it instantly reads as "proof-of-life is up"
-/// rather than "something defaulted to a flat colour after crashing".
-const STARTUP_COLOR: u32 = 0x0064_95ED;
 
 /// Mutable state threaded through every event-loop callback.
 ///
@@ -78,15 +73,17 @@ struct State {
     /// which doesn't matter for a single hard-coded exit hotkey.
     shift_held: bool,
     super_held: bool,
-    /// DRM device + surface + dumb framebuffer kept alive together.
-    /// Held purely so the modeset stays on screen — dropping any
-    /// component hands the display back to logind, which is what we
-    /// want on clean shutdown.
+    /// DRM master claim. Held by the State so the master claim
+    /// outlives the renderer's swapchain — dropping it releases the
+    /// display back to logind on clean shutdown.
     #[allow(
         dead_code,
-        reason = "held only to keep the initial modeset live; queried in later milestones"
+        reason = "kept alive for the DRM master claim; will be queried by VT-switch / session-activation code"
     )]
-    drm: drm::DrmKeepalive,
+    drm_device: DrmDevice,
+    /// GBM + EGL + GLES render pipeline. The vblank callback drives
+    /// it once per refresh.
+    renderer: render::Renderer,
 }
 
 impl State {
@@ -151,22 +148,26 @@ fn main() -> Result<()> {
         debug!(device_id, path = %path.display(), "udev pre-existing device");
     }
 
-    // Pick a /dev/dri/cardN node — render nodes (renderD128) come through
-    // the same udev subsystem and we explicitly don't want them for
-    // modesetting. First card wins for now; multi-GPU is a later milestone.
-    let drm_path = initial_devices
-        .iter()
-        .find(|(_, p)| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("card"))
-        })
-        .map(|(_, p)| p.clone())
-        .context("no /dev/dri/cardN device enumerated by udev — no display to drive")?;
+    let drm_path = pick_drm_card_path(&initial_devices)?;
     info!(drm_path = %drm_path.display(), "selected DRM device");
 
-    let (drm_keepalive, drm_notifier) = drm::open_and_paint(&mut session, &drm_path, STARTUP_COLOR)
-        .context("DRM/KMS initial paint failed")?;
+    let drm_init = drm::open_display(&mut session, &drm_path).context("DRM device init failed")?;
+    let drm::DrmInit {
+        device: drm_device,
+        surface: drm_surface,
+        fd: drm_fd,
+        notifier: drm_notifier,
+        mode: drm_mode,
+    } = drm_init;
+
+    let mut renderer = render::Renderer::new(drm_fd, drm_surface, drm_mode)
+        .context("render pipeline init failed")?;
+
+    info!("phase: rendering initial frame to prime the swapchain");
+    renderer
+        .render_and_queue()
+        .context("initial frame render failed")?;
+    info!("initial frame queued for scanout");
 
     info!("phase: creating libinput context");
     // libinput opens `/dev/input/*` via the session interface so libseat
@@ -181,53 +182,15 @@ fn main() -> Result<()> {
     info!("libinput seat assigned");
     let libinput_backend = LibinputInputBackend::new(libinput_ctx);
 
-    handle
-        .insert_source(notifier, |event, (), _state| match event {
-            smithay::backend::session::Event::PauseSession => warn!("session paused"),
-            smithay::backend::session::Event::ActivateSession => info!("session activated"),
-        })
-        .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
-
-    handle
-        .insert_source(udev, |event, (), _state| match event {
-            UdevEvent::Added { device_id, path } => {
-                info!(device_id, path = %path.display(), "udev: device added");
-            }
-            UdevEvent::Removed { device_id } => {
-                info!(device_id, "udev: device removed");
-            }
-            UdevEvent::Changed { device_id } => {
-                debug!(device_id, "udev: device changed");
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
-
-    handle
-        .insert_source(drm_notifier, |event, _meta, _state| match event {
-            smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                debug!(?crtc, "drm: vblank");
-            }
-            smithay::backend::drm::DrmEvent::Error(err) => {
-                warn!(error = %err, "drm: event-source error");
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("failed to insert drm source: {e}"))?;
-
-    handle
-        .insert_source(libinput_backend, |event, (), state| {
-            log_input_event(&event);
-            if let InputEvent::Keyboard { event: ke } = &event {
-                state.handle_key(ke);
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("failed to insert libinput source: {e}"))?;
+    wire_event_sources(&handle, notifier, udev, drm_notifier, libinput_backend)?;
 
     let mut state = State {
         session,
         loop_signal,
         shift_held: false,
         super_held: false,
-        drm: drm_keepalive,
+        drm_device,
+        renderer,
     };
 
     info!("entering event loop — type to generate events, super+shift+e to exit");
@@ -356,6 +319,83 @@ fn install_panic_hook() {
         tracing::error!(panic = %panic_info, "compositor panicked");
         default_hook(panic_info);
     }));
+}
+
+/// Pick a `/dev/dri/cardN` node from a udev enumeration — render nodes
+/// (`renderD128`) come through the same DRM subsystem and we
+/// explicitly don't want them for modesetting. First card wins for
+/// now; multi-GPU is a later milestone.
+fn pick_drm_card_path<T>(devices: &[(T, std::path::PathBuf)]) -> Result<std::path::PathBuf> {
+    devices
+        .iter()
+        .find(|(_, p)| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("card"))
+        })
+        .map(|(_, p)| p.clone())
+        .context("no /dev/dri/cardN device enumerated by udev — no display to drive")
+}
+
+/// Insert all four event sources (libseat session, udev, DRM vblank,
+/// libinput) into the calloop handle. Pulled out of `main` so the
+/// init flow stays under clippy's `too_many_lines` threshold without
+/// losing per-source visibility.
+fn wire_event_sources(
+    handle: &smithay::reexports::calloop::LoopHandle<'_, State>,
+    session_notifier: LibSeatSessionNotifier,
+    udev: UdevBackend,
+    drm_notifier: smithay::backend::drm::DrmDeviceNotifier,
+    libinput_backend: LibinputInputBackend,
+) -> Result<()> {
+    handle
+        .insert_source(session_notifier, |event, (), _state| match event {
+            smithay::backend::session::Event::PauseSession => warn!("session paused"),
+            smithay::backend::session::Event::ActivateSession => info!("session activated"),
+        })
+        .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
+
+    handle
+        .insert_source(udev, |event, (), _state| match event {
+            UdevEvent::Added { device_id, path } => {
+                info!(device_id, path = %path.display(), "udev: device added");
+            }
+            UdevEvent::Removed { device_id } => {
+                info!(device_id, "udev: device removed");
+            }
+            UdevEvent::Changed { device_id } => {
+                debug!(device_id, "udev: device changed");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
+
+    handle
+        .insert_source(drm_notifier, |event, _meta, state| match event {
+            smithay::backend::drm::DrmEvent::VBlank(crtc) => {
+                if let Err(err) = state.renderer.render_and_queue() {
+                    // Don't kill the event loop on a render hiccup — log
+                    // and let the next vblank try again. A persistent
+                    // failure manifests as a frozen frame, which is at
+                    // least recoverable via Super+Shift+E.
+                    warn!(error = %err, ?crtc, "render_and_queue failed on vblank");
+                }
+            }
+            smithay::backend::drm::DrmEvent::Error(err) => {
+                warn!(error = %err, "drm: event-source error");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to insert drm source: {e}"))?;
+
+    handle
+        .insert_source(libinput_backend, |event, (), state| {
+            log_input_event(&event);
+            if let InputEvent::Keyboard { event: ke } = &event {
+                state.handle_key(ke);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to insert libinput source: {e}"))?;
+
+    Ok(())
 }
 
 /// Log a single libinput event. Keyboard / pointer events are what we
