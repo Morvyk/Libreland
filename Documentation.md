@@ -25,18 +25,23 @@ Pre-alpha. Each `cargo run` currently:
    `wl_subcompositor`, `wl_shm`, `wl_seat` (with keyboard + pointer
    capabilities advertised), `wl_output`, and `xdg_wm_base`/
    `xdg_toplevel`/`xdg_surface`. Sets `$WAYLAND_DISPLAY` and spawns
-   every `config.startup` command as a child. Clients connect,
-   allocate surfaces, and get configured; their lifecycle reaches the
-   log. **Rendering client buffers (4b) and routing input to focused
-   clients (4c) are still to come** — windows are accepted but
-   invisible at this stage.
-6. Sits in the calloop event loop until an `Exit` action runs.
+   every `config.startup` command as a child.
+6. Composites every live `xdg_toplevel`'s surface onto the
+   framebuffer between wallpaper and cursor, by uploading each
+   client buffer as a GLES texture and drawing it through smithay's
+   surface render-element pipeline. After each output is queued for
+   scanout, drains the surface tree's `wl_callback` queue so clients
+   know to draw the next frame. **Input routing to the focused
+   client (4c) and window placement / focus / stacking (4d) are
+   still to come** — every window currently pins to `(0, 0)` of the
+   virtual layout.
+7. Sits in the calloop event loop until an `Exit` action runs.
 
 All user-tunable behaviour lives in a single `Config` struct (see
 [Configuration](#configuration)).
 
-Still to come: composite client surfaces onto the framebuffer (4b),
-input routing to focused clients (4c), window management (4d).
+Still to come: input routing to focused clients (4c), window
+management (4d).
 
 ## Configuration
 

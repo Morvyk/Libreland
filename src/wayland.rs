@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_output;
 use smithay::delegate_seat;
@@ -169,6 +170,13 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         debug!(surface = ?surface.id(), "wayland: surface commit");
+        // Hands the freshly-attached buffer over to smithay's
+        // RendererSurfaceState — uploads it on the next render and
+        // makes `render_elements_from_surface_tree` produce a
+        // non-empty element. Skipping this leaves the surface
+        // invisible (no texture) even though the client did
+        // everything right.
+        on_commit_buffer_handler::<State>(surface);
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {

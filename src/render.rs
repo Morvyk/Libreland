@@ -14,15 +14,26 @@
 //! draw the cursor only when the hotspot falls within that output's
 //! rectangle.
 
+use std::time::Instant;
+
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::{DrmDeviceFd, GbmBufferedSurface};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+};
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
+use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{Bind as _, Color32F, Frame as _, Renderer as _};
 use smithay::reexports::drm::control::crtc;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use smithay::wayland::compositor::{
+    SurfaceAttributes, TraversalAction, with_surface_tree_downward,
+};
 use tracing::{debug, info};
 
 use crate::config::Wallpaper;
@@ -49,6 +60,12 @@ pub struct Renderer {
     cursor_y: f64,
     /// Wallpaper drawn under the cursor on every output.
     wallpaper: Wallpaper,
+    /// Origin used for the monotonic ms timestamp fed into
+    /// `wl_callback.done` after each output is queued for scanout.
+    /// Clients use this value to schedule their next frame's draw —
+    /// the spec defines it as an unsigned 32-bit ms count expected
+    /// to wrap freely.
+    start: Instant,
 }
 
 /// One output's render state: swapchain, dimensions, and position in
@@ -183,28 +200,37 @@ impl Renderer {
             cursor_x,
             cursor_y,
             wallpaper,
+            start: Instant::now(),
         })
     }
 
     /// Render every output's initial frame to prime its swapchain.
     /// Called once at startup before the event loop runs; thereafter
-    /// each output's frames are driven by its own vblank events.
+    /// each output's frames are driven by its own vblank events. No
+    /// Wayland clients have connected yet at this point, so we pass
+    /// an empty surface slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
-            self.render_output(idx)
+            self.render_output(idx, &[])
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
     }
 
     /// Render the output driven by `crtc`, in response to its vblank.
-    pub fn render_for_crtc(&mut self, crtc: crtc::Handle) -> Result<()> {
+    /// `surfaces` is the snapshot of every live `xdg_toplevel`'s
+    /// `wl_surface` that the caller wants composited this frame; for
+    /// 4b every entry is pinned to the absolute origin (0, 0) of the
+    /// virtual layout, so on a multi-output setup the same window
+    /// only appears on whichever output covers that point. Real
+    /// per-window placement is window-management (4d).
+    pub fn render_for_crtc(&mut self, crtc: crtc::Handle, surfaces: &[WlSurface]) -> Result<()> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx)
+        self.render_output(idx, surfaces)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -216,30 +242,29 @@ impl Renderer {
         self.cursor_y = (self.cursor_y + dy).clamp(0.0, max_y);
     }
 
-    /// Render one output's frame: wallpaper, then cursor sprite if
-    /// the global hotspot falls within this output's rectangle.
-    fn render_output(&mut self, idx: usize) -> Result<()> {
-        // Pull everything we need before the GLES bind borrows
-        // `self.gles`. After that point we can still read other
-        // fields of `self` (split borrows) but it's clearer to
-        // localise.
+    /// Render one output's frame: wallpaper, then every client
+    /// surface positioned in this output's local space, then the
+    /// cursor sprite on top if its hotspot falls in this output.
+    /// Sends `wl_callback.done` on each surface after the buffer is
+    /// queued so clients know they can draw the next frame.
+    fn render_output(&mut self, idx: usize, surfaces: &[WlSurface]) -> Result<()> {
+        // Pull everything we need before the mutable borrows on
+        // `self.outputs[idx].surface` / `self.gles` kick in.
         let cursor_x = self.cursor_x;
         let cursor_y = self.cursor_y;
         let wallpaper = self.wallpaper.clone();
-
-        let output = &mut self.outputs[idx];
-        let output_size = output.size;
-        let output_pos = output.position;
-        let output_name = output.name.clone();
+        let output_size = self.outputs[idx].size;
+        let output_pos = self.outputs[idx].position;
+        let output_name = self.outputs[idx].name.clone();
 
         // No-op on the first call (no pending fb), the ack of the
         // previous frame's flip thereafter.
-        let _ = output
+        let _ = self.outputs[idx]
             .surface
             .frame_submitted()
             .with_context(|| format!("frame_submitted failed for {output_name}"))?;
 
-        let (mut dmabuf, _age) = output
+        let (mut dmabuf, _age) = self.outputs[idx]
             .surface
             .next_buffer()
             .with_context(|| format!("next_buffer failed for {output_name}"))?;
@@ -256,6 +281,33 @@ impl Renderer {
             && cursor_local_x < f64::from(output_size.w)
             && cursor_local_y < f64::from(output_size.h);
 
+        // Build client-surface render elements *before* binding the
+        // dmabuf. `render_elements_from_surface_tree` uses the
+        // renderer to import each surface's buffer as a GLES texture
+        // (via the `ImportAll` trait GlesRenderer impls); that has
+        // to happen while no `Frame` is alive. The resulting Vec
+        // owns its `TextureId`s, so it's free to outlive the
+        // renderer borrow and be drawn during the frame below.
+        //
+        // 4b pins every surface at (0, 0) absolute; on this output
+        // that means (-output_pos.x, -output_pos.y) locally. Outputs
+        // not covering (0, 0) just get a fully-clipped surface —
+        // the GLES viewport handles it. Real placement is 4d.
+        let local_origin = Point::<i32, Physical>::from((-output_pos.x, -output_pos.y));
+        let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = surfaces
+            .iter()
+            .flat_map(|surface| {
+                render_elements_from_surface_tree(
+                    &mut self.gles,
+                    surface,
+                    local_origin,
+                    1.0_f64,
+                    1.0_f32,
+                    Kind::Unspecified,
+                )
+            })
+            .collect();
+
         let sync = {
             let mut target = self
                 .gles
@@ -268,27 +320,51 @@ impl Renderer {
 
             draw_wallpaper(&mut frame, &wallpaper, output_size)?;
 
+            // Full-output damage for 4b — we redraw everything every
+            // vblank. Per-element damage tracking is a later
+            // optimisation (matters more for partial-occlusion
+            // perf and battery, neither of which we care about yet).
+            let full_damage = [Rectangle::<i32, Physical>::from_size(output_size)];
+            draw_render_elements::<GlesRenderer, _, _>(
+                &mut frame,
+                1.0_f64,
+                &surface_elements,
+                &full_damage,
+            )
+            .context("draw_render_elements failed")?;
+
             if cursor_in_bounds {
-                // Truncation `as i32` is bounded: cursor coords are
-                // clamped to layout_bounds (i32), and local coords
-                // here are within that minus a positive offset.
                 #[allow(
                     clippy::cast_possible_truncation,
                     reason = "cursor coords are clamped to layout_bounds (i32) in on_pointer_motion, so this truncation is bounded"
                 )]
-                let local_origin =
+                let cursor_origin =
                     Point::<i32, Physical>::from((cursor_local_x as i32, cursor_local_y as i32));
-                draw_cursor(&mut frame, local_origin)?;
+                draw_cursor(&mut frame, cursor_origin)?;
             }
 
             frame.finish().context("Frame::finish failed")?
         };
 
-        output
+        self.outputs[idx]
             .surface
             .queue_buffer(Some(sync), None, ())
             .with_context(|| format!("queue_buffer failed for {output_name}"))?;
         debug!(output = %output_name, "frame queued for scanout");
+
+        // Fire wl_callback.done on every surface we rendered. The
+        // callback queue is drained per surface, so calling this
+        // again from a second output's render is a harmless no-op
+        // (which is what we want — one done() per frame, not one
+        // per output).
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
+        )]
+        let elapsed_ms = self.start.elapsed().as_millis() as u32;
+        for surface in surfaces {
+            send_frame_callbacks(surface, elapsed_ms);
+        }
         Ok(())
     }
 }
@@ -344,6 +420,28 @@ fn draw_wallpaper(
         }
     }
     Ok(())
+}
+
+/// Walk a surface tree and drain every queued `wl_callback`, firing
+/// `done(time_ms)` on each so the client knows to schedule its next
+/// frame. Smithay's `desktop::send_frames_surface_tree` does this
+/// plus primary-scanout-output filtering and throttling, all of
+/// which presuppose a `Space<Window>` we don't have yet (4d); this
+/// minimal version is enough for 4b — every visible surface gets a
+/// callback per vblank cycle.
+fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |_surf, states, &()| {
+            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+            for callback in attrs.current().frame_callbacks.drain(..) {
+                callback.done(time_ms);
+            }
+        },
+        |_, _, &()| true,
+    );
 }
 
 /// Draw the 24×24 white right-triangle cursor with its apex at

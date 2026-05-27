@@ -37,6 +37,7 @@ use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAct
 use smithay::reexports::input as libinput;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
@@ -587,7 +588,18 @@ fn wire_event_sources(
             drm_notifier,
             |event, _meta, data: &mut LoopData| match event {
                 smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                    if let Err(err) = data.state.renderer.render_for_crtc(crtc) {
+                    // Snapshot every live xdg_toplevel's wl_surface so
+                    // the borrow on `xdg_shell_state` ends before the
+                    // mut borrow on `renderer` starts. WlSurface clones
+                    // are Arc-backed — cheap.
+                    let surfaces: Vec<WlSurface> = data
+                        .state
+                        .xdg_shell_state
+                        .toplevel_surfaces()
+                        .iter()
+                        .map(|t| t.wl_surface().clone())
+                        .collect();
+                    if let Err(err) = data.state.renderer.render_for_crtc(crtc, &surfaces) {
                         // Don't kill the event loop on a render hiccup —
                         // log and let the next vblank try again. A
                         // persistent failure on one CRTC freezes that
