@@ -32,32 +32,105 @@ protocol handling (`wl_compositor` / `xdg_shell` / clients).
 
 ## Configuration
 
-Every runtime setting lives in `src/config.rs` as `Config`. Today the
-struct is populated with sensible defaults at startup. Milestone 3c
-adds a Lua loader that reads
-`$XDG_CONFIG_HOME/libreland/config.lua` and replaces those defaults.
-The fields listed below are the full schema — some are wired into the
-runtime today (✅), others sit in the struct waiting for the milestone
-that uses them (⏳).
+Drop a Lua file at `$XDG_CONFIG_HOME/libreland/config.lua` (typically
+`~/.config/libreland/config.lua`). Anything you set there overrides
+the corresponding default; anything you don't set keeps its default.
+
+- **No file present**: libreland logs `no config.lua found, using
+  defaults` and starts with the defaults below.
+- **File present but Lua syntax or schema error**: libreland fails at
+  startup with the file path, the Lua error message (line + column
+  for syntax errors), and a breadcrumb chain through the schema
+  (`binds[2] → mods[0] → unknown modifier "Sper"`).
+- **File present and valid**: values flow into `Config` and propagate
+  through the runtime.
+
+### Complete example
+
+```lua
+-- ~/.config/libreland/config.lua
+
+monitors = {
+    primary = "DP-1",          -- optional; defaults to first connected
+    outputs = {
+        ["DP-1"] = {
+            mode = { width = 3840, height = 2160, refresh_mhz = 144000 },  -- optional; defaults to EDID-preferred
+            position = { x = 0, y = 0 },
+            scale = 1.0,
+        },
+        ["HDMI-A-1"] = {
+            position = { x = 3840, y = 0 },
+            scale = 1.5,
+        },
+    },
+}
+
+input = {
+    repeat_rate = 25,
+    repeat_delay = 600,
+    keyboard_layout = "",                 -- "" defers to $XKB_DEFAULT_LAYOUT
+    mouse_accel_profile = "flat",         -- "flat" or "adaptive"
+    mouse_accel_speed = 0.0,              -- [-1.0, 1.0]
+}
+
+binds = {
+    { mods = { "Super", "Shift" }, key = "E", action = "exit" },
+}
+
+misc = {
+    wallpaper = {
+        type = "vertical_gradient",
+        top    = { 0.40, 0.60, 0.90 },
+        bottom = { 0.10, 0.20, 0.50 },
+    },
+    -- Or a solid colour:
+    -- wallpaper = { type = "solid", color = { 0.20, 0.40, 0.80 } },
+}
+```
+
+### Modifier names (case-insensitive)
+
+`"Shift"`, `"Ctrl"` (alias `"Control"`), `"Alt"` (alias `"Mod1"`),
+`"Super"` (aliases `"Logo"`, `"Mod4"`).
+
+### Key names
+
+Anything xkbcommon's `xkb_keysym_from_name` accepts — `"E"`,
+`"Return"`, `"F1"`, `"space"`, `"comma"`, …
+
+### Actions
+
+| Action  | Effect                       |
+| ------- | ---------------------------- |
+| `"exit"` | Cleanly exit the compositor. |
+
+(More actions land as features grow: `"reload"`, `"spawn"`,
+`"change_vt"`, …)
+
+### Schema reference
+
+Every field, its default, and whether it's plumbed all the way into
+the runtime today (✅) or just held in `Config` for a later consumer
+(⏳). Lua can set every field regardless.
 
 ### monitors
 
-| Field                    | Default  | State  | Notes                                                                           |
-| ------------------------ | -------- | ------ | ------------------------------------------------------------------------------- |
-| `outputs[name].mode`     | `None`   | ⏳ 3b  | `Some((width, height, refresh_mHz))` forces a mode; `None` uses EDID-preferred. |
-| `outputs[name].position` | `(0, 0)` | ⏳ 3b  | Top-left of the output in the virtual layout, logical pixels.                   |
-| `outputs[name].scale`    | `1.0`    | ⏳ 3b  | Fractional scale. Exposed to clients via `wp_fractional_scale_manager_v1` once the Wayland frontend lands. |
-| `primary`                | `None`   | ⏳ 3b  | Connector name of the primary output; `None` = first connected.                 |
+| Field                    | Default  | State              | Notes                                                                           |
+| ------------------------ | -------- | ------------------ | ------------------------------------------------------------------------------- |
+| `outputs[name].mode`     | `nil`    | ⏳ later           | `{ width = …, height = …, refresh_mhz = … }` to force a mode; `nil` uses EDID-preferred. |
+| `outputs[name].position` | `(0,0)`  | ⏳ overrides 3b    | Top-left in the virtual layout (logical pixels). 3b uses the auto left-to-right layout; Lua-supplied positions wait for a follow-up that honours them. |
+| `outputs[name].scale`    | `1.0`    | ⏳ Wayland frontend | Fractional scale. Exposed to clients via `wp_fractional_scale_manager_v1` once we have a Wayland frontend. |
+| `primary`                | `nil`    | ⏳ later           | Connector name of the primary output; `nil` = first connected.                  |
 
 ### input
 
-| Field                  | Default | State                            | Notes                                                                                  |
-| ---------------------- | ------- | -------------------------------- | -------------------------------------------------------------------------------------- |
-| `repeat_rate`          | `25`    | ⏳ Wayland frontend              | Repeats per second after the delay elapses. 25 matches X11's classic default.          |
-| `repeat_delay`         | `600`   | ⏳ Wayland frontend              | Milliseconds before repeat fires.                                                      |
-| `keyboard_layout`      | `""`    | ✅                               | xkb RMLVO layout field. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default.        |
-| `mouse_accel_profile`  | `Flat`  | ✅ (applied per pointer device)  | `Flat` (1:1, no ramp) or `Adaptive` (libinput's curve, system default).                |
-| `mouse_accel_speed`    | `0.0`   | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `Flat` this is "no extra sensitivity". |
+| Field                  | Default  | State                            | Notes                                                                                      |
+| ---------------------- | -------- | -------------------------------- | ------------------------------------------------------------------------------------------ |
+| `repeat_rate`          | `25`     | ⏳ Wayland frontend              | Repeats per second after the delay elapses. 25 matches X11's classic default.              |
+| `repeat_delay`         | `600`    | ⏳ Wayland frontend              | Milliseconds before repeat fires.                                                          |
+| `keyboard_layout`      | `""`     | ✅                               | xkb RMLVO layout. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default.                  |
+| `mouse_accel_profile`  | `"flat"` | ✅ (applied per pointer device)  | `"flat"` (1:1, no ramp) or `"adaptive"` (libinput's curve, system default).                |
+| `mouse_accel_speed`    | `0.0`    | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `"flat"` this is "no extra sensitivity". |
 
 ### binds
 

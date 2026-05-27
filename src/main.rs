@@ -141,10 +141,12 @@ fn main() -> Result<()> {
     let _log_guard = init_tracing()?;
     info!("libreland starting");
 
-    // Compositor configuration. Defaults today; replaced wholesale
-    // by the Lua loader in milestone 3c.
-    let config = config::Config::default();
-    info!("compositor config initialised from defaults");
+    // Compositor configuration: load Lua from $XDG_CONFIG_HOME/libreland/
+    // config.lua if present, else fall back to compiled-in defaults.
+    // A missing file is fine (logged at info); a present-but-broken
+    // file aborts startup with a clear error chain.
+    let config = config::Config::load_or_default().context("config load failed")?;
+    info!("compositor config ready");
 
     let mut event_loop: EventLoop<State> =
         EventLoop::try_new().context("failed to create calloop event loop")?;
