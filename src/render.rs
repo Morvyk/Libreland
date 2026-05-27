@@ -22,18 +22,18 @@
 //! frame to ack), each subsequent call acks the previous frame via
 //! `frame_submitted` before rendering and queuing the next.
 
-use std::time::Instant;
-
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::{DrmDeviceFd, DrmSurface, GbmBufferedSurface};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
 use smithay::backend::renderer::{Bind as _, Color32F, Frame as _, Renderer as _};
 use smithay::reexports::drm::control::Mode;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 use tracing::info;
+
+use crate::config::Wallpaper;
 
 /// Render pipeline for one display: GBM allocator, EGL context, GLES
 /// renderer, and the buffered surface that page-flips on vblank.
@@ -46,9 +46,10 @@ pub struct Renderer {
     /// Output dimensions in physical pixels — passed to `render` so
     /// the renderer knows the viewport size.
     output_size: Size<i32, Physical>,
-    /// Wall-clock origin for the hue animation. Fixed at startup so
-    /// the cycle is stable across runs (modulo wall-clock skew).
-    start: Instant,
+    /// Background pattern painted before the cursor each frame.
+    /// Owned (not borrowed) so live config reloads can swap it via
+    /// a setter later without churn here.
+    wallpaper: Wallpaper,
     /// Cursor hotspot position in physical pixels, advanced by
     /// [`Self::on_pointer_motion`] and read each frame to position
     /// the cursor sprite. Stored as `f64` so libinput's sub-pixel
@@ -70,7 +71,12 @@ impl Renderer {
     /// opened on; it gets cloned (cheap, Arc-backed) into a `GbmDevice`
     /// for the EGL display and into the `GbmAllocator` for scanout
     /// buffers.
-    pub fn new(drm_fd: DrmDeviceFd, drm_surface: DrmSurface, mode: Mode) -> Result<Self> {
+    pub fn new(
+        drm_fd: DrmDeviceFd,
+        drm_surface: DrmSurface,
+        mode: Mode,
+        wallpaper: Wallpaper,
+    ) -> Result<Self> {
         info!("phase: opening GBM device");
         let gbm_device = GbmDevice::new(drm_fd).context("GbmDevice::new failed")?;
         info!("GBM device created");
@@ -123,7 +129,7 @@ impl Renderer {
             surface,
             gles,
             output_size: Size::new(i32::from(w), i32::from(h)),
-            start: Instant::now(),
+            wallpaper,
             // Start the cursor at the centre of the output rather
             // than (0, 0) so it's immediately visible after the
             // first paint without needing pointer movement.
@@ -158,20 +164,6 @@ impl Renderer {
             .surface
             .next_buffer()
             .context("GbmBufferedSurface::next_buffer failed")?;
-
-        // Hue cycles 360° every 8 seconds (45°/s). Time origin is
-        // fixed at construction so the cycle is stable across vblanks
-        // rather than reset on each frame.
-        let elapsed = self.start.elapsed().as_secs_f32();
-        let hue = (elapsed * 45.0) % 360.0;
-        let (r, g, b) = hue_to_rgb(hue);
-
-        // GLES's `Frame::clear` is damage-aware: an empty `at` slice
-        // is treated as "nothing changed, nothing to paint" and the
-        // function early-returns without touching pixels. Pass the
-        // whole-output rectangle so the entire framebuffer actually
-        // gets coloured every frame.
-        let full_damage = [Rectangle::<i32, Physical>::from_size(self.output_size)];
 
         // Build the cursor draw: a right-triangle with apex at the
         // hotspot. We pass the bounding box as `dst` and a per-row
@@ -213,9 +205,7 @@ impl Renderer {
                 .gles
                 .render(&mut target, self.output_size, Transform::Normal)
                 .context("GlesRenderer::render begin failed")?;
-            frame
-                .clear(Color32F::new(r, g, b, 1.0), &full_damage)
-                .context("Frame::clear failed")?;
+            draw_wallpaper(&mut frame, &self.wallpaper, self.output_size)?;
             frame
                 .draw_solid(
                     cursor_bbox,
@@ -233,25 +223,57 @@ impl Renderer {
     }
 }
 
-/// HSV(`hue`, 1.0, 1.0) → linear RGB in [0, 1]. Standard 6-region
-/// formula. Hue is in degrees and wraps around 360. Uses `f32`
-/// comparisons rather than `h as i32` to keep `clippy::pedantic` happy
-/// without an allow — and the if-ladder is no harder to read than the
-/// cast-and-match form.
-fn hue_to_rgb(hue: f32) -> (f32, f32, f32) {
-    let h = (hue % 360.0) / 60.0;
-    let x = 1.0 - (h % 2.0 - 1.0).abs();
-    if h < 1.0 {
-        (1.0, x, 0.0)
-    } else if h < 2.0 {
-        (x, 1.0, 0.0)
-    } else if h < 3.0 {
-        (0.0, 1.0, x)
-    } else if h < 4.0 {
-        (0.0, x, 1.0)
-    } else if h < 5.0 {
-        (x, 0.0, 1.0)
-    } else {
-        (1.0, 0.0, x)
+/// Paint the wallpaper across the full output. `Solid` is one
+/// `draw_solid` call; `VerticalGradient` does 256 horizontal stripes
+/// with colours linearly interpolated between top and bottom — that
+/// many stripes keeps banding imperceptible on a 2160-px-tall display.
+/// On shorter outputs some stripes collapse to zero height and are
+/// skipped harmlessly.
+fn draw_wallpaper(
+    frame: &mut GlesFrame<'_, '_>,
+    wallpaper: &Wallpaper,
+    output_size: Size<i32, Physical>,
+) -> Result<()> {
+    match wallpaper {
+        Wallpaper::Solid(rgb) => {
+            let dst = Rectangle::<i32, Physical>::from_size(output_size);
+            let damage = [Rectangle::from_size(output_size)];
+            frame
+                .draw_solid(dst, &damage, Color32F::new(rgb[0], rgb[1], rgb[2], 1.0))
+                .context("Frame::draw_solid (wallpaper solid) failed")?;
+        }
+        Wallpaper::VerticalGradient { top, bottom } => {
+            // u8 iteration: 256 stripes, and f32::from(u8) /
+            // i32::from(u8) are both exact (no clippy cast warnings).
+            const STRIPE_COUNT: i32 = 256;
+            let height = output_size.h;
+            for stripe in 0u8..=u8::MAX {
+                let t = f32::from(stripe) / 255.0;
+                let color = Color32F::new(
+                    top[0].mul_add(1.0 - t, bottom[0] * t),
+                    top[1].mul_add(1.0 - t, bottom[1] * t),
+                    top[2].mul_add(1.0 - t, bottom[2] * t),
+                    1.0,
+                );
+
+                let idx = i32::from(stripe);
+                let y_start = (idx * height) / STRIPE_COUNT;
+                let y_end = ((idx + 1) * height) / STRIPE_COUNT;
+                let stripe_h = y_end - y_start;
+                if stripe_h <= 0 {
+                    continue;
+                }
+
+                let stripe_dst = Rectangle::<i32, Physical>::new(
+                    Point::from((0, y_start)),
+                    Size::new(output_size.w, stripe_h),
+                );
+                let damage = [Rectangle::from_size(stripe_dst.size)];
+                frame
+                    .draw_solid(stripe_dst, &damage, color)
+                    .context("Frame::draw_solid (wallpaper stripe) failed")?;
+            }
+        }
     }
+    Ok(())
 }

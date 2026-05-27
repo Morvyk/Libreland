@@ -6,24 +6,75 @@ A Wayland compositor written in pure Rust, configured in Lua.
 
 Pre-alpha. Each `cargo run` currently:
 
-1. Opens a libseat session, enumerates input devices via udev + libinput,
-   and logs every event that flows through (keys, pointer motion, buttons).
+1. Opens a libseat session and enumerates input devices via udev +
+   libinput. Every pointer-capable device gets the configured accel
+   profile + speed applied on `DeviceAdded` (defaults: `Flat` / `0.0`
+   — 1:1 motion, no acceleration ramp).
 2. Opens the first DRM card, picks the first connected output and its
    preferred mode, then sets up a **GBM + EGL + GLES2 render pipeline**
    over it (via smithay's `GbmBufferedSurface`).
-3. Renders a vblank-paced hue cycle on the background (red → yellow →
-   green → cyan → blue → magenta, full rotation every 8 seconds) with
-   a 24×24 white right-triangle cursor that follows mouse motion. Each
-   frame is fsync'd through the GPU before scanout (tearing-free).
+3. Each vblank renders the configured wallpaper (default: vertical
+   sky-blue → navy gradient via 256 horizontal stripes) with a 24×24
+   white right-triangle cursor that follows mouse motion. Frame GPU
+   work is fenced before scanout (tearing-free).
 4. Routes every key event through **xkbcommon** for layout-aware
-   keysym + modifier handling — `Super+Shift+E` is matched on the
-   keysym `E` plus required mods `Shift|Super`, tolerating extras like
-   `NumLock`. The keymap defaults to `XKB_DEFAULT_*` env vars or the
-   libxkbcommon system defaults (`evdev` / `pc105` / `us` / `` / ``).
-5. Sits in the calloop event loop until the exit hotkey fires.
+   keysym + modifier handling, then matches against the keybind list
+   in [`config.binds`](#binds). The default binding fires the `Exit`
+   action on `Super+Shift+E`.
+5. Sits in the calloop event loop until an `Exit` action runs.
 
-Still to come: multi-output, Wayland protocol handling (`wl_compositor`
-/ `xdg_shell` / clients), and the Lua config layer.
+All user-tunable behaviour lives in a single `Config` struct (see
+[Configuration](#configuration)). Defaults today; the Lua loader is
+milestone 3c.
+
+Still to come: multi-output (3b), Lua config loading (3c), Wayland
+protocol handling (`wl_compositor` / `xdg_shell` / clients).
+
+## Configuration
+
+Every runtime setting lives in `src/config.rs` as `Config`. Today the
+struct is populated with sensible defaults at startup. Milestone 3c
+adds a Lua loader that reads
+`$XDG_CONFIG_HOME/libreland/config.lua` and replaces those defaults.
+The fields listed below are the full schema — some are wired into the
+runtime today (✅), others sit in the struct waiting for the milestone
+that uses them (⏳).
+
+### monitors
+
+| Field                    | Default  | State  | Notes                                                                           |
+| ------------------------ | -------- | ------ | ------------------------------------------------------------------------------- |
+| `outputs[name].mode`     | `None`   | ⏳ 3b  | `Some((width, height, refresh_mHz))` forces a mode; `None` uses EDID-preferred. |
+| `outputs[name].position` | `(0, 0)` | ⏳ 3b  | Top-left of the output in the virtual layout, logical pixels.                   |
+| `outputs[name].scale`    | `1.0`    | ⏳ 3b  | Fractional scale. Exposed to clients via `wp_fractional_scale_manager_v1` once the Wayland frontend lands. |
+| `primary`                | `None`   | ⏳ 3b  | Connector name of the primary output; `None` = first connected.                 |
+
+### input
+
+| Field                  | Default | State                            | Notes                                                                                  |
+| ---------------------- | ------- | -------------------------------- | -------------------------------------------------------------------------------------- |
+| `repeat_rate`          | `25`    | ⏳ Wayland frontend              | Repeats per second after the delay elapses. 25 matches X11's classic default.          |
+| `repeat_delay`         | `600`   | ⏳ Wayland frontend              | Milliseconds before repeat fires.                                                      |
+| `keyboard_layout`      | `""`    | ✅                               | xkb RMLVO layout field. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default.        |
+| `mouse_accel_profile`  | `Flat`  | ✅ (applied per pointer device)  | `Flat` (1:1, no ramp) or `Adaptive` (libinput's curve, system default).                |
+| `mouse_accel_speed`    | `0.0`   | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `Flat` this is "no extra sensitivity". |
+
+### binds
+
+A list of keybindings. A press matches when its xkb keysym equals the
+binding's `keysym` **and** every modifier in the binding's `mods` mask is
+held. Extras like `NumLock` are tolerated. First match wins.
+
+Built-in default: `Super+Shift+E → Action::Exit`.
+
+Available actions today: `Exit`. The list grows as we add `Reload`,
+`Spawn`, `ChangeVt`, …
+
+### misc
+
+| Field        | Default            | State | Notes                                                                                                          |
+| ------------ | ------------------ | ----- | -------------------------------------------------------------------------------------------------------------- |
+| `wallpaper`  | vertical gradient  | ✅    | `Solid([r, g, b])` or `VerticalGradient { top, bottom }`. RGB components in `[0, 1]`. Drawn every frame.       |
 
 ## Keybindings
 

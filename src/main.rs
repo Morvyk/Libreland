@@ -1,9 +1,12 @@
 //! Libreland: a Wayland compositor in pure Rust, configured in Lua.
 //!
 //! Binary entry point. Current scope: open a libseat session, enumerate
-//! input devices through udev + libinput, set up a GBM + EGL + GLES
+//! input devices through udev + libinput (with libinput accel /
+//! profile applied from [`config::Config`]), set up a GBM + EGL + GLES
 //! render loop on the first connected display, and paint each vblank
-//! with a wall-clock hue cycle until the exit hotkey fires.
+//! with the configured wallpaper plus a mouse-following cursor sprite.
+//! Key events are routed through xkbcommon and matched against the
+//! keybind list in [`config::Config::binds`].
 //!
 //! Run on a free virtual terminal (e.g. Ctrl+Alt+F2), `cargo run`, then
 //! type and move the pointer. Press `Super+Shift+E` to exit. Once DRM
@@ -27,6 +30,7 @@ use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::reexports::calloop::{EventLoop, LoopSignal};
+use smithay::reexports::input as libinput;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
 use std::fs::File;
@@ -37,15 +41,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod config;
 mod drm;
 mod keyboard;
 mod render;
-
-/// Modifier mask required by the exit hotkey: Super + Shift held
-/// simultaneously. xkbcommon's `STATE_MODS_EFFECTIVE` tolerates
-/// extras (`NumLock` etc.), so this is a "must-have" set, not an
-/// exact match.
-const EXIT_HOTKEY_MODS: u32 = keyboard::MOD_SHIFT | keyboard::MOD_SUPER;
 
 /// Mutable state threaded through every event-loop callback.
 ///
@@ -78,16 +77,19 @@ struct State {
     /// through this to get a layout-aware keysym + modifier mask,
     /// which the hotkey logic matches on.
     keyboard: keyboard::Keyboard,
+    /// All runtime settings (monitors, input, binds, wallpaper, …)
+    /// in one place. Defaults today; the Lua loader in milestone
+    /// 3c will replace this from `$XDG_CONFIG_HOME/libreland/config.lua`.
+    config: config::Config,
 }
 
 impl State {
     /// Feed a key event through xkbcommon to get its layout-aware
-    /// keysym + effective modifier mask, log the result at debug, and
-    /// trigger the exit hotkey when `Super+Shift+E` is pressed.
-    ///
-    /// Hotkeys are hard-coded here for the first milestone. Once the
-    /// Lua config layer exists, bindings move out of this function
-    /// and into user-defined config.
+    /// keysym + effective modifier mask, log the result at debug,
+    /// and fire whichever `config.binds.bindings` entry matches the
+    /// press (keysym AND every required modifier present, extras
+    /// tolerated). First match wins. Release events don't fire
+    /// actions but still update xkb's internal modifier state.
     fn handle_key(&mut self, event: &LibinputKeyEvent) {
         let pressed = matches!(event.state(), KeyState::Pressed);
         let result = self.keyboard.process(event.key_code(), pressed);
@@ -99,10 +101,34 @@ impl State {
             "key processed through xkb"
         );
 
-        if pressed && result.keysym == keyboard::Keysym::E && result.has_all_mods(EXIT_HOTKEY_MODS)
-        {
-            info!("exit hotkey (super+shift+e) pressed — stopping event loop");
-            self.loop_signal.stop();
+        if !pressed {
+            return;
+        }
+
+        // Find the matching binding's action first so the borrow on
+        // `self.config.binds` ends before we dispatch — `Action` is
+        // `Copy`, so this is a cheap byte-copy out.
+        let matched = self
+            .config
+            .binds
+            .bindings
+            .iter()
+            .find(|b| result.keysym == b.keysym && result.has_all_mods(b.mods))
+            .map(|b| b.action);
+
+        if let Some(action) = matched {
+            self.dispatch_action(action);
+        }
+    }
+
+    /// Run a bound action. Single-armed today; grows as we add more
+    /// actions (`reload`, `spawn`, `change_vt`, …).
+    fn dispatch_action(&mut self, action: config::Action) {
+        match action {
+            config::Action::Exit => {
+                info!("exit action fired — stopping event loop");
+                self.loop_signal.stop();
+            }
         }
     }
 }
@@ -114,6 +140,11 @@ fn main() -> Result<()> {
     // do NOT use `_` (anonymous) — that would drop it immediately.
     let _log_guard = init_tracing()?;
     info!("libreland starting");
+
+    // Compositor configuration. Defaults today; replaced wholesale
+    // by the Lua loader in milestone 3c.
+    let config = config::Config::default();
+    info!("compositor config initialised from defaults");
 
     let mut event_loop: EventLoop<State> =
         EventLoop::try_new().context("failed to create calloop event loop")?;
@@ -158,8 +189,9 @@ fn main() -> Result<()> {
         mode: drm_mode,
     } = drm_init;
 
-    let mut renderer = render::Renderer::new(drm_fd, drm_surface, drm_mode)
-        .context("render pipeline init failed")?;
+    let mut renderer =
+        render::Renderer::new(drm_fd, drm_surface, drm_mode, config.misc.wallpaper.clone())
+            .context("render pipeline init failed")?;
 
     info!("phase: rendering initial frame to prime the swapchain");
     renderer
@@ -168,7 +200,8 @@ fn main() -> Result<()> {
     info!("initial frame queued for scanout");
 
     info!("phase: initialising xkbcommon keyboard");
-    let keyboard = keyboard::Keyboard::new().context("keyboard init failed")?;
+    let keyboard =
+        keyboard::Keyboard::new(&config.input.keyboard_layout).context("keyboard init failed")?;
     info!("xkb keymap compiled");
 
     info!("phase: creating libinput context");
@@ -192,6 +225,7 @@ fn main() -> Result<()> {
         drm_device,
         renderer,
         keyboard,
+        config,
     };
 
     info!("entering event loop — type to generate events, super+shift+e to exit");
@@ -322,6 +356,27 @@ fn install_panic_hook() {
     }));
 }
 
+/// Apply the user's libinput config (acceleration profile + speed) to
+/// a newly-added pointer-capable device. No-op for non-pointers
+/// (keyboards / touch / tablet). Logs and continues on failure — a
+/// device that refuses one of the config calls still works at its
+/// previous setting.
+fn apply_input_config(device: &mut libinput::Device, input_config: &config::InputConfig) {
+    if !device.has_capability(libinput::DeviceCapability::Pointer) {
+        return;
+    }
+    let profile = match input_config.mouse_accel_profile {
+        config::AccelProfile::Flat => libinput::AccelProfile::Flat,
+        config::AccelProfile::Adaptive => libinput::AccelProfile::Adaptive,
+    };
+    if let Err(err) = device.config_accel_set_profile(profile) {
+        warn!(?err, ?device, "failed to set libinput accel profile");
+    }
+    if let Err(err) = device.config_accel_set_speed(input_config.mouse_accel_speed) {
+        warn!(?err, ?device, "failed to set libinput accel speed");
+    }
+}
+
 /// Pick a `/dev/dri/cardN` node from a udev enumeration — render nodes
 /// (`renderD128`) come through the same DRM subsystem and we
 /// explicitly don't want them for modesetting. First card wins for
@@ -390,10 +445,13 @@ fn wire_event_sources(
     handle
         .insert_source(libinput_backend, |event, (), state| {
             log_input_event(&event);
-            match &event {
-                InputEvent::Keyboard { event: ke } => state.handle_key(ke),
+            match event {
+                InputEvent::Keyboard { event: ke } => state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {
                     state.renderer.on_pointer_motion(pm.dx(), pm.dy());
+                }
+                InputEvent::DeviceAdded { mut device } => {
+                    apply_input_config(&mut device, &state.config.input);
                 }
                 _ => {}
             }

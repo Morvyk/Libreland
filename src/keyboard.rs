@@ -57,16 +57,18 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
-    pub fn new() -> Result<Self> {
+    /// Compile a keymap using the given `RMLVO` layout (the rest of
+    /// the fields use xkbcommon's env-or-default fallback). Passing
+    /// `""` defers entirely to `XKB_DEFAULT_LAYOUT` / system default,
+    /// which is what `Config::default` does so the user's existing
+    /// keyboard config applies untouched.
+    pub fn new(layout: &str) -> Result<Self> {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        // Empty RMLVO strings → xkbcommon consults `XKB_DEFAULT_*`
-        // env vars and falls back to its compile-time defaults
-        // (`evdev` / `pc105` / `us` / `` / ``) when those are unset.
         let keymap = xkb::Keymap::new_from_names(
             &context,
             "",
             "",
-            "",
+            layout,
             "",
             None,
             xkb::KEYMAP_COMPILE_NO_FLAGS,
