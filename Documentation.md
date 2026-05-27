@@ -11,15 +11,19 @@ Pre-alpha. Each `cargo run` currently:
 2. Opens the first DRM card, picks the first connected output and its
    preferred mode, then sets up a **GBM + EGL + GLES2 render pipeline**
    over it (via smithay's `GbmBufferedSurface`).
-3. Renders a vblank-paced hue cycle to the display: the screen sweeps
-   red → yellow → green → cyan → blue → magenta → red, full cycle every
-   8 seconds. Each frame is fsync'd through the GPU before scanout, so
-   timing should be tearing-free.
-4. Sits in the calloop event loop until you press `Super+Shift+E`.
+3. Renders a vblank-paced hue cycle on the background (red → yellow →
+   green → cyan → blue → magenta, full rotation every 8 seconds) with
+   a 24×24 white right-triangle cursor that follows mouse motion. Each
+   frame is fsync'd through the GPU before scanout (tearing-free).
+4. Routes every key event through **xkbcommon** for layout-aware
+   keysym + modifier handling — `Super+Shift+E` is matched on the
+   keysym `E` plus required mods `Shift|Super`, tolerating extras like
+   `NumLock`. The keymap defaults to `XKB_DEFAULT_*` env vars or the
+   libxkbcommon system defaults (`evdev` / `pc105` / `us` / `` / ``).
+5. Sits in the calloop event loop until the exit hotkey fires.
 
-Still to come: cursor sprite tracking pointer motion, xkbcommon
-keyboard handling, multi-output, Wayland protocol handling
-(`wl_compositor` / `xdg_shell` / clients), and the Lua config layer.
+Still to come: multi-output, Wayland protocol handling (`wl_compositor`
+/ `xdg_shell` / clients), and the Lua config layer.
 
 ## Keybindings
 

@@ -16,6 +16,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xdg = "3.0.0"
+xkbcommon = "0.8"
 
 # Unsafe code is forbidden by default. When unsafe is genuinely required,
 # override at the smallest scope with

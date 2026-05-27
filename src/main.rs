@@ -20,7 +20,7 @@
 use anyhow::{Context as _, Result};
 use smithay::backend::drm::DrmDevice;
 use smithay::backend::input::{
-    InputEvent, KeyState, KeyboardKeyEvent as _, Keycode, PointerButtonEvent as _,
+    InputEvent, KeyState, KeyboardKeyEvent as _, PointerButtonEvent as _,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session as _;
@@ -38,17 +38,14 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod drm;
+mod keyboard;
 mod render;
 
-// Smithay returns keycodes as X11 keycodes (evdev code + 8); see
-// `(self.key() + 8).into()` in the LibinputInputBackend impl. Applying
-// the offset at the constant site keeps comparisons at the call site
-// readable.
-const KEY_LEFTSHIFT: Keycode = Keycode::new(42 + 8);
-const KEY_RIGHTSHIFT: Keycode = Keycode::new(54 + 8);
-const KEY_LEFTMETA: Keycode = Keycode::new(125 + 8);
-const KEY_RIGHTMETA: Keycode = Keycode::new(126 + 8);
-const KEY_E: Keycode = Keycode::new(18 + 8);
+/// Modifier mask required by the exit hotkey: Super + Shift held
+/// simultaneously. xkbcommon's `STATE_MODS_EFFECTIVE` tolerates
+/// extras (`NumLock` etc.), so this is a "must-have" set, not an
+/// exact match.
+const EXIT_HOTKEY_MODS: u32 = keyboard::MOD_SHIFT | keyboard::MOD_SUPER;
 
 /// Mutable state threaded through every event-loop callback.
 ///
@@ -66,13 +63,6 @@ struct State {
     session: LibSeatSession,
     /// Used by the exit hotkey to break calloop's `run` cleanly.
     loop_signal: LoopSignal,
-    /// Modifier state derived from raw libinput key events. Tracking
-    /// either side of a modifier as a single bool is enough until we
-    /// add xkbcommon's proper mod-state composition; it only breaks
-    /// down for the unusual "hold both shifts, release one" sequence,
-    /// which doesn't matter for a single hard-coded exit hotkey.
-    shift_held: bool,
-    super_held: bool,
     /// DRM master claim. Held by the State so the master claim
     /// outlives the renderer's swapchain — dropping it releases the
     /// display back to logind on clean shutdown.
@@ -84,27 +74,35 @@ struct State {
     /// GBM + EGL + GLES render pipeline. The vblank callback drives
     /// it once per refresh.
     renderer: render::Renderer,
+    /// xkbcommon keymap + state. Every libinput key event flows
+    /// through this to get a layout-aware keysym + modifier mask,
+    /// which the hotkey logic matches on.
+    keyboard: keyboard::Keyboard,
 }
 
 impl State {
-    /// Update modifier flags from a key event, and trigger the exit
-    /// hotkey when `Super+Shift+E` is pressed.
+    /// Feed a key event through xkbcommon to get its layout-aware
+    /// keysym + effective modifier mask, log the result at debug, and
+    /// trigger the exit hotkey when `Super+Shift+E` is pressed.
     ///
     /// Hotkeys are hard-coded here for the first milestone. Once the
     /// Lua config layer exists, bindings move out of this function
     /// and into user-defined config.
     fn handle_key(&mut self, event: &LibinputKeyEvent) {
-        let keycode = event.key_code();
         let pressed = matches!(event.state(), KeyState::Pressed);
+        let result = self.keyboard.process(event.key_code(), pressed);
 
-        match keycode {
-            KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift_held = pressed,
-            KEY_LEFTMETA | KEY_RIGHTMETA => self.super_held = pressed,
-            KEY_E if pressed && self.shift_held && self.super_held => {
-                info!("exit hotkey (super+shift+e) pressed — stopping event loop");
-                self.loop_signal.stop();
-            }
-            _ => {}
+        debug!(
+            keysym = ?result.keysym,
+            mods = format!("{:#06b}", result.mods),
+            pressed,
+            "key processed through xkb"
+        );
+
+        if pressed && result.keysym == keyboard::Keysym::E && result.has_all_mods(EXIT_HOTKEY_MODS)
+        {
+            info!("exit hotkey (super+shift+e) pressed — stopping event loop");
+            self.loop_signal.stop();
         }
     }
 }
@@ -169,6 +167,10 @@ fn main() -> Result<()> {
         .context("initial frame render failed")?;
     info!("initial frame queued for scanout");
 
+    info!("phase: initialising xkbcommon keyboard");
+    let keyboard = keyboard::Keyboard::new().context("keyboard init failed")?;
+    info!("xkb keymap compiled");
+
     info!("phase: creating libinput context");
     // libinput opens `/dev/input/*` via the session interface so libseat
     // can grant the file descriptors under its permission model.
@@ -187,10 +189,9 @@ fn main() -> Result<()> {
     let mut state = State {
         session,
         loop_signal,
-        shift_held: false,
-        super_held: false,
         drm_device,
         renderer,
+        keyboard,
     };
 
     info!("entering event loop — type to generate events, super+shift+e to exit");

@@ -411,6 +411,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "xdg",
+ "xkbcommon",
 ]
 
 [[package]]
