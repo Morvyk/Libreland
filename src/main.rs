@@ -1,12 +1,14 @@
 //! Libreland: a Wayland compositor in pure Rust, configured in Lua.
 //!
 //! Binary entry point. Current scope: open a libseat session, enumerate
-//! input devices through udev + libinput (with libinput accel /
-//! profile applied from [`config::Config`]), set up a GBM + EGL + GLES
-//! render loop on the first connected display, and paint each vblank
-//! with the configured wallpaper plus a mouse-following cursor sprite.
-//! Key events are routed through xkbcommon and matched against the
-//! keybind list in [`config::Config::binds`].
+//! input devices through udev + libinput (with libinput accel / profile
+//! from [`config::Config`]), set up a GBM + EGL + GLES render loop on
+//! every connected output, paint each vblank with the configured
+//! wallpaper plus a mouse-following cursor sprite, route key events
+//! through xkbcommon, and host a minimal Wayland frontend — clients can
+//! connect, query the seat and outputs, and create `xdg_toplevel`s
+//! whose lifecycle reaches the log. Compositing client buffers and
+//! routing input to them are 4b / 4c milestones.
 //!
 //! Run on a free virtual terminal (e.g. Ctrl+Alt+F2), `cargo run`, then
 //! type and move the pointer. Press `Super+Shift+E` to exit. Once DRM
@@ -29,10 +31,18 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
-use smithay::reexports::calloop::{EventLoop, LoopSignal};
+use smithay::input::{Seat, SeatState};
+use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use smithay::reexports::input as libinput;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
+use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shm::ShmState;
+use smithay::wayland::socket::ListeningSocketSource;
 use std::fs::File;
 use std::io;
 use tracing::{debug, info, warn};
@@ -45,13 +55,24 @@ mod config;
 mod drm;
 mod keyboard;
 mod render;
+mod wayland;
 
 /// Mutable state threaded through every event-loop callback.
 ///
-/// Kept deliberately small for now — once we add a renderer, protocol
-/// handlers and the Lua config bridge, those will move in here too so
-/// the calloop closures can mutate them without juggling `Rc<RefCell<_>>`.
-struct State {
+/// Holds the existing libseat / DRM / renderer / xkb / config state
+/// plus the Wayland frontend substate added in milestone 4a
+/// (compositor, shm, seat, `xdg_shell`, `output_manager`). The owned
+/// `Display<State>` itself can't live here (the type would be
+/// circular), so it sits beside `State` in [`LoopData`].
+///
+/// All fields are `pub(crate)` so handler impls in sibling modules
+/// (especially [`crate::wayland`]) can reach them directly without
+/// every field needing its own accessor method.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the *_state suffix is smithay's convention and matches each field's type name; renaming would just diverge from upstream docs"
+)]
+pub(crate) struct State {
     /// The libseat session is retained so future code can query its
     /// active flag and switch VTs. libinput already holds an internal
     /// clone for opening `/dev/input/*` device nodes.
@@ -59,9 +80,9 @@ struct State {
         dead_code,
         reason = "session is held for upcoming VT-switch and activation tracking; not read yet"
     )]
-    session: LibSeatSession,
+    pub(crate) session: LibSeatSession,
     /// Used by the exit hotkey to break calloop's `run` cleanly.
-    loop_signal: LoopSignal,
+    pub(crate) loop_signal: LoopSignal,
     /// DRM master claim. Held by the State so the master claim
     /// outlives the renderer's swapchain — dropping it releases the
     /// display back to logind on clean shutdown.
@@ -69,18 +90,58 @@ struct State {
         dead_code,
         reason = "kept alive for the DRM master claim; will be queried by VT-switch / session-activation code"
     )]
-    drm_device: DrmDevice,
+    pub(crate) drm_device: DrmDevice,
     /// GBM + EGL + GLES render pipeline. The vblank callback drives
     /// it once per refresh.
-    renderer: render::Renderer,
+    pub(crate) renderer: render::Renderer,
     /// xkbcommon keymap + state. Every libinput key event flows
     /// through this to get a layout-aware keysym + modifier mask,
     /// which the hotkey logic matches on.
-    keyboard: keyboard::Keyboard,
+    pub(crate) keyboard: keyboard::Keyboard,
     /// All runtime settings (monitors, input, binds, wallpaper, …)
     /// in one place. Defaults today; the Lua loader in milestone
     /// 3c will replace this from `$XDG_CONFIG_HOME/libreland/config.lua`.
-    config: config::Config,
+    pub(crate) config: config::Config,
+    /// Cheap-to-clone handle to the Wayland display. Used by handler
+    /// impls that need to create new globals or look up clients.
+    #[allow(
+        dead_code,
+        reason = "held for future use by handlers (creating outputs, surfaces); not read directly yet"
+    )]
+    pub(crate) display_handle: DisplayHandle,
+    /// `wl_compositor` + `wl_subcompositor` substate.
+    pub(crate) compositor_state: CompositorState,
+    /// `wl_shm` substate.
+    pub(crate) shm_state: ShmState,
+    /// `wl_seat` substate; tracks all seats on the compositor.
+    pub(crate) seat_state: SeatState<State>,
+    /// The single seat we currently advertise. Kept for input
+    /// forwarding in 4c (looking up `KeyboardHandle` /
+    /// `PointerHandle`).
+    #[allow(
+        dead_code,
+        reason = "held for input forwarding in milestone 4c; reachable via seat_state today"
+    )]
+    pub(crate) seat: Seat<State>,
+    /// `xdg_wm_base` + `xdg_surface` + `xdg_toplevel` substate.
+    pub(crate) xdg_shell_state: XdgShellState,
+    /// `wl_output` substate; used when we expose each DRM output to
+    /// clients (4a wires the global; per-output `Output` objects
+    /// come with the renderer→clients integration in 4b/later).
+    #[allow(
+        dead_code,
+        reason = "held so delegate_output! can route global dispatch through it; per-output Output objects (which read it) land in 4b"
+    )]
+    pub(crate) output_manager_state: OutputManagerState,
+}
+
+/// Calloop user-data wrapper: owns the Wayland `Display<State>` and
+/// the compositor `State` side by side, since they can't be nested
+/// (the type would be circular). Calloop source callbacks receive
+/// `&mut LoopData` and split-borrow the two fields independently.
+pub(crate) struct LoopData {
+    pub(crate) state: State,
+    pub(crate) display: Display<State>,
 }
 
 impl State {
@@ -133,6 +194,10 @@ impl State {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "init flow is naturally linear (session → udev → DRM → renderer → keyboard → libinput → Wayland → state → run); extracting sub-helpers would obscure ownership/order more than the function being long does"
+)]
 fn main() -> Result<()> {
     // The WorkerGuard MUST stay alive for the whole of main; dropping it
     // releases the tracing-appender worker thread and flushes the file
@@ -148,7 +213,15 @@ fn main() -> Result<()> {
     let config = config::Config::load_or_default().context("config load failed")?;
     info!("compositor config ready");
 
-    let mut event_loop: EventLoop<State> =
+    // Wayland frontend bootstrap. Display must exist before the
+    // EventLoop because the EventLoop's user-data type
+    // (`LoopData`) contains the `Display<State>`.
+    info!("phase: creating Wayland Display + substate");
+    let mut display: Display<State> = Display::new().context("wayland Display::new failed")?;
+    let wayland_init = wayland::init(&display, &config).context("wayland substate init failed")?;
+    info!("Wayland substate ready");
+
+    let mut event_loop: EventLoop<LoopData> =
         EventLoop::try_new().context("failed to create calloop event loop")?;
     let handle = event_loop.handle();
     let loop_signal = event_loop.get_signal();
@@ -215,22 +288,106 @@ fn main() -> Result<()> {
     info!("libinput seat assigned");
     let libinput_backend = LibinputInputBackend::new(libinput_ctx);
 
+    info!("phase: opening Wayland listening socket");
+    let listening_socket = ListeningSocketSource::new_auto()
+        .context("Wayland ListeningSocketSource::new_auto failed")?;
+    let socket_name = listening_socket.socket_name().to_os_string();
+    info!(socket = ?socket_name, "Wayland socket listening");
+
+    // SAFETY: `std::env::set_var` is `unsafe` in modern Rust because
+    // setting the process environment is racy if other threads are
+    // reading it concurrently. We're still in single-threaded init
+    // (only the tracing-appender worker exists, and it doesn't read
+    // env vars), so the call is safe here. We set `WAYLAND_DISPLAY`
+    // so child processes spawned via `wayland::spawn_startup`
+    // (below) and ad-hoc shell launches from the same login session
+    // connect to *our* socket.
+    #[allow(
+        unsafe_code,
+        reason = "set_var is unsafe due to multi-threaded env races; we call it before spawning any non-trivial thread (tracing-appender is the only background thread and never reads env), so the race window doesn't exist"
+    )]
+    // SAFETY: see #[allow] above.
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    }
+
+    // Snapshot the Display's poll fd so calloop can register a
+    // `Generic` source over it. `try_clone_to_owned` gives us a
+    // separate kernel fd referring to the same underlying file
+    // description, sidestepping the lifetime issue of registering a
+    // `BorrowedFd` whose lifetime is tied to `display`.
+    let poll_fd = display
+        .backend()
+        .poll_fd()
+        .try_clone_to_owned()
+        .context("clone Display::poll_fd")?;
+
     wire_event_sources(&handle, notifier, udev, drm_notifier, libinput_backend)?;
 
-    let mut state = State {
+    // Wayland socket source: each accepted UnixStream is registered
+    // as a client on the display, attaching our per-client state.
+    handle
+        .insert_source(listening_socket, |stream, (), data: &mut LoopData| {
+            info!("Wayland: accepting new client");
+            if let Err(err) = data
+                .display
+                .handle()
+                .insert_client(stream, wayland::new_client_data())
+            {
+                warn!(error = %err, "Wayland: insert_client failed");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to insert wayland listener source: {e}"))?;
+
+    // Wayland dispatch source: epoll-wakes us when any client has
+    // sent a request; we drain it via `display.dispatch_clients`.
+    // `flush_clients` runs in the event-loop post-batch callback
+    // below so outbound messages don't accumulate.
+    handle
+        .insert_source(
+            Generic::new(poll_fd, Interest::READ, Mode::Level),
+            |_, _, data: &mut LoopData| {
+                if let Err(err) = data.display.dispatch_clients(&mut data.state) {
+                    warn!(error = %err, "wayland dispatch_clients failed");
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("failed to insert wayland dispatch source: {e}"))?;
+
+    // Now that the socket is listening and `$WAYLAND_DISPLAY` is
+    // set, spawn any configured startup commands. Their stdout /
+    // stderr inherit ours (so they share the file log via
+    // descriptors, if relevant).
+    wayland::spawn_startup(&config.startup);
+
+    let state = State {
         session,
         loop_signal,
         drm_device,
         renderer,
         keyboard,
         config,
+        display_handle: wayland_init.display_handle,
+        compositor_state: wayland_init.compositor_state,
+        shm_state: wayland_init.shm_state,
+        seat_state: wayland_init.seat_state,
+        seat: wayland_init.seat,
+        xdg_shell_state: wayland_init.xdg_shell_state,
+        output_manager_state: wayland_init.output_manager_state,
     };
+    let mut loop_data = LoopData { state, display };
 
     info!("entering event loop — type to generate events, super+shift+e to exit");
     event_loop
-        .run(None, &mut state, |_state| {
-            // Called after each batch of dispatched events. We have no
-            // per-tick work yet; that changes once we add a renderer.
+        .run(None, &mut loop_data, |data| {
+            // Post-batch: flush Wayland clients so their pending
+            // outbound messages don't accumulate. A failure here
+            // typically means a client died mid-flight; log and
+            // move on rather than crash the compositor.
+            if let Err(err) = data.display.flush_clients() {
+                warn!(error = %err, "wayland flush_clients failed");
+            }
         })
         .map_err(|e| anyhow::anyhow!("event loop error: {e}"))?;
 
@@ -391,26 +548,28 @@ fn pick_drm_card_path<T>(devices: &[(T, std::path::PathBuf)]) -> Result<std::pat
         .context("no /dev/dri/cardN device enumerated by udev — no display to drive")
 }
 
-/// Insert all four event sources (libseat session, udev, DRM vblank,
-/// libinput) into the calloop handle. Pulled out of `main` so the
-/// init flow stays under clippy's `too_many_lines` threshold without
-/// losing per-source visibility.
+/// Insert the libseat/udev/DRM/libinput event sources into the calloop
+/// handle. Pulled out of `main` so the init flow stays under clippy's
+/// `too_many_lines` threshold without losing per-source visibility.
+/// The Wayland-related sources (listener + dispatch fd) are inserted
+/// directly in `main` because they share lifetimes with the `Display`
+/// + `ListeningSocketSource` constructed there.
 fn wire_event_sources(
-    handle: &smithay::reexports::calloop::LoopHandle<'_, State>,
+    handle: &smithay::reexports::calloop::LoopHandle<'_, LoopData>,
     session_notifier: LibSeatSessionNotifier,
     udev: UdevBackend,
     drm_notifier: smithay::backend::drm::DrmDeviceNotifier,
     libinput_backend: LibinputInputBackend,
 ) -> Result<()> {
     handle
-        .insert_source(session_notifier, |event, (), _state| match event {
+        .insert_source(session_notifier, |event, (), _data| match event {
             smithay::backend::session::Event::PauseSession => warn!("session paused"),
             smithay::backend::session::Event::ActivateSession => info!("session activated"),
         })
         .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
 
     handle
-        .insert_source(udev, |event, (), _state| match event {
+        .insert_source(udev, |event, (), _data| match event {
             UdevEvent::Added { device_id, path } => {
                 info!(device_id, path = %path.display(), "udev: device added");
             }
@@ -424,33 +583,36 @@ fn wire_event_sources(
         .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
 
     handle
-        .insert_source(drm_notifier, |event, _meta, state| match event {
-            smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                if let Err(err) = state.renderer.render_for_crtc(crtc) {
-                    // Don't kill the event loop on a render hiccup —
-                    // log and let the next vblank try again. A
-                    // persistent failure on one CRTC freezes that
-                    // output but leaves the others (and the exit
-                    // hotkey) responsive.
-                    warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
+        .insert_source(
+            drm_notifier,
+            |event, _meta, data: &mut LoopData| match event {
+                smithay::backend::drm::DrmEvent::VBlank(crtc) => {
+                    if let Err(err) = data.state.renderer.render_for_crtc(crtc) {
+                        // Don't kill the event loop on a render hiccup —
+                        // log and let the next vblank try again. A
+                        // persistent failure on one CRTC freezes that
+                        // output but leaves the others (and the exit
+                        // hotkey) responsive.
+                        warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
+                    }
                 }
-            }
-            smithay::backend::drm::DrmEvent::Error(err) => {
-                warn!(error = %err, "drm: event-source error");
-            }
-        })
+                smithay::backend::drm::DrmEvent::Error(err) => {
+                    warn!(error = %err, "drm: event-source error");
+                }
+            },
+        )
         .map_err(|e| anyhow::anyhow!("failed to insert drm source: {e}"))?;
 
     handle
-        .insert_source(libinput_backend, |event, (), state| {
+        .insert_source(libinput_backend, |event, (), data: &mut LoopData| {
             log_input_event(&event);
             match event {
-                InputEvent::Keyboard { event: ke } => state.handle_key(&ke),
+                InputEvent::Keyboard { event: ke } => data.state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {
-                    state.renderer.on_pointer_motion(pm.dx(), pm.dy());
+                    data.state.renderer.on_pointer_motion(pm.dx(), pm.dy());
                 }
                 InputEvent::DeviceAdded { mut device } => {
-                    apply_input_config(&mut device, &state.config.input);
+                    apply_input_config(&mut device, &data.state.config.input);
                 }
                 _ => {}
             }

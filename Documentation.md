@@ -21,14 +21,22 @@ Pre-alpha. Each `cargo run` currently:
    keysym + modifier handling, then matches against the keybind list
    in [`config.binds`](#binds). The default binding fires the `Exit`
    action on `Super+Shift+E`.
-5. Sits in the calloop event loop until an `Exit` action runs.
+5. Brings up a minimal **Wayland frontend** — `wl_compositor`,
+   `wl_subcompositor`, `wl_shm`, `wl_seat` (with keyboard + pointer
+   capabilities advertised), `wl_output`, and `xdg_wm_base`/
+   `xdg_toplevel`/`xdg_surface`. Sets `$WAYLAND_DISPLAY` and spawns
+   every `config.startup` command as a child. Clients connect,
+   allocate surfaces, and get configured; their lifecycle reaches the
+   log. **Rendering client buffers (4b) and routing input to focused
+   clients (4c) are still to come** — windows are accepted but
+   invisible at this stage.
+6. Sits in the calloop event loop until an `Exit` action runs.
 
 All user-tunable behaviour lives in a single `Config` struct (see
-[Configuration](#configuration)). Defaults today; the Lua loader is
-milestone 3c.
+[Configuration](#configuration)).
 
-Still to come: multi-output (3b), Lua config loading (3c), Wayland
-protocol handling (`wl_compositor` / `xdg_shell` / clients).
+Still to come: composite client surfaces onto the framebuffer (4b),
+input routing to focused clients (4c), window management (4d).
 
 ## Configuration
 
@@ -86,7 +94,22 @@ misc = {
     -- Or a solid colour:
     -- wallpaper = { type = "solid", color = { 0.20, 0.40, 0.80 } },
 }
+
+-- Commands to spawn once the Wayland socket is listening. Each
+-- string is whitespace-split into program + args; children inherit
+-- $WAYLAND_DISPLAY so they connect to *our* compositor. For shell
+-- features (pipes, env, &), wrap with `"sh -c '…'"`.
+startup = {
+    "kitty",
+    -- "sh -c 'swaybg -i ~/wallpapers/blue.png &'",
+}
 ```
+
+### startup
+
+| Field     | Default      | State | Notes                                                                          |
+| --------- | ------------ | ----- | ------------------------------------------------------------------------------ |
+| `startup` | `{}` (empty) | ✅    | Vec of command strings spawned once the Wayland socket is up. Whitespace-split into program + args. |
 
 ### Modifier names (case-insensitive)
 

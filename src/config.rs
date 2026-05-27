@@ -56,6 +56,12 @@ pub struct Config {
     pub input: InputConfig,
     pub binds: BindsConfig,
     pub misc: MiscConfig,
+    /// Commands to spawn as children once the Wayland socket is
+    /// listening. Each entry is whitespace-split into program +
+    /// args; needs a shell wrapper (`"sh -c '…'"`) for shell
+    /// features. Children inherit the compositor's environment
+    /// (notably `$WAYLAND_DISPLAY`).
+    pub startup: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,6 +197,7 @@ impl Default for Config {
                     bottom: [0.10, 0.20, 0.50], // deep navy
                 },
             },
+            startup: Vec::new(),
         }
     }
 }
@@ -245,6 +252,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("misc")? {
             config.misc = parse_misc(&t, config.misc).context("misc")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("startup")? {
+            config.startup = parse_startup(&t).context("startup")?;
         }
 
         Ok(config)
@@ -426,6 +436,15 @@ fn parse_wallpaper(t: &Table) -> mlua::Result<Wallpaper> {
             )
         }
     }
+}
+
+fn parse_startup(t: &Table) -> mlua::Result<Vec<String>> {
+    let mut commands = Vec::new();
+    for (i, entry) in t.sequence_values::<String>().enumerate() {
+        let cmd = entry.with_context(|_| format!("startup[{i}] not a string"))?;
+        commands.push(cmd);
+    }
+    Ok(commands)
 }
 
 fn parse_rgb_triple(t: &Table) -> mlua::Result<[f32; 3]> {
