@@ -1,0 +1,52 @@
+[package]
+name = "libreland"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["Morvyk <Morvyk@proton.me>"]
+license = "MIT"
+description = "A Wayland compositor in pure Rust, configured in Lua."
+publish = false
+
+[dependencies]
+anyhow = "1.0.102"
+smithay = { version = "0.7.0", default-features = false, features = ["backend_libinput", "backend_session_libseat", "backend_udev"] }
+time = { version = "0.3.47", features = ["formatting", "macros"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xdg = "3.0.0"
+
+# Unsafe code is forbidden by default. When unsafe is genuinely required,
+# override at the smallest scope with
+#   #[allow(unsafe_code, reason = "…")]
+# alongside a `// SAFETY:` comment on the block itself.
+[lints.rust]
+unsafe_code = "deny"
+
+# clippy::all is treated as hard errors; clippy::pedantic as warnings we
+# are expected to fix at the source. Reach for #[allow(name, reason = "…")]
+# only when satisfying the lint is genuinely impossible or actively wrong.
+[lints.clippy]
+all      = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# dev is tuned for pure compile speed — used for every build, test, and
+# clippy invocation. The mold linker is enabled globally in .cargo/config.toml,
+# which contributes most of the dev-time win.
+[profile.dev]
+opt-level       = 0
+debug           = true
+incremental     = true
+codegen-units   = 256
+split-debuginfo = "unpacked"
+
+# release is tuned for pure runtime performance. Fat LTO costs compile
+# time we don't pay in dev in exchange for the best possible codegen, and
+# stripping symbols keeps the shipped binary lean.
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+debug         = false
+strip         = "symbols"

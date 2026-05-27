@@ -1,0 +1,6 @@
+# Mold is enabled globally rather than per-profile so dev builds benefit
+# from its fast linking (which is the dominant cost on incremental builds).
+# Release also routes through mold; the runtime characteristics of the
+# linker output are equivalent to GNU ld for our purposes.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

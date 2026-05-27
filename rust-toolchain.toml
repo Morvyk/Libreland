@@ -1,0 +1,6 @@
+# Pins the toolchain for anyone using rustup. On systems whose Rust is
+# packaged by the distro (e.g. Arch's `rust` package), this file is purely
+# informational — the system rustc is whatever the package provides.
+[toolchain]
+channel    = "1.95.0"
+components = ["rustfmt", "clippy"]
