@@ -4,10 +4,17 @@ A Wayland compositor written in pure Rust, configured in Lua.
 
 ## Status
 
-Pre-alpha. The compositor currently does nothing graphical — it opens a
-libseat session, enumerates input devices via udev + libinput, and logs the
-events that flow through. This is the foundation that DRM/KMS rendering,
-Wayland protocol handling, and the Lua config layer will be built on top of.
+Pre-alpha. Each `cargo run` currently:
+
+1. Opens a libseat session, enumerates input devices via udev + libinput,
+   and logs every event that flows through (keys, pointer motion, buttons).
+2. Opens the first DRM card, finds the first connected output, allocates
+   a dumb framebuffer matching its preferred mode, paints it cornflower
+   blue, and commits a static modeset — proof we own the display.
+3. Sits in the calloop event loop until you press `Super+Shift+E`.
+
+Still to come: a real renderer (pixman or GBM+EGL), page-flipping,
+multi-output, Wayland protocol handling, and the Lua config layer.
 
 ## Keybindings
 

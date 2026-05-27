@@ -1,16 +1,15 @@
 //! Libreland: a Wayland compositor in pure Rust, configured in Lua.
 //!
-//! Binary entry point. For the first milestone the compositor does nothing
-//! graphical — it opens a libseat session, watches udev for input device
-//! hotplug, opens devices via libinput, and logs the events that flow
-//! through. The point is to validate the session/udev/libinput plumbing on
-//! a real TTY before we layer DRM, rendering, or Wayland clients on top.
+//! Binary entry point. Current scope: open a libseat session, enumerate
+//! input devices through udev + libinput, paint a solid colour to the
+//! first connected display via DRM/KMS, and stay in the calloop event
+//! loop until the exit hotkey fires.
 //!
 //! Run on a free virtual terminal (e.g. Ctrl+Alt+F2), `cargo run`, then
-//! type and move the pointer. Press `Super+Shift+E` to exit cleanly — the
-//! TTY's Ctrl+C still works today because we haven't grabbed the VT yet,
-//! but once we add DRM and take exclusive control of the terminal the
-//! kernel's keyboard-to-signal path goes away and we need our own hotkey.
+//! type and move the pointer. Press `Super+Shift+E` to exit. Once DRM
+//! sets the mode the kernel TTY console can't repaint that VT — that's
+//! expected, not a freeze — and your shell prompt reappears when we
+//! exit and the seat is handed back to logind.
 //! Configure log output with `RUST_LOG`; the default is
 //! `info,libreland=debug` so our own messages show up while third-party
 //! crates stay quiet. The same records are also written to
@@ -37,6 +36,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod drm;
+
 // Smithay returns keycodes as X11 keycodes (evdev code + 8); see
 // `(self.key() + 8).into()` in the LibinputInputBackend impl. Applying
 // the offset at the constant site keeps comparisons at the call site
@@ -46,6 +47,13 @@ const KEY_RIGHTSHIFT: Keycode = Keycode::new(54 + 8);
 const KEY_LEFTMETA: Keycode = Keycode::new(125 + 8);
 const KEY_RIGHTMETA: Keycode = Keycode::new(126 + 8);
 const KEY_E: Keycode = Keycode::new(18 + 8);
+
+/// XRGB8888 colour painted to the framebuffer at startup. Cornflower
+/// blue is the classic "graphics-hello-world" tone — bright enough to
+/// confirm we own the display from across the room, and visually
+/// distinct enough that it instantly reads as "proof-of-life is up"
+/// rather than "something defaulted to a flat colour after crashing".
+const STARTUP_COLOR: u32 = 0x0064_95ED;
 
 /// Mutable state threaded through every event-loop callback.
 ///
@@ -70,6 +78,15 @@ struct State {
     /// which doesn't matter for a single hard-coded exit hotkey.
     shift_held: bool,
     super_held: bool,
+    /// DRM device + surface + dumb framebuffer kept alive together.
+    /// Held purely so the modeset stays on screen — dropping any
+    /// component hands the display back to logind, which is what we
+    /// want on clean shutdown.
+    #[allow(
+        dead_code,
+        reason = "held only to keep the initial modeset live; queried in later milestones"
+    )]
+    drm: drm::DrmKeepalive,
 }
 
 impl State {
@@ -115,21 +132,41 @@ fn main() -> Result<()> {
     // libseat probes for systemd-logind first and falls back to seatd.
     // It refuses if neither grants seat access (no logind session and the
     // user isn't a member of the seat group / not running under seatd-launch).
-    let (session, notifier) = LibSeatSession::new()
+    let (mut session, notifier) = LibSeatSession::new()
         .context("failed to open libseat session (need a logind session or seat-group access)")?;
     let seat_name = session.seat();
     info!(seat = %seat_name, "libseat session acquired");
 
     info!("phase: opening udev backend");
     // udev gives us both initial device enumeration and live hotplug events
-    // for the same seat. We log what's already present before handing the
-    // backend to calloop.
+    // for the same seat. We snapshot paths into owned PathBufs so we can
+    // keep using them after moving `udev` into the event loop below.
     let udev = UdevBackend::new(&seat_name).context("failed to start udev backend")?;
-    let initial_devices: Vec<_> = udev.device_list().collect();
+    let initial_devices: Vec<(_, std::path::PathBuf)> = udev
+        .device_list()
+        .map(|(id, path)| (id, path.to_path_buf()))
+        .collect();
     info!(count = initial_devices.len(), "udev backend ready");
-    for (device_id, path) in initial_devices {
+    for (device_id, path) in &initial_devices {
         debug!(device_id, path = %path.display(), "udev pre-existing device");
     }
+
+    // Pick a /dev/dri/cardN node — render nodes (renderD128) come through
+    // the same udev subsystem and we explicitly don't want them for
+    // modesetting. First card wins for now; multi-GPU is a later milestone.
+    let drm_path = initial_devices
+        .iter()
+        .find(|(_, p)| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("card"))
+        })
+        .map(|(_, p)| p.clone())
+        .context("no /dev/dri/cardN device enumerated by udev — no display to drive")?;
+    info!(drm_path = %drm_path.display(), "selected DRM device");
+
+    let (drm_keepalive, drm_notifier) = drm::open_and_paint(&mut session, &drm_path, STARTUP_COLOR)
+        .context("DRM/KMS initial paint failed")?;
 
     info!("phase: creating libinput context");
     // libinput opens `/dev/input/*` via the session interface so libseat
@@ -166,6 +203,17 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
 
     handle
+        .insert_source(drm_notifier, |event, _meta, _state| match event {
+            smithay::backend::drm::DrmEvent::VBlank(crtc) => {
+                debug!(?crtc, "drm: vblank");
+            }
+            smithay::backend::drm::DrmEvent::Error(err) => {
+                warn!(error = %err, "drm: event-source error");
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to insert drm source: {e}"))?;
+
+    handle
         .insert_source(libinput_backend, |event, (), state| {
             log_input_event(&event);
             if let InputEvent::Keyboard { event: ke } = &event {
@@ -179,6 +227,7 @@ fn main() -> Result<()> {
         loop_signal,
         shift_held: false,
         super_held: false,
+        drm: drm_keepalive,
     };
 
     info!("entering event loop — type to generate events, super+shift+e to exit");
