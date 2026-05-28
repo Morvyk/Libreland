@@ -95,8 +95,9 @@ input = {
 }
 
 binds = {
-    { mods = { "Super", "Shift" }, key = "E", action = "exit" },
-    { mods = { "Super" },          key = "F", action = "togglefloating" },
+    { mods = { "Super", "Shift" }, key = "E",     action = "exit" },
+    { mods = { "Super" },          key = "F",     action = "togglefloating" },
+    { mods = { "Super" },          key = "space", action = "spawn", command = "rofi -show drun" },
 }
 
 misc = {
@@ -157,9 +158,9 @@ Anything xkbcommon's `xkb_keysym_from_name` accepts — `"E"`,
 | ------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `"exit"`            | Cleanly exit the compositor.                                                                                 |
 | `"togglefloating"`  | Flip the focused window between tiled and floating. A newly floating window centres at ~70% of its previous cell. |
+| `"spawn"`           | Run an arbitrary command. Requires an additional `command = "…"` field on the bind table; the string is whitespace-split into program + args, children inherit our env (so `$WAYLAND_DISPLAY` reaches them). Wrap with `"sh -c '…'"` for shell features (pipes, env, `&`). |
 
-(More actions land as features grow: `"reload"`, `"spawn"`,
-`"change_vt"`, …)
+(More actions land as features grow: `"reload"`, `"change_vt"`, …)
 
 ### Schema reference
 

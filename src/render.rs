@@ -46,6 +46,33 @@ use crate::layout::Placement;
 /// `wl_output` and seed `wp_fractional_scale_manager_v1`. Mirrors
 /// the renderer's internal `OutputRender` but exposes only the
 /// fields the frontend cares about (no GBM surface handle).
+/// A layer surface to render this frame. Pre-computed by main
+/// before calling `render_for_crtc` so the renderer doesn't need
+/// to know about `wlr_layer_shell` types or per-output
+/// associations — just "draw this surface at this rect, in this
+/// layer bucket".
+#[derive(Debug, Clone)]
+pub struct LayerPlacement {
+    pub surface: WlSurface,
+    /// Top-left in absolute compositor coords.
+    pub position: Point<i32, Physical>,
+    /// Logical "depth" used to interleave with windows in
+    /// `render_output`. Renderer treats `Background`/`Bottom` as
+    /// below windows and `Top`/`Overlay` as above.
+    pub layer: LayerBucket,
+}
+
+/// Renderer-side mirror of `smithay::wayland::shell::wlr_layer::Layer`.
+/// Defined here so render.rs doesn't depend on smithay's shell
+/// module types beyond what's needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerBucket {
+    Background,
+    Bottom,
+    Top,
+    Overlay,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputDescriptor {
     pub name: String,
@@ -426,7 +453,7 @@ impl Renderer {
     /// an empty placement slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
-            self.render_output(idx, &[])
+            self.render_output(idx, &[], &[])
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -436,13 +463,18 @@ impl Renderer {
     /// `placements` is the caller-snapshot of every visible window as
     /// `(wl_surface, top-left in absolute virtual-layout coords)`;
     /// the layout module owns positioning, the renderer just paints.
-    pub fn render_for_crtc(&mut self, crtc: crtc::Handle, placements: &[Placement]) -> Result<()> {
+    pub fn render_for_crtc(
+        &mut self,
+        crtc: crtc::Handle,
+        placements: &[Placement],
+        layers: &[LayerPlacement],
+    ) -> Result<()> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx, placements)
+        self.render_output(idx, placements, layers)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -507,7 +539,12 @@ impl Renderer {
         clippy::too_many_lines,
         reason = "this is the per-output render loop — wallpaper, per-window border+surface+rounded-mask, cursor, queue, frame callbacks. Splitting any one piece out would require threading the dmabuf/frame borrow through another method, which adds more friction than length removes."
     )]
-    fn render_output(&mut self, idx: usize, placements: &[Placement]) -> Result<()> {
+    fn render_output(
+        &mut self,
+        idx: usize,
+        placements: &[Placement],
+        layers: &[LayerPlacement],
+    ) -> Result<()> {
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in. All
         // *_phys helpers below take pre-scaled physical pixel
@@ -583,6 +620,31 @@ impl Renderer {
             })
             .collect();
 
+        // Layer surfaces: pre-import textures while we still
+        // hold `&mut self.gles` outside the frame scope, like we
+        // do for window placements. Each entry pairs the layer
+        // bucket with the imported elements so we can paint them
+        // in the correct z-order during the frame block below.
+        let layer_groups: Vec<(LayerBucket, Vec<WaylandSurfaceRenderElement<GlesRenderer>>)> =
+            layers
+                .iter()
+                .map(|l| {
+                    let local_phys = Point::<i32, Physical>::from((
+                        scale_i(l.position.x - compositor_position.x, scale),
+                        scale_i(l.position.y - compositor_position.y, scale),
+                    ));
+                    let elements = render_elements_from_surface_tree(
+                        &mut self.gles,
+                        &l.surface,
+                        local_phys,
+                        scale,
+                        1.0_f32,
+                        Kind::Unspecified,
+                    );
+                    (l.layer, elements)
+                })
+                .collect();
+
         let sync = {
             let mut target = self
                 .gles
@@ -605,6 +667,28 @@ impl Renderer {
             draw_fill(&mut frame, &wallpaper, mode_size, mode_size)?;
 
             let full_damage = [Rectangle::<i32, Physical>::from_size(mode_size)];
+
+            // Layer-shell render order, per wlr-layer-shell spec:
+            //   wallpaper → Background → Bottom → windows → Top → Overlay → cursor.
+            // Background + Bottom go between wallpaper and tiles
+            // so panels and wallpaper-like surfaces sit behind
+            // application windows; Top + Overlay go on top of
+            // windows so notifications, launchers, OSDs are
+            // visible. We draw each layer surface with its own
+            // `draw_render_elements` call (single-element slice)
+            // for the same opaque-region reason the window loop
+            // uses below.
+            for (bucket, elements) in &layer_groups {
+                if matches!(bucket, LayerBucket::Background | LayerBucket::Bottom) {
+                    draw_render_elements::<GlesRenderer, _, _>(
+                        &mut frame,
+                        scale,
+                        elements,
+                        &full_damage,
+                    )
+                    .context("draw_render_elements (layer bg/bottom) failed")?;
+                }
+            }
             let radius_comp = border.rounded_corners.max(0);
             for (p, elements) in placements.iter().zip(grouped.iter()) {
                 let cell_local_phys = Rectangle::<i32, Physical>::new(
@@ -650,6 +734,22 @@ impl Renderer {
                 }
             }
 
+            // Top + Overlay layer surfaces go above windows but
+            // below the cursor, matching common compositor
+            // behaviour (rofi above kitty, status bar above
+            // everything but the cursor).
+            for (bucket, elements) in &layer_groups {
+                if matches!(bucket, LayerBucket::Top | LayerBucket::Overlay) {
+                    draw_render_elements::<GlesRenderer, _, _>(
+                        &mut frame,
+                        scale,
+                        elements,
+                        &full_damage,
+                    )
+                    .context("draw_render_elements (layer top/overlay) failed")?;
+                }
+            }
+
             if cursor_in_bounds {
                 let cursor_origin = Point::<i32, Physical>::from((
                     scale_f(cursor_local_x, scale),
@@ -679,6 +779,9 @@ impl Renderer {
         let elapsed_ms = self.start.elapsed().as_millis() as u32;
         for p in placements {
             send_frame_callbacks(&p.surface, elapsed_ms);
+        }
+        for l in layers {
+            send_frame_callbacks(&l.surface, elapsed_ms);
         }
         Ok(())
     }

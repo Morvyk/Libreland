@@ -166,6 +166,15 @@ pub(crate) struct State {
     /// output's configured scale; will become per-surface once
     /// per-output workspaces ship.
     pub(crate) preferred_scale: f64,
+    /// `wlr_layer_shell` substate. The handler in
+    /// [`crate::wayland`] reads / writes it for new + destroyed
+    /// layer surfaces; renderer reads it each frame.
+    pub(crate) layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    /// Keyboard focus saved when a layer-shell surface grabs
+    /// exclusive focus (e.g. rofi), restored when that surface
+    /// is destroyed.
+    pub(crate) kbd_focus_before_layer:
+        Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     /// Dwindle tiling layout — owns every visible window's
     /// `(wl_surface, rect)` pair. The vblank handler snapshots
     /// this each frame; xdg handlers in [`crate::wayland`] insert
@@ -257,7 +266,7 @@ impl State {
                 .bindings
                 .iter()
                 .find(|b| result.keysym == b.keysym && result.has_all_mods(b.mods))
-                .map(|b| b.action)
+                .map(|b| b.action.clone())
         } else {
             None
         };
@@ -535,6 +544,122 @@ impl State {
         pointer.frame(self);
     }
 
+    /// Build one `LayerPlacement` per live layer surface for this
+    /// frame. The renderer needs each surface's top-left in
+    /// compositor coords + a layer bucket so it knows whether to
+    /// paint background/bottom surfaces between the wallpaper and
+    /// the tiles, or top/overlay surfaces between the tiles and
+    /// the cursor.
+    ///
+    /// Position is derived from the cached layer state's anchor +
+    /// margin + size, evaluated against the primary output's
+    /// compositor rect. Surfaces with a non-positive size (set by
+    /// clients that want the compositor to choose) get the full
+    /// primary output dimension in the unsized axis; non-anchored
+    /// surfaces are centred. Multi-output layer placement is a
+    /// later milestone — for now every layer surface lands on
+    /// primary.
+    pub(crate) fn snapshot_layer_placements(&self) -> Vec<render::LayerPlacement> {
+        use smithay::wayland::shell::wlr_layer::{Anchor, Layer};
+        let primary = self.renderer.primary_output_rect();
+        let mut out = Vec::new();
+        for layer_surface in self.layer_shell_state.layer_surfaces() {
+            let surface = layer_surface.wl_surface();
+            let cached = crate::wayland::layer_cached_state(surface);
+            let mut width = cached.size.w;
+            let mut height = cached.size.h;
+            if width <= 0 {
+                width = primary.size.w;
+            }
+            if height <= 0 {
+                height = primary.size.h;
+            }
+            // Default: centre the surface on the output.
+            let mut x = primary.loc.x + (primary.size.w - width) / 2;
+            let mut y = primary.loc.y + (primary.size.h - height) / 2;
+            // Anchor pulls each axis to an edge or stretches across.
+            let anchor = cached.anchor;
+            if anchor.contains(Anchor::LEFT) && !anchor.contains(Anchor::RIGHT) {
+                x = primary.loc.x + cached.margin.left;
+            } else if anchor.contains(Anchor::RIGHT) && !anchor.contains(Anchor::LEFT) {
+                x = primary.loc.x + primary.size.w - width - cached.margin.right;
+            } else if anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT) {
+                x = primary.loc.x + cached.margin.left;
+            }
+            if anchor.contains(Anchor::TOP) && !anchor.contains(Anchor::BOTTOM) {
+                y = primary.loc.y + cached.margin.top;
+            } else if anchor.contains(Anchor::BOTTOM) && !anchor.contains(Anchor::TOP) {
+                y = primary.loc.y + primary.size.h - height - cached.margin.bottom;
+            } else if anchor.contains(Anchor::TOP) && anchor.contains(Anchor::BOTTOM) {
+                y = primary.loc.y + cached.margin.top;
+            }
+            let bucket = match cached.layer {
+                Layer::Background => render::LayerBucket::Background,
+                Layer::Bottom => render::LayerBucket::Bottom,
+                Layer::Top => render::LayerBucket::Top,
+                Layer::Overlay => render::LayerBucket::Overlay,
+            };
+            out.push(render::LayerPlacement {
+                surface: surface.clone(),
+                position: smithay::utils::Point::new(x, y),
+                layer: bucket,
+            });
+        }
+        out
+    }
+
+    /// Walk every known layer surface, sum its exclusive zones
+    /// per anchored edge (`top`/`bottom`/`left`/`right`), and
+    /// shrink the layout's bounds by the totals. Called whenever
+    /// a layer surface is added, destroyed, or commits a new
+    /// state — anything that might change a `Layer::Top` /
+    /// `Bottom` reservation. Background and overlay layers are
+    /// rendered, but exclusive zones from those layers are not
+    /// honoured per protocol (overlay floats on top; background
+    /// always renders below).
+    pub(crate) fn recompute_layer_layout(&mut self) {
+        use smithay::wayland::shell::wlr_layer::Anchor;
+        let primary = self.renderer.primary_output_rect();
+        let mut top = 0_i32;
+        let mut bottom = 0_i32;
+        let mut left = 0_i32;
+        let mut right = 0_i32;
+        for layer in self.layer_shell_state.layer_surfaces() {
+            let cached = crate::wayland::layer_cached_state(layer.wl_surface());
+            let exclusive: i32 = cached.exclusive_zone.into();
+            if exclusive <= 0 {
+                continue;
+            }
+            // Per spec: exclusive is meaningful only when anchored
+            // to one edge or to one edge + the two perpendicular
+            // ones. We approximate by attributing the zone to
+            // whichever single edge is anchored without its
+            // opposite.
+            let anchor = cached.anchor;
+            let t = anchor.contains(Anchor::TOP);
+            let b = anchor.contains(Anchor::BOTTOM);
+            let l = anchor.contains(Anchor::LEFT);
+            let r = anchor.contains(Anchor::RIGHT);
+            if t && !b {
+                top = top.max(exclusive);
+            } else if b && !t {
+                bottom = bottom.max(exclusive);
+            } else if l && !r {
+                left = left.max(exclusive);
+            } else if r && !l {
+                right = right.max(exclusive);
+            }
+        }
+        let new_bounds = smithay::utils::Rectangle::<i32, smithay::utils::Physical>::new(
+            smithay::utils::Point::new(primary.loc.x + left, primary.loc.y + top),
+            smithay::utils::Size::new(
+                (primary.size.w - left - right).max(1),
+                (primary.size.h - top - bottom).max(1),
+            ),
+        );
+        self.layout.set_bounds(new_bounds);
+    }
+
     /// Run a bound action. Grows as we add more actions (`reload`,
     /// `spawn`, `change_vt`, …).
     fn dispatch_action(&mut self, action: config::Action) {
@@ -550,6 +675,31 @@ impl State {
                 if let Some(surface) = focus {
                     info!(surface = ?surface.id(), "togglefloating action fired");
                     self.layout.toggle_floating(&surface);
+                }
+            }
+            config::Action::Spawn(cmd) => {
+                // Identical semantics to `wayland::spawn_startup`
+                // but runs at bind-press time: whitespace-split
+                // into program + args, inherit our env so
+                // `$WAYLAND_DISPLAY` reaches the child. Empty
+                // commands and failures are logged and the loop
+                // keeps running.
+                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                let Some((program, args)) = parts.split_first() else {
+                    warn!(command = %cmd, "spawn action: empty command");
+                    return;
+                };
+                match std::process::Command::new(program).args(args).spawn() {
+                    Ok(child) => info!(
+                        pid = child.id(),
+                        command = %cmd,
+                        "spawn action fired"
+                    ),
+                    Err(err) => warn!(
+                        error = %err,
+                        command = %cmd,
+                        "spawn action failed"
+                    ),
                 }
             }
         }
@@ -767,6 +917,8 @@ fn main() -> Result<()> {
         outputs: wayland_init.outputs,
         fractional_scale_state: wayland_init.fractional_scale_state,
         preferred_scale: wayland_init.preferred_scale,
+        layer_shell_state: wayland_init.layer_shell_state,
+        kbd_focus_before_layer: None,
         layout,
         drag: None,
     };
@@ -995,7 +1147,12 @@ fn wire_event_sources(
                         .get_keyboard()
                         .and_then(|k| k.current_focus());
                     let placements = data.state.layout.placements(focused.as_ref());
-                    if let Err(err) = data.state.renderer.render_for_crtc(crtc, &placements) {
+                    let layer_placements = data.state.snapshot_layer_placements();
+                    if let Err(err) =
+                        data.state
+                            .renderer
+                            .render_for_crtc(crtc, &placements, &layer_placements)
+                    {
                         // Don't kill the event loop on a render hiccup —
                         // log and let the next vblank try again. A
                         // persistent failure on one CRTC freezes that

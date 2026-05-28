@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use mlua::{ErrorContext as _, Lua, Table};
@@ -183,7 +184,7 @@ pub struct KeyBinding {
     pub action: Action,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Break the calloop event loop and exit the compositor cleanly.
     Exit,
@@ -191,6 +192,12 @@ pub enum Action {
     /// floating window is centred at ~70 % of its previous tiled
     /// cell; a newly tiled window rejoins the dwindle flow.
     ToggleFloating,
+    /// Spawn a child process from the configured command string.
+    /// The string is whitespace-split into program + args; wrap in
+    /// `"sh -c '…'"` for shell features. Inherits the compositor's
+    /// environment (notably `$WAYLAND_DISPLAY`). `Arc<str>` so
+    /// `Action` is cheap to clone but doesn't need to be `Copy`.
+    Spawn(Arc<str>),
 }
 
 #[derive(Debug, Clone)]
@@ -474,10 +481,7 @@ fn parse_bind(t: &Table) -> mlua::Result<KeyBinding> {
         );
     }
 
-    let action_name: String = t
-        .get("action")
-        .context("missing or invalid `action` (expected string)")?;
-    let action = parse_action(&action_name)?;
+    let action = parse_action(t)?;
 
     Ok(KeyBinding {
         mods,
@@ -500,13 +504,25 @@ fn parse_modifier(name: &str) -> mlua::Result<u32> {
     }
 }
 
-fn parse_action(name: &str) -> mlua::Result<Action> {
+fn parse_action(t: &Table) -> mlua::Result<Action> {
+    let name: String = t
+        .get("action")
+        .context("missing or invalid `action` (expected string)")?;
     match name.to_lowercase().as_str() {
         "exit" => Ok(Action::Exit),
         "togglefloating" | "toggle_floating" => Ok(Action::ToggleFloating),
-        other => {
-            lua_bail!("unknown action {other:?}; supported actions: \"exit\", \"togglefloating\"")
+        "spawn" => {
+            let command: String = t
+                .get("command")
+                .context("spawn action requires `command` (expected string)")?;
+            if command.trim().is_empty() {
+                lua_bail!("spawn action `command` is empty");
+            }
+            Ok(Action::Spawn(Arc::from(command)))
         }
+        other => lua_bail!(
+            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"spawn\""
+        ),
     }
 }
 

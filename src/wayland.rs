@@ -19,6 +19,7 @@ use anyhow::{Context as _, Result};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_fractional_scale;
+use smithay::delegate_layer_shell;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
@@ -31,6 +32,7 @@ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Sub
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource as _};
@@ -43,6 +45,9 @@ use smithay::wayland::fractional_scale::{
     self, FractionalScaleHandler, FractionalScaleManagerState,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -86,6 +91,7 @@ pub struct WaylandInit {
     pub xdg_decoration_state: XdgDecorationState,
     pub output_manager_state: OutputManagerState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    pub layer_shell_state: WlrLayerShellState,
     /// One smithay `Output` per DRM connector. Each carries its
     /// physical mode + configured scale and is advertised to
     /// clients as a `wl_output` global so they can pick a target
@@ -122,6 +128,11 @@ pub fn init(
     let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
     let fractional_scale_state = FractionalScaleManagerState::new::<State>(&dh);
+    // wlr_layer_shell: panels, bars, lockscreens, launchers, OSDs.
+    // We render layer surfaces above or below the tile area
+    // depending on their `Layer`, and honour their exclusive
+    // zones by shrinking the layout's bounds.
+    let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
 
     // One smithay `Output` per DRM connector. Each becomes a
     // `wl_output` global the client can bind to learn the mode
@@ -198,6 +209,7 @@ pub fn init(
         xdg_decoration_state,
         output_manager_state,
         fractional_scale_state,
+        layer_shell_state,
         outputs,
         preferred_scale,
     })
@@ -415,6 +427,90 @@ impl XdgDecorationHandler for State {
     }
 }
 
+impl WlrLayerShellHandler for State {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        info!(
+            namespace,
+            ?layer,
+            surface = ?surface.wl_surface().id(),
+            "wayland: new layer surface"
+        );
+        // Send the initial configure carrying the layout area the
+        // surface can occupy. Anchor + size + exclusive-zone math
+        // is handled by the renderer / layout once the client
+        // commits a buffer; here we just bootstrap the configure
+        // cycle. Clients that requested an explicit size (rofi:
+        // anchored centre, 800x600) keep that; clients that asked
+        // for "0" in some axis get the matching output dimension.
+        let primary = self.renderer.primary_output_rect();
+        let bounds_size = primary.size;
+        surface.with_pending_state(|state| {
+            state.size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from(
+                (bounds_size.w, bounds_size.h),
+            ));
+        });
+        surface.send_configure();
+        // Recompute the tile area so any exclusive zone this layer
+        // declares (set by the first commit) is honoured.
+        self.recompute_layer_layout();
+        // If the layer requested exclusive keyboard focus, hand it
+        // over now. Restoring focus on destroy lands in
+        // `layer_destroyed` below.
+        let cached = layer_cached_state(surface.wl_surface());
+        if matches!(
+            cached.keyboard_interactivity,
+            smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive
+        ) && matches!(layer, Layer::Top | Layer::Overlay)
+            && let Some(kbd) = self.seat.get_keyboard()
+        {
+            self.kbd_focus_before_layer = kbd.current_focus();
+            kbd.set_focus(
+                self,
+                Some(surface.wl_surface().clone()),
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        info!(surface = ?surface.wl_surface().id(), "wayland: layer surface destroyed");
+        let cur_focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        if cur_focus.as_ref() == Some(surface.wl_surface())
+            && let Some(kbd) = self.seat.get_keyboard()
+        {
+            let restore = self.kbd_focus_before_layer.take();
+            kbd.set_focus(self, restore, SERIAL_COUNTER.next_serial());
+        }
+        self.recompute_layer_layout();
+    }
+}
+
+/// Read the current cached `LayerSurfaceCachedState` of a layer
+/// surface — pulled out into a free function because the closure
+/// in `with_states` can't directly return a non-`'static` borrow,
+/// so we clone the whole cached struct.
+pub fn layer_cached_state(
+    surface: &WlSurface,
+) -> smithay::wayland::shell::wlr_layer::LayerSurfaceCachedState {
+    use smithay::wayland::shell::wlr_layer::LayerSurfaceCachedState;
+    let mut out: LayerSurfaceCachedState = LayerSurfaceCachedState::default();
+    with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<LayerSurfaceCachedState>();
+        out = *cached.current();
+    });
+    out
+}
+
 impl FractionalScaleHandler for State {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
         // The preferred fractional scale is whatever the layout's
@@ -437,3 +533,4 @@ delegate_xdg_shell!(State);
 delegate_xdg_decoration!(State);
 delegate_output!(State);
 delegate_fractional_scale!(State);
+delegate_layer_shell!(State);
