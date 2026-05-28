@@ -21,10 +21,12 @@ use smithay::delegate_compositor;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
@@ -34,6 +36,7 @@ use smithay::utils::{SERIAL_COUNTER, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -72,6 +75,7 @@ pub struct WaylandInit {
     pub seat_state: SeatState<State>,
     pub seat: Seat<State>,
     pub xdg_shell_state: XdgShellState,
+    pub xdg_decoration_state: XdgDecorationState,
     pub output_manager_state: OutputManagerState,
 }
 
@@ -85,6 +89,13 @@ pub fn init(display: &Display<State>, config: &Config) -> Result<WaylandInit> {
     let compositor_state = CompositorState::new::<State>(&dh);
     let shm_state = ShmState::new::<State>(&dh, vec![]);
     let xdg_shell_state = XdgShellState::new::<State>(&dh);
+    // Advertise xdg_decoration with our reply hard-coded to
+    // ServerSide (= "compositor draws decorations"). Libreland
+    // is a tiler and deliberately draws none, so the visible
+    // effect is "client doesn't draw a title bar / border". A
+    // client requesting ClientSide is overridden — we don't
+    // accept CSD.
+    let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
     let output_manager_state = OutputManagerState::new();
 
     let mut seat_state = SeatState::<State>::new();
@@ -122,6 +133,7 @@ pub fn init(display: &Display<State>, config: &Config) -> Result<WaylandInit> {
         seat_state,
         seat,
         xdg_shell_state,
+        xdg_decoration_state,
         output_manager_state,
     })
 }
@@ -233,14 +245,23 @@ impl XdgShellHandler for State {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: new xdg_toplevel");
-        // Hand the toplevel to the tiler. Layout::insert calls
-        // send_configure on every affected window with its newly-
-        // assigned rect — the new arrival and any existing tiles
-        // whose cells just got bisected.
-        self.layout.insert(surface.clone());
-        // Promote the new toplevel to keyboard focus (4d.1's interim
-        // "last mapped wins" rule; 4d.2 replaces this with a
-        // configurable click vs hover model).
+        // Hand the toplevel to the tiler at the cursor's current
+        // position. The layout splits whichever existing leaf the
+        // cursor is over, so spawning a terminal with the mouse
+        // over the right half makes room there instead of always
+        // dropping the new tile in the deepest dwindle cell.
+        let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+        )]
+        let cursor =
+            smithay::utils::Point::<i32, smithay::utils::Physical>::from((cx as i32, cy as i32));
+        self.layout.insert(surface.clone(), Some(cursor));
+        // Promote the new toplevel to keyboard focus. For both
+        // hover and click models a fresh window should start with
+        // focus so the user can type into it immediately, even if
+        // the pointer hasn't moved onto it yet.
         let wl_surface = surface.wl_surface().clone();
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
@@ -299,8 +320,39 @@ impl AsMut<CompositorState> for State {
     }
 }
 
+impl XdgDecorationHandler for State {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        // Client created a decoration object — pin us to
+        // ServerSide before the first configure so the client
+        // never starts with CSD then has to redraw without it.
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        // Client preference is ignored; tiling WM doesn't have
+        // optional decorations to negotiate over.
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        // Client released the decoration object. Keep ServerSide
+        // pinned so it doesn't accidentally fall back to CSD.
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
 delegate_compositor!(State);
 delegate_shm!(State);
 delegate_seat!(State);
 delegate_xdg_shell!(State);
+delegate_xdg_decoration!(State);
 delegate_output!(State);

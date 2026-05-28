@@ -128,6 +128,16 @@ pub(crate) struct State {
     pub(crate) seat: Seat<State>,
     /// `xdg_wm_base` + `xdg_surface` + `xdg_toplevel` substate.
     pub(crate) xdg_shell_state: XdgShellState,
+    /// `zxdg_decoration_manager_v1` substate. Held so the
+    /// `delegate_xdg_decoration!` macro routes per-toplevel
+    /// decoration objects through us; our handler pins every
+    /// client to `ServerSide` mode and we then draw no
+    /// decorations at all (it's a tiler).
+    #[allow(
+        dead_code,
+        reason = "held so delegate_xdg_decoration! can route global dispatch through it; the global is the only externally-visible effect"
+    )]
+    pub(crate) xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
     /// `wl_output` substate; used when we expose each DRM output to
     /// clients (4a wires the global; per-output `Output` objects
     /// come with the renderer→clients integration in 4b/later).
@@ -272,7 +282,10 @@ impl State {
 
         // Drag in flight: update the dragged window's rect and
         // swallow the motion event so the client doesn't see a
-        // running pointer underneath the grab.
+        // running pointer underneath the grab. Move drags update
+        // `in_transit` (a free-floating window that follows the
+        // cursor and rejoins the tree on drop); Resize drags
+        // update the floating window's rect in place.
         if let Some(drag) = self.drag.clone() {
             #[allow(
                 clippy::cast_possible_truncation,
@@ -284,23 +297,28 @@ impl State {
                 reason = "cursor deltas are bounded by layout_bounds (i32) from on_pointer_motion"
             )]
             let delta_y = (cy - drag.cursor_start.1) as i32;
-            let new_rect = match drag.mode {
-                DragMode::Move => smithay::utils::Rectangle::new(
-                    Point::<i32, Physical>::new(
-                        drag.rect_start.loc.x + delta_x,
-                        drag.rect_start.loc.y + delta_y,
-                    ),
-                    drag.rect_start.size,
-                ),
-                DragMode::Resize => smithay::utils::Rectangle::new(
-                    drag.rect_start.loc,
-                    smithay::utils::Size::<i32, Physical>::new(
-                        (drag.rect_start.size.w + delta_x).max(MIN_DRAG_RESIZE_W),
-                        (drag.rect_start.size.h + delta_y).max(MIN_DRAG_RESIZE_H),
-                    ),
-                ),
-            };
-            self.layout.set_floating_rect(&drag.surface, new_rect);
+            match drag.mode {
+                DragMode::Move => {
+                    let new_rect = smithay::utils::Rectangle::new(
+                        Point::<i32, Physical>::new(
+                            drag.rect_start.loc.x + delta_x,
+                            drag.rect_start.loc.y + delta_y,
+                        ),
+                        drag.rect_start.size,
+                    );
+                    self.layout.update_in_transit_rect(new_rect);
+                }
+                DragMode::Resize => {
+                    let new_rect = smithay::utils::Rectangle::new(
+                        drag.rect_start.loc,
+                        smithay::utils::Size::<i32, Physical>::new(
+                            (drag.rect_start.size.w + delta_x).max(MIN_DRAG_RESIZE_W),
+                            (drag.rect_start.size.h + delta_y).max(MIN_DRAG_RESIZE_H),
+                        ),
+                    );
+                    self.layout.set_floating_rect(&drag.surface, new_rect);
+                }
+            }
             return;
         }
 
@@ -353,10 +371,19 @@ impl State {
     /// so the focused client sees its first key as expected.
     ///
     /// Super + LMB press starts an interactive Move drag on the
-    /// window under the cursor (auto-floating it first if tiled);
-    /// Super + RMB starts a Resize drag. While a drag is active,
-    /// any release ends it, and no press / release leaks to the
-    /// focused client — otherwise it would see a stuck button.
+    /// window under the cursor: the window is pulled out of its
+    /// current home (tree or floating list) into `in_transit` and
+    /// follows the cursor; on release it rejoins the tree at the
+    /// drop position (if it came from the tree) or the floating
+    /// stack (if it was already floating). Super + RMB starts a
+    /// Resize drag, which only works on floating windows — resize
+    /// on a tile is a logged no-op (use Super+F first). While a
+    /// drag is active, any release ends it, and no press / release
+    /// leaks to the focused client.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this function is a single decision tree for one event source (pointer button) — drag end, drag start, click-to-focus, and normal forwarding all live here. Splitting any of those out duplicates the active-drag short-circuit checks at every site, which is worse than the length."
+    )]
     fn forward_pointer_button(
         &mut self,
         button: u32,
@@ -367,7 +394,16 @@ impl State {
         // swallowed so we don't accidentally cancel mid-drag.
         if self.drag.is_some() {
             if matches!(state, smithay::backend::input::ButtonState::Released) {
-                self.drag = None;
+                let drag = self.drag.take().expect("checked is_some above");
+                if matches!(drag.mode, DragMode::Move) {
+                    let (cx, cy) = self.renderer.cursor_pos();
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+                    )]
+                    let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+                    self.layout.finish_move_drag(cursor_i);
+                }
             }
             return;
         }
@@ -409,7 +445,11 @@ impl State {
                     {
                         kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
                     }
-                    if let Some(rect_start) = self.layout.start_drag_for(&surface) {
+                    let rect_start = match mode {
+                        DragMode::Move => self.layout.start_move_drag(&surface),
+                        DragMode::Resize => self.layout.start_resize_drag(&surface),
+                    };
+                    if let Some(rect_start) = rect_start {
                         info!(
                             ?mode,
                             surface = ?surface.id(),
@@ -421,6 +461,11 @@ impl State {
                             cursor_start: (cx, cy),
                             rect_start,
                         });
+                    } else if matches!(mode, DragMode::Resize) {
+                        warn!(
+                            surface = ?surface.id(),
+                            "Super+RMB resize is only supported on floating windows; toggle floating (Super+F) first"
+                        );
                     }
                     // Either way we don't forward this press to
                     // the client — Super+click is the compositor's
@@ -658,7 +703,13 @@ fn main() -> Result<()> {
     // descriptors, if relevant).
     wayland::spawn_startup(&config.startup);
 
-    let layout = layout::Layout::new(renderer.primary_output_rect());
+    let layout = layout::Layout::new(
+        renderer.primary_output_rect(),
+        layout::Gaps {
+            outer: config.layout.gaps_outer,
+            inner: config.layout.gaps_inner,
+        },
+    );
     let state = State {
         session,
         loop_signal,
@@ -672,6 +723,7 @@ fn main() -> Result<()> {
         seat_state: wayland_init.seat_state,
         seat: wayland_init.seat,
         xdg_shell_state: wayland_init.xdg_shell_state,
+        xdg_decoration_state: wayland_init.xdg_decoration_state,
         output_manager_state: wayland_init.output_manager_state,
         layout,
         drag: None,
@@ -890,13 +942,18 @@ fn wire_event_sources(
                     // Snapshot every laid-out window's (surface,
                     // position) pair so the borrow on `layout`
                     // ends before the mut borrow on `renderer`
-                    // starts. WlSurface clones are Arc-backed — cheap.
+                    // starts. WlSurface clones are Arc-backed —
+                    // cheap. Layout returns placements in draw
+                    // order (tiled tree first, floats next,
+                    // in-transit on top); we drop the rect's
+                    // size for the renderer (it pulls size from
+                    // the surface's buffer) and only pass loc.
                     let placements: Vec<(WlSurface, Point<i32, Physical>)> = data
                         .state
                         .layout
-                        .windows()
-                        .iter()
-                        .map(|w| (w.toplevel.wl_surface().clone(), w.rect.loc))
+                        .placements()
+                        .into_iter()
+                        .map(|(surface, rect)| (surface, rect.loc))
                         .collect();
                     if let Err(err) = data.state.renderer.render_for_crtc(crtc, &placements) {
                         // Don't kill the event loop on a render hiccup —

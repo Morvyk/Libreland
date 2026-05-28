@@ -56,12 +56,25 @@ pub struct Config {
     pub input: InputConfig,
     pub binds: BindsConfig,
     pub misc: MiscConfig,
+    pub layout: LayoutConfig,
     /// Commands to spawn as children once the Wayland socket is
     /// listening. Each entry is whitespace-split into program +
     /// args; needs a shell wrapper (`"sh -c '…'"`) for shell
     /// features. Children inherit the compositor's environment
     /// (notably `$WAYLAND_DISPLAY`).
     pub startup: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayoutConfig {
+    /// Pixels of empty space between the tile area and each edge
+    /// of the layout's bounds. Wallpaper shows through the gap.
+    /// Default `8`.
+    pub gaps_outer: i32,
+    /// Pixels of empty space between adjacent tile cells.
+    /// Centred on each split divider — each cell gives up
+    /// `inner / 2` on the dividing side. Default `3`.
+    pub gaps_inner: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -226,6 +239,10 @@ impl Default for Config {
                     bottom: [0.10, 0.20, 0.50], // deep navy
                 },
             },
+            layout: LayoutConfig {
+                gaps_outer: 8,
+                gaps_inner: 3,
+            },
             startup: Vec::new(),
         }
     }
@@ -281,6 +298,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("misc")? {
             config.misc = parse_misc(&t, config.misc).context("misc")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("layout")? {
+            config.layout = parse_layout(&t, config.layout).context("layout")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("startup")? {
             config.startup = parse_startup(&t).context("startup")?;
@@ -442,6 +462,23 @@ fn parse_misc(t: &Table, defaults: MiscConfig) -> mlua::Result<MiscConfig> {
     let mut cfg = defaults;
     if let Some(w) = t.get::<Option<Table>>("wallpaper")? {
         cfg.wallpaper = parse_wallpaper(&w).context("wallpaper")?;
+    }
+    Ok(cfg)
+}
+
+fn parse_layout(t: &Table, defaults: LayoutConfig) -> mlua::Result<LayoutConfig> {
+    let mut cfg = defaults;
+    if let Some(g) = t.get::<Option<i32>>("gaps_outer")? {
+        if g < 0 {
+            lua_bail!("gaps_outer {g} out of range; expected >= 0");
+        }
+        cfg.gaps_outer = g;
+    }
+    if let Some(g) = t.get::<Option<i32>>("gaps_inner")? {
+        if g < 0 {
+            lua_bail!("gaps_inner {g} out of range; expected >= 0");
+        }
+        cfg.gaps_inner = g;
     }
     Ok(cfg)
 }

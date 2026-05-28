@@ -109,6 +109,11 @@ misc = {
     -- wallpaper = { type = "solid", color = { 0.20, 0.40, 0.80 } },
 }
 
+layout = {
+    gaps_outer = 8,                       -- px between tile area and screen edges
+    gaps_inner = 3,                       -- px between adjacent tile cells
+}
+
 -- Commands to spawn once the Wayland socket is listening. Each
 -- string is whitespace-split into program + args; children inherit
 -- $WAYLAND_DISPLAY so they connect to *our* compositor. For shell
@@ -190,6 +195,13 @@ as we add `Reload`, `Spawn`, `ChangeVt`, …
 | Field        | Default            | State | Notes                                                                                                          |
 | ------------ | ------------------ | ----- | -------------------------------------------------------------------------------------------------------------- |
 | `wallpaper`  | vertical gradient  | ✅    | `Solid([r, g, b])` or `VerticalGradient { top, bottom }`. RGB components in `[0, 1]`. Drawn every frame.       |
+
+### layout
+
+| Field         | Default | State | Notes                                                                                                |
+| ------------- | ------- | ----- | ---------------------------------------------------------------------------------------------------- |
+| `gaps_outer`  | `8`     | ✅    | Pixels of empty space between the tile area and the screen edge. Wallpaper shows through. `>= 0`.    |
+| `gaps_inner`  | `3`     | ✅    | Pixels of empty space between adjacent tile cells. Centred on each split divider. `>= 0`.            |
 
 ## Keybindings
 
