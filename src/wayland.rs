@@ -142,11 +142,10 @@ pub fn init(
         );
         let mode = OutputMode {
             size: desc.mode_size,
-            // Refresh advertised to clients in mHz. We don't yet
-            // thread the actual DRM refresh through; fill in a
-            // sensible 60 Hz placeholder until per-output mode
-            // tracking lands.
-            refresh: 60_000,
+            // Refresh in milli-Hz, threaded through from the
+            // active DRM mode (so a 4K@144 monitor advertises
+            // 144 000 here, not a placeholder).
+            refresh: desc.refresh_mhz,
         };
         output.change_current_state(
             Some(mode),

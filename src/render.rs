@@ -50,6 +50,10 @@ use crate::layout::Placement;
 pub struct OutputDescriptor {
     pub name: String,
     pub mode_size: Size<i32, Physical>,
+    /// DRM mode refresh rate in milli-Hz. Advertised via
+    /// `wl_output.refresh` so clients can choose modes that match
+    /// the output they'll fullscreen on.
+    pub refresh_mhz: i32,
     pub compositor_position: Point<i32, Physical>,
     /// Logical (= compositor) area covered by this output. Held
     /// so the future `xdg_output` / layer-shell handlers can compute
@@ -162,6 +166,10 @@ struct OutputRender {
     surface: GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
     /// DRM framebuffer dimensions in physical pixels.
     mode_size: Size<i32, Physical>,
+    /// DRM mode refresh rate in milli-Hz (so 144 Hz = `144_000`).
+    /// Threaded out to `wl_output.refresh` so clients see the real
+    /// rate they're driving against.
+    refresh_mhz: i32,
     /// This output's area in absolute compositor coords (logical).
     compositor_position: Point<i32, Physical>,
     compositor_size: Size<i32, Physical>,
@@ -249,6 +257,11 @@ impl Renderer {
         for drm_output in drm_outputs {
             let (mode_w, mode_h) = drm_output.mode.size();
             let mode_size = Size::<i32, Physical>::new(i32::from(mode_w), i32::from(mode_h));
+            // DRM reports vrefresh in Hz (u32). Convert to milli-Hz
+            // for wl_output, clamping at i32::MAX in the absurd
+            // case of a connector reporting a refresh past ~2 MHz.
+            let refresh_mhz =
+                i32::try_from(drm_output.mode.vrefresh().saturating_mul(1000)).unwrap_or(i32::MAX);
             let output_cfg = monitors.outputs.get(&drm_output.name);
             let scale = output_cfg.map_or(1.0, |c| c.scale);
             #[allow(
@@ -288,6 +301,7 @@ impl Renderer {
                 comp_h = compositor_size.h,
                 phys_w = mode_size.w,
                 phys_h = mode_size.h,
+                refresh_mhz,
                 scale,
                 "output swapchain ready"
             );
@@ -297,6 +311,7 @@ impl Renderer {
                 crtc: drm_output.crtc,
                 surface,
                 mode_size,
+                refresh_mhz,
                 compositor_position,
                 compositor_size,
                 scale,
@@ -412,6 +427,7 @@ impl Renderer {
             .map(|o| OutputDescriptor {
                 name: o.name.clone(),
                 mode_size: o.mode_size,
+                refresh_mhz: o.refresh_mhz,
                 compositor_position: o.compositor_position,
                 compositor_size: o.compositor_size,
                 scale: o.scale,
