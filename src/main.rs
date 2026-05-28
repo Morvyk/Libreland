@@ -138,14 +138,34 @@ pub(crate) struct State {
         reason = "held so delegate_xdg_decoration! can route global dispatch through it; the global is the only externally-visible effect"
     )]
     pub(crate) xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
-    /// `wl_output` substate; used when we expose each DRM output to
-    /// clients (4a wires the global; per-output `Output` objects
-    /// come with the renderer→clients integration in 4b/later).
+    /// `wl_output` substate. The `OutputManagerState` carries the
+    /// `xdg_output_manager_v1` global; per-output `wl_output`
+    /// globals live on the individual `Output`s in `outputs`.
     #[allow(
         dead_code,
-        reason = "held so delegate_output! can route global dispatch through it; per-output Output objects (which read it) land in 4b"
+        reason = "held so delegate_output! can route global dispatch through it; the outputs vec is the per-display source of truth"
     )]
     pub(crate) output_manager_state: OutputManagerState,
+    /// One `smithay::output::Output` per DRM connector. Held so
+    /// each global's lifetime is the compositor's; the renderer
+    /// owns the framebuffer side, this owns the protocol side.
+    #[allow(
+        dead_code,
+        reason = "held so each wl_output global stays alive; reads happen via the Output objects themselves on focus/resize"
+    )]
+    pub(crate) outputs: Vec<smithay::output::Output>,
+    /// `wp_fractional_scale_manager_v1` substate.
+    #[allow(
+        dead_code,
+        reason = "held so delegate_fractional_scale! routes through it; new_fractional_scale callbacks read preferred_scale"
+    )]
+    pub(crate) fractional_scale_state:
+        smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    /// Fractional scale to send to every new
+    /// `wp_fractional_scale` object. Currently the primary
+    /// output's configured scale; will become per-surface once
+    /// per-output workspaces ship.
+    pub(crate) preferred_scale: f64,
     /// Dwindle tiling layout — owns every visible window's
     /// `(wl_surface, rect)` pair. The vblank handler snapshots
     /// this each frame; xdg handlers in [`crate::wayland`] insert
@@ -560,8 +580,12 @@ fn main() -> Result<()> {
     // (`LoopData`) contains the `Display<State>`.
     info!("phase: creating Wayland Display + substate");
     let mut display: Display<State> = Display::new().context("wayland Display::new failed")?;
-    let wayland_init = wayland::init(&display, &config).context("wayland substate init failed")?;
-    info!("Wayland substate ready");
+    // Wayland init runs *after* the renderer is up — it needs the
+    // renderer's per-output descriptors (mode size + compositor
+    // position + scale) to create the `wl_output` globals and
+    // seed the fractional-scale state. The Display itself, on
+    // the other hand, has to exist before the EventLoop because
+    // `LoopData` carries it.
 
     let mut event_loop: EventLoop<LoopData> =
         EventLoop::try_new().context("failed to create calloop event loop")?;
@@ -597,7 +621,8 @@ fn main() -> Result<()> {
     let drm_path = pick_drm_card_path(&initial_devices)?;
     info!(drm_path = %drm_path.display(), "selected DRM device");
 
-    let drm_init = drm::open_display(&mut session, &drm_path).context("DRM device init failed")?;
+    let drm_init = drm::open_display(&mut session, &drm_path, &config.monitors)
+        .context("DRM device init failed")?;
     let drm::DrmInit {
         device: drm_device,
         fd: drm_fd,
@@ -610,12 +635,20 @@ fn main() -> Result<()> {
         drm_outputs,
         config.misc.wallpaper.clone(),
         config.border.clone(),
+        &config.monitors,
     )
     .context("render pipeline init failed")?;
 
     info!("phase: priming swapchains (one initial frame per output)");
     renderer.render_initial().context("initial render failed")?;
     info!("all outputs primed for scanout");
+
+    info!("phase: building Wayland frontend substate (post-renderer)");
+    let output_descs = renderer.output_descriptors();
+    let preferred_scale = renderer.primary_scale();
+    let wayland_init = wayland::init(&display, &config, &output_descs, preferred_scale)
+        .context("wayland substate init failed")?;
+    info!("Wayland substate ready");
 
     info!("phase: initialising xkbcommon keyboard");
     let keyboard =
@@ -731,6 +764,9 @@ fn main() -> Result<()> {
         xdg_shell_state: wayland_init.xdg_shell_state,
         xdg_decoration_state: wayland_init.xdg_decoration_state,
         output_manager_state: wayland_init.output_manager_state,
+        outputs: wayland_init.outputs,
+        fractional_scale_state: wayland_init.fractional_scale_state,
+        preferred_scale: wayland_init.preferred_scale,
         layout,
         drag: None,
     };

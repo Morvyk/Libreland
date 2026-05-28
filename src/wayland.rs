@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
+use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
@@ -26,15 +27,21 @@ use smithay::delegate_xdg_shell;
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource as _};
-use smithay::utils::{SERIAL_COUNTER, Serial};
+use smithay::utils::{SERIAL_COUNTER, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
+use smithay::wayland::compositor::{
+    CompositorClientState, CompositorHandler, CompositorState, with_states,
+};
+use smithay::wayland::fractional_scale::{
+    self, FractionalScaleHandler, FractionalScaleManagerState,
+};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
@@ -45,6 +52,7 @@ use tracing::{debug, info, warn};
 
 use crate::State;
 use crate::config::Config;
+use crate::render::OutputDescriptor;
 
 /// Per-client state attached to every Wayland client at
 /// `insert_client` time. Smithay's `CompositorClientState` has to
@@ -77,13 +85,29 @@ pub struct WaylandInit {
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
     pub output_manager_state: OutputManagerState,
+    pub fractional_scale_state: FractionalScaleManagerState,
+    /// One smithay `Output` per DRM connector. Each carries its
+    /// physical mode + configured scale and is advertised to
+    /// clients as a `wl_output` global so they can pick a target
+    /// output for fullscreen / fractional scale.
+    pub outputs: Vec<Output>,
+    /// Preferred fractional scale shipped to every new
+    /// `wp_fractional_scale` object. For now this is the primary
+    /// output's scale; multi-output per-surface scale tracking
+    /// lands with workspaces.
+    pub preferred_scale: f64,
 }
 
 /// Build every Wayland substate, register the corresponding globals
 /// on the display, and bind keyboard + pointer capabilities to the
 /// seat (so clients see them advertised). Forwarding events to those
 /// capabilities is milestone 4c.
-pub fn init(display: &Display<State>, config: &Config) -> Result<WaylandInit> {
+pub fn init(
+    display: &Display<State>,
+    config: &Config,
+    output_descs: &[OutputDescriptor],
+    preferred_scale: f64,
+) -> Result<WaylandInit> {
     let dh = display.handle();
 
     let compositor_state = CompositorState::new::<State>(&dh);
@@ -96,7 +120,46 @@ pub fn init(display: &Display<State>, config: &Config) -> Result<WaylandInit> {
     // client requesting ClientSide is overridden — we don't
     // accept CSD.
     let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
-    let output_manager_state = OutputManagerState::new();
+    let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
+    let fractional_scale_state = FractionalScaleManagerState::new::<State>(&dh);
+
+    // One smithay `Output` per DRM connector. Each becomes a
+    // `wl_output` global the client can bind to learn the mode
+    // and scale. `wl_output.scale` is integer-only per protocol;
+    // we ceil the fractional scale so legacy clients get sharp
+    // text. Fractional-aware clients see the exact scale via
+    // `wp_fractional_scale_manager_v1`.
+    let mut outputs = Vec::with_capacity(output_descs.len());
+    for desc in output_descs {
+        let output = Output::new(
+            desc.name.clone(),
+            PhysicalProperties {
+                size: smithay::utils::Size::from((0, 0)),
+                subpixel: Subpixel::Unknown,
+                make: "libreland".into(),
+                model: desc.name.clone(),
+            },
+        );
+        let mode = OutputMode {
+            size: desc.mode_size,
+            // Refresh advertised to clients in mHz. We don't yet
+            // thread the actual DRM refresh through; fill in a
+            // sensible 60 Hz placeholder until per-output mode
+            // tracking lands.
+            refresh: 60_000,
+        };
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(Scale::Fractional(desc.scale)),
+            Some(smithay::utils::Point::<i32, smithay::utils::Logical>::from(
+                (desc.compositor_position.x, desc.compositor_position.y),
+            )),
+        );
+        output.set_preferred(mode);
+        output.create_global::<State>(&dh);
+        outputs.push(output);
+    }
 
     let mut seat_state = SeatState::<State>::new();
     let mut seat = seat_state.new_wl_seat(&dh, "seat0");
@@ -135,6 +198,9 @@ pub fn init(display: &Display<State>, config: &Config) -> Result<WaylandInit> {
         xdg_shell_state,
         xdg_decoration_state,
         output_manager_state,
+        fractional_scale_state,
+        outputs,
+        preferred_scale,
     })
 }
 
@@ -350,9 +416,25 @@ impl XdgDecorationHandler for State {
     }
 }
 
+impl FractionalScaleHandler for State {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        // The preferred fractional scale is whatever the layout's
+        // primary output is configured to. Once we have per-output
+        // workspaces we'll re-send this per-surface based on which
+        // output that surface ends up on.
+        let preferred = self.preferred_scale;
+        with_states(&surface, |states| {
+            fractional_scale::with_fractional_scale(states, |fs| {
+                fs.set_preferred_scale(preferred);
+            });
+        });
+    }
+}
+
 delegate_compositor!(State);
 delegate_shm!(State);
 delegate_seat!(State);
 delegate_xdg_shell!(State);
 delegate_xdg_decoration!(State);
 delegate_output!(State);
+delegate_fractional_scale!(State);

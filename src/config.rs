@@ -97,12 +97,16 @@ pub struct OutputConfig {
     /// a specific mode; `None` uses the connector's `PREFERRED` flag
     /// from the EDID (or the first advertised mode).
     pub mode: Option<(u32, u32, u32)>,
-    /// Top-left position in the virtual layout, in logical pixels.
-    pub position: (i32, i32),
+    /// Top-left position in the virtual layout, in *logical* pixels
+    /// (after applying this output's `scale`). `None` means "auto",
+    /// which is the left-to-right enumeration order at `y = 0`.
+    pub position: Option<(i32, i32)>,
     /// Fractional scale factor. `1.0` is unscaled; `1.5`, `2.0`
-    /// typical for `HiDPI`. The internal value is the source of truth;
-    /// `wp_fractional_scale_manager_v1` will expose it to clients
-    /// once the Wayland frontend lands.
+    /// typical for `HiDPI`. Applied to the renderer's output rect
+    /// (physical = logical * scale) and advertised to clients via
+    /// both `wl_output.scale` (rounded up to the nearest integer
+    /// for legacy clients) and `wp_fractional_scale_manager_v1`
+    /// (full fractional value, for clients that support it).
     pub scale: f64,
 }
 
@@ -110,7 +114,7 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             mode: None,
-            position: (0, 0),
+            position: None,
             scale: 1.0,
         }
     }
@@ -385,9 +389,12 @@ fn parse_output(t: &Table) -> mlua::Result<OutputConfig> {
     if let Some(pos) = t.get::<Option<Table>>("position")? {
         let x: i32 = pos.get("x").context("position.x (expected i32)")?;
         let y: i32 = pos.get("y").context("position.y (expected i32)")?;
-        cfg.position = (x, y);
+        cfg.position = Some((x, y));
     }
     if let Some(scale) = t.get::<Option<f64>>("scale")? {
+        if !scale.is_finite() || scale <= 0.0 {
+            lua_bail!("scale {scale} invalid; expected a positive finite number");
+        }
         cfg.scale = scale;
     }
     Ok(cfg)

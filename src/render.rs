@@ -38,9 +38,30 @@ use smithay::wayland::compositor::{
 };
 use tracing::{debug, info};
 
-use crate::config::{BorderConfig, Fill};
+use crate::config::{BorderConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
 use crate::layout::Placement;
+
+/// Per-output metadata the Wayland frontend needs to advertise
+/// `wl_output` and seed `wp_fractional_scale_manager_v1`. Mirrors
+/// the renderer's internal `OutputRender` but exposes only the
+/// fields the frontend cares about (no GBM surface handle).
+#[derive(Debug, Clone)]
+pub struct OutputDescriptor {
+    pub name: String,
+    pub mode_size: Size<i32, Physical>,
+    pub compositor_position: Point<i32, Physical>,
+    /// Logical (= compositor) area covered by this output. Held
+    /// so the future `xdg_output` / layer-shell handlers can compute
+    /// exclusive zones in the same coordinate space the layout
+    /// uses, without recomputing `mode_size / scale`.
+    #[allow(
+        dead_code,
+        reason = "consumer is the upcoming xdg_output / layer-shell hookup; field is held now so the descriptor's surface doesn't need to change later"
+    )]
+    pub compositor_size: Size<i32, Physical>,
+    pub scale: f64,
+}
 
 /// Side length of the cursor sprite in physical pixels. The sprite
 /// is a right-triangle with apex at the hotspot, so this is also
@@ -97,12 +118,17 @@ pub struct Renderer {
     gles: GlesRenderer,
     /// One swapchain + framebuffer chain per output.
     outputs: Vec<OutputRender>,
-    /// Bounding box of the virtual layout, anchored at `(0, 0)`.
-    /// Used to clamp the cursor.
+    /// Index into `outputs` of the layout's primary output. Picked
+    /// from `monitors.primary` if set, otherwise the first connected
+    /// in DRM enumeration order.
+    primary_idx: usize,
+    /// Bounding box of the virtual layout in **compositor** (= logical)
+    /// pixels, anchored at `(0, 0)`. Used to clamp the cursor across
+    /// the full multi-output area.
     layout_bounds: Size<i32, Physical>,
-    /// Cursor hotspot in **absolute** virtual-layout coordinates.
-    /// Each per-output render translates to local coords by
-    /// subtracting that output's `position`.
+    /// Cursor hotspot in **absolute compositor** coordinates (logical
+    /// pixels). Each per-output render translates to that output's
+    /// local logical, then scales to physical via `OutputRender::scale`.
     cursor_x: f64,
     cursor_y: f64,
     /// Wallpaper drawn under the cursor on every output.
@@ -121,16 +147,26 @@ pub struct Renderer {
     start: Instant,
 }
 
-/// One output's render state: swapchain, dimensions, and position in
-/// the virtual layout.
+/// One output's render state.
+///
+/// Internally, the layout works in **compositor** pixels (= logical):
+/// `compositor_position` + `compositor_size` describe where the output
+/// sits in that space. The DRM framebuffer is in **physical** pixels
+/// (`mode_size`); `scale` is the multiplier between the two
+/// (`mode_size = compositor_size * scale`, give or take rounding).
+/// Per-output `render` multiplies everything that hits the
+/// `GlesFrame` by `scale` to land at the right physical pixel.
 struct OutputRender {
     name: String,
     crtc: crtc::Handle,
     surface: GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
-    /// Output dimensions in physical pixels (from its DRM mode).
-    size: Size<i32, Physical>,
-    /// Top-left of this output in absolute virtual-layout coords.
-    position: Point<i32, Physical>,
+    /// DRM framebuffer dimensions in physical pixels.
+    mode_size: Size<i32, Physical>,
+    /// This output's area in absolute compositor coords (logical).
+    compositor_position: Point<i32, Physical>,
+    compositor_size: Size<i32, Physical>,
+    /// Fractional scale; physical = compositor * scale (component-wise).
+    scale: f64,
 }
 
 impl Renderer {
@@ -147,6 +183,7 @@ impl Renderer {
         drm_outputs: Vec<DrmOutput>,
         wallpaper: Fill,
         border: BorderConfig,
+        monitors: &MonitorsConfig,
     ) -> Result<Self> {
         info!("phase: opening GBM device");
         let gbm_device = GbmDevice::new(drm_fd).context("GbmDevice::new failed")?;
@@ -204,16 +241,31 @@ impl Renderer {
         info!("phase: building per-output GBM buffered surfaces");
         let renderer_formats = gles.egl_context().dmabuf_render_formats().clone();
         let mut outputs = Vec::with_capacity(drm_outputs.len());
-        // Running cursor for the left-to-right layout. `max_height`
-        // captures the tallest output so the layout bounding box is
-        // (sum_widths, max_height).
-        let mut layout_x: i32 = 0;
-        let mut layout_max_h: i32 = 0;
+        // Running compositor-x cursor for outputs the user didn't
+        // pin to a specific position. Configured positions can
+        // overlap with the auto cursor; that's the user's call.
+        let mut auto_x: i32 = 0;
 
         for drm_output in drm_outputs {
             let (mode_w, mode_h) = drm_output.mode.size();
-            let size = Size::<i32, Physical>::new(i32::from(mode_w), i32::from(mode_h));
-            let position = Point::<i32, Physical>::from((layout_x, 0));
+            let mode_size = Size::<i32, Physical>::new(i32::from(mode_w), i32::from(mode_h));
+            let output_cfg = monitors.outputs.get(&drm_output.name);
+            let scale = output_cfg.map_or(1.0, |c| c.scale);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "mode pixels are u16-bounded; divided by scale > 0 fits in i32 trivially"
+            )]
+            let compositor_size = Size::<i32, Physical>::new(
+                (f64::from(mode_size.w) / scale).round() as i32,
+                (f64::from(mode_size.h) / scale).round() as i32,
+            );
+            let compositor_position = match output_cfg.and_then(|c| c.position) {
+                Some((x, y)) => Point::<i32, Physical>::from((x, y)),
+                None => Point::<i32, Physical>::from((auto_x, 0)),
+            };
+            if output_cfg.and_then(|c| c.position).is_none() {
+                auto_x = auto_x.saturating_add(compositor_size.w);
+            }
 
             let surface = GbmBufferedSurface::new(
                 drm_output.surface,
@@ -230,10 +282,13 @@ impl Renderer {
 
             info!(
                 output = %drm_output.name,
-                pos_x = layout_x,
-                pos_y = 0,
-                width = size.w,
-                height = size.h,
+                pos_x = compositor_position.x,
+                pos_y = compositor_position.y,
+                comp_w = compositor_size.w,
+                comp_h = compositor_size.h,
+                phys_w = mode_size.w,
+                phys_h = mode_size.h,
+                scale,
                 "output swapchain ready"
             );
 
@@ -241,34 +296,49 @@ impl Renderer {
                 name: drm_output.name,
                 crtc: drm_output.crtc,
                 surface,
-                size,
-                position,
+                mode_size,
+                compositor_position,
+                compositor_size,
+                scale,
             });
-
-            layout_x = layout_x.saturating_add(size.w);
-            layout_max_h = layout_max_h.max(size.h);
         }
 
-        let layout_bounds = Size::<i32, Physical>::new(layout_x, layout_max_h);
+        // Compositor-space union of every output's rect. Used by
+        // `on_pointer_motion` to clamp the cursor — it can roam
+        // anywhere a real pixel exists.
+        let mut layout_w: i32 = 0;
+        let mut layout_h: i32 = 0;
+        for o in &outputs {
+            layout_w = layout_w.max(o.compositor_position.x + o.compositor_size.w);
+            layout_h = layout_h.max(o.compositor_position.y + o.compositor_size.h);
+        }
+        let layout_bounds = Size::<i32, Physical>::new(layout_w, layout_h);
+
+        let primary_idx = monitors
+            .primary
+            .as_deref()
+            .and_then(|name| outputs.iter().position(|o| o.name == name))
+            .unwrap_or(0);
+
         info!(
             outputs = outputs.len(),
+            primary = %outputs[primary_idx].name,
             layout_w = layout_bounds.w,
             layout_h = layout_bounds.h,
             "render layout finalised"
         );
 
-        // Cursor starts at the centre of the first output. `unwrap`
-        // is safe because `drm::open_display` errors out if there are
-        // zero outputs.
-        let first = outputs
-            .first()
-            .expect("Renderer::new given empty outputs vec");
-        let cursor_x = f64::from(first.position.x) + f64::from(first.size.w) / 2.0;
-        let cursor_y = f64::from(first.position.y) + f64::from(first.size.h) / 2.0;
+        // Cursor starts at the centre of the primary output.
+        let primary = &outputs[primary_idx];
+        let cursor_x =
+            f64::from(primary.compositor_position.x) + f64::from(primary.compositor_size.w) / 2.0;
+        let cursor_y =
+            f64::from(primary.compositor_position.y) + f64::from(primary.compositor_size.h) / 2.0;
 
         Ok(Self {
             gles,
             outputs,
+            primary_idx,
             layout_bounds,
             cursor_x,
             cursor_y,
@@ -321,17 +391,40 @@ impl Renderer {
         (self.cursor_x, self.cursor_y)
     }
 
-    /// Rectangle of the first connected output in absolute virtual-
-    /// layout coordinates. Used by the tiling layer to bound its
-    /// initial workspace before per-output workspaces exist.
-    /// Renderer guarantees a non-empty `outputs` (panic at
-    /// construction otherwise), so the `expect` is unreachable.
+    /// Rectangle of the configured primary output in absolute
+    /// **compositor** (= logical) coordinates. Used by the tiling
+    /// layer to bound its initial workspace before per-output
+    /// workspaces exist. `primary_idx` is set in `new()` from
+    /// `monitors.primary` (falling back to the first connected),
+    /// so the indexing is always safe.
     pub fn primary_output_rect(&self) -> Rectangle<i32, Physical> {
-        let o = self
-            .outputs
-            .first()
-            .expect("Renderer constructed with zero outputs");
-        Rectangle::new(o.position, o.size)
+        let o = &self.outputs[self.primary_idx];
+        Rectangle::new(o.compositor_position, o.compositor_size)
+    }
+
+    /// Per-output `(name, mode_size_physical, compositor_size,
+    /// position_compositor, scale)`. Used by the Wayland frontend
+    /// to advertise `wl_output` globals to clients (one per DRM
+    /// output) and to seed the fractional-scale state.
+    pub fn output_descriptors(&self) -> Vec<OutputDescriptor> {
+        self.outputs
+            .iter()
+            .map(|o| OutputDescriptor {
+                name: o.name.clone(),
+                mode_size: o.mode_size,
+                compositor_position: o.compositor_position,
+                compositor_size: o.compositor_size,
+                scale: o.scale,
+            })
+            .collect()
+    }
+
+    /// Scale of the configured primary output. The Wayland frontend
+    /// sends this as the preferred fractional scale to every surface
+    /// (since the layout is single-output for now — multi-output
+    /// per-surface scale tracking is a later milestone).
+    pub fn primary_scale(&self) -> f64 {
+        self.outputs[self.primary_idx].scale
     }
 
     /// Render one output's frame: wallpaper, then per window in
@@ -345,15 +438,21 @@ impl Renderer {
     )]
     fn render_output(&mut self, idx: usize, placements: &[Placement]) -> Result<()> {
         // Pull everything we need before the mutable borrows on
-        // `self.outputs[idx].surface` / `self.gles` kick in.
-        let cursor_x = self.cursor_x;
-        let cursor_y = self.cursor_y;
+        // `self.outputs[idx].surface` / `self.gles` kick in. All
+        // *_phys helpers below take pre-scaled physical pixel
+        // values; this function is the one place compositor →
+        // physical conversion happens.
+        let cursor_abs_x = self.cursor_x;
+        let cursor_abs_y = self.cursor_y;
         let wallpaper = self.wallpaper.clone();
         let border = self.border.clone();
         let rounded_shader = self.rounded_shader.clone();
-        let output_size = self.outputs[idx].size;
-        let output_pos = self.outputs[idx].position;
-        let output_name = self.outputs[idx].name.clone();
+        let output = &self.outputs[idx];
+        let mode_size = output.mode_size;
+        let compositor_position = output.compositor_position;
+        let compositor_size = output.compositor_size;
+        let scale = output.scale;
+        let output_name = output.name.clone();
 
         // No-op on the first call (no pending fb), the ack of the
         // previous frame's flip thereafter.
@@ -367,17 +466,17 @@ impl Renderer {
             .next_buffer()
             .with_context(|| format!("next_buffer failed for {output_name}"))?;
 
-        // Cursor in this output's local coord space (subtract the
-        // output's origin). Bounds check on the hotspot — if the
-        // hotspot is off this output, don't draw the cursor here at
-        // all. Sprite may still partially overflow the output's
-        // bottom-right edge; that's clipped by GLES viewport.
-        let cursor_local_x = cursor_x - f64::from(output_pos.x);
-        let cursor_local_y = cursor_y - f64::from(output_pos.y);
+        // Cursor in this output's local compositor space; convert to
+        // physical for drawing. Bounds check uses the compositor
+        // size so cursors that fall outside the visible area of
+        // this output are skipped (cursor may be on a different
+        // output in a multi-display setup).
+        let cursor_local_x = cursor_abs_x - f64::from(compositor_position.x);
+        let cursor_local_y = cursor_abs_y - f64::from(compositor_position.y);
         let cursor_in_bounds = cursor_local_x >= 0.0
             && cursor_local_y >= 0.0
-            && cursor_local_x < f64::from(output_size.w)
-            && cursor_local_y < f64::from(output_size.h);
+            && cursor_local_x < f64::from(compositor_size.w)
+            && cursor_local_y < f64::from(compositor_size.h);
 
         // Build client-surface render elements *before* binding the
         // dmabuf. `render_elements_from_surface_tree` uses the
@@ -388,23 +487,25 @@ impl Renderer {
         // renderer borrow and be drawn during the frame below.
         //
         // Per placement: the surface itself draws inside the cell,
-        // shrunk by `border` on every side. Cell -> output-local
-        // coords by subtracting `output_pos`. Surfaces whose
-        // bounding rect doesn't overlap the output get fully
-        // clipped by the GLES viewport — no need to early-skip.
-        let bw = border.width.max(0);
+        // shrunk by `border` (in compositor px) on every side; the
+        // resulting position is multiplied by `scale` so the
+        // texture lands at the right physical pixel on the
+        // framebuffer. We also pass `scale` to smithay so it
+        // composes the client buffer at the right size for
+        // fractional displays.
+        let bw_comp = border.width.max(0);
         let grouped: Vec<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> = placements
             .iter()
             .map(|p| {
-                let surface_local = Point::<i32, Physical>::from((
-                    p.cell_rect.loc.x + bw - output_pos.x,
-                    p.cell_rect.loc.y + bw - output_pos.y,
+                let surface_local_phys = Point::<i32, Physical>::from((
+                    scale_i(p.cell_rect.loc.x + bw_comp - compositor_position.x, scale),
+                    scale_i(p.cell_rect.loc.y + bw_comp - compositor_position.y, scale),
                 ));
                 render_elements_from_surface_tree(
                     &mut self.gles,
                     &p.surface,
-                    surface_local,
-                    1.0_f64,
+                    surface_local_phys,
+                    scale,
                     1.0_f32,
                     Kind::Unspecified,
                 )
@@ -418,7 +519,7 @@ impl Renderer {
                 .with_context(|| format!("GlesRenderer::bind failed for {output_name}"))?;
             let mut frame = self
                 .gles
-                .render(&mut target, output_size, Transform::Normal)
+                .render(&mut target, mode_size, Transform::Normal)
                 .with_context(|| format!("GlesRenderer::render failed for {output_name}"))?;
 
             // Background fills first, then for each placement
@@ -430,47 +531,60 @@ impl Renderer {
             // culling can't accidentally skip floats behind
             // earlier tiles when there's only ever one element in
             // the slice.
-            draw_fill(&mut frame, &wallpaper, output_size, output_size)?;
+            draw_fill(&mut frame, &wallpaper, mode_size, mode_size)?;
 
-            let full_damage = [Rectangle::<i32, Physical>::from_size(output_size)];
-            let radius = border.rounded_corners.max(0);
+            let full_damage = [Rectangle::<i32, Physical>::from_size(mode_size)];
+            let radius_comp = border.rounded_corners.max(0);
             for (p, elements) in placements.iter().zip(grouped.iter()) {
-                if bw > 0 {
+                let cell_local_phys = Rectangle::<i32, Physical>::new(
+                    Point::new(
+                        scale_i(p.cell_rect.loc.x - compositor_position.x, scale),
+                        scale_i(p.cell_rect.loc.y - compositor_position.y, scale),
+                    ),
+                    Size::new(
+                        scale_i(p.cell_rect.size.w, scale),
+                        scale_i(p.cell_rect.size.h, scale),
+                    ),
+                );
+                if bw_comp > 0 {
                     let fill = if p.focused {
                         &border.active
                     } else {
                         &border.inactive
                     };
-                    draw_border(&mut frame, p.cell_rect, output_pos, bw, fill, output_size)?;
+                    draw_border(
+                        &mut frame,
+                        cell_local_phys,
+                        scale_i(bw_comp, scale),
+                        fill,
+                        mode_size,
+                    )?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(
                     &mut frame,
-                    1.0_f64,
+                    scale,
                     elements,
                     &full_damage,
                 )
                 .context("draw_render_elements failed")?;
-                if radius > 0 {
+                if radius_comp > 0 {
                     draw_rounded_corner_mask(
                         &mut frame,
                         &rounded_shader,
-                        p.cell_rect,
-                        output_pos,
-                        radius,
+                        cell_local_phys,
+                        scale_i(radius_comp, scale),
                         &wallpaper,
-                        output_size,
+                        mode_size,
                     )?;
                 }
             }
 
             if cursor_in_bounds {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "cursor coords are clamped to layout_bounds (i32) in on_pointer_motion, so this truncation is bounded"
-                )]
-                let cursor_origin =
-                    Point::<i32, Physical>::from((cursor_local_x as i32, cursor_local_y as i32));
-                draw_cursor(&mut frame, cursor_origin)?;
+                let cursor_origin = Point::<i32, Physical>::from((
+                    scale_f(cursor_local_x, scale),
+                    scale_f(cursor_local_y, scale),
+                ));
+                draw_cursor(&mut frame, cursor_origin, scale)?;
             }
 
             frame.finish().context("Frame::finish failed")?
@@ -596,19 +710,18 @@ fn draw_fill_rect(
 fn draw_rounded_corner_mask(
     frame: &mut GlesFrame<'_, '_>,
     shader: &GlesPixelProgram,
-    cell_rect: Rectangle<i32, Physical>,
-    output_pos: Point<i32, Physical>,
-    radius: i32,
+    cell_rect_phys: Rectangle<i32, Physical>,
+    radius_phys: i32,
     wallpaper: &Fill,
     output_size: Size<i32, Physical>,
 ) -> Result<()> {
-    let r = radius.min(cell_rect.size.w / 2).min(cell_rect.size.h / 2);
+    let r = radius_phys
+        .min(cell_rect_phys.size.w / 2)
+        .min(cell_rect_phys.size.h / 2);
     if r <= 0 {
         return Ok(());
     }
-    let local_x = cell_rect.loc.x - output_pos.x;
-    let local_y = cell_rect.loc.y - output_pos.y;
-    let dest = Rectangle::<i32, Physical>::new(Point::new(local_x, local_y), cell_rect.size);
+    let dest = cell_rect_phys;
     let (grad_top, grad_bottom) = match wallpaper {
         Fill::Solid(rgb) => (*rgb, *rgb),
         Fill::VerticalGradient { top, bottom } => (*top, *bottom),
@@ -622,7 +735,7 @@ fn draw_rounded_corner_mask(
         Uniform::new("grad_top", grad_top),
         Uniform::new("grad_bottom", grad_bottom),
         Uniform::new("output_height", output_size.h as f32),
-        Uniform::new("cell_origin_y", local_y as f32),
+        Uniform::new("cell_origin_y", cell_rect_phys.loc.y as f32),
     ];
     // The source rect / sample size are unused by our shader (we
     // don't sample any texture) but the API requires them; pass
@@ -632,12 +745,12 @@ fn draw_rounded_corner_mask(
         f64,
         smithay::utils::Buffer,
     >::from((
-        f64::from(cell_rect.size.w),
-        f64::from(cell_rect.size.h),
+        f64::from(cell_rect_phys.size.w),
+        f64::from(cell_rect_phys.size.h),
     )));
     let size = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((
-        cell_rect.size.w,
-        cell_rect.size.h,
+        cell_rect_phys.size.w,
+        cell_rect_phys.size.h,
     ));
     frame
         .render_pixel_shader_to(shader, src, dest, size, None, 1.0, &uniforms)
@@ -646,25 +759,18 @@ fn draw_rounded_corner_mask(
 }
 
 /// Draw a window's border as four rectangles around the cell.
-/// `cell_rect` is in absolute virtual-layout coords; the four
-/// edges are converted to output-local by subtracting
-/// `output_pos`. Edge sizes that go negative (cell smaller than
-/// `2 * width`) are clamped and the affected edges no-op.
+/// All values in physical pixels of the destination framebuffer.
+/// Edge sizes that go negative (cell smaller than `2 * width`)
+/// are clamped and the affected edges no-op.
 fn draw_border(
     frame: &mut GlesFrame<'_, '_>,
-    cell_rect: Rectangle<i32, Physical>,
-    output_pos: Point<i32, Physical>,
-    width: i32,
+    cell_rect_phys: Rectangle<i32, Physical>,
+    width_phys: i32,
     fill: &Fill,
     output_size: Size<i32, Physical>,
 ) -> Result<()> {
-    let local = Rectangle::<i32, Physical>::new(
-        Point::new(
-            cell_rect.loc.x - output_pos.x,
-            cell_rect.loc.y - output_pos.y,
-        ),
-        cell_rect.size,
-    );
+    let local = cell_rect_phys;
+    let width = width_phys;
     let mid_h = (local.size.h - 2 * width).max(0);
     let top = Rectangle::<i32, Physical>::new(local.loc, Size::new(local.size.w, width));
     let bottom = Rectangle::<i32, Physical>::new(
@@ -683,6 +789,25 @@ fn draw_border(
         draw_fill_rect(frame, fill, edge, output_size)?;
     }
     Ok(())
+}
+
+/// Multiply an i32 by a positive f64 scale and round to the nearest
+/// integer. The cast can't truncate in any practical case: input is
+/// bounded by i32 cell coords and scale is configured-positive.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "compositor coordinates are bounded by total display dimensions; scale * coord stays within i32 with room to spare"
+)]
+fn scale_i(v: i32, scale: f64) -> i32 {
+    (f64::from(v) * scale).round() as i32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "cursor coords are clamped to layout_bounds (i32) in on_pointer_motion; scale * coord stays within i32"
+)]
+fn scale_f(v: f64, scale: f64) -> i32 {
+    (v * scale).round() as i32
 }
 
 /// Walk a surface tree and drain every queued `wl_callback`, firing
@@ -712,9 +837,18 @@ fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
 /// are anchored at `(0, row)` relative to `dst.loc` — see the long
 /// note in milestone 2c about `Frame::draw_solid`'s damage-coordinate
 /// semantics.
-fn draw_cursor(frame: &mut GlesFrame<'_, '_>, local_origin: Point<i32, Physical>) -> Result<()> {
-    let cursor_bbox = Rectangle::new(local_origin, Size::new(CURSOR_SIZE, CURSOR_SIZE));
-    let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..CURSOR_SIZE)
+fn draw_cursor(
+    frame: &mut GlesFrame<'_, '_>,
+    local_origin: Point<i32, Physical>,
+    scale: f64,
+) -> Result<()> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "CURSOR_SIZE is 24 and scale is bounded; product stays in i32"
+    )]
+    let size = ((f64::from(CURSOR_SIZE) * scale).round() as i32).max(1);
+    let cursor_bbox = Rectangle::new(local_origin, Size::new(size, size));
+    let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..size)
         .map(|row| Rectangle::new(Point::from((0, row)), Size::new(row + 1, 1)))
         .collect();
     frame

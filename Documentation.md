@@ -169,19 +169,19 @@ the runtime today (✅) or just held in `Config` for a later consumer
 
 ### monitors
 
-| Field                    | Default  | State              | Notes                                                                           |
-| ------------------------ | -------- | ------------------ | ------------------------------------------------------------------------------- |
-| `outputs[name].mode`     | `nil`    | ⏳ later           | `{ width = …, height = …, refresh_mhz = … }` to force a mode; `nil` uses EDID-preferred. |
-| `outputs[name].position` | `(0,0)`  | ⏳ overrides 3b    | Top-left in the virtual layout (logical pixels). 3b uses the auto left-to-right layout; Lua-supplied positions wait for a follow-up that honours them. |
-| `outputs[name].scale`    | `1.0`    | ⏳ Wayland frontend | Fractional scale. Exposed to clients via `wp_fractional_scale_manager_v1` once we have a Wayland frontend. |
-| `primary`                | `nil`    | ⏳ later           | Connector name of the primary output; `nil` = first connected.                  |
+| Field                    | Default  | State | Notes                                                                                                                                                                                                                                                                                                          |
+| ------------------------ | -------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `outputs[name].mode`     | `nil`    | ✅    | `{ width = …, height = …, refresh_mhz = … }` to force a mode. The override is matched against the EDID mode list by size and refresh (mHz); on a miss it logs and falls back to the EDID-preferred mode. `nil` uses EDID-preferred directly.                                                                   |
+| `outputs[name].position` | `nil`    | ✅    | Top-left of this output in the virtual layout, in *logical* pixels (`{ x = …, y = … }`). `nil` falls back to the auto left-to-right layout. Mixing configured and auto-positioned outputs is fine; positions can overlap if you let them.                                                                       |
+| `outputs[name].scale`    | `1.0`    | ✅    | Fractional scale. The renderer scales every layout coordinate from compositor (= logical) to physical by this factor. Clients see the exact fractional value via `wp_fractional_scale_manager_v1` and a rounded integer fallback via `wl_output.scale`. Must be positive. Per-surface scale tracking is single-output for now — every surface gets the primary's scale until per-output workspaces ship. |
+| `primary`                | `nil`    | ✅    | Connector name of the primary output. The tile area's bounds + the initial cursor position come from this output. `nil` falls back to the first connected output in DRM enumeration order.                                                                                                                      |
 
 ### input
 
 | Field                  | Default  | State                            | Notes                                                                                      |
 | ---------------------- | -------- | -------------------------------- | ------------------------------------------------------------------------------------------ |
-| `repeat_rate`          | `25`     | ⏳ Wayland frontend              | Repeats per second after the delay elapses. 25 matches X11's classic default.              |
-| `repeat_delay`         | `600`    | ⏳ Wayland frontend              | Milliseconds before repeat fires.                                                          |
+| `repeat_rate`          | `25`     | ✅                               | Repeats per second after the delay elapses. 25 matches X11's classic default. Passed to `wl_keyboard` via the seat at startup. |
+| `repeat_delay`         | `600`    | ✅                               | Milliseconds before repeat fires. Passed to `wl_keyboard` at startup.                      |
 | `keyboard_layout`      | `""`     | ✅                               | xkb RMLVO layout. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default.                  |
 | `mouse_accel_profile`  | `"flat"` | ✅ (applied per pointer device)  | `"flat"` (1:1, no ramp) or `"adaptive"` (libinput's curve, system default).                |
 | `mouse_accel_speed`    | `0.0`    | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `"flat"` this is "no extra sensitivity". |

@@ -22,6 +22,8 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 use tracing::{info, warn};
 
+use crate::config::MonitorsConfig;
+
 /// Top-level result of [`open_display`]. Holds the master-claim
 /// device, the fd (Arc-backed; clone for additional owners), the
 /// calloop notifier, and one [`DrmOutput`] per connected output.
@@ -56,7 +58,19 @@ pub struct DrmOutput {
 /// error only if literally no outputs could be brought up; a
 /// connector that fails individually (no compatible free CRTC,
 /// no modes, query error) is logged and skipped.
-pub fn open_display(session: &mut LibSeatSession, path: &Path) -> Result<DrmInit> {
+///
+/// `monitors` carries optional per-connector mode overrides. For
+/// each connector that finds a matching entry in
+/// `monitors.outputs[name].mode`, the requested
+/// `(width, height, refresh_mHz)` is matched against the EDID
+/// mode list; the first match wins. Unmatched overrides fall back
+/// to the EDID-preferred mode with a warning so the user knows
+/// their request didn't take.
+pub fn open_display(
+    session: &mut LibSeatSession,
+    path: &Path,
+    monitors: &MonitorsConfig,
+) -> Result<DrmInit> {
     info!(path = %path.display(), "phase: opening DRM device via libseat");
     let owned_fd = session
         .open(path, OFlags::RDWR | OFlags::NONBLOCK)
@@ -90,7 +104,8 @@ pub fn open_display(session: &mut LibSeatSession, path: &Path) -> Result<DrmInit
         }
         let name = conn_info.to_string();
 
-        let Some(mode) = pick_preferred_mode(&conn_info) else {
+        let requested_mode = monitors.outputs.get(&name).and_then(|cfg| cfg.mode);
+        let Some(mode) = pick_mode(&conn_info, requested_mode, &name) else {
             warn!(connector = %name, "connector reports no modes — skipping");
             continue;
         };
@@ -139,9 +154,39 @@ pub fn open_display(session: &mut LibSeatSession, path: &Path) -> Result<DrmInit
     })
 }
 
-/// Pick the connector's preferred mode if the EDID advertises one,
-/// falling back to the first advertised mode.
-fn pick_preferred_mode(conn: &connector::Info) -> Option<Mode> {
+/// Pick a mode for `conn`. If `requested` is `Some`, look for an
+/// EDID entry whose size and refresh rate match (refresh compared
+/// in milli-Hz to allow rates like 59.94 vs 60.00 to disambiguate).
+/// On a miss, fall back to the EDID-preferred mode and log a
+/// warning so the user knows the override didn't take.
+fn pick_mode(
+    conn: &connector::Info,
+    requested: Option<(u32, u32, u32)>,
+    name: &str,
+) -> Option<Mode> {
+    if let Some((req_w, req_h, req_mhz)) = requested {
+        let matched = conn.modes().iter().find(|m| {
+            let (mw, mh) = m.size();
+            u32::from(mw) == req_w && u32::from(mh) == req_h && m.vrefresh() * 1000 == req_mhz
+        });
+        if let Some(m) = matched {
+            info!(
+                connector = %name,
+                width = req_w,
+                height = req_h,
+                refresh_mhz = req_mhz,
+                "mode override matched"
+            );
+            return Some(*m);
+        }
+        warn!(
+            connector = %name,
+            width = req_w,
+            height = req_h,
+            refresh_mhz = req_mhz,
+            "mode override didn't match any advertised mode — falling back to EDID preferred"
+        );
+    }
     conn.modes()
         .iter()
         .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
