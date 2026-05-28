@@ -50,12 +50,13 @@ use crate::layout::Placement;
 /// before calling `render_for_crtc` so the renderer doesn't need
 /// to know about `wlr_layer_shell` types or per-output
 /// associations — just "draw this surface at this rect, in this
-/// layer bucket".
+/// layer bucket". `rect` is also the bounding box for pointer
+/// hit-testing on the main-side.
 #[derive(Debug, Clone)]
 pub struct LayerPlacement {
     pub surface: WlSurface,
-    /// Top-left in absolute compositor coords.
-    pub position: Point<i32, Physical>,
+    /// Surface rect in absolute compositor coords.
+    pub rect: Rectangle<i32, Physical>,
     /// Logical "depth" used to interleave with windows in
     /// `render_output`. Renderer treats `Background`/`Bottom` as
     /// below windows and `Top`/`Overlay` as above.
@@ -630,8 +631,8 @@ impl Renderer {
                 .iter()
                 .map(|l| {
                     let local_phys = Point::<i32, Physical>::from((
-                        scale_i(l.position.x - compositor_position.x, scale),
-                        scale_i(l.position.y - compositor_position.y, scale),
+                        scale_i(l.rect.loc.x - compositor_position.x, scale),
+                        scale_i(l.rect.loc.y - compositor_position.y, scale),
                     ));
                     let elements = render_elements_from_surface_tree(
                         &mut self.gles,

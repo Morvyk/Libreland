@@ -360,16 +360,38 @@ impl State {
 
         // Snapshot the hit surface + its top-left into owned values
         // so the layout borrow ends before the mut-borrow on self
-        // (via kbd.set_focus / pointer.motion).
-        let hit = self.layout.window_at(cursor_i).map(|w| {
-            (
-                w.toplevel.wl_surface().clone(),
-                Point::<f64, Logical>::from((f64::from(w.rect.loc.x), f64::from(w.rect.loc.y))),
-            )
-        });
+        // (via kbd.set_focus / pointer.motion). Layer surfaces
+        // (rofi, panels, OSDs) are hit-tested first so the pointer
+        // reaches them when the cursor is over them; otherwise we
+        // fall through to the tile / floating layout as before.
+        let hit = self
+            .layer_at(cursor_i)
+            .map(|(surface, rect)| {
+                (
+                    surface,
+                    Point::<f64, Logical>::from((f64::from(rect.loc.x), f64::from(rect.loc.y))),
+                )
+            })
+            .or_else(|| {
+                self.layout.window_at(cursor_i).map(|w| {
+                    (
+                        w.toplevel.wl_surface().clone(),
+                        Point::<f64, Logical>::from((
+                            f64::from(w.rect.loc.x),
+                            f64::from(w.rect.loc.y),
+                        )),
+                    )
+                })
+            });
         let kbd_target = hit.as_ref().map(|(surface, _)| surface.clone());
 
+        // Hover focus model: pull keyboard focus to the surface
+        // under the cursor — *unless* an exclusive-keyboard layer
+        // surface currently owns focus, in which case we leave it
+        // alone (otherwise opening rofi and moving the mouse would
+        // immediately yank focus back to kitty).
         if matches!(self.config.input.focus_model, config::FocusModel::Hover)
+            && !self.focus_locked_by_layer()
             && let Some(kbd) = self.seat.get_keyboard()
             && kbd.current_focus() != kbd_target
         {
@@ -510,6 +532,7 @@ impl State {
 
         if matches!(state, smithay::backend::input::ButtonState::Pressed)
             && matches!(self.config.input.focus_model, config::FocusModel::Click)
+            && !self.focus_locked_by_layer()
         {
             let (cx, cy) = self.renderer.cursor_pos();
             #[allow(
@@ -517,10 +540,14 @@ impl State {
                 reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
             )]
             let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
-            let target = self
-                .layout
-                .window_at(cursor_i)
-                .map(|w| w.toplevel.wl_surface().clone());
+            // Prefer a layer surface under the cursor (rofi / OSDs)
+            // over a tile so click-to-focus on a panel works without
+            // a separate path.
+            let target = self.layer_at(cursor_i).map(|(s, _)| s).or_else(|| {
+                self.layout
+                    .window_at(cursor_i)
+                    .map(|w| w.toplevel.wl_surface().clone())
+            });
             if let Some(kbd) = self.seat.get_keyboard()
                 && kbd.current_focus() != target
             {
@@ -601,11 +628,81 @@ impl State {
             };
             out.push(render::LayerPlacement {
                 surface: surface.clone(),
-                position: smithay::utils::Point::new(x, y),
+                rect: smithay::utils::Rectangle::new(
+                    smithay::utils::Point::new(x, y),
+                    smithay::utils::Size::new(width, height),
+                ),
                 layer: bucket,
             });
         }
         out
+    }
+
+    /// Walk the layer-surface list in top-down z-order (`Overlay`
+    /// first, then `Top`, then `Bottom`, then `Background`) and
+    /// return the first one whose rect contains `pos`, plus its
+    /// rect. Used by the pointer paths so mouse motion over rofi
+    /// / waybar / etc. reaches them.
+    pub(crate) fn layer_at(
+        &self,
+        pos: smithay::utils::Point<i32, smithay::utils::Physical>,
+    ) -> Option<(
+        WlSurface,
+        smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    )> {
+        fn priority(bucket: render::LayerBucket) -> u8 {
+            match bucket {
+                render::LayerBucket::Overlay => 3,
+                render::LayerBucket::Top => 2,
+                render::LayerBucket::Bottom => 1,
+                render::LayerBucket::Background => 0,
+            }
+        }
+        let mut best: Option<(render::LayerPlacement, u8)> = None;
+        for placement in self.snapshot_layer_placements() {
+            let r = placement.rect;
+            let inside = r.size.w > 0
+                && r.size.h > 0
+                && pos.x >= r.loc.x
+                && pos.x < r.loc.x + r.size.w
+                && pos.y >= r.loc.y
+                && pos.y < r.loc.y + r.size.h;
+            if !inside {
+                continue;
+            }
+            let p = priority(placement.layer);
+            if best.as_ref().is_none_or(|(_, bp)| *bp < p) {
+                best = Some((placement, p));
+            }
+        }
+        best.map(|(p, _)| (p.surface, p.rect))
+    }
+
+    /// `true` when the keyboard's current focus is a layer surface
+    /// that requested `KeyboardInteractivity::Exclusive` on the
+    /// `Top` or `Overlay` layer. While this holds, pointer-driven
+    /// focus changes (hover or click) must be suppressed so the
+    /// modal layer keeps the keyboard — otherwise the hover focus
+    /// model would yank focus back the moment the user moved the
+    /// mouse off the layer surface.
+    pub(crate) fn focus_locked_by_layer(&self) -> bool {
+        use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
+        let Some(kbd) = self.seat.get_keyboard() else {
+            return false;
+        };
+        let Some(focus) = kbd.current_focus() else {
+            return false;
+        };
+        for layer_surface in self.layer_shell_state.layer_surfaces() {
+            if layer_surface.wl_surface() == &focus {
+                let cached = crate::wayland::layer_cached_state(&focus);
+                return matches!(
+                    cached.keyboard_interactivity,
+                    KeyboardInteractivity::Exclusive
+                ) && matches!(cached.layer, Layer::Top | Layer::Overlay);
+            }
+        }
+        false
     }
 
     /// Walk every known layer surface, sum its exclusive zones
