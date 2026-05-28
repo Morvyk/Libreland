@@ -96,6 +96,7 @@ input = {
 
 binds = {
     { mods = { "Super", "Shift" }, key = "E", action = "exit" },
+    { mods = { "Super" },          key = "F", action = "togglefloating" },
 }
 
 misc = {
@@ -136,9 +137,10 @@ Anything xkbcommon's `xkb_keysym_from_name` accepts — `"E"`,
 
 ### Actions
 
-| Action  | Effect                       |
-| ------- | ---------------------------- |
-| `"exit"` | Cleanly exit the compositor. |
+| Action              | Effect                                                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `"exit"`            | Cleanly exit the compositor.                                                                                 |
+| `"togglefloating"`  | Flip the focused window between tiled and floating. A newly floating window centres at ~70% of its previous cell. |
 
 (More actions land as features grow: `"reload"`, `"spawn"`,
 `"change_vt"`, …)
@@ -175,10 +177,13 @@ A list of keybindings. A press matches when its xkb keysym equals the
 binding's `keysym` **and** every modifier in the binding's `mods` mask is
 held. Extras like `NumLock` are tolerated. First match wins.
 
-Built-in default: `Super+Shift+E → Action::Exit`.
+Built-in defaults:
 
-Available actions today: `Exit`. The list grows as we add `Reload`,
-`Spawn`, `ChangeVt`, …
+- `Super+Shift+E → Action::Exit`
+- `Super+F → Action::ToggleFloating`
+
+Available actions today: `Exit`, `ToggleFloating`. The list grows
+as we add `Reload`, `Spawn`, `ChangeVt`, …
 
 ### misc
 
@@ -191,9 +196,10 @@ Available actions today: `Exit`. The list grows as we add `Reload`,
 Bindings are hard-coded in `src/main.rs` for now. They will move to the Lua
 config layer once that exists.
 
-| Combo           | Action                       |
-| --------------- | ---------------------------- |
-| `Super+Shift+E` | Exit the compositor cleanly. |
+| Combo           | Action                                              |
+| --------------- | --------------------------------------------------- |
+| `Super+Shift+E` | Exit the compositor cleanly.                        |
+| `Super+F`       | Toggle floating mode on the focused window.         |
 
 The hotkey is matched against raw libinput key codes, so it will keep working
 once a future DRM grab disables the kernel's Ctrl+C path. Until that grab

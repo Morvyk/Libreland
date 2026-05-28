@@ -41,7 +41,7 @@ use smithay::reexports::input as libinput;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
 use smithay::utils::{Logical, Physical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
@@ -308,13 +308,22 @@ impl State {
         pointer.frame(self);
     }
 
-    /// Run a bound action. Single-armed today; grows as we add more
-    /// actions (`reload`, `spawn`, `change_vt`, …).
+    /// Run a bound action. Grows as we add more actions (`reload`,
+    /// `spawn`, `change_vt`, …).
     fn dispatch_action(&mut self, action: config::Action) {
         match action {
             config::Action::Exit => {
                 info!("exit action fired — stopping event loop");
                 self.loop_signal.stop();
+            }
+            config::Action::ToggleFloating => {
+                // Toggle the currently keyboard-focused surface.
+                // No focus = nothing to toggle, silent no-op.
+                let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+                if let Some(surface) = focus {
+                    info!(surface = ?surface.id(), "togglefloating action fired");
+                    self.layout.toggle_floating(&surface);
+                }
             }
         }
     }

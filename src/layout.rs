@@ -1,20 +1,22 @@
-//! Window layout — dwindle tiling.
+//! Window layout — dwindle tiling with a per-window floating flag.
 //!
-//! Each new toplevel takes half of the previously-last cell, split
-//! along that cell's longer axis. So:
+//! Tiled windows are assigned rects by the dwindle rule: a "current
+//! cell" starts at the layout's bounds; each non-final tiled window
+//! takes half of the current cell along the cell's longer axis; the
+//! other half becomes the next current cell; the final tile takes
+//! whatever remains. Floating windows are skipped by that pass and
+//! keep their explicitly-stored rect.
 //!
-//! ```text
-//! 1 window:   2 windows:   3 windows:    4 windows:
-//! ┌──────┐   ┌───┬──┐    ┌───┬──┐      ┌───┬──┐
-//! │  A   │   │ A │B │    │ A │B │      │ A │B │
-//! │      │   │   │  │    │   ├──┤      │   ├──┤
-//! └──────┘   └───┴──┘    └───┴──┘      └───┴┬─┘
-//!                          (C below B)      │D│ (D right of C)
-//! ```
+//! Storage invariant: every floating window sits *after* every
+//! tiled window in the backing `Vec`. The renderer iterates in
+//! order, so floats draw on top of tiles; the hit-tester iterates
+//! in reverse, so floats win over tiles for pointer focus.
 //!
-//! Removing a window collapses its cell into its sibling; the rest
-//! of the tree reflows. The layout drives `xdg_toplevel.configure`
-//! sizes — clients then commit buffers matching the assigned rect.
+//! Toggling between tiled and floating moves the window to the
+//! end of its destination section (top of float stack / end of
+//! tile order). A newly floating window is centred at ~70 % of
+//! its previous tiled cell so the user sees a smooth size change
+//! rather than a jarring jump.
 //!
 //! Coordinates are stored as `Physical` because the renderer
 //! consumes physical pixels; for `scale = 1.0` outputs (the only
@@ -29,18 +31,23 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use tracing::debug;
 
-/// One tiled toplevel and the rect the layout currently assigns it.
+/// One window managed by the layout, plus its current placement.
 #[derive(Debug, Clone)]
-pub struct TiledWindow {
+pub struct Window {
     pub toplevel: ToplevelSurface,
     pub rect: Rectangle<i32, Physical>,
+    pub floating: bool,
 }
 
 /// Dwindle tiler bounded to a single rectangle in virtual-layout
-/// space. 4d.1 uses one Layout for the primary output; per-output
+/// space. 4d uses one Layout for the primary output; per-output
 /// workspaces are a future milestone.
 pub struct Layout {
-    tiled: Vec<TiledWindow>,
+    /// Tiled windows first, floating windows last (see the module
+    /// doc for why). Order within each section is insertion-newest
+    /// at the back.
+    windows: Vec<Window>,
+    /// Bounding rect every tiled window is laid out inside.
     bounds: Rectangle<i32, Physical>,
 }
 
@@ -48,50 +55,104 @@ impl Layout {
     /// Build an empty layout that will place windows inside `bounds`.
     pub fn new(bounds: Rectangle<i32, Physical>) -> Self {
         Self {
-            tiled: Vec::new(),
+            windows: Vec::new(),
             bounds,
         }
     }
 
-    /// Append a new toplevel to the tiling order, recompute every
-    /// rect, then push the resulting sizes to clients via
-    /// `xdg_toplevel.configure`. Order matters: a window inserted
-    /// last lives in the deepest dwindle cell.
+    /// Append a new toplevel as a tiled window. Recomputes every
+    /// tiled rect, then ships every window (tiled or floating) its
+    /// updated configure. Where in the Vec it lands: end of the
+    /// tiled section (= just before the first floating window).
     pub fn insert(&mut self, toplevel: ToplevelSurface) {
-        self.tiled.push(TiledWindow {
+        let entry = Window {
             toplevel,
             rect: self.bounds,
-        });
+            floating: false,
+        };
+        let pos = self
+            .windows
+            .iter()
+            .position(|w| w.floating)
+            .unwrap_or(self.windows.len());
+        self.windows.insert(pos, entry);
         self.recompute();
         self.push_configures();
     }
 
-    /// Remove a toplevel matching `surface` and reflow.
+    /// Remove a toplevel matching `surface` and reflow tiled windows.
     pub fn remove(&mut self, surface: &WlSurface) {
-        let before = self.tiled.len();
-        self.tiled.retain(|w| w.toplevel.wl_surface() != surface);
-        if self.tiled.len() == before {
-            // Not in the tiled set — destroyed surface was already
-            // removed, or this was never tiled (popup, never mapped,
-            // …). Nothing to reflow.
+        let before = self.windows.len();
+        self.windows.retain(|w| w.toplevel.wl_surface() != surface);
+        if self.windows.len() == before {
+            // Not in our list — never mapped, popup, etc. No
+            // reflow needed.
             return;
         }
         self.recompute();
         self.push_configures();
     }
 
-    /// Current window placements. Returned in insertion order, which
-    /// is also draw order (last = top-most when stacking applies).
-    pub fn windows(&self) -> &[TiledWindow] {
-        &self.tiled
+    /// Flip the floating flag on the window matching `surface`.
+    /// Tiled → floating: window gets a centred rect at 70 % of its
+    /// previous tiled cell and is moved to the top of the float
+    /// stack. Floating → tiled: rejoins the dwindle flow at the
+    /// end of the tiled section (recompute overwrites its rect).
+    /// A missing surface (already destroyed, never tracked) is a
+    /// silent no-op.
+    pub fn toggle_floating(&mut self, surface: &WlSurface) {
+        let Some(idx) = self
+            .windows
+            .iter()
+            .position(|w| w.toplevel.wl_surface() == surface)
+        else {
+            return;
+        };
+
+        let now_floating = !self.windows[idx].floating;
+        if now_floating {
+            // Shrink to 70 % of current rect, keep the same centre,
+            // so the user sees a continuous size change.
+            let prev = self.windows[idx].rect;
+            let new_size =
+                Size::<i32, Physical>::new((prev.size.w * 7) / 10, (prev.size.h * 7) / 10);
+            let new_loc = Point::<i32, Physical>::new(
+                prev.loc.x + (prev.size.w - new_size.w) / 2,
+                prev.loc.y + (prev.size.h - new_size.h) / 2,
+            );
+            self.windows[idx].rect = Rectangle::new(new_loc, new_size);
+            self.windows[idx].floating = true;
+            // Move to end of Vec → top of float stack.
+            let entry = self.windows.remove(idx);
+            self.windows.push(entry);
+        } else {
+            // Becoming tiled — clear the flag, move just before
+            // the first floating window so the invariant holds.
+            self.windows[idx].floating = false;
+            let entry = self.windows.remove(idx);
+            let pos = self
+                .windows
+                .iter()
+                .position(|w| w.floating)
+                .unwrap_or(self.windows.len());
+            self.windows.insert(pos, entry);
+        }
+        self.recompute();
+        self.push_configures();
     }
 
-    /// Find the topmost window whose rect contains `pos`. Tiled
-    /// cells don't overlap, so iteration order doesn't change the
-    /// result today; reverse-iterating is forward-compatible with
-    /// the floating-mode stack order that lands in 4d.3.
-    pub fn window_at(&self, pos: Point<i32, Physical>) -> Option<&TiledWindow> {
-        self.tiled.iter().rev().find(|w| {
+    /// Current window placements in render order: tiled first, then
+    /// floating (which means floats draw on top).
+    pub fn windows(&self) -> &[Window] {
+        &self.windows
+    }
+
+    /// Find the topmost window whose rect contains `pos`. Reverse-
+    /// iterates so floating windows (stored at the tail) are
+    /// checked first — they always win over tiled windows they
+    /// overlap.
+    pub fn window_at(&self, pos: Point<i32, Physical>) -> Option<&Window> {
+        self.windows.iter().rev().find(|w| {
             pos.x >= w.rect.loc.x
                 && pos.x < w.rect.loc.x + w.rect.size.w
                 && pos.y >= w.rect.loc.y
@@ -99,38 +160,42 @@ impl Layout {
         })
     }
 
-    /// Walk every tiled window in order and assign rects using the
-    /// dwindle rule: a "current cell" starts at `bounds`; each
-    /// non-final window takes half of the current cell along the
-    /// cell's longer axis, and the other half becomes the new
-    /// current cell. The final window takes whatever remains.
+    /// Walk every tiled window in storage order and assign rects
+    /// via dwindle. Floating windows are skipped — their rects
+    /// stay wherever the user (or a previous toggle) put them.
     fn recompute(&mut self) {
-        let n = self.tiled.len();
+        let tiled: Vec<usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| (!w.floating).then_some(i))
+            .collect();
+        let n = tiled.len();
         if n == 0 {
             return;
         }
         let mut cur = self.bounds;
-        for window in self.tiled.iter_mut().take(n - 1) {
-            let dir = if cur.size.w >= cur.size.h {
-                SplitDir::Horizontal
+        for (i, &idx) in tiled.iter().enumerate() {
+            if i == n - 1 {
+                self.windows[idx].rect = cur;
             } else {
-                SplitDir::Vertical
-            };
-            let (a, b) = split_half(cur, dir);
-            window.rect = a;
-            cur = b;
+                let dir = if cur.size.w >= cur.size.h {
+                    SplitDir::Horizontal
+                } else {
+                    SplitDir::Vertical
+                };
+                let (a, b) = split_half(cur, dir);
+                self.windows[idx].rect = a;
+                cur = b;
+            }
         }
-        // n >= 1 so this index is in bounds.
-        self.tiled[n - 1].rect = cur;
     }
 
-    /// Send each tiled window its new `xdg_toplevel.configure` so
-    /// the client commits a buffer at the assigned size on its
-    /// next paint. `xdg_toplevel.size` is in `Logical` pixels;
-    /// at `scale = 1.0` (the only 4d case) the numeric values are
-    /// identical to our `Physical` rect, so the cast is exact.
+    /// Ship every window its current rect via `xdg_toplevel.configure`,
+    /// regardless of tiled vs floating — both flavours need to keep
+    /// their client buffer in sync with the rect we draw.
     fn push_configures(&self) {
-        for window in &self.tiled {
+        for window in &self.windows {
             let size = Size::<i32, Logical>::from((window.rect.size.w, window.rect.size.h));
             window.toplevel.with_pending_state(|state| {
                 state.size = Some(size);
@@ -142,6 +207,7 @@ impl Layout {
                 y = window.rect.loc.y,
                 w = window.rect.size.w,
                 h = window.rect.size.h,
+                floating = window.floating,
                 "layout: configure sent",
             );
         }
@@ -160,8 +226,6 @@ fn split_half(
 ) -> (Rectangle<i32, Physical>, Rectangle<i32, Physical>) {
     match dir {
         SplitDir::Horizontal => {
-            // Bias `a` by 1 px when the width is odd so `a + b ==
-            // r.size.w` exactly — keeps the layout pixel-tight.
             let half = r.size.w / 2;
             let a = Rectangle::new(r.loc, Size::new(half, r.size.h));
             let b = Rectangle::new(

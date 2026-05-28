@@ -169,6 +169,10 @@ pub struct KeyBinding {
 pub enum Action {
     /// Break the calloop event loop and exit the compositor cleanly.
     Exit,
+    /// Flip the focused window between tiled and floating. A newly
+    /// floating window is centred at ~70 % of its previous tiled
+    /// cell; a newly tiled window rejoins the dwindle flow.
+    ToggleFloating,
 }
 
 #[derive(Debug, Clone)]
@@ -199,13 +203,22 @@ impl Default for Config {
                 focus_model: FocusModel::Hover,
             },
             binds: BindsConfig {
-                // Single default binding: Super+Shift+E exits.
-                // Anything else the user wants comes from Lua.
-                bindings: vec![KeyBinding {
-                    mods: keyboard::MOD_SHIFT | keyboard::MOD_SUPER,
-                    keysym: Keysym::E,
-                    action: Action::Exit,
-                }],
+                // Default bindings. Anything else the user wants
+                // comes from Lua. Order matters because the first
+                // match wins, but neither default overlaps the
+                // other so the order here is just readability.
+                bindings: vec![
+                    KeyBinding {
+                        mods: keyboard::MOD_SHIFT | keyboard::MOD_SUPER,
+                        keysym: Keysym::E,
+                        action: Action::Exit,
+                    },
+                    KeyBinding {
+                        mods: keyboard::MOD_SUPER,
+                        keysym: Keysym::F,
+                        action: Action::ToggleFloating,
+                    },
+                ],
             },
             misc: MiscConfig {
                 wallpaper: Wallpaper::VerticalGradient {
@@ -418,7 +431,10 @@ fn parse_modifier(name: &str) -> mlua::Result<u32> {
 fn parse_action(name: &str) -> mlua::Result<Action> {
     match name.to_lowercase().as_str() {
         "exit" => Ok(Action::Exit),
-        other => lua_bail!("unknown action {other:?}; supported actions: \"exit\""),
+        "togglefloating" | "toggle_floating" => Ok(Action::ToggleFloating),
+        other => {
+            lua_bail!("unknown action {other:?}; supported actions: \"exit\", \"togglefloating\"")
+        }
     }
 }
 
