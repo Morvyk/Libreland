@@ -72,29 +72,49 @@ pub struct OutputDescriptor {
 /// the bounding-box width and height.
 const CURSOR_SIZE: i32 = 24;
 
-/// GLES2 fragment shader that masks rounded-rectangle corners on
-/// top of an already-drawn window. The shader is called once per
-/// window over the window's cell rect; for fragments inside the
-/// rounded shape it writes alpha = 0 (existing surface pixel
-/// kept), for fragments outside the rounded shape it writes the
-/// wallpaper colour with alpha = 1, and the ~1 px transition
-/// between the two ends gets a smoothstep ramp so the rounded
-/// edge looks anti-aliased rather than staircased. Mask colour
-/// is sampled from a vertical gradient (`top`/`bottom`) using the
-/// fragment's *global* y so it stays continuous with the
-/// wallpaper drawn underneath.
+/// GLES2 fragment shader that paints the *frame* of a window —
+/// the rounded-corner cutout (wallpaper) and the border ring
+/// (border colour) — in one pass over the window's cell rect.
+/// Runs after the surface is drawn, so the surface fills the
+/// interior and this shader overpaints everything from the
+/// border ring outward.
 ///
-/// Uniforms: `size` and `alpha` come from smithay (viewport size
-/// and per-call alpha multiplier); the rest are registered when
-/// we compile the shader and updated each frame.
-const ROUNDED_MASK_SHADER: &str = r"
+/// Region selection uses the signed-distance field of a rounded
+/// rectangle. With `dist` = SDF distance from the rounded
+/// boundary (positive outside, negative inside):
+///
+/// - `dist >  0`: outside the cell shape → paint wallpaper.
+/// - `dist in (-border_width, 0]`: in the border ring → paint
+///   border colour, which itself can be a vertical gradient.
+/// - `dist <= -border_width`: interior → discard, keeping the
+///   surface pixel that was drawn before.
+///
+/// Both transitions get a `smoothstep` ramp so the curve and
+/// the border's inner edge are anti-aliased. Colours are sampled
+/// from vertical gradients keyed off the fragment's *global* y
+/// (output-space), so the active-border gradient stays
+/// continuous between adjacent tiles instead of resetting per
+/// cell, and similarly for the wallpaper cutout.
+///
+/// Uniforms: `size` and `alpha` come from smithay; the rest are
+/// registered at compile time and re-set each frame.
+const FRAME_SHADER: &str = r"
+#extension GL_OES_standard_derivatives : enable
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 
 uniform vec2 size;
 uniform float alpha;
 uniform float radius;
+uniform float border_width;
 uniform vec3 grad_top;
 uniform vec3 grad_bottom;
+uniform vec3 border_top;
+uniform vec3 border_bottom;
 uniform float output_height;
 uniform float cell_origin_y;
 
@@ -105,14 +125,46 @@ void main() {
     vec2 half_size = size * 0.5;
     vec2 d = abs(p - half_size) - (half_size - vec2(radius));
     float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
-    float mask_alpha = smoothstep(-0.5, 0.5, dist);
-    if (mask_alpha <= 0.0) {
+
+    // Screen-space AA half-width via the derivative of the SDF.
+    // Falls back to 0.5 px when `fwidth` isn't supported or
+    // returns 0 (e.g. on perfectly axis-aligned edges of an
+    // un-rotated frame). This makes the AA ramp exactly one
+    // *output* pixel wide regardless of fractional scale, so a
+    // 4K display at scale 1.5 gets the same crisp 1-pixel ramp
+    // as a 1080p panel at scale 1.
+    float aa = max(fwidth(dist) * 0.5, 0.5);
+
+    // Inner cutoff (cell interior, surface kept). The AA ramp
+    // for the inner edge fits below this threshold.
+    if (dist <= -border_width - aa) {
         discard;
     }
+
     float global_y = cell_origin_y + p.y;
     float t = clamp(global_y / max(output_height, 1.0), 0.0, 1.0);
-    vec3 mask_rgb = mix(grad_top, grad_bottom, t);
-    gl_FragColor = vec4(mask_rgb, mask_alpha * alpha);
+    vec3 wallpaper_rgb = mix(grad_top, grad_bottom, t);
+    vec3 border_rgb = mix(border_top, border_bottom, t);
+
+    // Pick wallpaper outside the rounded boundary, border colour
+    // inside, with a derivative-sized smoothstep across `dist = 0`.
+    float outer_blend = smoothstep(-aa, aa, dist);
+    vec3 color = mix(border_rgb, wallpaper_rgb, outer_blend);
+
+    // Alpha: 1 from the outside through the border ring, fading
+    // to 0 across the inner edge (`dist = -border_width`) so the
+    // surface peeks through smoothly. With border_width = 0 the
+    // two transitions coincide and the shader collapses to the
+    // wallpaper-only mask case.
+    float a = smoothstep(-border_width - aa, -border_width + aa, dist) * alpha;
+
+    // The frame's blend mode is GL_ONE / GL_ONE_MINUS_SRC_ALPHA
+    // (premultiplied source-over), so RGB has to be multiplied
+    // by alpha here. Without this, partially-transparent edge
+    // fragments come out over-bright and the smoothstep AA on
+    // the curve and the border's inner edge looks like a hard
+    // halo instead of a smooth ramp.
+    gl_FragColor = vec4(color * a, a);
 }
 ";
 
@@ -142,7 +194,7 @@ pub struct Renderer {
     /// Custom GLES pixel shader used to mask rounded corners.
     /// `Arc`-backed so it's cheap to clone out before borrowing
     /// the renderer for the frame.
-    rounded_shader: GlesPixelProgram,
+    frame_shader: GlesPixelProgram,
     /// Origin used for the monotonic ms timestamp fed into
     /// `wl_callback.done` after each output is queued for scanout.
     /// Clients use this value to schedule their next frame's draw —
@@ -226,19 +278,22 @@ impl Renderer {
             unsafe { GlesRenderer::new(egl_context) }.context("GlesRenderer::new failed")?;
         info!("GLES renderer created");
 
-        info!("phase: compiling rounded-corner pixel shader");
-        let rounded_shader = gles
+        info!("phase: compiling window-frame pixel shader");
+        let frame_shader = gles
             .compile_custom_pixel_shader(
-                ROUNDED_MASK_SHADER,
+                FRAME_SHADER,
                 &[
                     UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("border_width", UniformType::_1f),
                     UniformName::new("grad_top", UniformType::_3f),
                     UniformName::new("grad_bottom", UniformType::_3f),
+                    UniformName::new("border_top", UniformType::_3f),
+                    UniformName::new("border_bottom", UniformType::_3f),
                     UniformName::new("output_height", UniformType::_1f),
                     UniformName::new("cell_origin_y", UniformType::_1f),
                 ],
             )
-            .context("rounded-corner shader compile failed")?;
+            .context("window-frame shader compile failed")?;
 
         info!("phase: creating GBM allocator");
         let allocator = GbmAllocator::new(
@@ -359,7 +414,7 @@ impl Renderer {
             cursor_y,
             wallpaper,
             border,
-            rounded_shader,
+            frame_shader,
             start: Instant::now(),
         })
     }
@@ -462,7 +517,7 @@ impl Renderer {
         let cursor_abs_y = self.cursor_y;
         let wallpaper = self.wallpaper.clone();
         let border = self.border.clone();
-        let rounded_shader = self.rounded_shader.clone();
+        let frame_shader = self.frame_shader.clone();
         let output = &self.outputs[idx];
         let mode_size = output.mode_size;
         let compositor_position = output.compositor_position;
@@ -562,20 +617,8 @@ impl Renderer {
                         scale_i(p.cell_rect.size.h, scale),
                     ),
                 );
-                if bw_comp > 0 {
-                    let fill = if p.focused {
-                        &border.active
-                    } else {
-                        &border.inactive
-                    };
-                    draw_border(
-                        &mut frame,
-                        cell_local_phys,
-                        scale_i(bw_comp, scale),
-                        fill,
-                        mode_size,
-                    )?;
-                }
+                // Surface first; the frame shader will overpaint
+                // the border ring and corner cutout on top.
                 draw_render_elements::<GlesRenderer, _, _>(
                     &mut frame,
                     scale,
@@ -583,12 +626,24 @@ impl Renderer {
                     &full_damage,
                 )
                 .context("draw_render_elements failed")?;
-                if radius_comp > 0 {
-                    draw_rounded_corner_mask(
+
+                // Frame shader runs whenever there's *anything*
+                // to paint over the surface — a border ring, a
+                // rounded-corner cutout, or both. With both at 0
+                // it would be a no-op so we skip the GL call.
+                if bw_comp > 0 || radius_comp > 0 {
+                    let fill = if p.focused {
+                        &border.active
+                    } else {
+                        &border.inactive
+                    };
+                    draw_window_frame(
                         &mut frame,
-                        &rounded_shader,
+                        &frame_shader,
                         cell_local_phys,
+                        scale_i(bw_comp, scale),
                         scale_i(radius_comp, scale),
+                        fill,
                         &wallpaper,
                         mode_size,
                     )?;
@@ -723,40 +778,54 @@ fn draw_fill_rect(
 /// colour rather than sampling whatever was underneath the
 /// surface. True transparency at corners needs per-window
 /// offscreen rendering, which is later polish.
-fn draw_rounded_corner_mask(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all 8 args are first-class inputs to one pixel-shader call; bundling them into a struct would just spread the call site across more lines for no real readability win"
+)]
+fn draw_window_frame(
     frame: &mut GlesFrame<'_, '_>,
     shader: &GlesPixelProgram,
     cell_rect_phys: Rectangle<i32, Physical>,
+    border_width_phys: i32,
     radius_phys: i32,
+    border_fill: &Fill,
     wallpaper: &Fill,
     output_size: Size<i32, Physical>,
 ) -> Result<()> {
-    let r = radius_phys
-        .min(cell_rect_phys.size.w / 2)
-        .min(cell_rect_phys.size.h / 2);
-    if r <= 0 {
+    let max_half = (cell_rect_phys.size.w / 2).min(cell_rect_phys.size.h / 2);
+    let radius = radius_phys.min(max_half).max(0);
+    // Don't let the border eat the entire cell — leave at least
+    // 1 px of surface visible. For tiny tiles this clamps the
+    // configured border down so the shader still has an interior.
+    let border = border_width_phys.min(max_half - 1).max(0);
+    if radius <= 0 && border <= 0 {
         return Ok(());
     }
-    let dest = cell_rect_phys;
     let (grad_top, grad_bottom) = match wallpaper {
+        Fill::Solid(rgb) => (*rgb, *rgb),
+        Fill::VerticalGradient { top, bottom } => (*top, *bottom),
+    };
+    let (border_top, border_bottom) = match border_fill {
         Fill::Solid(rgb) => (*rgb, *rgb),
         Fill::VerticalGradient { top, bottom } => (*top, *bottom),
     };
     #[allow(
         clippy::cast_precision_loss,
-        reason = "radius and output_height are bounded by i32 cell / output sizes; fit f32 exactly for any realistic value"
+        reason = "radius, border, and cell origin are bounded by i32 cell / output sizes; fit f32 exactly for any realistic value"
     )]
     let uniforms = [
-        Uniform::new("radius", r as f32),
+        Uniform::new("radius", radius as f32),
+        Uniform::new("border_width", border as f32),
         Uniform::new("grad_top", grad_top),
         Uniform::new("grad_bottom", grad_bottom),
+        Uniform::new("border_top", border_top),
+        Uniform::new("border_bottom", border_bottom),
         Uniform::new("output_height", output_size.h as f32),
         Uniform::new("cell_origin_y", cell_rect_phys.loc.y as f32),
     ];
-    // The source rect / sample size are unused by our shader (we
-    // don't sample any texture) but the API requires them; pass
-    // the cell size so the `size` uniform the shader does read
-    // ends up as the cell's pixel size.
+    // The shader doesn't sample any texture but the API still
+    // wants a `src` + `size`; passing the cell rect makes the
+    // built-in `size` uniform come out as the cell's pixel size.
     let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(smithay::utils::Size::<
         f64,
         smithay::utils::Buffer,
@@ -769,41 +838,8 @@ fn draw_rounded_corner_mask(
         cell_rect_phys.size.h,
     ));
     frame
-        .render_pixel_shader_to(shader, src, dest, size, None, 1.0, &uniforms)
-        .context("render_pixel_shader_to (rounded mask) failed")?;
-    Ok(())
-}
-
-/// Draw a window's border as four rectangles around the cell.
-/// All values in physical pixels of the destination framebuffer.
-/// Edge sizes that go negative (cell smaller than `2 * width`)
-/// are clamped and the affected edges no-op.
-fn draw_border(
-    frame: &mut GlesFrame<'_, '_>,
-    cell_rect_phys: Rectangle<i32, Physical>,
-    width_phys: i32,
-    fill: &Fill,
-    output_size: Size<i32, Physical>,
-) -> Result<()> {
-    let local = cell_rect_phys;
-    let width = width_phys;
-    let mid_h = (local.size.h - 2 * width).max(0);
-    let top = Rectangle::<i32, Physical>::new(local.loc, Size::new(local.size.w, width));
-    let bottom = Rectangle::<i32, Physical>::new(
-        Point::new(local.loc.x, local.loc.y + local.size.h - width),
-        Size::new(local.size.w, width),
-    );
-    let left = Rectangle::<i32, Physical>::new(
-        Point::new(local.loc.x, local.loc.y + width),
-        Size::new(width, mid_h),
-    );
-    let right = Rectangle::<i32, Physical>::new(
-        Point::new(local.loc.x + local.size.w - width, local.loc.y + width),
-        Size::new(width, mid_h),
-    );
-    for edge in [top, bottom, left, right] {
-        draw_fill_rect(frame, fill, edge, output_size)?;
-    }
+        .render_pixel_shader_to(shader, src, cell_rect_phys, size, None, 1.0, &uniforms)
+        .context("render_pixel_shader_to (window frame) failed")?;
     Ok(())
 }
 

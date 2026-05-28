@@ -116,7 +116,7 @@ layout = {
 
 border = {
     width = 1,                            -- 0 disables
-    rounded_corners = 4,                  -- 0 disables
+    rounded_corners = 4,                  -- 0 disables; radius is in compositor px
     active = {
         type = "vertical_gradient",
         top    = { 0.55, 0.80, 1.00 },
@@ -221,7 +221,7 @@ as we add `Reload`, `Spawn`, `ChangeVt`, …
 | `width`           | `1`                                  | ✅    | Border width in pixels around every window. `0` disables borders entirely. `>= 0`.                                                                 |
 | `active`          | bright blue gradient                 | ✅    | Fill drawn around the keyboard-focused window. Same `Solid` / `VerticalGradient` types as `misc.wallpaper`.                                        |
 | `inactive`        | `Solid([0.30, 0.30, 0.30])` (grey)   | ✅    | Fill drawn around every unfocused window.                                                                                                          |
-| `rounded_corners` | `4`                                  | ✅    | Corner radius in pixels. `0` disables. Per-window radius is clamped to half the cell's smaller dimension so corners never overlap on tiny tiles. |
+| `rounded_corners` | `4`                                  | ✅    | Corner radius in **compositor** pixels (multiplied by the output's scale at render time). `0` disables. Per-window effective radius is clamped to half the cell's smaller dimension so corners never overlap on tiny tiles. The frame shader paints both the corner cutout and the border ring along the curve, so the border follows the rounded shape instead of stopping at square corners. |
 
 The client's surface is shrunk by `2 * width` per axis before
 configure so the buffer doesn't overlap the border. Rounded

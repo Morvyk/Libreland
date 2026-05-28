@@ -280,6 +280,13 @@ impl Default for Config {
                 // windows visibly de-emphasise without competing
                 // with the wallpaper.
                 inactive: Fill::Solid([0.30, 0.30, 0.30]),
+                // Default radius is in *compositor* pixels and
+                // gets multiplied by output scale at render time.
+                // 4 is a subtle rounding; bump higher for more
+                // pronounced corners. `0` disables. With the
+                // fwidth-based shader AA the curve is crisp at
+                // any radius >= 1, so the only reason to go
+                // bigger is taste.
                 rounded_corners: 4,
             },
             startup: Vec::new(),
