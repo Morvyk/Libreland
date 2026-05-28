@@ -160,6 +160,66 @@ impl Layout {
         })
     }
 
+    /// Prepare a window to be the target of an interactive drag
+    /// (move or resize). Promotes it to floating *in place* (no
+    /// 70 % shrink — the user wants to drag from where they
+    /// clicked) and raises it to the top of the float stack so
+    /// subsequent pointer events draw / hit it first. Returns the
+    /// rect the caller should record as the drag's "start rect";
+    /// the caller will translate this rect with cursor deltas via
+    /// [`Layout::set_floating_rect`]. Returns `None` if `surface`
+    /// isn't tracked.
+    pub fn start_drag_for(&mut self, surface: &WlSurface) -> Option<Rectangle<i32, Physical>> {
+        let idx = self
+            .windows
+            .iter()
+            .position(|w| w.toplevel.wl_surface() == surface)?;
+        let was_tiled = !self.windows[idx].floating;
+        if was_tiled {
+            self.windows[idx].floating = true;
+        }
+        // Move to end of Vec → top of float stack. Skip the
+        // remove/push if already at the end (e.g. a re-drag of
+        // the topmost float).
+        if idx != self.windows.len() - 1 {
+            let entry = self.windows.remove(idx);
+            self.windows.push(entry);
+        }
+        let rect = self.windows.last().expect("just pushed").rect;
+        if was_tiled {
+            // Tiles need to reflow now that one of them just left
+            // the dwindle flow. Floating windows are unaffected.
+            self.recompute();
+            self.push_configures();
+        }
+        Some(rect)
+    }
+
+    /// Update the rect of a floating window during a drag. Pushes
+    /// a fresh `xdg_toplevel.configure` so the client redraws at
+    /// the new size; clients that don't honour resize fall back to
+    /// stretching their old buffer. Silent no-op if `surface`
+    /// isn't tracked or is currently tiled (tiles get their rect
+    /// from the dwindle pass, not from this method).
+    pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
+        let Some(window) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.toplevel.wl_surface() == surface)
+        else {
+            return;
+        };
+        if !window.floating {
+            return;
+        }
+        window.rect = rect;
+        let size = Size::<i32, Logical>::from((rect.size.w, rect.size.h));
+        window.toplevel.with_pending_state(|state| {
+            state.size = Some(size);
+        });
+        window.toplevel.send_configure();
+    }
+
     /// Walk every tiled window in storage order and assign rects
     /// via dwindle. Floating windows are skipped — their rects
     /// stay wherever the user (or a previous toggle) put them.

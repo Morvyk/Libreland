@@ -200,6 +200,8 @@ config layer once that exists.
 | --------------- | --------------------------------------------------- |
 | `Super+Shift+E` | Exit the compositor cleanly.                        |
 | `Super+F`       | Toggle floating mode on the focused window.         |
+| `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled). |
+| `Super+RMB`-drag | Interactively resize the window under the cursor from its bottom-right corner (auto-floats it if tiled). |
 
 The hotkey is matched against raw libinput key codes, so it will keep working
 once a future DRM grab disables the kernel's Ctrl+C path. Until that grab

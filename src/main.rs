@@ -141,7 +141,51 @@ pub(crate) struct State {
     /// this each frame; xdg handlers in [`crate::wayland`] insert
     /// + remove entries on toplevel map / destroy.
     pub(crate) layout: layout::Layout,
+    /// Active interactive drag (Super + LMB to move, Super + RMB
+    /// to resize). `Some` only between the initiating press and
+    /// the matching release; during that window, pointer motion
+    /// events update the dragged surface's rect instead of
+    /// reaching its client, and intervening button events are
+    /// swallowed.
+    pub(crate) drag: Option<DragState>,
 }
+
+/// In-progress interactive drag. The dragged surface is always
+/// floating (we promote it on drag start if it was tiled).
+#[derive(Debug, Clone)]
+pub(crate) struct DragState {
+    pub(crate) surface: WlSurface,
+    pub(crate) mode: DragMode,
+    /// Cursor position (compositor coords, `f64`) at the moment
+    /// the drag began.
+    pub(crate) cursor_start: (f64, f64),
+    /// Window rect at the moment the drag began. Motion deltas
+    /// transform this into the current rect.
+    pub(crate) rect_start: smithay::utils::Rectangle<i32, Physical>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DragMode {
+    /// Translate the rect by the cursor delta; size unchanged.
+    Move,
+    /// Stretch the rect's size by the cursor delta from the
+    /// initial bottom-right corner; clamped to a sane minimum so
+    /// the user can never resize a window into invisibility.
+    Resize,
+}
+
+/// evdev button codes for the two buttons we react to. See
+/// `linux/input-event-codes.h`. Anything else falls through to
+/// the focused client as a normal pointer button event.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+
+/// Lower bound a drag-resize will clamp the floating rect to so
+/// the window can't be resized into a slice too small to grab
+/// again. Conservative — most useful clients render correctly
+/// well above this.
+const MIN_DRAG_RESIZE_W: i32 = 100;
+const MIN_DRAG_RESIZE_H: i32 = 60;
 
 /// Calloop user-data wrapper: owns the Wayland `Display<State>` and
 /// the compositor `State` side by side, since they can't be nested
@@ -217,8 +261,49 @@ impl State {
     /// same surface also takes keyboard focus, but only on actual
     /// change so we don't flood `wl_keyboard.enter` /
     /// `wl_keyboard.leave` on every motion event.
+    ///
+    /// When [`State::drag`] is active, the motion is consumed by
+    /// the drag instead: the dragged window's rect is updated
+    /// (translated for Move, stretched for Resize) and no
+    /// `wl_pointer.motion` is sent — the focused client should
+    /// see a still pointer until the drag ends.
     fn forward_pointer_motion(&mut self, time: u32) {
         let (cx, cy) = self.renderer.cursor_pos();
+
+        // Drag in flight: update the dragged window's rect and
+        // swallow the motion event so the client doesn't see a
+        // running pointer underneath the grab.
+        if let Some(drag) = self.drag.clone() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor deltas are bounded by layout_bounds (i32) from on_pointer_motion"
+            )]
+            let delta_x = (cx - drag.cursor_start.0) as i32;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor deltas are bounded by layout_bounds (i32) from on_pointer_motion"
+            )]
+            let delta_y = (cy - drag.cursor_start.1) as i32;
+            let new_rect = match drag.mode {
+                DragMode::Move => smithay::utils::Rectangle::new(
+                    Point::<i32, Physical>::new(
+                        drag.rect_start.loc.x + delta_x,
+                        drag.rect_start.loc.y + delta_y,
+                    ),
+                    drag.rect_start.size,
+                ),
+                DragMode::Resize => smithay::utils::Rectangle::new(
+                    drag.rect_start.loc,
+                    smithay::utils::Size::<i32, Physical>::new(
+                        (drag.rect_start.size.w + delta_x).max(MIN_DRAG_RESIZE_W),
+                        (drag.rect_start.size.h + delta_y).max(MIN_DRAG_RESIZE_H),
+                    ),
+                ),
+            };
+            self.layout.set_floating_rect(&drag.surface, new_rect);
+            return;
+        }
+
         let location = Point::<f64, Logical>::from((cx, cy));
         #[allow(
             clippy::cast_possible_truncation,
@@ -266,12 +351,89 @@ impl State {
     /// `FocusModel::Click` a *press* also promotes the surface under
     /// the cursor to keyboard focus before the button event is sent,
     /// so the focused client sees its first key as expected.
+    ///
+    /// Super + LMB press starts an interactive Move drag on the
+    /// window under the cursor (auto-floating it first if tiled);
+    /// Super + RMB starts a Resize drag. While a drag is active,
+    /// any release ends it, and no press / release leaks to the
+    /// focused client — otherwise it would see a stuck button.
     fn forward_pointer_button(
         &mut self,
         button: u32,
         state: smithay::backend::input::ButtonState,
         time: u32,
     ) {
+        // Active drag: any release ends it. Other buttons are
+        // swallowed so we don't accidentally cancel mid-drag.
+        if self.drag.is_some() {
+            if matches!(state, smithay::backend::input::ButtonState::Released) {
+                self.drag = None;
+            }
+            return;
+        }
+
+        // Drag start: Super + (LMB or RMB) press on a window.
+        if matches!(state, smithay::backend::input::ButtonState::Pressed) {
+            let super_held = self
+                .seat
+                .get_keyboard()
+                .is_some_and(|k| k.modifier_state().logo);
+            let mode = if super_held {
+                match button {
+                    BTN_LEFT => Some(DragMode::Move),
+                    BTN_RIGHT => Some(DragMode::Resize),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(mode) = mode {
+                let (cx, cy) = self.renderer.cursor_pos();
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+                )]
+                let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+                let hit_surface = self
+                    .layout
+                    .window_at(cursor_i)
+                    .map(|w| w.toplevel.wl_surface().clone());
+                if let Some(surface) = hit_surface {
+                    // Focus the dragged window before the grab so
+                    // releases-after-drag still find the right
+                    // client for keyboard input. In hover mode
+                    // it's usually already focused; in click mode
+                    // this is the refocus-on-press path.
+                    if let Some(kbd) = self.seat.get_keyboard()
+                        && kbd.current_focus().as_ref() != Some(&surface)
+                    {
+                        kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+                    }
+                    if let Some(rect_start) = self.layout.start_drag_for(&surface) {
+                        info!(
+                            ?mode,
+                            surface = ?surface.id(),
+                            "drag start"
+                        );
+                        self.drag = Some(DragState {
+                            surface,
+                            mode,
+                            cursor_start: (cx, cy),
+                            rect_start,
+                        });
+                    }
+                    // Either way we don't forward this press to
+                    // the client — Super+click is the compositor's
+                    // gesture, not the client's.
+                    return;
+                }
+                // Super + click on empty wallpaper: falls through
+                // to the normal forward path below (which sends
+                // the press to whatever pointer-focus surface, if
+                // any — likely none over the wallpaper).
+            }
+        }
+
         if matches!(state, smithay::backend::input::ButtonState::Pressed)
             && matches!(self.config.input.focus_model, config::FocusModel::Click)
         {
@@ -512,6 +674,7 @@ fn main() -> Result<()> {
         xdg_shell_state: wayland_init.xdg_shell_state,
         output_manager_state: wayland_init.output_manager_state,
         layout,
+        drag: None,
     };
     let mut loop_data = LoopData { state, display };
 
