@@ -42,7 +42,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::utils::{Logical, Physical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -59,6 +59,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod config;
 mod drm;
 mod keyboard;
+mod layout;
 mod render;
 mod wayland;
 
@@ -135,6 +136,11 @@ pub(crate) struct State {
         reason = "held so delegate_output! can route global dispatch through it; per-output Output objects (which read it) land in 4b"
     )]
     pub(crate) output_manager_state: OutputManagerState,
+    /// Dwindle tiling layout — owns every visible window's
+    /// `(wl_surface, rect)` pair. The vblank handler snapshots
+    /// this each frame; xdg handlers in [`crate::wayland`] insert
+    /// + remove entries on toplevel map / destroy.
+    pub(crate) layout: layout::Layout,
 }
 
 /// Calloop user-data wrapper: owns the Wayland `Display<State>` and
@@ -439,6 +445,7 @@ fn main() -> Result<()> {
     // descriptors, if relevant).
     wayland::spawn_startup(&config.startup);
 
+    let layout = layout::Layout::new(renderer.primary_output_rect());
     let state = State {
         session,
         loop_signal,
@@ -453,6 +460,7 @@ fn main() -> Result<()> {
         seat: wayland_init.seat,
         xdg_shell_state: wayland_init.xdg_shell_state,
         output_manager_state: wayland_init.output_manager_state,
+        layout,
     };
     let mut loop_data = LoopData { state, display };
 
@@ -665,18 +673,18 @@ fn wire_event_sources(
             drm_notifier,
             |event, _meta, data: &mut LoopData| match event {
                 smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                    // Snapshot every live xdg_toplevel's wl_surface so
-                    // the borrow on `xdg_shell_state` ends before the
-                    // mut borrow on `renderer` starts. WlSurface clones
-                    // are Arc-backed — cheap.
-                    let surfaces: Vec<WlSurface> = data
+                    // Snapshot every laid-out window's (surface,
+                    // position) pair so the borrow on `layout`
+                    // ends before the mut borrow on `renderer`
+                    // starts. WlSurface clones are Arc-backed — cheap.
+                    let placements: Vec<(WlSurface, Point<i32, Physical>)> = data
                         .state
-                        .xdg_shell_state
-                        .toplevel_surfaces()
+                        .layout
+                        .windows()
                         .iter()
-                        .map(|t| t.wl_surface().clone())
+                        .map(|w| (w.toplevel.wl_surface().clone(), w.rect.loc))
                         .collect();
-                    if let Err(err) = data.state.renderer.render_for_crtc(crtc, &surfaces) {
+                    if let Err(err) = data.state.renderer.render_for_crtc(crtc, &placements) {
                         // Don't kill the event loop on a render hiccup —
                         // log and let the next vblank try again. A
                         // persistent failure on one CRTC freezes that

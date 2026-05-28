@@ -233,16 +233,14 @@ impl XdgShellHandler for State {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: new xdg_toplevel");
-        // Mandatory: clients hang waiting for an initial configure
-        // before they start drawing. The default configure carries
-        // no size, which means "you decide" — fine for 4c since
-        // window placement / explicit sizing arrives in 4d.
-        surface.send_configure();
-        // Promote the new toplevel to keyboard focus immediately so
-        // the user can type into it without first clicking. A proper
-        // focus model (click-to-focus / focus-follows-mouse) lands
-        // in 4d alongside window management; for 4c the rule is just
-        // "most recently mapped wins".
+        // Hand the toplevel to the tiler. Layout::insert calls
+        // send_configure on every affected window with its newly-
+        // assigned rect — the new arrival and any existing tiles
+        // whose cells just got bisected.
+        self.layout.insert(surface.clone());
+        // Promote the new toplevel to keyboard focus (4d.1's interim
+        // "last mapped wins" rule; 4d.2 replaces this with a
+        // configurable click vs hover model).
         let wl_surface = surface.wl_surface().clone();
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
@@ -272,9 +270,12 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: xdg_toplevel destroyed");
+        // Pull from the tiler — its sibling takes the freed cell
+        // and every remaining window receives a fresh configure.
+        self.layout.remove(surface.wl_surface());
         // Clear keyboard focus only if the destroyed surface was
         // actually focused — otherwise leave whatever is focused
-        // alone (it might be a different live toplevel). 4d will
+        // alone (it might be a different live toplevel). 4d.2 will
         // pick a sensible replacement instead of dropping to None.
         if let Some(kbd) = self.seat.get_keyboard() {
             let was_focused = kbd

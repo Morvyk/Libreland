@@ -208,7 +208,7 @@ impl Renderer {
     /// Called once at startup before the event loop runs; thereafter
     /// each output's frames are driven by its own vblank events. No
     /// Wayland clients have connected yet at this point, so we pass
-    /// an empty surface slice — only the wallpaper + cursor land.
+    /// an empty placement slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
             self.render_output(idx, &[])
@@ -218,19 +218,20 @@ impl Renderer {
     }
 
     /// Render the output driven by `crtc`, in response to its vblank.
-    /// `surfaces` is the snapshot of every live `xdg_toplevel`'s
-    /// `wl_surface` that the caller wants composited this frame; for
-    /// 4b every entry is pinned to the absolute origin (0, 0) of the
-    /// virtual layout, so on a multi-output setup the same window
-    /// only appears on whichever output covers that point. Real
-    /// per-window placement is window-management (4d).
-    pub fn render_for_crtc(&mut self, crtc: crtc::Handle, surfaces: &[WlSurface]) -> Result<()> {
+    /// `placements` is the caller-snapshot of every visible window as
+    /// `(wl_surface, top-left in absolute virtual-layout coords)`;
+    /// the layout module owns positioning, the renderer just paints.
+    pub fn render_for_crtc(
+        &mut self,
+        crtc: crtc::Handle,
+        placements: &[(WlSurface, Point<i32, Physical>)],
+    ) -> Result<()> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx, surfaces)
+        self.render_output(idx, placements)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -249,12 +250,29 @@ impl Renderer {
         (self.cursor_x, self.cursor_y)
     }
 
+    /// Rectangle of the first connected output in absolute virtual-
+    /// layout coordinates. Used by the tiling layer to bound its
+    /// initial workspace before per-output workspaces exist.
+    /// Renderer guarantees a non-empty `outputs` (panic at
+    /// construction otherwise), so the `expect` is unreachable.
+    pub fn primary_output_rect(&self) -> Rectangle<i32, Physical> {
+        let o = self
+            .outputs
+            .first()
+            .expect("Renderer constructed with zero outputs");
+        Rectangle::new(o.position, o.size)
+    }
+
     /// Render one output's frame: wallpaper, then every client
     /// surface positioned in this output's local space, then the
     /// cursor sprite on top if its hotspot falls in this output.
     /// Sends `wl_callback.done` on each surface after the buffer is
     /// queued so clients know they can draw the next frame.
-    fn render_output(&mut self, idx: usize, surfaces: &[WlSurface]) -> Result<()> {
+    fn render_output(
+        &mut self,
+        idx: usize,
+        placements: &[(WlSurface, Point<i32, Physical>)],
+    ) -> Result<()> {
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in.
         let cursor_x = self.cursor_x;
@@ -296,18 +314,21 @@ impl Renderer {
         // owns its `TextureId`s, so it's free to outlive the
         // renderer borrow and be drawn during the frame below.
         //
-        // 4b pins every surface at (0, 0) absolute; on this output
-        // that means (-output_pos.x, -output_pos.y) locally. Outputs
-        // not covering (0, 0) just get a fully-clipped surface —
-        // the GLES viewport handles it. Real placement is 4d.
-        let local_origin = Point::<i32, Physical>::from((-output_pos.x, -output_pos.y));
-        let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = surfaces
+        // Per surface: absolute position → this output's local
+        // coords by subtracting `output_pos`. Surfaces whose
+        // bounding rect doesn't overlap the output get fully
+        // clipped by the GLES viewport — no need to early-skip.
+        let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = placements
             .iter()
-            .flat_map(|surface| {
+            .flat_map(|(surface, abs_pos)| {
+                let local = Point::<i32, Physical>::from((
+                    abs_pos.x - output_pos.x,
+                    abs_pos.y - output_pos.y,
+                ));
                 render_elements_from_surface_tree(
                     &mut self.gles,
                     surface,
-                    local_origin,
+                    local,
                     1.0_f64,
                     1.0_f32,
                     Kind::Unspecified,
@@ -369,7 +390,7 @@ impl Renderer {
             reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
         )]
         let elapsed_ms = self.start.elapsed().as_millis() as u32;
-        for surface in surfaces {
+        for (surface, _) in placements {
             send_frame_callbacks(surface, elapsed_ms);
         }
         Ok(())
