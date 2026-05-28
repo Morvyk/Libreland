@@ -605,8 +605,13 @@ fn main() -> Result<()> {
         outputs: drm_outputs,
     } = drm_init;
 
-    let mut renderer = render::Renderer::new(drm_fd, drm_outputs, config.misc.wallpaper.clone())
-        .context("render pipeline init failed")?;
+    let mut renderer = render::Renderer::new(
+        drm_fd,
+        drm_outputs,
+        config.misc.wallpaper.clone(),
+        config.border.clone(),
+    )
+    .context("render pipeline init failed")?;
 
     info!("phase: priming swapchains (one initial frame per output)");
     renderer.render_initial().context("initial render failed")?;
@@ -709,6 +714,7 @@ fn main() -> Result<()> {
             outer: config.layout.gaps_outer,
             inner: config.layout.gaps_inner,
         },
+        config.border.width,
     );
     let state = State {
         session,
@@ -939,22 +945,20 @@ fn wire_event_sources(
             drm_notifier,
             |event, _meta, data: &mut LoopData| match event {
                 smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                    // Snapshot every laid-out window's (surface,
-                    // position) pair so the borrow on `layout`
-                    // ends before the mut borrow on `renderer`
-                    // starts. WlSurface clones are Arc-backed —
-                    // cheap. Layout returns placements in draw
-                    // order (tiled tree first, floats next,
-                    // in-transit on top); we drop the rect's
-                    // size for the renderer (it pulls size from
-                    // the surface's buffer) and only pass loc.
-                    let placements: Vec<(WlSurface, Point<i32, Physical>)> = data
+                    // Snapshot every laid-out window's placement so
+                    // the borrow on `layout` ends before the mut
+                    // borrow on `renderer` starts. WlSurface clones
+                    // are Arc-backed — cheap. Layout returns
+                    // placements in draw order (tiled tree first,
+                    // floats next, in-transit on top) along with
+                    // each window's focused flag so the renderer
+                    // picks active vs inactive border colour.
+                    let focused = data
                         .state
-                        .layout
-                        .placements()
-                        .into_iter()
-                        .map(|(surface, rect)| (surface, rect.loc))
-                        .collect();
+                        .seat
+                        .get_keyboard()
+                        .and_then(|k| k.current_focus());
+                    let placements = data.state.layout.placements(focused.as_ref());
                     if let Err(err) = data.state.renderer.render_for_crtc(crtc, &placements) {
                         // Don't kill the event loop on a render hiccup —
                         // log and let the next vblank try again. A

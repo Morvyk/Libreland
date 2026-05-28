@@ -25,7 +25,9 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
+use smithay::backend::renderer::gles::{
+    GlesFrame, GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
+};
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{Bind as _, Color32F, Frame as _, Renderer as _};
 use smithay::reexports::drm::control::crtc;
@@ -36,13 +38,58 @@ use smithay::wayland::compositor::{
 };
 use tracing::{debug, info};
 
-use crate::config::Wallpaper;
+use crate::config::{BorderConfig, Fill};
 use crate::drm::DrmOutput;
+use crate::layout::Placement;
 
 /// Side length of the cursor sprite in physical pixels. The sprite
 /// is a right-triangle with apex at the hotspot, so this is also
 /// the bounding-box width and height.
 const CURSOR_SIZE: i32 = 24;
+
+/// GLES2 fragment shader that masks rounded-rectangle corners on
+/// top of an already-drawn window. The shader is called once per
+/// window over the window's cell rect; for fragments inside the
+/// rounded shape it writes alpha = 0 (existing surface pixel
+/// kept), for fragments outside the rounded shape it writes the
+/// wallpaper colour with alpha = 1, and the ~1 px transition
+/// between the two ends gets a smoothstep ramp so the rounded
+/// edge looks anti-aliased rather than staircased. Mask colour
+/// is sampled from a vertical gradient (`top`/`bottom`) using the
+/// fragment's *global* y so it stays continuous with the
+/// wallpaper drawn underneath.
+///
+/// Uniforms: `size` and `alpha` come from smithay (viewport size
+/// and per-call alpha multiplier); the rest are registered when
+/// we compile the shader and updated each frame.
+const ROUNDED_MASK_SHADER: &str = r"
+precision mediump float;
+
+uniform vec2 size;
+uniform float alpha;
+uniform float radius;
+uniform vec3 grad_top;
+uniform vec3 grad_bottom;
+uniform float output_height;
+uniform float cell_origin_y;
+
+varying vec2 v_coords;
+
+void main() {
+    vec2 p = v_coords * size;
+    vec2 half_size = size * 0.5;
+    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
+    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
+    float mask_alpha = smoothstep(-0.5, 0.5, dist);
+    if (mask_alpha <= 0.0) {
+        discard;
+    }
+    float global_y = cell_origin_y + p.y;
+    float t = clamp(global_y / max(output_height, 1.0), 0.0, 1.0);
+    vec3 mask_rgb = mix(grad_top, grad_bottom, t);
+    gl_FragColor = vec4(mask_rgb, mask_alpha * alpha);
+}
+";
 
 /// Renderer for every connected output on a single GPU.
 pub struct Renderer {
@@ -59,7 +106,13 @@ pub struct Renderer {
     cursor_x: f64,
     cursor_y: f64,
     /// Wallpaper drawn under the cursor on every output.
-    wallpaper: Wallpaper,
+    wallpaper: Fill,
+    /// Window border width + active / inactive fills.
+    border: BorderConfig,
+    /// Custom GLES pixel shader used to mask rounded corners.
+    /// `Arc`-backed so it's cheap to clone out before borrowing
+    /// the renderer for the frame.
+    rounded_shader: GlesPixelProgram,
     /// Origin used for the monotonic ms timestamp fed into
     /// `wl_callback.done` after each output is queued for scanout.
     /// Clients use this value to schedule their next frame's draw —
@@ -85,10 +138,15 @@ impl Renderer {
     /// per output. Outputs are placed left-to-right at `y=0` in the
     /// order the DRM layer enumerated them; the cursor is initialised
     /// at the centre of the first output so it's immediately visible.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear initialisation sequence (GBM device, EGL display, EGL context, GLES renderer, custom shader, GBM allocator, per-output GbmBufferedSurfaces). Splitting it forces threading several mid-construction values through extra functions for no real win."
+    )]
     pub fn new(
         drm_fd: DrmDeviceFd,
         drm_outputs: Vec<DrmOutput>,
-        wallpaper: Wallpaper,
+        wallpaper: Fill,
+        border: BorderConfig,
     ) -> Result<Self> {
         info!("phase: opening GBM device");
         let gbm_device = GbmDevice::new(drm_fd).context("GbmDevice::new failed")?;
@@ -119,8 +177,23 @@ impl Renderer {
                       crosses threads."
         )]
         // SAFETY: see #[allow].
-        let gles = unsafe { GlesRenderer::new(egl_context) }.context("GlesRenderer::new failed")?;
+        let mut gles =
+            unsafe { GlesRenderer::new(egl_context) }.context("GlesRenderer::new failed")?;
         info!("GLES renderer created");
+
+        info!("phase: compiling rounded-corner pixel shader");
+        let rounded_shader = gles
+            .compile_custom_pixel_shader(
+                ROUNDED_MASK_SHADER,
+                &[
+                    UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("grad_top", UniformType::_3f),
+                    UniformName::new("grad_bottom", UniformType::_3f),
+                    UniformName::new("output_height", UniformType::_1f),
+                    UniformName::new("cell_origin_y", UniformType::_1f),
+                ],
+            )
+            .context("rounded-corner shader compile failed")?;
 
         info!("phase: creating GBM allocator");
         let allocator = GbmAllocator::new(
@@ -200,6 +273,8 @@ impl Renderer {
             cursor_x,
             cursor_y,
             wallpaper,
+            border,
+            rounded_shader,
             start: Instant::now(),
         })
     }
@@ -221,11 +296,7 @@ impl Renderer {
     /// `placements` is the caller-snapshot of every visible window as
     /// `(wl_surface, top-left in absolute virtual-layout coords)`;
     /// the layout module owns positioning, the renderer just paints.
-    pub fn render_for_crtc(
-        &mut self,
-        crtc: crtc::Handle,
-        placements: &[(WlSurface, Point<i32, Physical>)],
-    ) -> Result<()> {
+    pub fn render_for_crtc(&mut self, crtc: crtc::Handle, placements: &[Placement]) -> Result<()> {
         let idx = self
             .outputs
             .iter()
@@ -263,21 +334,23 @@ impl Renderer {
         Rectangle::new(o.position, o.size)
     }
 
-    /// Render one output's frame: wallpaper, then every client
-    /// surface positioned in this output's local space, then the
+    /// Render one output's frame: wallpaper, then per window in
+    /// bottom-up draw order render its border + surface, then the
     /// cursor sprite on top if its hotspot falls in this output.
     /// Sends `wl_callback.done` on each surface after the buffer is
     /// queued so clients know they can draw the next frame.
-    fn render_output(
-        &mut self,
-        idx: usize,
-        placements: &[(WlSurface, Point<i32, Physical>)],
-    ) -> Result<()> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this is the per-output render loop — wallpaper, per-window border+surface+rounded-mask, cursor, queue, frame callbacks. Splitting any one piece out would require threading the dmabuf/frame borrow through another method, which adds more friction than length removes."
+    )]
+    fn render_output(&mut self, idx: usize, placements: &[Placement]) -> Result<()> {
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in.
         let cursor_x = self.cursor_x;
         let cursor_y = self.cursor_y;
         let wallpaper = self.wallpaper.clone();
+        let border = self.border.clone();
+        let rounded_shader = self.rounded_shader.clone();
         let output_size = self.outputs[idx].size;
         let output_pos = self.outputs[idx].position;
         let output_name = self.outputs[idx].name.clone();
@@ -314,21 +387,23 @@ impl Renderer {
         // owns its `TextureId`s, so it's free to outlive the
         // renderer borrow and be drawn during the frame below.
         //
-        // Per surface: absolute position → this output's local
+        // Per placement: the surface itself draws inside the cell,
+        // shrunk by `border` on every side. Cell -> output-local
         // coords by subtracting `output_pos`. Surfaces whose
         // bounding rect doesn't overlap the output get fully
         // clipped by the GLES viewport — no need to early-skip.
-        let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = placements
+        let bw = border.width.max(0);
+        let grouped: Vec<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> = placements
             .iter()
-            .flat_map(|(surface, abs_pos)| {
-                let local = Point::<i32, Physical>::from((
-                    abs_pos.x - output_pos.x,
-                    abs_pos.y - output_pos.y,
+            .map(|p| {
+                let surface_local = Point::<i32, Physical>::from((
+                    p.cell_rect.loc.x + bw - output_pos.x,
+                    p.cell_rect.loc.y + bw - output_pos.y,
                 ));
                 render_elements_from_surface_tree(
                     &mut self.gles,
-                    surface,
-                    local,
+                    &p.surface,
+                    surface_local,
                     1.0_f64,
                     1.0_f32,
                     Kind::Unspecified,
@@ -346,20 +421,47 @@ impl Renderer {
                 .render(&mut target, output_size, Transform::Normal)
                 .with_context(|| format!("GlesRenderer::render failed for {output_name}"))?;
 
-            draw_wallpaper(&mut frame, &wallpaper, output_size)?;
+            // Background fills first, then for each placement
+            // (bottom-up) the border frame followed by the surface,
+            // so that floating-window borders and surfaces end up
+            // visually above the tiled cells they overlap. Each
+            // window's `draw_render_elements` call carries just
+            // that window's elements — smithay's opaque-region
+            // culling can't accidentally skip floats behind
+            // earlier tiles when there's only ever one element in
+            // the slice.
+            draw_fill(&mut frame, &wallpaper, output_size, output_size)?;
 
-            // Full-output damage for 4b — we redraw everything every
-            // vblank. Per-element damage tracking is a later
-            // optimisation (matters more for partial-occlusion
-            // perf and battery, neither of which we care about yet).
             let full_damage = [Rectangle::<i32, Physical>::from_size(output_size)];
-            draw_render_elements::<GlesRenderer, _, _>(
-                &mut frame,
-                1.0_f64,
-                &surface_elements,
-                &full_damage,
-            )
-            .context("draw_render_elements failed")?;
+            let radius = border.rounded_corners.max(0);
+            for (p, elements) in placements.iter().zip(grouped.iter()) {
+                if bw > 0 {
+                    let fill = if p.focused {
+                        &border.active
+                    } else {
+                        &border.inactive
+                    };
+                    draw_border(&mut frame, p.cell_rect, output_pos, bw, fill, output_size)?;
+                }
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    1.0_f64,
+                    elements,
+                    &full_damage,
+                )
+                .context("draw_render_elements failed")?;
+                if radius > 0 {
+                    draw_rounded_corner_mask(
+                        &mut frame,
+                        &rounded_shader,
+                        p.cell_rect,
+                        output_pos,
+                        radius,
+                        &wallpaper,
+                        output_size,
+                    )?;
+                }
+            }
 
             if cursor_in_bounds {
                 #[allow(
@@ -390,35 +492,54 @@ impl Renderer {
             reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
         )]
         let elapsed_ms = self.start.elapsed().as_millis() as u32;
-        for (surface, _) in placements {
-            send_frame_callbacks(surface, elapsed_ms);
+        for p in placements {
+            send_frame_callbacks(&p.surface, elapsed_ms);
         }
         Ok(())
     }
 }
 
-/// Paint the wallpaper across the full output. `Solid` is one
-/// `draw_solid` call; `VerticalGradient` does 256 horizontal stripes
-/// with colours linearly interpolated between top and bottom — that
-/// many stripes keeps banding imperceptible on a 2160-px-tall display.
-/// On shorter outputs some stripes collapse to zero height and are
-/// skipped harmlessly.
-fn draw_wallpaper(
+/// Paint `fill` inside the output-local rect `rect`. `Solid` is
+/// one `draw_solid` call. `VerticalGradient` walks 256 horizontal
+/// stripes spanning the full output height (so the gradient stays
+/// continuous with the wallpaper even when only the border edges
+/// are being painted); each stripe is clipped to `rect` and
+/// skipped if it lies entirely outside, so border edges that
+/// only intersect a few stripes don't pay for the rest.
+fn draw_fill(
     frame: &mut GlesFrame<'_, '_>,
-    wallpaper: &Wallpaper,
+    fill: &Fill,
+    rect: Size<i32, Physical>,
     output_size: Size<i32, Physical>,
 ) -> Result<()> {
-    match wallpaper {
-        Wallpaper::Solid(rgb) => {
-            let dst = Rectangle::<i32, Physical>::from_size(output_size);
-            let damage = [Rectangle::from_size(output_size)];
+    draw_fill_rect(
+        frame,
+        fill,
+        Rectangle::<i32, Physical>::from_size(rect),
+        output_size,
+    )
+}
+
+fn draw_fill_rect(
+    frame: &mut GlesFrame<'_, '_>,
+    fill: &Fill,
+    rect: Rectangle<i32, Physical>,
+    output_size: Size<i32, Physical>,
+) -> Result<()> {
+    if rect.size.w <= 0 || rect.size.h <= 0 {
+        return Ok(());
+    }
+    match fill {
+        Fill::Solid(rgb) => {
+            let damage = [Rectangle::from_size(rect.size)];
             frame
-                .draw_solid(dst, &damage, Color32F::new(rgb[0], rgb[1], rgb[2], 1.0))
-                .context("Frame::draw_solid (wallpaper solid) failed")?;
+                .draw_solid(rect, &damage, Color32F::new(rgb[0], rgb[1], rgb[2], 1.0))
+                .context("Frame::draw_solid (fill solid) failed")?;
         }
-        Wallpaper::VerticalGradient { top, bottom } => {
+        Fill::VerticalGradient { top, bottom } => {
             const STRIPE_COUNT: i32 = 256;
-            let height = output_size.h;
+            let height = output_size.h.max(1);
+            let rect_y_end = rect.loc.y + rect.size.h;
             for stripe in 0u8..=u8::MAX {
                 let t = f32::from(stripe) / 255.0;
                 let color = Color32F::new(
@@ -429,23 +550,137 @@ fn draw_wallpaper(
                 );
 
                 let idx = i32::from(stripe);
-                let y_start = (idx * height) / STRIPE_COUNT;
-                let y_end = ((idx + 1) * height) / STRIPE_COUNT;
-                let stripe_h = y_end - y_start;
-                if stripe_h <= 0 {
+                let stripe_y_start = (idx * height) / STRIPE_COUNT;
+                let stripe_y_end = ((idx + 1) * height) / STRIPE_COUNT;
+                if stripe_y_end <= rect.loc.y || stripe_y_start >= rect_y_end {
+                    continue;
+                }
+                let clipped_y = stripe_y_start.max(rect.loc.y);
+                let clipped_h = stripe_y_end.min(rect_y_end) - clipped_y;
+                if clipped_h <= 0 {
                     continue;
                 }
 
                 let stripe_dst = Rectangle::<i32, Physical>::new(
-                    Point::from((0, y_start)),
-                    Size::new(output_size.w, stripe_h),
+                    Point::from((rect.loc.x, clipped_y)),
+                    Size::new(rect.size.w, clipped_h),
                 );
                 let damage = [Rectangle::from_size(stripe_dst.size)];
                 frame
                     .draw_solid(stripe_dst, &damage, color)
-                    .context("Frame::draw_solid (wallpaper stripe) failed")?;
+                    .context("Frame::draw_solid (fill stripe) failed")?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Mask a window's corners into a rounded shape by running the
+/// custom GLES pixel shader over the cell rect. The shader writes
+/// alpha = 1 with the wallpaper colour outside the rounded
+/// boundary and discards / writes alpha = 0 inside, so the
+/// already-drawn border + surface remain visible inside and the
+/// wallpaper colour appears in the corner cutouts. The
+/// `smoothstep` in the shader gives ~1 px of anti-aliasing along
+/// the curve.
+///
+/// Per-cell effective radius is clamped to half the cell's
+/// smaller dimension so two corners can never overlap on a tiny
+/// tile.
+///
+/// Trade-off: a floating window over a tile shows wallpaper (not
+/// the tile) at the rounded corners — the shader paints the mask
+/// colour rather than sampling whatever was underneath the
+/// surface. True transparency at corners needs per-window
+/// offscreen rendering, which is later polish.
+fn draw_rounded_corner_mask(
+    frame: &mut GlesFrame<'_, '_>,
+    shader: &GlesPixelProgram,
+    cell_rect: Rectangle<i32, Physical>,
+    output_pos: Point<i32, Physical>,
+    radius: i32,
+    wallpaper: &Fill,
+    output_size: Size<i32, Physical>,
+) -> Result<()> {
+    let r = radius.min(cell_rect.size.w / 2).min(cell_rect.size.h / 2);
+    if r <= 0 {
+        return Ok(());
+    }
+    let local_x = cell_rect.loc.x - output_pos.x;
+    let local_y = cell_rect.loc.y - output_pos.y;
+    let dest = Rectangle::<i32, Physical>::new(Point::new(local_x, local_y), cell_rect.size);
+    let (grad_top, grad_bottom) = match wallpaper {
+        Fill::Solid(rgb) => (*rgb, *rgb),
+        Fill::VerticalGradient { top, bottom } => (*top, *bottom),
+    };
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "radius and output_height are bounded by i32 cell / output sizes; fit f32 exactly for any realistic value"
+    )]
+    let uniforms = [
+        Uniform::new("radius", r as f32),
+        Uniform::new("grad_top", grad_top),
+        Uniform::new("grad_bottom", grad_bottom),
+        Uniform::new("output_height", output_size.h as f32),
+        Uniform::new("cell_origin_y", local_y as f32),
+    ];
+    // The source rect / sample size are unused by our shader (we
+    // don't sample any texture) but the API requires them; pass
+    // the cell size so the `size` uniform the shader does read
+    // ends up as the cell's pixel size.
+    let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(smithay::utils::Size::<
+        f64,
+        smithay::utils::Buffer,
+    >::from((
+        f64::from(cell_rect.size.w),
+        f64::from(cell_rect.size.h),
+    )));
+    let size = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((
+        cell_rect.size.w,
+        cell_rect.size.h,
+    ));
+    frame
+        .render_pixel_shader_to(shader, src, dest, size, None, 1.0, &uniforms)
+        .context("render_pixel_shader_to (rounded mask) failed")?;
+    Ok(())
+}
+
+/// Draw a window's border as four rectangles around the cell.
+/// `cell_rect` is in absolute virtual-layout coords; the four
+/// edges are converted to output-local by subtracting
+/// `output_pos`. Edge sizes that go negative (cell smaller than
+/// `2 * width`) are clamped and the affected edges no-op.
+fn draw_border(
+    frame: &mut GlesFrame<'_, '_>,
+    cell_rect: Rectangle<i32, Physical>,
+    output_pos: Point<i32, Physical>,
+    width: i32,
+    fill: &Fill,
+    output_size: Size<i32, Physical>,
+) -> Result<()> {
+    let local = Rectangle::<i32, Physical>::new(
+        Point::new(
+            cell_rect.loc.x - output_pos.x,
+            cell_rect.loc.y - output_pos.y,
+        ),
+        cell_rect.size,
+    );
+    let mid_h = (local.size.h - 2 * width).max(0);
+    let top = Rectangle::<i32, Physical>::new(local.loc, Size::new(local.size.w, width));
+    let bottom = Rectangle::<i32, Physical>::new(
+        Point::new(local.loc.x, local.loc.y + local.size.h - width),
+        Size::new(local.size.w, width),
+    );
+    let left = Rectangle::<i32, Physical>::new(
+        Point::new(local.loc.x, local.loc.y + width),
+        Size::new(width, mid_h),
+    );
+    let right = Rectangle::<i32, Physical>::new(
+        Point::new(local.loc.x + local.size.w - width, local.loc.y + width),
+        Size::new(width, mid_h),
+    );
+    for edge in [top, bottom, left, right] {
+        draw_fill_rect(frame, fill, edge, output_size)?;
     }
     Ok(())
 }

@@ -114,6 +114,17 @@ layout = {
     gaps_inner = 3,                       -- px between adjacent tile cells
 }
 
+border = {
+    width = 1,                            -- 0 disables
+    rounded_corners = 4,                  -- 0 disables
+    active = {
+        type = "vertical_gradient",
+        top    = { 0.55, 0.80, 1.00 },
+        bottom = { 0.30, 0.55, 0.95 },
+    },
+    inactive = { type = "solid", color = { 0.30, 0.30, 0.30 } },
+}
+
 -- Commands to spawn once the Wayland socket is listening. Each
 -- string is whitespace-split into program + args; children inherit
 -- $WAYLAND_DISPLAY so they connect to *our* compositor. For shell
@@ -202,6 +213,21 @@ as we add `Reload`, `Spawn`, `ChangeVt`, …
 | ------------- | ------- | ----- | ---------------------------------------------------------------------------------------------------- |
 | `gaps_outer`  | `8`     | ✅    | Pixels of empty space between the tile area and the screen edge. Wallpaper shows through. `>= 0`.    |
 | `gaps_inner`  | `3`     | ✅    | Pixels of empty space between adjacent tile cells. Centred on each split divider. `>= 0`.            |
+
+### border
+
+| Field             | Default                              | State | Notes                                                                                                                                              |
+| ----------------- | ------------------------------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `width`           | `1`                                  | ✅    | Border width in pixels around every window. `0` disables borders entirely. `>= 0`.                                                                 |
+| `active`          | bright blue gradient                 | ✅    | Fill drawn around the keyboard-focused window. Same `Solid` / `VerticalGradient` types as `misc.wallpaper`.                                        |
+| `inactive`        | `Solid([0.30, 0.30, 0.30])` (grey)   | ✅    | Fill drawn around every unfocused window.                                                                                                          |
+| `rounded_corners` | `4`                                  | ✅    | Corner radius in pixels. `0` disables. Per-window radius is clamped to half the cell's smaller dimension so corners never overlap on tiny tiles. |
+
+The client's surface is shrunk by `2 * width` per axis before
+configure so the buffer doesn't overlap the border. Rounded
+corners are masked with the wallpaper after the border + surface
+draw, so floats over tiles show wallpaper (not the tile) at the
+rounded corners — proper shader-based rounding is later polish.
 
 ## Keybindings
 

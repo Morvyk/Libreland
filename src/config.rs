@@ -57,6 +57,7 @@ pub struct Config {
     pub binds: BindsConfig,
     pub misc: MiscConfig,
     pub layout: LayoutConfig,
+    pub border: BorderConfig,
     /// Commands to spawn as children once the Wayland socket is
     /// listening. Each entry is whitespace-split into program +
     /// args; needs a shell wrapper (`"sh -c '…'"`) for shell
@@ -191,11 +192,30 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct MiscConfig {
     /// Background painted before any cursor / surface composition.
-    pub wallpaper: Wallpaper,
+    pub wallpaper: Fill,
 }
 
 #[derive(Debug, Clone)]
-pub enum Wallpaper {
+pub struct BorderConfig {
+    /// Border width in pixels around every window. `0` disables
+    /// borders entirely (no draw, no client-side shrinking).
+    pub width: i32,
+    /// Fill drawn around the keyboard-focused window.
+    pub active: Fill,
+    /// Fill drawn around every other window.
+    pub inactive: Fill,
+    /// Corner radius in pixels. `0` disables; non-zero values
+    /// mask each window's four corners with the wallpaper after
+    /// the border + surface are drawn, so the visible cell looks
+    /// rounded. Per-cell radius is clamped so it never exceeds
+    /// half the cell's smaller dimension.
+    pub rounded_corners: i32,
+}
+
+/// A paint pattern. Used for the wallpaper background and for
+/// active / inactive window borders.
+#[derive(Debug, Clone)]
+pub enum Fill {
     /// Single solid colour. RGB components in `[0.0, 1.0]`.
     Solid([f32; 3]),
     /// Vertical linear gradient from `top` at `y=0` to `bottom` at
@@ -234,7 +254,7 @@ impl Default for Config {
                 ],
             },
             misc: MiscConfig {
-                wallpaper: Wallpaper::VerticalGradient {
+                wallpaper: Fill::VerticalGradient {
                     top: [0.40, 0.60, 0.90],    // light sky blue
                     bottom: [0.10, 0.20, 0.50], // deep navy
                 },
@@ -242,6 +262,21 @@ impl Default for Config {
             layout: LayoutConfig {
                 gaps_outer: 8,
                 gaps_inner: 3,
+            },
+            border: BorderConfig {
+                width: 1,
+                // Active border keeps the wallpaper gradient
+                // family but brightens it noticeably so the
+                // frame stands out from the background.
+                active: Fill::VerticalGradient {
+                    top: [0.55, 0.80, 1.00],
+                    bottom: [0.30, 0.55, 0.95],
+                },
+                // Inactive: neutral medium grey so unfocused
+                // windows visibly de-emphasise without competing
+                // with the wallpaper.
+                inactive: Fill::Solid([0.30, 0.30, 0.30]),
+                rounded_corners: 4,
             },
             startup: Vec::new(),
         }
@@ -301,6 +336,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("layout")? {
             config.layout = parse_layout(&t, config.layout).context("layout")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("border")? {
+            config.border = parse_border(&t, config.border).context("border")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("startup")? {
             config.startup = parse_startup(&t).context("startup")?;
@@ -461,7 +499,7 @@ fn parse_action(name: &str) -> mlua::Result<Action> {
 fn parse_misc(t: &Table, defaults: MiscConfig) -> mlua::Result<MiscConfig> {
     let mut cfg = defaults;
     if let Some(w) = t.get::<Option<Table>>("wallpaper")? {
-        cfg.wallpaper = parse_wallpaper(&w).context("wallpaper")?;
+        cfg.wallpaper = parse_fill(&w).context("wallpaper")?;
     }
     Ok(cfg)
 }
@@ -483,7 +521,30 @@ fn parse_layout(t: &Table, defaults: LayoutConfig) -> mlua::Result<LayoutConfig>
     Ok(cfg)
 }
 
-fn parse_wallpaper(t: &Table) -> mlua::Result<Wallpaper> {
+fn parse_border(t: &Table, defaults: BorderConfig) -> mlua::Result<BorderConfig> {
+    let mut cfg = defaults;
+    if let Some(w) = t.get::<Option<i32>>("width")? {
+        if w < 0 {
+            lua_bail!("border.width {w} out of range; expected >= 0");
+        }
+        cfg.width = w;
+    }
+    if let Some(f) = t.get::<Option<Table>>("active")? {
+        cfg.active = parse_fill(&f).context("active")?;
+    }
+    if let Some(f) = t.get::<Option<Table>>("inactive")? {
+        cfg.inactive = parse_fill(&f).context("inactive")?;
+    }
+    if let Some(r) = t.get::<Option<i32>>("rounded_corners")? {
+        if r < 0 {
+            lua_bail!("border.rounded_corners {r} out of range; expected >= 0");
+        }
+        cfg.rounded_corners = r;
+    }
+    Ok(cfg)
+}
+
+fn parse_fill(t: &Table) -> mlua::Result<Fill> {
     let kind: String = t
         .get("type")
         .context("missing or invalid `type` (expected \"solid\" or \"vertical_gradient\")")?;
@@ -492,7 +553,7 @@ fn parse_wallpaper(t: &Table) -> mlua::Result<Wallpaper> {
             let color: Table = t
                 .get("color")
                 .context("`color` (expected {r, g, b} array of 3 numbers)")?;
-            Ok(Wallpaper::Solid(parse_rgb_triple(&color).context("color")?))
+            Ok(Fill::Solid(parse_rgb_triple(&color).context("color")?))
         }
         "vertical_gradient" => {
             let top: Table = t
@@ -501,15 +562,13 @@ fn parse_wallpaper(t: &Table) -> mlua::Result<Wallpaper> {
             let bottom: Table = t
                 .get("bottom")
                 .context("`bottom` (expected {r, g, b} array of 3 numbers)")?;
-            Ok(Wallpaper::VerticalGradient {
+            Ok(Fill::VerticalGradient {
                 top: parse_rgb_triple(&top).context("top")?,
                 bottom: parse_rgb_triple(&bottom).context("bottom")?,
             })
         }
         other => {
-            lua_bail!(
-                "unknown wallpaper type {other:?}; expected \"solid\" or \"vertical_gradient\""
-            )
+            lua_bail!("unknown fill type {other:?}; expected \"solid\" or \"vertical_gradient\"")
         }
     }
 }

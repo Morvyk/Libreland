@@ -88,6 +88,18 @@ pub struct Layout {
     in_transit: Option<InTransit>,
     bounds: Rectangle<i32, Physical>,
     gaps: Gaps,
+    border_width: i32,
+}
+
+/// One window + its current placement, as the renderer consumes
+/// it. `cell_rect` is the full cell the layout allocates; the
+/// renderer paints the border in `cell_rect` and the surface
+/// inside it (`cell_rect` shrunk by `border_width`).
+#[derive(Debug, Clone)]
+pub struct Placement {
+    pub surface: WlSurface,
+    pub cell_rect: Rectangle<i32, Physical>,
+    pub focused: bool,
 }
 
 /// Gap configuration. `outer` is empty space between the tile
@@ -122,13 +134,14 @@ enum SplitAxis {
 }
 
 impl Layout {
-    pub fn new(bounds: Rectangle<i32, Physical>, gaps: Gaps) -> Self {
+    pub fn new(bounds: Rectangle<i32, Physical>, gaps: Gaps, border_width: i32) -> Self {
         Self {
             tree: None,
             floating: Vec::new(),
             in_transit: None,
             bounds,
             gaps,
+            border_width: border_width.max(0),
         }
     }
 
@@ -212,7 +225,7 @@ impl Layout {
                     prev.loc.y + (prev.size.h - new_size.h) / 2,
                 );
                 window.rect = Rectangle::new(new_loc, new_size);
-                push_configure_for_floating(&window);
+                push_configure_for_floating(&window, self.border_width);
                 self.floating.push(window);
                 self.recompute_and_push();
                 return;
@@ -301,7 +314,7 @@ impl Layout {
             // it either drops onto a tile cell or rejoins the
             // float stack, so configure it as such (no Tiled*
             // states, free-form resize).
-            push_configure_for_floating(&t.window);
+            push_configure_for_floating(&t.window, self.border_width);
         }
     }
 
@@ -309,6 +322,7 @@ impl Layout {
     /// ship the corresponding configure. Silent no-op for surfaces
     /// that aren't currently floating.
     pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
+        let border = self.border_width;
         let Some(window) = self
             .floating
             .iter_mut()
@@ -317,7 +331,7 @@ impl Layout {
             return;
         };
         window.rect = rect;
-        push_configure_for_floating(window);
+        push_configure_for_floating(window, border);
     }
 
     /// Finish an interactive move drag at `cursor`.
@@ -345,33 +359,44 @@ impl Layout {
                 self.recompute_and_push();
             }
             DragSource::Floating => {
-                push_configure_for_floating(&t.window);
+                push_configure_for_floating(&t.window, self.border_width);
                 self.floating.push(t.window);
             }
         }
     }
 
-    /// Renderer snapshot: every visible window with its rect, in
-    /// **top-down** order — first entry is the topmost (drawn last,
-    /// occluding everything below). The renderer feeds this into
-    /// smithay's `draw_render_elements`, which expects top-down
-    /// (it accumulates opaque regions as it iterates and skips
-    /// elements fully hidden behind earlier ones; passing bottom-up
-    /// caused floating + in-transit windows to be culled behind
-    /// opaque tiles).
+    /// Renderer snapshot: every visible window with its cell rect
+    /// and a focused flag, in **bottom-up** draw order. The
+    /// renderer paints each placement individually (border then
+    /// surface) in this order, so floating windows draw on top
+    /// of tiles and the in-transit drag follower draws on top of
+    /// everything.
     ///
-    /// Order: in-transit (drag follow) → floating top-of-stack
-    /// downward → tiled leaves (which don't overlap each other).
-    pub fn placements(&self) -> Vec<(WlSurface, Rectangle<i32, Physical>)> {
+    /// Order: tiled leaves (which don't overlap each other) then
+    /// floating bottom-of-stack upward then in-transit (top).
+    ///
+    /// `focused` lets the caller mark which surface gets the
+    /// `active` border colour; the focus surface is owned by the
+    /// seat, not the layout, so it comes in as a parameter.
+    pub fn placements(&self, focused: Option<&WlSurface>) -> Vec<Placement> {
+        let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
         let mut out = Vec::new();
-        if let Some(t) = &self.in_transit {
-            out.push((t.window.toplevel.wl_surface().clone(), t.window.rect));
-        }
-        for w in self.floating.iter().rev() {
-            out.push((w.toplevel.wl_surface().clone(), w.rect));
-        }
         if let Some(tree) = &self.tree {
-            collect_placements(tree, &mut out);
+            collect_placements(tree, &is_focused, &mut out);
+        }
+        for w in &self.floating {
+            out.push(Placement {
+                surface: w.toplevel.wl_surface().clone(),
+                cell_rect: w.rect,
+                focused: is_focused(w.toplevel.wl_surface()),
+            });
+        }
+        if let Some(t) = &self.in_transit {
+            out.push(Placement {
+                surface: t.window.toplevel.wl_surface().clone(),
+                cell_rect: t.window.rect,
+                focused: is_focused(t.window.toplevel.wl_surface()),
+            });
         }
         out
     }
@@ -395,14 +420,15 @@ impl Layout {
     fn recompute_and_push(&mut self) {
         let tile_bounds = self.tile_bounds();
         let inner = self.gaps.inner;
+        let border = self.border_width;
         if let Some(tree) = &mut self.tree {
             assign_rects(tree, tile_bounds, inner);
         }
         if let Some(tree) = &self.tree {
-            push_configures_tree(tree);
+            push_configures_tree(tree, border);
         }
         for w in &self.floating {
-            push_configure_for_floating(w);
+            push_configure_for_floating(w, border);
         }
     }
 
@@ -416,6 +442,10 @@ impl Layout {
     #[allow(
         dead_code,
         reason = "the layer-shell handler that will call this lands in a separate milestone; the hook is committed now so the eventual change is a one-liner instead of also changing Layout's surface"
+    )]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "API takes owned for symmetry with Rectangle::new"
     )]
     pub fn set_bounds(&mut self, new_bounds: Rectangle<i32, Physical>) {
         if self.bounds == new_bounds {
@@ -607,13 +637,21 @@ fn assign_rects(node: &mut Node, bounds: Rectangle<i32, Physical>, inner: i32) {
     }
 }
 
-/// Walk the tree and emit `(wl_surface, rect)` for every leaf.
-fn collect_placements(node: &Node, out: &mut Vec<(WlSurface, Rectangle<i32, Physical>)>) {
+/// Walk the tree and emit a `Placement` for every leaf.
+fn collect_placements(
+    node: &Node,
+    is_focused: &impl Fn(&WlSurface) -> bool,
+    out: &mut Vec<Placement>,
+) {
     match node {
-        Node::Leaf(w) => out.push((w.toplevel.wl_surface().clone(), w.rect)),
+        Node::Leaf(w) => out.push(Placement {
+            surface: w.toplevel.wl_surface().clone(),
+            cell_rect: w.rect,
+            focused: is_focused(w.toplevel.wl_surface()),
+        }),
         Node::Split { first, second, .. } => {
-            collect_placements(first, out);
-            collect_placements(second, out);
+            collect_placements(first, is_focused, out);
+            collect_placements(second, is_focused, out);
         }
     }
 }
@@ -637,24 +675,36 @@ fn leaf_at(node: &Node, pos: Point<i32, Physical>) -> Option<&Window> {
 /// Bottom}` so that clients (notably kitty) treat the cell as a
 /// hard size to fill, without leaving margins for their own
 /// resize handles or rounding to a font grid.
-fn push_configures_tree(node: &Node) {
+fn push_configures_tree(node: &Node, border: i32) {
     match node {
-        Node::Leaf(w) => push_configure_for_tile(w),
+        Node::Leaf(w) => push_configure_for_tile(w, border),
         Node::Split { first, second, .. } => {
-            push_configures_tree(first);
-            push_configures_tree(second);
+            push_configures_tree(first, border);
+            push_configures_tree(second, border);
         }
     }
 }
 
-/// Configure a tiled window: send its assigned size, and set the
-/// activated + tiled-on-all-sides state set so the client fills
-/// the cell exactly. Each `TiledX` flag tells the client "the
-/// X edge is shared with the compositor / another window, so
-/// don't draw a resize handle or border on that side". A tiling
-/// WM cell is tiled on every side.
-fn push_configure_for_tile(w: &Window) {
-    let size = Size::<i32, Logical>::from((w.rect.size.w, w.rect.size.h));
+/// Shrink `cell_size` by `2 * border` on each axis (clamped to a
+/// minimum of `1` so we never ship a zero-size configure, which
+/// the client can't render) and return the result as a
+/// `Logical`-typed `Size` ready for `state.size`.
+fn surface_size(cell_size: Size<i32, Physical>, border: i32) -> Size<i32, Logical> {
+    let border = border.max(0);
+    Size::<i32, Logical>::from((
+        (cell_size.w - 2 * border).max(1),
+        (cell_size.h - 2 * border).max(1),
+    ))
+}
+
+/// Configure a tiled window: send the inside-border size, and
+/// set the activated + tiled-on-all-sides state set so the
+/// client fills the cell exactly. Each `TiledX` flag tells the
+/// client "the X edge is shared with the compositor / another
+/// window, so don't draw a resize handle or border on that side".
+/// A tiling WM cell is tiled on every side.
+fn push_configure_for_tile(w: &Window, border: i32) {
+    let size = surface_size(w.rect.size, border);
     w.toplevel.with_pending_state(|state| {
         state.size = Some(size);
         state.states.set(xdg_toplevel::State::Activated);
@@ -670,16 +720,17 @@ fn push_configure_for_tile(w: &Window) {
         y = w.rect.loc.y,
         w = w.rect.size.w,
         h = w.rect.size.h,
+        border,
         "layout: tile configure sent",
     );
 }
 
-/// Configure a floating (or in-transit) window: send the size,
-/// clear the Tiled* flags so the client knows it can resize
-/// freely, but still set Activated so the focused float doesn't
-/// dim or hide its content.
-fn push_configure_for_floating(w: &Window) {
-    let size = Size::<i32, Logical>::from((w.rect.size.w, w.rect.size.h));
+/// Configure a floating (or in-transit) window: send the inside-
+/// border size, clear the `Tiled*` flags so the client knows it
+/// can resize freely, but still set `Activated` so the focused
+/// float doesn't dim or hide its content.
+fn push_configure_for_floating(w: &Window, border: i32) {
+    let size = surface_size(w.rect.size, border);
     w.toplevel.with_pending_state(|state| {
         state.size = Some(size);
         state.states.set(xdg_toplevel::State::Activated);
@@ -695,6 +746,7 @@ fn push_configure_for_floating(w: &Window) {
         y = w.rect.loc.y,
         w = w.rect.size.w,
         h = w.rect.size.h,
+        border,
         "layout: floating configure sent",
     );
 }
