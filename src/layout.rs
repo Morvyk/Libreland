@@ -86,6 +86,19 @@ impl Layout {
         &self.tiled
     }
 
+    /// Find the topmost window whose rect contains `pos`. Tiled
+    /// cells don't overlap, so iteration order doesn't change the
+    /// result today; reverse-iterating is forward-compatible with
+    /// the floating-mode stack order that lands in 4d.3.
+    pub fn window_at(&self, pos: Point<i32, Physical>) -> Option<&TiledWindow> {
+        self.tiled.iter().rev().find(|w| {
+            pos.x >= w.rect.loc.x
+                && pos.x < w.rect.loc.x + w.rect.size.w
+                && pos.y >= w.rect.loc.y
+                && pos.y < w.rect.loc.y + w.rect.size.h
+        })
+    }
+
     /// Walk every tiled window in order and assign rects using the
     /// dwindle rule: a "current cell" starts at `bounds`; each
     /// non-final window takes half of the current cell along the

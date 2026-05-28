@@ -211,27 +211,46 @@ impl State {
     }
 
     /// Forward the current cursor location to the focused client as
-    /// a `wl_pointer.motion` event (plus enter/leave handled by
-    /// smithay if focus changed). 4c pins every toplevel at the
-    /// origin, so focus = first live toplevel and surface-local
-    /// coordinates equal compositor-space coordinates; 4d will pick
-    /// focus via hit-testing and translate per window position.
+    /// a `wl_pointer.motion` event (smithay generates enter/leave
+    /// when the focus surface changes). Hit-tests the layout to
+    /// pick the surface under the cursor; in `FocusModel::Hover` the
+    /// same surface also takes keyboard focus, but only on actual
+    /// change so we don't flood `wl_keyboard.enter` /
+    /// `wl_keyboard.leave` on every motion event.
     fn forward_pointer_motion(&mut self, time: u32) {
         let (cx, cy) = self.renderer.cursor_pos();
         let location = Point::<f64, Logical>::from((cx, cy));
-        let focus = self.xdg_shell_state.toplevel_surfaces().first().map(|t| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+        )]
+        let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+
+        // Snapshot the hit surface + its top-left into owned values
+        // so the layout borrow ends before the mut-borrow on self
+        // (via kbd.set_focus / pointer.motion).
+        let hit = self.layout.window_at(cursor_i).map(|w| {
             (
-                t.wl_surface().clone(),
-                Point::<f64, Logical>::from((0.0, 0.0)),
+                w.toplevel.wl_surface().clone(),
+                Point::<f64, Logical>::from((f64::from(w.rect.loc.x), f64::from(w.rect.loc.y))),
             )
         });
+        let kbd_target = hit.as_ref().map(|(surface, _)| surface.clone());
+
+        if matches!(self.config.input.focus_model, config::FocusModel::Hover)
+            && let Some(kbd) = self.seat.get_keyboard()
+            && kbd.current_focus() != kbd_target
+        {
+            kbd.set_focus(self, kbd_target, SERIAL_COUNTER.next_serial());
+        }
+
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
         pointer.motion(
             self,
-            focus,
+            hit,
             &MotionEvent {
                 location,
                 serial,
@@ -243,13 +262,36 @@ impl State {
 
     /// Forward a pointer button press/release to the focused client.
     /// `button` is the raw evdev button code (`BTN_LEFT = 0x110`, …)
-    /// which is exactly what `wl_pointer.button` carries.
+    /// which is exactly what `wl_pointer.button` carries. In
+    /// `FocusModel::Click` a *press* also promotes the surface under
+    /// the cursor to keyboard focus before the button event is sent,
+    /// so the focused client sees its first key as expected.
     fn forward_pointer_button(
         &mut self,
         button: u32,
         state: smithay::backend::input::ButtonState,
         time: u32,
     ) {
+        if matches!(state, smithay::backend::input::ButtonState::Pressed)
+            && matches!(self.config.input.focus_model, config::FocusModel::Click)
+        {
+            let (cx, cy) = self.renderer.cursor_pos();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+            )]
+            let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+            let target = self
+                .layout
+                .window_at(cursor_i)
+                .map(|w| w.toplevel.wl_surface().clone());
+            if let Some(kbd) = self.seat.get_keyboard()
+                && kbd.current_focus() != target
+            {
+                kbd.set_focus(self, target, SERIAL_COUNTER.next_serial());
+            }
+        }
+
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };

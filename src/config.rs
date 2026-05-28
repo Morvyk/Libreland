@@ -120,6 +120,11 @@ pub struct InputConfig {
     /// is the device's neutral position; with [`AccelProfile::Flat`]
     /// this also means "no extra sensitivity multiplier".
     pub mouse_accel_speed: f64,
+    /// Which surface receives keyboard focus when the pointer moves
+    /// or a button is pressed. [`FocusModel::Hover`] is the default
+    /// (focus follows the surface under the cursor on every motion
+    /// event); [`FocusModel::Click`] only refocuses on press.
+    pub focus_model: FocusModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +133,16 @@ pub enum AccelProfile {
     Flat,
     /// libinput's adaptive curve (the system default).
     Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusModel {
+    /// Keyboard focus follows the surface under the cursor on every
+    /// pointer motion event. The default.
+    Hover,
+    /// Keyboard focus only changes when the user presses a pointer
+    /// button on a surface.
+    Click,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +196,7 @@ impl Default for Config {
                 keyboard_layout: String::new(),
                 mouse_accel_profile: AccelProfile::Flat,
                 mouse_accel_speed: 0.0,
+                focus_model: FocusModel::Hover,
             },
             binds: BindsConfig {
                 // Single default binding: Super+Shift+E exits.
@@ -331,6 +347,13 @@ fn parse_input(t: &Table, defaults: InputConfig) -> mlua::Result<InputConfig> {
             lua_bail!("mouse_accel_speed {speed} out of range; expected [-1.0, 1.0]");
         }
         cfg.mouse_accel_speed = speed;
+    }
+    if let Some(model) = t.get::<Option<String>>("focus_model")? {
+        cfg.focus_model = match model.to_lowercase().as_str() {
+            "hover" => FocusModel::Hover,
+            "click" => FocusModel::Click,
+            other => lua_bail!("unknown focus_model {other:?}; expected \"hover\" or \"click\""),
+        };
     }
     Ok(cfg)
 }

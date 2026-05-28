@@ -38,10 +38,11 @@ Pre-alpha. Each `cargo run` currently:
    including modifier tracking — through `wl_keyboard.key` /
    `wl_keyboard.modifiers`. Compositor-level hotkeys (see
    `config.binds`) are filtered out of forwarding so e.g. typing in
-   a focused client can't accidentally trigger them. The most
-   recently mapped toplevel takes keyboard focus; clicks don't yet
-   shift focus, and every window stacks at `(0, 0)` — proper window
-   placement / focus / stacking lands in **4d**.
+   a focused client can't accidentally trigger them. Pointer focus
+   is set by hit-testing the layout each motion; keyboard focus
+   follows the [`input.focus_model`](#input) (`"hover"` by default,
+   `"click"` available). Newly mapped windows take focus on map in
+   either model.
 8. Sits in the calloop event loop until an `Exit` action runs.
 
 All user-tunable behaviour lives in a single `Config` struct (see
@@ -90,6 +91,7 @@ input = {
     keyboard_layout = "",                 -- "" defers to $XKB_DEFAULT_LAYOUT
     mouse_accel_profile = "flat",         -- "flat" or "adaptive"
     mouse_accel_speed = 0.0,              -- [-1.0, 1.0]
+    focus_model = "hover",                -- "hover" or "click"
 }
 
 binds = {
@@ -165,6 +167,7 @@ the runtime today (✅) or just held in `Config` for a later consumer
 | `keyboard_layout`      | `""`     | ✅                               | xkb RMLVO layout. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default.                  |
 | `mouse_accel_profile`  | `"flat"` | ✅ (applied per pointer device)  | `"flat"` (1:1, no ramp) or `"adaptive"` (libinput's curve, system default).                |
 | `mouse_accel_speed`    | `0.0`    | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `"flat"` this is "no extra sensitivity". |
+| `focus_model`          | `"hover"`| ✅                               | `"hover"`: keyboard focus follows the surface under the cursor on every motion event. `"click"`: focus only changes on a pointer-button press. New windows take focus on map either way. |
 
 ### binds
 
