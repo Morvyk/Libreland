@@ -1330,7 +1330,7 @@ impl State {
         smithay::utils::Point<f64, smithay::utils::Logical>,
     )> {
         let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
-        let placements = self.layout.placements(focused.as_ref());
+        let placements = self.layout.placements(focused.as_ref(), None);
         let layers = self.snapshot_layer_placements();
         let popups = self.snapshot_popup_placements(&placements, &layers);
         popups.iter().rev().find_map(|pp| {
@@ -1362,7 +1362,7 @@ impl State {
         use smithay::desktop::PopupManager;
         let mut roots: Vec<WlSurface> = self
             .layout
-            .placements(None)
+            .placements(None, None)
             .into_iter()
             .map(|p| p.surface)
             .collect();
@@ -2704,7 +2704,14 @@ fn wire_event_sources(
                         .seat
                         .get_keyboard()
                         .and_then(|k| k.current_focus());
-                    let placements = data.state.layout.placements(focused.as_ref());
+                    // Workspace slide spec (None when disabled). Clear
+                    // finished slides, then emit (both workspaces during
+                    // one, the active one otherwise).
+                    let ws_anim = data.state.config.animations.workspace;
+                    let slide = (data.state.config.animations.enabled && ws_anim.enabled)
+                        .then_some(ws_anim);
+                    data.state.layout.tick_transitions(slide);
+                    let placements = data.state.layout.placements(focused.as_ref(), slide);
                     let layer_placements = data.state.snapshot_layer_placements();
                     let popup_placements = data
                         .state

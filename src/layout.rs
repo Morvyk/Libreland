@@ -54,12 +54,16 @@
 //! composites (so `HiDPI` works) and ships the same values as the
 //! `Logical`-typed `xdg_toplevel.configure` size.
 
+use std::time::Instant;
+
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use tracing::debug;
+
+use crate::config::AnimSpec;
 
 /// How a window fills its output. `Maximized` and `Fullscreen` both
 /// cover the window's whole output with no border or rounded corners
@@ -153,6 +157,23 @@ struct Outpane {
     bounds: Rectangle<i32, Physical>,
     workspaces: Vec<Workspace>,
     active: usize,
+    /// In-flight workspace switch animation, if any. Holds a *snapshot*
+    /// of the outgoing workspace's placements (immune to the workspace
+    /// reindexing `normalize_output` does on switch) plus the direction
+    /// and start time, so the slide can render both workspaces.
+    transition: Option<WsTransition>,
+}
+
+/// A workspace-switch slide in progress on one output.
+struct WsTransition {
+    /// Outgoing workspace's placements, captured at switch time.
+    from: Vec<Placement>,
+    /// Slide direction: `+1` slides everything down (incoming from the
+    /// top), `-1` slides up (incoming from the bottom). Switching to the
+    /// next workspace slides up; to the previous, down.
+    dir: i32,
+    /// When the slide began.
+    start: Instant,
 }
 
 /// The two rects a fill mode can target: `full` (entire output, for
@@ -188,6 +209,7 @@ impl Outpane {
             // window lands on it.
             workspaces: vec![Workspace::default()],
             active: 0,
+            transition: None,
         }
     }
 
@@ -226,6 +248,12 @@ pub struct Placement {
     /// for non-`Normal` placements and draws them in a higher z-bucket
     /// (maximized above windows, fullscreen above panels too).
     pub fill: FillMode,
+    /// Extra vertical offset (compositor px) the renderer adds *after*
+    /// per-window animation, used for the workspace slide so both the
+    /// outgoing and incoming workspaces translate together without
+    /// disturbing each window's own move animation (`cell_rect` stays
+    /// the settled target). `0` outside a workspace transition.
+    pub slide_dy: i32,
 }
 
 /// Gap configuration. `outer` is empty space between the tile
@@ -659,31 +687,38 @@ impl Layout {
     /// `focused` lets the caller mark which surface gets the
     /// `active` border colour; the focus surface is owned by the
     /// seat, not the layout, so it comes in as a parameter.
-    pub fn placements(&self, focused: Option<&WlSurface>) -> Vec<Placement> {
+    pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<AnimSpec>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
         let mut out = Vec::new();
-        // Only the active workspace of each output is visible.
+        // Only the active workspace of each output is visible — except
+        // mid workspace-switch, where the outgoing (captured) and
+        // incoming workspaces are both emitted, translated vertically.
         for op in &self.outputs {
             let area = op.area();
-            let ws = &op.workspaces[op.active];
-            if let Some(tree) = &ws.tree {
-                collect_placements(tree, &is_focused, area, &mut out);
-            }
-            for w in &ws.floating {
-                let surface = w.toplevel.wl_surface();
-                out.push(Placement {
-                    surface: surface.clone(),
-                    // A maximized float covers the work area, a
-                    // fullscreen one the whole output; both ignore the
-                    // floating rect.
-                    cell_rect: if w.fill == FillMode::Normal {
-                        w.rect
-                    } else {
-                        area.fill(w.fill)
-                    },
-                    focused: is_focused(surface),
-                    fill: w.fill,
-                });
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slide offset = small fraction × output height (i32), well within range"
+            )]
+            if let (Some(t), Some(spec)) = (op.transition.as_ref(), slide)
+                && let Some(p) = transition_eased(t, spec)
+            {
+                let h = f64::from(op.full.size.h);
+                let off_from = (f64::from(t.dir) * p * h).round() as i32;
+                let off_to = (f64::from(-t.dir) * (1.0 - p) * h).round() as i32;
+                for fp in &t.from {
+                    out.push(Placement {
+                        slide_dy: off_from,
+                        focused: false, // the outgoing workspace isn't focused
+                        ..fp.clone()
+                    });
+                }
+                let base = out.len();
+                collect_workspace(&op.workspaces[op.active], &is_focused, area, &mut out);
+                for q in &mut out[base..] {
+                    q.slide_dy = off_to;
+                }
+            } else {
+                collect_workspace(&op.workspaces[op.active], &is_focused, area, &mut out);
             }
         }
         if let Some(t) = &self.in_transit {
@@ -693,9 +728,26 @@ impl Layout {
                 cell_rect: t.window.rect,
                 focused: is_focused(surface),
                 fill: t.window.fill,
+                slide_dy: 0,
             });
         }
         out
+    }
+
+    /// Clear workspace-switch transitions that have finished (or that
+    /// can't run because the slide is disabled), freeing their captured
+    /// snapshots. Call once per frame before [`Self::placements`].
+    pub fn tick_transitions(&mut self, slide: Option<AnimSpec>) {
+        for op in &mut self.outputs {
+            let done = match (op.transition.as_ref(), slide) {
+                (Some(t), Some(spec)) => transition_eased(t, spec).is_none(),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if done {
+                op.transition = None;
+            }
+        }
     }
 
     /// Hit-test the topmost window at `pos`, returning it together
@@ -954,6 +1006,24 @@ impl Layout {
         if target == self.outputs[oi].active {
             return false;
         }
+        // Snapshot the outgoing workspace for the slide animation before
+        // `active` moves (and before `normalize_output` may reindex the
+        // workspace list, which would invalidate a stored index).
+        let area = self.outputs[oi].area();
+        let mut from = Vec::new();
+        collect_workspace(
+            &self.outputs[oi].workspaces[self.outputs[oi].active],
+            &|_| false,
+            area,
+            &mut from,
+        );
+        self.outputs[oi].transition = Some(WsTransition {
+            from,
+            // Next workspace slides up (incoming from the bottom),
+            // previous slides down — the natural scroll mapping.
+            dir: -delta.signum(),
+            start: Instant::now(),
+        });
         self.outputs[oi].active = target;
         self.normalize_output(oi);
         self.recompute_and_push();
@@ -1295,6 +1365,7 @@ fn collect_placements(
                 },
                 focused: is_focused(surface),
                 fill: w.fill,
+                slide_dy: 0,
             });
         }
         Node::Split { first, second, .. } => {
@@ -1302,6 +1373,46 @@ fn collect_placements(
             collect_placements(second, is_focused, area, out);
         }
     }
+}
+
+/// Build one workspace's placements: the tiled tree, then floating
+/// windows bottom-up (drawn above the tiles they overlap).
+fn collect_workspace(
+    ws: &Workspace,
+    is_focused: &impl Fn(&WlSurface) -> bool,
+    area: OutputArea,
+    out: &mut Vec<Placement>,
+) {
+    if let Some(tree) = &ws.tree {
+        collect_placements(tree, is_focused, area, out);
+    }
+    for w in &ws.floating {
+        let surface = w.toplevel.wl_surface();
+        out.push(Placement {
+            surface: surface.clone(),
+            // A maximized float covers the work area, a fullscreen one
+            // the whole output; both ignore the floating rect.
+            cell_rect: if w.fill == FillMode::Normal {
+                w.rect
+            } else {
+                area.fill(w.fill)
+            },
+            focused: is_focused(surface),
+            fill: w.fill,
+            slide_dy: 0,
+        });
+    }
+}
+
+/// Eased progress `[0, 1)` of a workspace slide, or `None` once it has
+/// run its course (so the caller emits only the active workspace).
+fn transition_eased(t: &WsTransition, spec: AnimSpec) -> Option<f64> {
+    let dur = spec.duration_secs();
+    let elapsed = t.start.elapsed().as_secs_f64();
+    if dur <= 0.0 || elapsed >= dur {
+        return None;
+    }
+    Some(spec.curve.eval(elapsed / dur))
 }
 
 /// Walk the tree, find the leaf containing `pos`, return it.

@@ -1184,6 +1184,10 @@ impl Renderer {
                     entry.open_anim = None;
                 }
             }
+            // Workspace slide: a uniform vertical offset applied *after*
+            // the per-window animation (so it doesn't perturb move/open),
+            // translating the whole workspace during a switch.
+            effective.loc.y += p.slide_dy;
             draws.push(WinDraw { effective, alpha });
         }
 
