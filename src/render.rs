@@ -27,11 +27,13 @@ use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
 use smithay::backend::renderer::gles::{
-    GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexture, Uniform, UniformName, UniformType,
+    GlesFrame, GlesPixelProgram, GlesRenderer, GlesTarget, GlesTexture, Uniform, UniformName,
+    UniformType,
 };
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
-    Bind as _, Color32F, Frame as _, ImportDma as _, ImportMem as _, Renderer as _, Texture as _,
+    Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
+    Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
 };
 use smithay::reexports::drm::control::crtc;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -40,7 +42,7 @@ use smithay::wayland::compositor::{
     SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
 use smithay::wayland::shell::xdg::SurfaceCachedState;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::{BorderConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
@@ -75,6 +77,52 @@ pub struct PopupPlacement {
     pub surface: WlSurface,
     pub buffer_origin: Point<i32, Physical>,
     pub rect: Rectangle<i32, Physical>,
+}
+
+/// Where a `zwlr_screencopy` capture writes its pixels.
+#[derive(Debug)]
+pub enum CaptureTarget {
+    /// CPU read-back; the bytes come back in [`CaptureOutcome::Shm`] for
+    /// the caller to copy into the client's `wl_shm` buffer.
+    Shm,
+    /// Zero-copy GPU path: blit the composited framebuffer straight into
+    /// this client-provided dmabuf. Nothing comes back — it's filled.
+    Dmabuf(Dmabuf),
+}
+
+/// One pending `zwlr_screencopy` capture for the output being
+/// rendered, in physical/buffer pixels.
+#[derive(Debug)]
+pub struct CaptureSpec {
+    pub region: Rectangle<i32, Physical>,
+    pub fourcc: Fourcc,
+    pub target: CaptureTarget,
+}
+
+/// Result of servicing one [`CaptureSpec`]. Both paths deliver the
+/// client an upright (top-down) buffer so we never set the screencopy
+/// `y_invert` flag: xdg-desktop-portal-wlr 0.8.2 never implemented
+/// `y_invert` handling and self-destructs on the flag (it hits an
+/// unimplemented stub that frees the cast instance, then double-frees
+/// during teardown → SIGSEGV). `flipped` on `Shm` only tells the writer
+/// whether the read-back rows need reversing into the client buffer.
+#[derive(Debug)]
+pub enum CaptureOutcome {
+    /// CPU read-back: a tight buffer (`width * 4` bytes/row). `flipped`
+    /// means the rows are bottom-up (GL origin) and must be reversed
+    /// when written to the client buffer.
+    Shm {
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        flipped: bool,
+    },
+    /// The client's dmabuf was filled directly by a GPU blit, already
+    /// upright (the blit copies GL→GL coordinates, so memory-row 0 is
+    /// the top of the image — no `y_invert` needed).
+    Dmabuf,
+    /// Capture failed; the caller fails the frame.
+    Failed,
 }
 
 /// Renderer-side mirror of `smithay::wayland::shell::wlr_layer::Layer`.
@@ -545,10 +593,29 @@ impl Renderer {
     /// an empty placement slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
-            self.render_output(idx, &[], &[], &[], false)
+            self.render_output(idx, &[], &[], &[], false, &[])
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
+    }
+
+    /// Full physical (framebuffer) size of the output named `name`,
+    /// used by screencopy to tell a client what buffer to allocate.
+    pub fn output_mode_size(&self, name: &str) -> Option<Size<i32, Physical>> {
+        self.outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.mode_size)
+    }
+
+    /// Connector name of the output driven by `crtc`, so the vblank
+    /// path can match pending screencopy captures to the output it is
+    /// about to render.
+    pub fn output_name_for_crtc(&self, crtc: crtc::Handle) -> Option<String> {
+        self.outputs
+            .iter()
+            .find(|o| o.crtc == crtc)
+            .map(|o| o.name.clone())
     }
 
     /// Clamp the cursor hotspot into `rect`. Used while a
@@ -587,13 +654,14 @@ impl Renderer {
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
         hide_cursor: bool,
-    ) -> Result<()> {
+        captures: &[CaptureSpec],
+    ) -> Result<Vec<CaptureOutcome>> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx, placements, layers, popups, hide_cursor)
+        self.render_output(idx, placements, layers, popups, hide_cursor, captures)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -639,6 +707,16 @@ impl Renderer {
             .collect()
     }
 
+    /// The compositor rect (absolute pixels) of a named output, or
+    /// `None` if no connector by that name is present. Used to place a
+    /// `wlr_layer_shell` surface on the output it asked for.
+    pub fn output_rect(&self, name: &str) -> Option<Rectangle<i32, Physical>> {
+        self.outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| Rectangle::new(o.compositor_position, o.compositor_size))
+    }
+
     /// Connector name of the primary output. Used by the layer-shell
     /// reflow to attribute exclusive zones to the primary by name.
     pub fn primary_output_name(&self) -> &str {
@@ -663,6 +741,19 @@ impl Renderer {
     /// render blank.
     pub fn dmabuf_formats(&self) -> Vec<Format> {
         self.gles.dmabuf_formats().into_iter().collect()
+    }
+
+    /// Whether the renderer can bind a dmabuf of `format` as a *render
+    /// target* (the subset of formats we can draw/blit *into*, which is
+    /// smaller than the texture-import set). Screencopy's GPU path
+    /// blits into the client's dmabuf, so it must be render-capable;
+    /// otherwise we fall back to the shm path. NVIDIA in particular has
+    /// a narrower render set than texture set.
+    pub fn can_render_to(&self, format: Format) -> bool {
+        self.gles
+            .egl_context()
+            .dmabuf_render_formats()
+            .contains(&format)
     }
 
     /// The render `DrmNode` backing our EGL context, used as the
@@ -728,7 +819,8 @@ impl Renderer {
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
         hide_cursor: bool,
-    ) -> Result<()> {
+        captures: &[CaptureSpec],
+    ) -> Result<Vec<CaptureOutcome>> {
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in. All
         // *_phys helpers below take pre-scaled physical pixel
@@ -883,11 +975,11 @@ impl Renderer {
             })
             .collect();
 
+        let mut target = self
+            .gles
+            .bind(&mut dmabuf)
+            .with_context(|| format!("GlesRenderer::bind failed for {output_name}"))?;
         let sync = {
-            let mut target = self
-                .gles
-                .bind(&mut dmabuf)
-                .with_context(|| format!("GlesRenderer::bind failed for {output_name}"))?;
             let mut frame = self
                 .gles
                 .render(&mut target, mode_size, Transform::Normal)
@@ -1064,6 +1156,31 @@ impl Renderer {
             frame.finish().context("Frame::finish failed")?
         };
 
+        // Service pending screencopy captures off the freshly
+        // composited framebuffer. `frame` is finished (so it no longer
+        // borrows the renderer) but `target` is still bound, which is
+        // exactly what `copy_framebuffer` needs. Pixels go back to the
+        // caller, which writes them into client buffers + signals the
+        // frames. Done before `queue_buffer` so we read the buffer
+        // while it's unambiguously ours.
+        let capture_results: Vec<CaptureOutcome> = captures
+            .iter()
+            .map(|spec| match &spec.target {
+                CaptureTarget::Shm => {
+                    capture_shm(&mut self.gles, &target, spec, mode_size.h, &output_name)
+                }
+                CaptureTarget::Dmabuf(client) => capture_dmabuf(
+                    &mut self.gles,
+                    &target,
+                    client,
+                    spec,
+                    mode_size.h,
+                    &output_name,
+                ),
+            })
+            .collect();
+        drop(target);
+
         self.outputs[idx]
             .surface
             .queue_buffer(Some(sync), None, ())
@@ -1089,7 +1206,89 @@ impl Renderer {
         for p in popups {
             send_frame_callbacks(&p.surface, elapsed_ms);
         }
-        Ok(())
+        Ok(capture_results)
+    }
+}
+
+/// Convert a screencopy region (top-left origin) to the bottom-left
+/// origin both `glReadPixels` and `glBlitFramebuffer` read from, so a
+/// partial region (`grim -g`) reads the band the client asked for. A
+/// full-output capture is unchanged (loc.y 0, full height -> 0).
+fn region_gl(spec: &CaptureSpec, fb_height: i32) -> Rectangle<i32, Physical> {
+    let gl_y = fb_height - spec.region.loc.y - spec.region.size.h;
+    Rectangle::new(
+        (spec.region.loc.x, gl_y).into(),
+        (spec.region.size.w, spec.region.size.h).into(),
+    )
+}
+
+/// CPU read-back: copy `spec.region` of `target` into a tight buffer.
+fn capture_shm(
+    gles: &mut GlesRenderer,
+    target: &GlesTarget<'_>,
+    spec: &CaptureSpec,
+    fb_height: i32,
+    output_name: &str,
+) -> CaptureOutcome {
+    let gl = region_gl(spec, fb_height);
+    let region = Rectangle::<i32, smithay::utils::Buffer>::new(
+        (gl.loc.x, gl.loc.y).into(),
+        (gl.size.w, gl.size.h).into(),
+    );
+    let mapping = match gles.copy_framebuffer(target, region, spec.fourcc) {
+        Ok(mapping) => mapping,
+        Err(err) => {
+            warn!(error = %err, output = %output_name, "screencopy: copy_framebuffer failed");
+            return CaptureOutcome::Failed;
+        }
+    };
+    // Rows come back bottom-up (GL origin); `write_to_shm` reverses them
+    // into the client buffer so the delivered frame is upright.
+    let flipped = mapping.flipped();
+    let (width, height) = (mapping.width(), mapping.height());
+    match gles.map_texture(&mapping) {
+        Ok(bytes) => CaptureOutcome::Shm {
+            bytes: bytes.to_vec(),
+            width,
+            height,
+            flipped,
+        },
+        Err(err) => {
+            warn!(error = %err, output = %output_name, "screencopy: map_texture failed");
+            CaptureOutcome::Failed
+        }
+    }
+}
+
+/// Zero-copy GPU path: bind the client's dmabuf as a framebuffer and
+/// blit `spec.region` of the composited output into it. The blit copies
+/// GL→GL coordinates; our output framebuffer and the client's dmabuf
+/// both map GL `(0,0)` to the bottom of the image, so the result lands
+/// upright in memory (row 0 = top) — no `y_invert` flag needed.
+fn capture_dmabuf(
+    gles: &mut GlesRenderer,
+    target: &GlesTarget<'_>,
+    client: &Dmabuf,
+    spec: &CaptureSpec,
+    fb_height: i32,
+    output_name: &str,
+) -> CaptureOutcome {
+    let mut client = client.clone();
+    let mut dst = match gles.bind(&mut client) {
+        Ok(dst) => dst,
+        Err(err) => {
+            warn!(error = %err, output = %output_name, "screencopy: bind client dmabuf failed");
+            return CaptureOutcome::Failed;
+        }
+    };
+    let src = region_gl(spec, fb_height);
+    let dst_rect = Rectangle::<i32, Physical>::from_size(spec.region.size);
+    match gles.blit(target, &mut dst, src, dst_rect, TextureFilter::Linear) {
+        Ok(()) => CaptureOutcome::Dmabuf,
+        Err(err) => {
+            warn!(error = %err, output = %output_name, "screencopy: blit to client dmabuf failed");
+            CaptureOutcome::Failed
+        }
     }
 }
 

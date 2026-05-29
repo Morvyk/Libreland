@@ -163,6 +163,9 @@ pub struct WaylandInit {
     /// `zwp_primary_selection_v1` — the primary (middle-click) selection.
     /// Held so the global stays alive.
     pub primary_selection_state: PrimarySelectionState,
+    /// `zwlr_screencopy_manager_v1` — output capture for screenshots
+    /// and screen sharing. Held so the global stays alive.
+    pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -262,6 +265,9 @@ pub fn init(
     // (see crate::clipboard) so a copied buffer survives the source app
     // exiting.
     let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
+    // zwlr_screencopy_manager_v1: lets grim / xdg-desktop-portal-wlr
+    // capture outputs for screenshots and screen sharing.
+    let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -351,6 +357,7 @@ pub fn init(
         relative_pointer_state,
         pointer_constraints_state,
         primary_selection_state,
+        screencopy_manager,
         popup_manager,
         outputs,
         preferred_scale,
@@ -459,6 +466,17 @@ fn maybe_handle_layer_commit(state: &mut State, surface: &WlSurface) {
         return;
     };
     if kbd.current_focus().as_ref() == Some(surface) {
+        return;
+    }
+    // Don't fight a *sibling* exclusive layer for the keyboard. slurp
+    // maps one exclusive Overlay surface per output and grabs the
+    // keyboard on each; without this guard every per-frame commit would
+    // steal focus back from the other surface, flooding both with a
+    // wl_keyboard.leave/enter storm each redraw. The first exclusive
+    // layer to grab the keyboard keeps it until it (and its siblings)
+    // close. `focus_locked_by_layer()` is true exactly when the current
+    // keyboard focus is already an exclusive Top/Overlay layer surface.
+    if state.focus_locked_by_layer() {
         return;
     }
     // Save the focus we're displacing, but only the first time —
@@ -841,13 +859,23 @@ impl WlrLayerShellHandler for State {
     fn new_layer_surface(
         &mut self,
         surface: LayerSurface,
-        _output: Option<WlOutput>,
+        output: Option<WlOutput>,
         layer: Layer,
         namespace: String,
     ) {
+        // Remember which output the client bound this surface to so it
+        // lands on that monitor, not always the primary. A null output
+        // means "compositor's choice" — left unrecorded so placement
+        // falls back to primary.
+        let output_name =
+            output.and_then(|wl| smithay::output::Output::from_resource(&wl).map(|o| o.name()));
+        if let Some(name) = output_name.clone() {
+            self.layer_outputs.insert(surface.wl_surface().clone(), name);
+        }
         info!(
             namespace,
             ?layer,
+            output = ?output_name,
             surface = ?surface.wl_surface().id(),
             "wayland: new layer surface"
         );
@@ -862,8 +890,11 @@ impl WlrLayerShellHandler for State {
         // rect as a size hint. The client-side keyboard / anchor /
         // exclusive-zone state isn't readable yet — that gets
         // looked at on the first commit, in `CompositorHandler::commit`.
-        let primary = self.renderer.primary_output_rect();
-        let bounds_size = primary.size;
+        let bounds = output_name
+            .as_deref()
+            .and_then(|name| self.renderer.output_rect(name))
+            .unwrap_or_else(|| self.renderer.primary_output_rect());
+        let bounds_size = bounds.size;
         surface.with_pending_state(|state| {
             state.size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from(
                 (bounds_size.w, bounds_size.h),
@@ -874,11 +905,19 @@ impl WlrLayerShellHandler for State {
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: layer surface destroyed");
+        self.layer_outputs.remove(surface.wl_surface());
         let cur_focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
         if cur_focus.as_ref() == Some(surface.wl_surface())
             && let Some(kbd) = self.seat.get_keyboard()
         {
-            let restore = self.kbd_focus_before_layer.take();
+            use smithay::reexports::wayland_server::Resource;
+            // Prefer handing the keyboard to a still-mapped sibling
+            // exclusive layer (slurp's other overlay); only when none
+            // remain fall back to the pre-layer focus — and only if that
+            // surface is still alive, so we never focus a dead surface.
+            let restore = self
+                .first_exclusive_layer_surface(surface.wl_surface())
+                .or_else(|| self.kbd_focus_before_layer.take().filter(Resource::is_alive));
             kbd.set_focus(self, restore, SERIAL_COUNTER.next_serial());
         }
         self.recompute_layer_layout();

@@ -65,6 +65,7 @@ mod drm;
 mod keyboard;
 mod layout;
 mod render;
+mod screencopy;
 mod wayland;
 
 /// Mutable state threaded through every event-loop callback.
@@ -204,6 +205,14 @@ pub(crate) struct State {
     /// [`crate::wayland`] reads / writes it for new + destroyed
     /// layer surfaces; renderer reads it each frame.
     pub(crate) layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    /// The output each `wlr_layer_shell` surface asked to live on, by
+    /// connector name. A layer surface (panel, bar, OSD, slurp's
+    /// per-output overlay) is created bound to one `wl_output`; without
+    /// tracking it we'd place every layer on the primary, so slurp's
+    /// second-monitor overlay would stack on the first. Keyed by the
+    /// layer surface's `wl_surface`; absent ⇒ the client let the
+    /// compositor choose ⇒ fall back to primary.
+    pub(crate) layer_outputs: std::collections::HashMap<WlSurface, String>,
     /// `zwp_relative_pointer_manager_v1` global — held alive so clients
     /// keep receiving relative motion (mouse-look). Dispatched via the
     /// delegate; not otherwise read.
@@ -224,6 +233,13 @@ pub(crate) struct State {
     /// copied buffer survives the source client closing. See
     /// [`crate::clipboard`].
     pub(crate) clipboard: clipboard::Selections,
+    /// `zwlr_screencopy_manager_v1` global — held alive so screenshot
+    /// tools and `xdg-desktop-portal-wlr` can capture outputs.
+    #[allow(dead_code, reason = "held to keep the global alive")]
+    pub(crate) screencopy_manager: screencopy::ScreencopyManagerState,
+    /// `zwlr_screencopy` `copy` requests awaiting the next render of
+    /// their output (see [`crate::screencopy`]).
+    pub(crate) screencopy_pending: Vec<screencopy::PendingCapture>,
     /// Calloop handle, used to register the async pipe reads/writes
     /// that drain and serve cached selections without blocking.
     pub(crate) loop_handle: smithay::reexports::calloop::LoopHandle<'static, LoopData>,
@@ -287,6 +303,16 @@ pub(crate) enum DragMode {
 /// the focused client as a normal pointer button event.
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+
+/// Session-identity environment defaults set at startup (overridable
+/// by the user's `env` config). Also exported to the D-Bus / systemd
+/// activation environment so D-Bus-activated services — notably
+/// `xdg-desktop-portal` — see them.
+const DEFAULT_SESSION_ENV: &[(&str, &str)] = &[
+    ("XDG_CURRENT_DESKTOP", "libreland"),
+    ("XDG_SESSION_TYPE", "wayland"),
+    ("XDG_SESSION_DESKTOP", "libreland"),
+];
 
 /// Lower bound a drag-resize will clamp the floating rect to so
 /// the window can't be resized into a slice too small to grab
@@ -903,6 +929,19 @@ impl State {
         }
     }
 
+    /// The compositor rect of the output a layer surface is bound to —
+    /// the one it named at creation (recorded in [`Self::layer_outputs`]),
+    /// or the primary output when it named none or the output is gone.
+    pub(crate) fn layer_output_rect(
+        &self,
+        surface: &WlSurface,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+        self.layer_outputs
+            .get(surface)
+            .and_then(|name| self.renderer.output_rect(name))
+            .unwrap_or_else(|| self.renderer.primary_output_rect())
+    }
+
     /// Build one `LayerPlacement` per live layer surface for this
     /// frame. The renderer needs each surface's top-left in
     /// compositor coords + a layer bucket so it knows whether to
@@ -911,19 +950,18 @@ impl State {
     /// the cursor.
     ///
     /// Position is derived from the cached layer state's anchor +
-    /// margin + size, evaluated against the primary output's
-    /// compositor rect. Surfaces with a non-positive size (set by
-    /// clients that want the compositor to choose) get the full
-    /// primary output dimension in the unsized axis; non-anchored
-    /// surfaces are centred. Multi-output layer placement is a
-    /// later milestone — for now every layer surface lands on
-    /// primary.
+    /// margin + size, evaluated against **the output the surface asked
+    /// for** (tracked in [`Self::layer_outputs`]; falls back to primary
+    /// when the client let the compositor choose). Surfaces with a
+    /// non-positive size (set by clients that want the compositor to
+    /// choose) get the full output dimension in the unsized axis;
+    /// non-anchored surfaces are centred on their output.
     pub(crate) fn snapshot_layer_placements(&self) -> Vec<render::LayerPlacement> {
         use smithay::wayland::shell::wlr_layer::{Anchor, Layer};
-        let primary = self.renderer.primary_output_rect();
         let mut out = Vec::new();
         for layer_surface in self.layer_shell_state.layer_surfaces() {
             let surface = layer_surface.wl_surface();
+            let area = self.layer_output_rect(surface);
             let cached = crate::wayland::layer_cached_state(surface);
             let anchor = cached.anchor;
             // Anchoring to BOTH opposite edges stretches the surface
@@ -936,37 +974,37 @@ impl State {
             // compositor to choose (size 0). Clamp to the output so a
             // misbehaving client can't drive a negative offset below.
             let mut width = if stretch_x {
-                primary.size.w - cached.margin.left - cached.margin.right
+                area.size.w - cached.margin.left - cached.margin.right
             } else if cached.size.w > 0 {
                 cached.size.w
             } else {
-                primary.size.w
+                area.size.w
             };
             let mut height = if stretch_y {
-                primary.size.h - cached.margin.top - cached.margin.bottom
+                area.size.h - cached.margin.top - cached.margin.bottom
             } else if cached.size.h > 0 {
                 cached.size.h
             } else {
-                primary.size.h
+                area.size.h
             };
-            width = width.clamp(1, primary.size.w);
-            height = height.clamp(1, primary.size.h);
+            width = width.clamp(1, area.size.w);
+            height = height.clamp(1, area.size.h);
             // Position: pinned to an anchored edge (+ its margin), else
             // centred. When stretched, LEFT/TOP is set so the surface
             // starts at the margin and spans to the far margin.
             let x = if anchor.contains(Anchor::LEFT) {
-                primary.loc.x + cached.margin.left
+                area.loc.x + cached.margin.left
             } else if anchor.contains(Anchor::RIGHT) {
-                primary.loc.x + primary.size.w - width - cached.margin.right
+                area.loc.x + area.size.w - width - cached.margin.right
             } else {
-                primary.loc.x + (primary.size.w - width) / 2
+                area.loc.x + (area.size.w - width) / 2
             };
             let y = if anchor.contains(Anchor::TOP) {
-                primary.loc.y + cached.margin.top
+                area.loc.y + cached.margin.top
             } else if anchor.contains(Anchor::BOTTOM) {
-                primary.loc.y + primary.size.h - height - cached.margin.bottom
+                area.loc.y + area.size.h - height - cached.margin.bottom
             } else {
-                primary.loc.y + (primary.size.h - height) / 2
+                area.loc.y + (area.size.h - height) / 2
             };
             let bucket = match cached.layer {
                 Layer::Background => render::LayerBucket::Background,
@@ -1230,6 +1268,28 @@ impl State {
     /// modal layer keeps the keyboard — otherwise the hover focus
     /// model would yank focus back the moment the user moved the
     /// mouse off the layer surface.
+    /// Any *other* still-mapped exclusive Top/Overlay layer surface
+    /// (skipping `exclude`) — i.e. one that should hold the keyboard.
+    /// Used when the focused exclusive layer is destroyed to hand the
+    /// keyboard to a live sibling (e.g. slurp's other-monitor overlay)
+    /// rather than dropping focus back to a window mid-selection.
+    pub(crate) fn first_exclusive_layer_surface(&self, exclude: &WlSurface) -> Option<WlSurface> {
+        use smithay::reexports::wayland_server::Resource;
+        use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
+        self.layer_shell_state.layer_surfaces().find_map(|ls| {
+            let surface = ls.wl_surface();
+            if surface == exclude || !surface.is_alive() {
+                return None;
+            }
+            let cached = crate::wayland::layer_cached_state(surface);
+            (matches!(
+                cached.keyboard_interactivity,
+                KeyboardInteractivity::Exclusive
+            ) && matches!(cached.layer, Layer::Top | Layer::Overlay))
+            .then(|| surface.clone())
+        })
+    }
+
     pub(crate) fn focus_locked_by_layer(&self) -> bool {
         use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
         let Some(kbd) = self.seat.get_keyboard() else {
@@ -1261,10 +1321,13 @@ impl State {
     /// always renders below).
     pub(crate) fn recompute_layer_layout(&mut self) {
         use smithay::wayland::shell::wlr_layer::Anchor;
-        let mut top = 0_i32;
-        let mut bottom = 0_i32;
-        let mut left = 0_i32;
-        let mut right = 0_i32;
+        // Exclusive zones (top, bottom, left, right) accumulated per
+        // output the reserving surface is bound to — so a bar on the
+        // secondary monitor shrinks *that* monitor's tile area, not the
+        // primary's.
+        let primary_name = self.renderer.primary_output_name().to_owned();
+        let mut zones: std::collections::HashMap<String, (i32, i32, i32, i32)> =
+            std::collections::HashMap::new();
         for layer in self.layer_shell_state.layer_surfaces() {
             let cached = crate::wayland::layer_cached_state(layer.wl_surface());
             let exclusive: i32 = cached.exclusive_zone.into();
@@ -1277,39 +1340,35 @@ impl State {
             // whichever single edge is anchored without its
             // opposite.
             let anchor = cached.anchor;
-            let t = anchor.contains(Anchor::TOP);
-            let b = anchor.contains(Anchor::BOTTOM);
-            let l = anchor.contains(Anchor::LEFT);
-            let r = anchor.contains(Anchor::RIGHT);
-            if t && !b {
-                top = top.max(exclusive);
-            } else if b && !t {
-                bottom = bottom.max(exclusive);
-            } else if l && !r {
-                left = left.max(exclusive);
-            } else if r && !l {
-                right = right.max(exclusive);
+            let at_top = anchor.contains(Anchor::TOP);
+            let at_bottom = anchor.contains(Anchor::BOTTOM);
+            let at_left = anchor.contains(Anchor::LEFT);
+            let at_right = anchor.contains(Anchor::RIGHT);
+            let out_name = self
+                .layer_outputs
+                .get(layer.wl_surface())
+                .cloned()
+                .unwrap_or_else(|| primary_name.clone());
+            let zone = zones.entry(out_name).or_insert((0, 0, 0, 0));
+            if at_top && !at_bottom {
+                zone.0 = zone.0.max(exclusive);
+            } else if at_bottom && !at_top {
+                zone.1 = zone.1.max(exclusive);
+            } else if at_left && !at_right {
+                zone.2 = zone.2.max(exclusive);
+            } else if at_right && !at_left {
+                zone.3 = zone.3.max(exclusive);
             }
         }
-        // Layer surfaces still land on the primary output only (see
-        // snapshot_layer_placements), so the exclusive zones shrink
-        // the primary's tile area; every other output gets its full
-        // bounds. The per-output loop shape is in place so per-output
-        // layer zones become a small follow-up once layers are
-        // multi-output.
-        let primary_name = self.renderer.primary_output_name().to_owned();
         for (name, rect) in self.renderer.output_rects() {
-            let new_bounds = if name == primary_name {
-                smithay::utils::Rectangle::<i32, smithay::utils::Physical>::new(
-                    smithay::utils::Point::new(rect.loc.x + left, rect.loc.y + top),
-                    smithay::utils::Size::new(
-                        (rect.size.w - left - right).max(1),
-                        (rect.size.h - top - bottom).max(1),
-                    ),
-                )
-            } else {
-                rect
-            };
+            let (top, bottom, left, right) = zones.get(&name).copied().unwrap_or((0, 0, 0, 0));
+            let new_bounds = smithay::utils::Rectangle::<i32, smithay::utils::Physical>::new(
+                smithay::utils::Point::new(rect.loc.x + left, rect.loc.y + top),
+                smithay::utils::Size::new(
+                    (rect.size.w - left - right).max(1),
+                    (rect.size.h - top - bottom).max(1),
+                ),
+            );
             // `rect` is the full output; `new_bounds` is the work area
             // (full minus exclusive zones). Fullscreen fills the
             // former, tiling/maximized the latter.
@@ -1495,6 +1554,17 @@ fn main() -> Result<()> {
     )]
     // SAFETY: see #[allow] above.
     unsafe {
+        // Session-identity defaults so apps + the desktop portal know
+        // what they're running in without the user repeating them in
+        // `env`. These describe the session truthfully — a Wayland
+        // session named "libreland" — and are exactly what e.g. the
+        // portal's config matching keys off (XDG_CURRENT_DESKTOP). The
+        // user's `env` table is applied right after and overrides any
+        // of these. (XDG base dirs / XDG_RUNTIME_DIR are deliberately
+        // not touched — those are managed by the system, not the WM.)
+        for (name, value) in DEFAULT_SESSION_ENV {
+            std::env::set_var(name, value);
+        }
         for (name, value) in &config.env {
             info!(name, value, "applying configured env var");
             std::env::set_var(name, value);
@@ -1662,6 +1732,13 @@ fn main() -> Result<()> {
         info!(x_display = %disp, "XWayland ready; $DISPLAY exported for X11 clients");
     }
 
+    // D-Bus-activated services (notably xdg-desktop-portal) are spawned
+    // by the session bus, not by us, so they don't inherit our process
+    // environment. Push the session-identity vars + WAYLAND_DISPLAY (and
+    // DISPLAY) into the D-Bus/systemd activation environment so the
+    // portal connects to us and matches the right config.
+    export_activation_environment();
+
     // Snapshot the Display's poll fd so calloop can register a
     // `Generic` source over it. `try_clone_to_owned` gives us a
     // separate kernel fd referring to the same underlying file
@@ -1783,10 +1860,13 @@ fn main() -> Result<()> {
         dmabuf_global: wayland_init.dmabuf_global,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
+        layer_outputs: std::collections::HashMap::new(),
         relative_pointer_state: wayland_init.relative_pointer_state,
         pointer_constraints_state: wayland_init.pointer_constraints_state,
         primary_selection_state: wayland_init.primary_selection_state,
         clipboard: clipboard::Selections::default(),
+        screencopy_manager: wayland_init.screencopy_manager,
+        screencopy_pending: Vec::new(),
         loop_handle: handle.clone(),
         popup_manager: wayland_init.popup_manager,
         kbd_focus_before_layer: None,
@@ -1950,6 +2030,39 @@ fn apply_input_config(device: &mut libinput::Device, input_config: &config::Inpu
     }
 }
 
+/// Export the session-identity vars (+ `WAYLAND_DISPLAY` / `DISPLAY`)
+/// into the D-Bus and systemd-user activation environment, so
+/// D-Bus-activated services started by the session bus — above all
+/// `xdg-desktop-portal` and its backends — see them. Without this the
+/// portal can't tell which desktop it's in or which compositor socket
+/// to use, and screencast/screenshot break. Best-effort: a missing
+/// `dbus-update-activation-environment` (or no session bus) is logged,
+/// never fatal.
+fn export_activation_environment() {
+    let mut names: Vec<&str> = DEFAULT_SESSION_ENV.iter().map(|(name, _)| *name).collect();
+    names.push("WAYLAND_DISPLAY");
+    if std::env::var_os("DISPLAY").is_some() {
+        names.push("DISPLAY");
+    }
+    match std::process::Command::new("dbus-update-activation-environment")
+        .arg("--systemd")
+        .args(&names)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            info!(vars = ?names, "exported session env to the D-Bus activation environment");
+        }
+        Ok(status) => warn!(
+            ?status,
+            "dbus-update-activation-environment exited non-zero; portals may not see the session env"
+        ),
+        Err(err) => warn!(
+            error = %err,
+            "could not run dbus-update-activation-environment (is dbus installed?); portals may not see the session env"
+        ),
+    }
+}
+
 /// Launch `xwayland-satellite` on the first free X display and return
 /// that display (e.g. `":1"`) so the caller can export `$DISPLAY`.
 /// Returns `None` if no display is free or the binary isn't installed
@@ -2014,6 +2127,10 @@ fn pick_drm_card_path<T>(devices: &[(T, std::path::PathBuf)]) -> Result<std::pat
 /// The Wayland-related sources (listener + dispatch fd) are inserted
 /// directly in `main` because they share lifetimes with the `Display`
 /// + `ListeningSocketSource` constructed there.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one function that wires every backend event source (session, udev, DRM vblank incl. screencopy servicing, libinput); splitting a source out means threading the loop handle + closures through another fn for no clarity gain"
+)]
 fn wire_event_sources(
     handle: &smithay::reexports::calloop::LoopHandle<'_, LoopData>,
     session_notifier: LibSeatSessionNotifier,
@@ -2065,22 +2182,64 @@ fn wire_event_sources(
                     let popup_placements = data
                         .state
                         .snapshot_popup_placements(&placements, &layer_placements);
+                    // Drain any pending screencopy captures for the
+                    // output this CRTC drives, so the renderer can read
+                    // them off this frame's framebuffer.
+                    let out_name = data.state.renderer.output_name_for_crtc(crtc);
+                    let mut captures: Vec<screencopy::PendingCapture> = Vec::new();
+                    if let Some(name) = out_name {
+                        let pending = std::mem::take(&mut data.state.screencopy_pending);
+                        let (mine, rest): (Vec<_>, Vec<_>) =
+                            pending.into_iter().partition(|p| p.output == name);
+                        data.state.screencopy_pending = rest;
+                        captures = mine;
+                    }
+                    let specs: Vec<render::CaptureSpec> = captures
+                        .iter()
+                        .map(|c| render::CaptureSpec {
+                            region: c.region,
+                            fourcc: screencopy::CAPTURE_FOURCC,
+                            // A dmabuf-backed client buffer takes the
+                            // zero-copy GPU blit path; everything else
+                            // (wl_shm) takes the CPU read-back path.
+                            target: match smithay::wayland::dmabuf::get_dmabuf(&c.buffer) {
+                                Ok(dmabuf) => render::CaptureTarget::Dmabuf(dmabuf.clone()),
+                                Err(_) => render::CaptureTarget::Shm,
+                            },
+                        })
+                        .collect();
                     // Hide our cursor while a game has the pointer
-                    // locked — it draws its own.
-                    let hide_cursor = data.state.pointer_locked();
-                    if let Err(err) = data.state.renderer.render_for_crtc(
+                    // locked — it draws its own. Also hide it for a
+                    // capture when every pending request asked for no
+                    // cursor (e.g. a screenshot), so the grab is clean.
+                    let capture_hides_cursor =
+                        !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
+                    let hide_cursor = data.state.pointer_locked() || capture_hides_cursor;
+                    match data.state.renderer.render_for_crtc(
                         crtc,
                         &placements,
                         &layer_placements,
                         &popup_placements,
                         hide_cursor,
+                        &specs,
                     ) {
-                        // Don't kill the event loop on a render hiccup —
-                        // log and let the next vblank try again. A
-                        // persistent failure on one CRTC freezes that
-                        // output but leaves the others (and the exit
-                        // hotkey) responsive.
-                        warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
+                        Ok(results) => {
+                            for (pending, captured) in captures.iter().zip(results) {
+                                screencopy::complete(pending, captured);
+                            }
+                        }
+                        Err(err) => {
+                            // Don't kill the event loop on a render
+                            // hiccup — log and let the next vblank try
+                            // again. A persistent failure on one CRTC
+                            // freezes that output but leaves the others
+                            // (and the exit hotkey) responsive. Fail any
+                            // captures that were riding this frame.
+                            warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
+                            for pending in &captures {
+                                screencopy::complete(pending, render::CaptureOutcome::Failed);
+                            }
+                        }
                     }
                 }
                 smithay::backend::drm::DrmEvent::Error(err) => {
