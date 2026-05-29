@@ -27,14 +27,14 @@ use anyhow::{Context as _, Result};
 use smithay::backend::drm::DrmDevice;
 use smithay::backend::input::{
     Axis, AxisSource, Event as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
-    PointerAxisEvent as _, PointerButtonEvent as _,
+    PointerAxisEvent as _, PointerButtonEvent as _, PointerMotionEvent as _,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::input::keyboard::FilterResult;
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
@@ -46,6 +46,7 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
 use smithay::utils::{Logical, Physical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -202,6 +203,18 @@ pub(crate) struct State {
     /// [`crate::wayland`] reads / writes it for new + destroyed
     /// layer surfaces; renderer reads it each frame.
     pub(crate) layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    /// `zwp_relative_pointer_manager_v1` global — held alive so clients
+    /// keep receiving relative motion (mouse-look). Dispatched via the
+    /// delegate; not otherwise read.
+    #[allow(dead_code, reason = "held to keep the global alive")]
+    pub(crate) relative_pointer_state:
+        smithay::wayland::relative_pointer::RelativePointerManagerState,
+    /// `zwp_pointer_constraints_v1` global — held alive so clients can
+    /// lock/confine the pointer. Dispatched via the delegate; the
+    /// active constraint is read per-motion via `with_pointer_constraint`.
+    #[allow(dead_code, reason = "held to keep the global alive")]
+    pub(crate) pointer_constraints_state:
+        smithay::wayland::pointer_constraints::PointerConstraintsState,
     /// Keyboard focus saved when a layer-shell surface grabs
     /// exclusive focus (e.g. rofi), restored when that surface
     /// is destroyed.
@@ -340,6 +353,21 @@ impl State {
         }
     }
 
+    /// Whether the focused surface currently holds an *active*
+    /// pointer-lock constraint. The renderer hides our cursor while
+    /// this is true (the locked client — a game — draws its own).
+    fn pointer_locked(&self) -> bool {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
+        let Some(surface) = pointer.current_focus() else {
+            return false;
+        };
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            constraint.is_some_and(|c| c.is_active() && matches!(*c, PointerConstraint::Locked(_)))
+        })
+    }
+
     /// Forward the current cursor location to the focused client as
     /// a `wl_pointer.motion` event (smithay generates enter/leave
     /// when the focus surface changes). Hit-tests the layout to
@@ -353,16 +381,25 @@ impl State {
     /// (translated for Move, stretched for Resize) and no
     /// `wl_pointer.motion` is sent — the focused client should
     /// see a still pointer until the drag ends.
-    fn forward_pointer_motion(&mut self, time: u32) {
-        let (cx, cy) = self.renderer.cursor_pos();
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single decision tree for one event source (pointer motion): drag, constraint check, locked short-circuit, confine clamp, hit-test, relative + absolute motion, and constraint activation. Splitting any piece out would thread the cursor/focus/constraint state through another method for no clarity gain."
+    )]
+    fn forward_pointer_motion<B: InputBackend>(&mut self, evt: &B::PointerMotionEvent) {
+        let delta = evt.delta();
+        let delta_unaccel = evt.delta_unaccel();
+        let time = evt.time_msec();
+        let utime = evt.time();
 
-        // Drag in flight: update the dragged window's rect and
-        // swallow the motion event so the client doesn't see a
-        // running pointer underneath the grab. Move drags update
-        // `in_transit` (a free-floating window that follows the
-        // cursor and rejoins the tree on drop); Resize drags
-        // update the floating window's rect in place.
+        // Drag in flight: the cursor follows the drag (a compositor
+        // gesture, unaffected by client pointer constraints). Move it,
+        // update the dragged window's rect, and swallow the event so
+        // the client sees a still pointer under the grab. Move drags
+        // update `in_transit` (a float that follows the cursor and
+        // rejoins the tree on drop); Resize drags resize in place.
         if let Some(drag) = self.drag.clone() {
+            self.renderer.on_pointer_motion(delta.x, delta.y);
+            let (cx, cy) = self.renderer.cursor_pos();
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "cursor deltas are bounded by layout_bounds (i32) from on_pointer_motion"
@@ -398,6 +435,70 @@ impl State {
             return;
         }
 
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+
+        // Inspect any active pointer constraint on the surface the
+        // cursor is currently over. A locked pointer must not move the
+        // cursor (the client reads relative motion instead — this is
+        // mouse-look in games); a confined one keeps the cursor inside
+        // the surface. Smithay deactivates the constraint automatically
+        // when the surface loses pointer focus.
+        let current = pointer.current_focus();
+        let mut locked = false;
+        let mut confined = false;
+        if let Some(surface) = current.as_ref() {
+            with_pointer_constraint(surface, &pointer, |constraint| {
+                if let Some(constraint) = constraint
+                    && constraint.is_active()
+                {
+                    match &*constraint {
+                        PointerConstraint::Locked(_) => locked = true,
+                        PointerConstraint::Confined(_) => confined = true,
+                    }
+                }
+            });
+        }
+
+        let relative = RelativeMotionEvent {
+            delta,
+            delta_unaccel,
+            utime,
+        };
+
+        if locked {
+            // Cursor frozen; deliver only relative motion to the locked
+            // client (the focus origin is unused by relative_motion).
+            let focus = current.map(|s| (s, Point::<f64, Logical>::from((0.0, 0.0))));
+            pointer.relative_motion(self, focus, &relative);
+            pointer.frame(self);
+            return;
+        }
+
+        // Confined: the cursor is currently over the confining surface,
+        // so grab that surface's rect to clamp the move back inside.
+        let confine_rect = if confined {
+            let (cx, cy) = self.renderer.cursor_pos();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+            )]
+            let ci = Point::<i32, Physical>::from((cx as i32, cy as i32));
+            self.layer_at(ci)
+                .map(|(_, rect)| rect)
+                .or_else(|| self.layout.window_at(ci).map(|(_, rect)| rect))
+        } else {
+            None
+        };
+
+        // Move the absolute cursor, then confine it if needed.
+        self.renderer.on_pointer_motion(delta.x, delta.y);
+        if let Some(rect) = confine_rect {
+            self.renderer.confine_cursor(rect);
+        }
+
+        let (cx, cy) = self.renderer.cursor_pos();
         let location = Point::<f64, Logical>::from((cx, cy));
         #[allow(
             clippy::cast_possible_truncation,
@@ -436,6 +537,11 @@ impl State {
         let kbd_target = surface_hit.as_ref().map(|(surface, _)| surface.clone());
         let hit = popup_hit.or(surface_hit);
 
+        // Relative motion goes to the *pre-move* pointer focus
+        // (`pointer.motion` below updates it), matching how
+        // compositors attribute the delta to where the pointer was.
+        pointer.relative_motion(self, hit.clone(), &relative);
+
         // Hover focus model: pull keyboard focus to the surface
         // under the cursor — *unless* an exclusive-keyboard layer
         // surface currently owns focus, in which case we leave it
@@ -449,13 +555,10 @@ impl State {
             kbd.set_focus(self, kbd_target, SERIAL_COUNTER.next_serial());
         }
 
-        let Some(pointer) = self.seat.get_pointer() else {
-            return;
-        };
         let serial = SERIAL_COUNTER.next_serial();
         pointer.motion(
             self,
-            hit,
+            hit.clone(),
             &MotionEvent {
                 location,
                 serial,
@@ -463,6 +566,28 @@ impl State {
             },
         );
         pointer.frame(self);
+
+        // Activate a not-yet-active constraint once the pointer enters
+        // its surface (and region, if any) — covers a lock requested
+        // while the surface was unfocused.
+        if let Some((surface, origin)) = hit.as_ref() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "surface-local coords are bounded by the output rect (i32)"
+            )]
+            let local = Point::<i32, Logical>::from((
+                (location.x - origin.x) as i32,
+                (location.y - origin.y) as i32,
+            ));
+            with_pointer_constraint(surface, &pointer, |constraint| {
+                if let Some(constraint) = constraint
+                    && !constraint.is_active()
+                    && constraint.region().is_none_or(|r| r.contains(local))
+                {
+                    constraint.activate();
+                }
+            });
+        }
     }
 
     /// Forward a pointer button press/release to the focused client.
@@ -1646,6 +1771,8 @@ fn main() -> Result<()> {
         dmabuf_global: wayland_init.dmabuf_global,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
+        relative_pointer_state: wayland_init.relative_pointer_state,
+        pointer_constraints_state: wayland_init.pointer_constraints_state,
         popup_manager: wayland_init.popup_manager,
         kbd_focus_before_layer: None,
         layout,
@@ -1923,11 +2050,15 @@ fn wire_event_sources(
                     let popup_placements = data
                         .state
                         .snapshot_popup_placements(&placements, &layer_placements);
+                    // Hide our cursor while a game has the pointer
+                    // locked — it draws its own.
+                    let hide_cursor = data.state.pointer_locked();
                     if let Err(err) = data.state.renderer.render_for_crtc(
                         crtc,
                         &placements,
                         &layer_placements,
                         &popup_placements,
+                        hide_cursor,
                     ) {
                         // Don't kill the event loop on a render hiccup —
                         // log and let the next vblank try again. A
@@ -1950,8 +2081,8 @@ fn wire_event_sources(
             match event {
                 InputEvent::Keyboard { event: ke } => data.state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {
-                    data.state.renderer.on_pointer_motion(pm.dx(), pm.dy());
-                    data.state.forward_pointer_motion(pm.time_msec());
+                    data.state
+                        .forward_pointer_motion::<LibinputInputBackend>(&pm);
                 }
                 InputEvent::PointerButton { event: pb } => {
                     data.state

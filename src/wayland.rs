@@ -25,12 +25,14 @@ use smithay::delegate_kde_decoration;
 use smithay::delegate_layer_shell;
 use smithay::delegate_viewporter;
 use smithay::delegate_output;
+use smithay::delegate_pointer_constraints;
+use smithay::delegate_relative_pointer;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::keyboard::XkbConfig;
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -56,6 +58,10 @@ use smithay::wayland::fractional_scale::{
     self, FractionalScaleHandler, FractionalScaleManagerState,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::pointer_constraints::{
+    PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint,
+};
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
@@ -141,6 +147,14 @@ pub struct WaylandInit {
     /// stays alive (dropping it removes the global).
     pub viewporter_state: ViewporterState,
     pub layer_shell_state: WlrLayerShellState,
+    /// `zwp_relative_pointer_manager_v1` — lets clients receive raw
+    /// relative motion deltas (mouse-look in games). Held so the
+    /// global stays alive.
+    pub relative_pointer_state: RelativePointerManagerState,
+    /// `zwp_pointer_constraints_v1` — lets clients lock or confine the
+    /// pointer (FPS games lock it in place and read relative motion).
+    /// Held so the global stays alive.
+    pub pointer_constraints_state: PointerConstraintsState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -227,6 +241,14 @@ pub fn init(
     // depending on their `Layer`, and honour their exclusive
     // zones by shrinking the layout's bounds.
     let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
+    // zwp_relative_pointer_manager_v1 + zwp_pointer_constraints_v1:
+    // together these let games do proper mouse-look — the client locks
+    // the pointer in place (so the cursor can't leave the window or hit
+    // another monitor) and reads raw relative-motion deltas (so it
+    // doesn't derive bogus deltas from a clamped absolute position,
+    // which is what makes the view spin).
+    let relative_pointer_state = RelativePointerManagerState::new::<State>(&dh);
+    let pointer_constraints_state = PointerConstraintsState::new::<State>(&dh);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -313,6 +335,8 @@ pub fn init(
         dmabuf_global,
         viewporter_state,
         layer_shell_state,
+        relative_pointer_state,
+        pointer_constraints_state,
         popup_manager,
         outputs,
         preferred_scale,
@@ -467,6 +491,36 @@ impl SeatHandler for State {
         // No-op in 4a; clients can request cursor images but we
         // keep drawing our procedural cursor until cursor-shape /
         // surface-cursor support lands.
+    }
+}
+
+impl PointerConstraintsHandler for State {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // A constraint is created inactive; the compositor decides when
+        // to honour it. Activate immediately if the pointer is already
+        // over this surface (the common case — a game requests the lock
+        // while focused); otherwise it activates on the next motion into
+        // the surface (see the motion path in main.rs). Smithay
+        // deactivates automatically when the surface loses pointer focus.
+        if pointer.current_focus().as_ref() == Some(surface) {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                if let Some(constraint) = constraint {
+                    constraint.activate();
+                }
+            });
+        }
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        // The locked client reports where it draws its own cursor so we
+        // could warp there on unlock. We keep the visible cursor parked
+        // where the lock engaged (it doesn't move during the lock and
+        // reappears in place on unlock), so there's nothing to do.
     }
 }
 
@@ -823,3 +877,5 @@ delegate_layer_shell!(State);
 delegate_viewporter!(State);
 delegate_data_device!(State);
 delegate_kde_decoration!(State);
+delegate_relative_pointer!(State);
+delegate_pointer_constraints!(State);

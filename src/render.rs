@@ -545,10 +545,35 @@ impl Renderer {
     /// an empty placement slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
-            self.render_output(idx, &[], &[], &[])
+            self.render_output(idx, &[], &[], &[], false)
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
+    }
+
+    /// Clamp the cursor hotspot into `rect`. Used while a
+    /// confined-pointer constraint is active so the cursor can't leave
+    /// the constraining surface. A degenerate rect is ignored.
+    ///
+    /// The upper bound is `loc + size - 1`, not `loc + size`: hit-tests
+    /// use a half-open interval (`pos < loc + size`), so a cursor
+    /// clamped exactly to `loc + size` would fall *outside* the surface
+    /// on the next frame, fire a `wl_pointer.leave`, and make smithay
+    /// auto-deactivate the constraint — letting the cursor escape, the
+    /// opposite of confinement. `saturating_add` guards against an
+    /// `i32` overflow for a pathological monitor position.
+    pub fn confine_cursor(&mut self, rect: Rectangle<i32, Physical>) {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return;
+        }
+        self.cursor_x = self.cursor_x.clamp(
+            f64::from(rect.loc.x),
+            f64::from(rect.loc.x.saturating_add(rect.size.w)) - 1.0,
+        );
+        self.cursor_y = self.cursor_y.clamp(
+            f64::from(rect.loc.y),
+            f64::from(rect.loc.y.saturating_add(rect.size.h)) - 1.0,
+        );
     }
 
     /// Render the output driven by `crtc`, in response to its vblank.
@@ -561,13 +586,14 @@ impl Renderer {
         placements: &[Placement],
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
+        hide_cursor: bool,
     ) -> Result<()> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx, placements, layers, popups)
+        self.render_output(idx, placements, layers, popups, hide_cursor)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -701,6 +727,7 @@ impl Renderer {
         placements: &[Placement],
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
+        hide_cursor: bool,
     ) -> Result<()> {
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in. All
@@ -1016,7 +1043,10 @@ impl Renderer {
                 .context("draw_render_elements (popup) failed")?;
             }
 
-            if cursor_in_bounds {
+            // Skip the cursor entirely while the pointer is locked (a
+            // game with an active pointer lock draws its own crosshair;
+            // ours would sit frozen at the lock point).
+            if cursor_in_bounds && !hide_cursor {
                 // Pointer hotspot in this output's physical pixels.
                 let hotspot = Point::<i32, Physical>::from((
                     scale_f(cursor_local_x, scale),
