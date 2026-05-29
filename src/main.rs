@@ -281,7 +281,10 @@ impl State {
                 .binds
                 .bindings
                 .iter()
-                .find(|b| result.keysym == b.keysym && result.has_all_mods(b.mods))
+                .find(|b| {
+                    keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
+                        && result.has_all_mods(b.mods)
+                })
                 .map(|b| b.action.clone())
         } else {
             None

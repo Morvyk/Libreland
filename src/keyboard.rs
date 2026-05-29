@@ -30,6 +30,26 @@ pub const MOD_ALT: u32 = 1 << 2;
 /// `Super`/`Logo`/`Mod4` (the Windows / command key) is currently held.
 pub const MOD_SUPER: u32 = 1 << 3;
 
+/// Fold an ASCII-letter keysym to its lowercase form for hotkey
+/// matching. xkbcommon hands us the *shifted* keysym, so an unshifted
+/// `c` arrives as `Keysym::c` (`0x63`) while a bind written as `"C"`
+/// (or the built-in `Keysym::C`) is `0x43` — they'd never compare
+/// equal without folding, so letter binds silently never fired unless
+/// Shift happened to be held. Modifiers are matched separately, so
+/// folding case here doesn't conflate `Super+C` with `Super+Shift+C`:
+/// the required-mods check still distinguishes binds that ask for
+/// Shift. Non-letter keysyms (`space`, `F1`, `Return`) are returned
+/// unchanged.
+#[must_use]
+pub fn fold_keysym(k: Keysym) -> Keysym {
+    let raw = k.raw();
+    if (0x41..=0x5A).contains(&raw) {
+        Keysym::new(raw + 0x20)
+    } else {
+        k
+    }
+}
+
 /// Outcome of feeding a single libinput key event through xkbcommon:
 /// the layout-aware keysym at this moment (with modifier effects
 /// applied — `Shift+e` becomes `Keysym::E`), and a bitmask of the
