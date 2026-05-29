@@ -11,7 +11,7 @@
 //! layout / renderer.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -61,6 +61,10 @@ pub struct Config {
     /// features. Children inherit the compositor's environment
     /// (notably `$WAYLAND_DISPLAY`).
     pub startup: Vec<String>,
+    /// Screenshot keybinds. `None` (the default) disables the built-in
+    /// screenshot tool entirely; `Some(list)` installs one bind per
+    /// entry. Re-applied on live reload like [`Self::binds`].
+    pub screenshot: Option<Vec<ScreenshotBind>>,
     /// Run `xwayland-satellite` at startup so X11 apps work (rootless
     /// Xwayland as a normal Wayland client). When `true` (default) and
     /// the binary is installed, the compositor picks a free X display,
@@ -212,6 +216,47 @@ pub enum Action {
     /// environment (notably `$WAYLAND_DISPLAY`). `Arc<str>` so
     /// `Action` is cheap to clone but doesn't need to be `Copy`.
     Spawn(Arc<str>),
+    /// Take a screenshot per the bound [`ScreenshotBind`] (mode, freeze,
+    /// save directory, clipboard). `Arc` so `Action` stays cheap to clone
+    /// and `Eq` while carrying the spec through the keybind pipeline.
+    Screenshot(Arc<ScreenshotBind>),
+}
+
+/// What a screenshot bind captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenshotMode {
+    /// Drag a rectangle (clamped to the output the drag starts on).
+    Region,
+    /// Click a window; captures that window's on-screen rect.
+    Window,
+    /// The whole output the cursor is on, captured immediately.
+    Output,
+}
+
+/// One configured screenshot keybind. The whole `screenshot` config is
+/// `None` by default (the tool is disabled); when present it's a list of
+/// these, each installing one bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenshotBind {
+    /// Required modifier mask (`MOD_*`), extras tolerated — like a bind.
+    pub mods: u32,
+    /// Keysym that triggers this screenshot.
+    pub keysym: Keysym,
+    /// Freeze the screen (snapshot every output and select against the
+    /// frozen image) instead of selecting against the live, updating
+    /// desktop. Ignored for [`ScreenshotMode::Output`] (instant).
+    pub freeze: bool,
+    /// Directory to save a PNG into (`~` and `$VAR`/`${VAR}` expanded);
+    /// `None` means don't save to disk. The file is named
+    /// `Screenshot_YYYYMMDD_HHMMSS.png`.
+    pub directory: Option<PathBuf>,
+    /// Also copy the PNG to the clipboard (`image/png`).
+    pub clipboard: bool,
+    /// Bake the pointer cursor into the capture (default `false` — most
+    /// screenshots omit it).
+    pub show_cursor: bool,
+    /// What to capture.
+    pub mode: ScreenshotMode,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +369,7 @@ impl Default for Config {
             },
             env: Vec::new(),
             startup: Vec::new(),
+            screenshot: None,
             xwayland: true,
         }
     }
@@ -416,6 +462,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("startup")? {
             config.startup = parse_startup(&t).context("startup")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("screenshot")? {
+            config.screenshot = Some(parse_screenshot(&t).context("screenshot")?);
         }
         if let Some(x) = globals.get::<Option<bool>>("xwayland")? {
             config.xwayland = x;
@@ -558,6 +607,67 @@ fn parse_bind(t: &Table) -> mlua::Result<KeyBinding> {
         mods,
         keysym,
         action,
+    })
+}
+
+fn parse_screenshot(t: &Table) -> mlua::Result<Vec<ScreenshotBind>> {
+    let mut binds = Vec::new();
+    for (i, entry) in t.sequence_values::<Table>().enumerate() {
+        let bind_table = entry.with_context(|_| format!("screenshot[{i}] not a table"))?;
+        let bind = parse_screenshot_bind(&bind_table).with_context(|_| format!("screenshot[{i}]"))?;
+        binds.push(bind);
+    }
+    Ok(binds)
+}
+
+fn parse_screenshot_bind(t: &Table) -> mlua::Result<ScreenshotBind> {
+    // `mods` is optional here (Print-alone is the usual screenshot key).
+    let mut mods: u32 = 0;
+    if let Some(mods_table) = t.get::<Option<Table>>("mods")? {
+        for (i, entry) in mods_table.sequence_values::<String>().enumerate() {
+            let name = entry.with_context(|_| format!("mods[{i}] not a string"))?;
+            mods |= parse_modifier(&name).with_context(|_| format!("mods[{i}]"))?;
+        }
+    }
+
+    let key_name: String = t
+        .get("key")
+        .context("missing or invalid `key` (expected xkb keysym name as a string)")?;
+    let keysym = xkb::keysym_from_name(&key_name, xkb::KEYSYM_NO_FLAGS);
+    if keysym.raw() == 0 {
+        lua_bail!(
+            "unknown key name {key_name:?}; must be a name xkbcommon's \
+             xkb_keysym_from_name accepts (e.g. \"Print\", \"S\", \"F12\")"
+        );
+    }
+
+    let requested: String = t
+        .get("mode")
+        .context("missing or invalid `mode` (expected \"region\", \"window\" or \"output\")")?;
+    let capture_mode = match requested.to_lowercase().as_str() {
+        "region" | "rectangle" | "rect" => ScreenshotMode::Region,
+        "window" | "surface" => ScreenshotMode::Window,
+        "output" | "fullscreen" | "screen" => ScreenshotMode::Output,
+        other => lua_bail!(
+            "unknown screenshot mode {other:?}; expected \"region\", \"window\" or \"output\""
+        ),
+    };
+
+    let freeze = t.get::<Option<bool>>("freeze")?.unwrap_or(false);
+    let clipboard = t.get::<Option<bool>>("clipboard")?.unwrap_or(false);
+    let show_cursor = t.get::<Option<bool>>("show_cursor")?.unwrap_or(false);
+    let directory = t
+        .get::<Option<String>>("directory")?
+        .map(|s| PathBuf::from(s.trim()));
+
+    Ok(ScreenshotBind {
+        mods,
+        keysym,
+        freeze,
+        directory,
+        clipboard,
+        show_cursor,
+        mode: capture_mode,
     })
 }
 

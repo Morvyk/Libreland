@@ -66,6 +66,7 @@ mod keyboard;
 mod layout;
 mod render;
 mod screencopy;
+mod screenshot;
 mod wayland;
 
 /// Mutable state threaded through every event-loop callback.
@@ -272,6 +273,61 @@ pub(crate) struct State {
     /// a hi-res / free-spinning wheel that emits sub-notch events
     /// doesn't switch several workspaces at once.
     pub(crate) ws_scroll_accum: f64,
+    /// Active built-in screenshot session (region drag / window pick).
+    /// `Some` only between the trigger keypress and the capture/cancel;
+    /// while set, pointer + keyboard input drives the selection instead
+    /// of reaching clients. `None` disables the screenshot UI.
+    pub(crate) screenshot: Option<ScreenshotState>,
+    /// Compositor-originated capture requests (full-output freeze
+    /// snapshots and final region grabs) awaiting the next render of
+    /// their output — the internal sibling of [`Self::screencopy_pending`].
+    pub(crate) screenshot_pending: Vec<InternalCapture>,
+    /// UTC offset captured once at startup (on the main thread, before
+    /// the process goes multithreaded) so screenshot filenames can use
+    /// local time reliably.
+    pub(crate) local_offset: time::UtcOffset,
+}
+
+/// An in-progress screenshot. `bind` carries the configured behaviour
+/// (mode, freeze, save dir, clipboard); the rest is selection progress.
+pub(crate) struct ScreenshotState {
+    pub(crate) bind: std::sync::Arc<config::ScreenshotBind>,
+    /// Region drag start corner (absolute compositor px), set on press.
+    pub(crate) anchor: Option<(f64, f64)>,
+    /// Frozen full-output snapshots (freeze mode), by output name, used
+    /// both as the displayed backdrop and as the source the final image
+    /// is cropped from.
+    pub(crate) frozen: std::collections::HashMap<String, FrozenFrame>,
+}
+
+/// A frozen full-output capture kept for the duration of a freeze-mode
+/// session — the backdrop shown during selection and the source the final
+/// crop is taken from. Bytes are the raw `CaptureOutcome::Shm` read-back
+/// (memory order B,G,R,X, natural top-down row order).
+pub(crate) struct FrozenFrame {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// A compositor-originated capture serviced in the vblank handler.
+pub(crate) struct InternalCapture {
+    pub(crate) output: String,
+    pub(crate) region: smithay::utils::Rectangle<i32, Physical>,
+    /// Bake the cursor into this capture's frame (per the bind's
+    /// `show_cursor`). Drives `hide_cursor` for the rendering vblank.
+    pub(crate) show_cursor: bool,
+    pub(crate) purpose: CapturePurpose,
+}
+
+/// What to do with an [`InternalCapture`]'s pixels once they come back.
+pub(crate) enum CapturePurpose {
+    /// Store + display as the frozen backdrop for its output.
+    Freeze,
+    /// Encode + save/clipboard immediately (full-output or live region).
+    Finalize {
+        bind: std::sync::Arc<config::ScreenshotBind>,
+    },
 }
 
 /// In-progress interactive drag. The dragged surface is always
@@ -355,8 +411,38 @@ impl State {
             "key processed through xkb"
         );
 
+        // While a screenshot session owns the screen, the keyboard drives
+        // it: Esc cancels, Enter confirms a region drag. Every key is
+        // swallowed (intercepted, never forwarded to a client). We still
+        // pump kbd.input so smithay's modifier bookkeeping stays in sync.
+        if self.screenshot.is_some() {
+            if pressed {
+                use xkbcommon::xkb::keysyms;
+                match result.keysym.raw() {
+                    keysyms::KEY_Escape => self.cancel_screenshot(),
+                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                        self.confirm_screenshot_region();
+                    }
+                    _ => {}
+                }
+            }
+            let serial = SERIAL_COUNTER.next_serial();
+            if let Some(kbd) = self.seat.get_keyboard() {
+                kbd.input::<(), _>(
+                    self,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    event.time_msec(),
+                    |_, _, _| FilterResult::Intercept(()),
+                );
+            }
+            return;
+        }
+
         let matched_action = if pressed {
-            self.config
+            let normal = self
+                .config
                 .binds
                 .bindings
                 .iter()
@@ -364,7 +450,20 @@ impl State {
                     keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
                         && result.has_all_mods(b.mods)
                 })
-                .map(|b| b.action.clone())
+                .map(|b| b.action.clone());
+            // Screenshot binds (if configured) are matched the same way;
+            // normal binds win a tie.
+            normal.or_else(|| {
+                self.config.screenshot.as_ref().and_then(|binds| {
+                    binds
+                        .iter()
+                        .find(|b| {
+                            keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
+                                && result.has_all_mods(b.mods)
+                        })
+                        .map(|b| config::Action::Screenshot(std::sync::Arc::new(b.clone())))
+                })
+            })
         } else {
             None
         };
@@ -428,6 +527,15 @@ impl State {
         let delta_unaccel = evt.delta_unaccel();
         let time = evt.time_msec();
         let utime = evt.time();
+
+        // A screenshot session owns the pointer: move the cursor and
+        // update the live selection (region drag corner / hovered
+        // window), swallowing the event so no client sees it.
+        if self.screenshot.is_some() {
+            self.renderer.on_pointer_motion(delta.x, delta.y);
+            self.screenshot_pointer_motion();
+            return;
+        }
 
         // Drag in flight: the cursor follows the drag (a compositor
         // gesture, unaffected by client pointer constraints). Move it,
@@ -655,6 +763,23 @@ impl State {
         state: smithay::backend::input::ButtonState,
         time: u32,
     ) {
+        use smithay::backend::input::ButtonState;
+        // A screenshot session owns the pointer. Left button: PRESS starts
+        // the region drag (anchor) / RELEASE finalizes it; for window mode
+        // a press captures the hovered window. Right button cancels. All
+        // buttons are swallowed (never reach a client).
+        if self.screenshot.is_some() {
+            if button == BTN_LEFT {
+                match state {
+                    ButtonState::Pressed => self.screenshot_pointer_press(),
+                    ButtonState::Released => self.screenshot_pointer_release(),
+                }
+            } else if button == BTN_RIGHT && matches!(state, ButtonState::Pressed) {
+                self.cancel_screenshot();
+            }
+            return;
+        }
+
         // Active drag: any release ends it. Other buttons are
         // swallowed so we don't accidentally cancel mid-drag.
         if self.drag.is_some() {
@@ -1447,6 +1572,7 @@ impl State {
                     ),
                 }
             }
+            config::Action::Screenshot(bind) => self.start_screenshot(&bind),
         }
     }
 
@@ -1515,6 +1641,352 @@ impl State {
     }
 }
 
+/// Axis-aligned rect (absolute compositor px) spanning two cursor
+/// corners, regardless of drag direction.
+fn rect_from_corners(ax: f64, ay: f64, bx: f64, by: f64) -> smithay::utils::Rectangle<i32, Physical> {
+    let x0 = ax.min(bx);
+    let y0 = ay.min(by);
+    let w = ax.max(bx) - x0;
+    let h = ay.max(by) - y0;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "cursor coordinates are clamped to the i32 layout bounds in on_pointer_motion"
+    )]
+    smithay::utils::Rectangle::new(
+        Point::from((x0.round() as i32, y0.round() as i32)),
+        smithay::utils::Size::from((w.round() as i32, h.round() as i32)),
+    )
+}
+
+/// Map an absolute-compositor rect into one output's framebuffer
+/// (physical) pixels: subtract the output origin, scale by its factor.
+fn compositor_rect_to_physical(
+    rect: smithay::utils::Rectangle<i32, Physical>,
+    origin: Point<i32, Physical>,
+    scale: f64,
+) -> smithay::utils::Rectangle<i32, Physical> {
+    let lx = f64::from(rect.loc.x - origin.x) * scale;
+    let ly = f64::from(rect.loc.y - origin.y) * scale;
+    let w = f64::from(rect.size.w) * scale;
+    let h = f64::from(rect.size.h) * scale;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "physical dimensions are bounded by the output's framebuffer size, well within i32"
+    )]
+    smithay::utils::Rectangle::new(
+        Point::from((lx.round() as i32, ly.round() as i32)),
+        smithay::utils::Size::from((w.round() as i32, h.round() as i32)),
+    )
+}
+
+impl State {
+    /// Cursor hotspot as integer physical/compositor pixels.
+    fn cursor_point(&self) -> Point<i32, Physical> {
+        let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor is clamped to the i32 layout bounds in Renderer::on_pointer_motion"
+        )]
+        Point::from((cx.round() as i32, cy.round() as i32))
+    }
+
+    /// Enter a screenshot session (Region/Window) or, for Output mode,
+    /// immediately enqueue a full-output grab. Re-triggers while a session
+    /// runs are ignored.
+    fn start_screenshot(&mut self, bind: &std::sync::Arc<config::ScreenshotBind>) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        match bind.mode {
+            config::ScreenshotMode::Output => {
+                let pt = self.cursor_point();
+                if let Some(geom) = self.renderer.output_at(pt) {
+                    info!(output = %geom.name, "screenshot: capturing full output");
+                    self.screenshot_pending.push(InternalCapture {
+                        output: geom.name,
+                        region: smithay::utils::Rectangle::from_size(geom.mode_size),
+                        show_cursor: bind.show_cursor,
+                        purpose: CapturePurpose::Finalize { bind: bind.clone() },
+                    });
+                } else {
+                    warn!("screenshot: no output under the cursor");
+                }
+            }
+            config::ScreenshotMode::Region | config::ScreenshotMode::Window => {
+                self.screenshot = Some(ScreenshotState {
+                    bind: bind.clone(),
+                    anchor: None,
+                    frozen: std::collections::HashMap::new(),
+                });
+                if bind.freeze {
+                    // Snapshot every output. The overlay (dim) is held back
+                    // until those captures land (in `complete_internal_capture`)
+                    // so the snapshot itself is clean — no dim baked in.
+                    for geom in self.renderer.output_geometries() {
+                        self.screenshot_pending.push(InternalCapture {
+                            output: geom.name,
+                            region: smithay::utils::Rectangle::from_size(geom.mode_size),
+                            show_cursor: bind.show_cursor,
+                            purpose: CapturePurpose::Freeze,
+                        });
+                    }
+                } else {
+                    // Live selection: dim immediately.
+                    self.update_screenshot_overlay();
+                }
+                info!("screenshot: session started");
+            }
+        }
+    }
+
+    /// Cancel an in-progress session: drop the UI + every pending capture
+    /// (nothing is saved or copied).
+    fn cancel_screenshot(&mut self) {
+        self.screenshot = None;
+        self.screenshot_pending.clear();
+        self.renderer.clear_screenshot();
+        info!("screenshot: cancelled");
+    }
+
+    /// End a session after a successful selection: drop the UI + leftover
+    /// freeze snapshots, but keep any enqueued `Finalize` capture so its
+    /// delivery on the next vblank still happens.
+    fn end_screenshot(&mut self) {
+        self.screenshot = None;
+        self.screenshot_pending
+            .retain(|c| matches!(c.purpose, CapturePurpose::Finalize { .. }));
+        self.renderer.clear_screenshot();
+    }
+
+    /// Recompute the selection from the cursor + session state and hand it
+    /// to the renderer for this and following frames.
+    fn update_screenshot_overlay(&mut self) {
+        let selection = self.current_screenshot_selection();
+        self.renderer
+            .set_screenshot_overlay(Some(render::ScreenshotOverlay { selection }));
+    }
+
+    /// The current selection in absolute compositor coords: the
+    /// anchor→cursor rect (Region, once dragging) or the hovered window
+    /// (Window). `None` dims the whole screen.
+    fn current_screenshot_selection(&self) -> Option<smithay::utils::Rectangle<i32, Physical>> {
+        let session = self.screenshot.as_ref()?;
+        match session.bind.mode {
+            config::ScreenshotMode::Region => {
+                let (ax, ay) = session.anchor?;
+                let (cx, cy) = self.renderer.cursor_pos();
+                Some(rect_from_corners(ax, ay, cx, cy))
+            }
+            config::ScreenshotMode::Window => {
+                self.layout.window_at(self.cursor_point()).map(|(_, r)| r)
+            }
+            config::ScreenshotMode::Output => None,
+        }
+    }
+
+    /// Pointer moved during a session — refresh the selection UI.
+    fn screenshot_pointer_motion(&mut self) {
+        self.update_screenshot_overlay();
+    }
+
+    /// Left-button press during a session.
+    fn screenshot_pointer_press(&mut self) {
+        let Some(mode) = self.screenshot.as_ref().map(|s| s.bind.mode) else {
+            return;
+        };
+        match mode {
+            config::ScreenshotMode::Region => {
+                let corner = self.renderer.cursor_pos();
+                if let Some(s) = &mut self.screenshot {
+                    s.anchor = Some(corner);
+                }
+                self.update_screenshot_overlay();
+            }
+            config::ScreenshotMode::Window => self.finalize_window(),
+            config::ScreenshotMode::Output => {}
+        }
+    }
+
+    /// Left-button release during a session — finalize a region drag.
+    fn screenshot_pointer_release(&mut self) {
+        let region_drag = self.screenshot.as_ref().is_some_and(|s| {
+            matches!(s.bind.mode, config::ScreenshotMode::Region) && s.anchor.is_some()
+        });
+        if region_drag {
+            self.finalize_region();
+        }
+    }
+
+    /// Enter key during a session — confirm the current selection.
+    fn confirm_screenshot_region(&mut self) {
+        let Some(session) = self.screenshot.as_ref() else {
+            return;
+        };
+        match (session.bind.mode, session.anchor.is_some()) {
+            (config::ScreenshotMode::Region, true) => self.finalize_region(),
+            (config::ScreenshotMode::Window, _) => self.finalize_window(),
+            _ => {}
+        }
+    }
+
+    /// Capture the dragged region (clamped to the output the drag started
+    /// on) and deliver it.
+    fn finalize_region(&mut self) {
+        let (cx, cy) = self.renderer.cursor_pos();
+        let Some(session) = self.screenshot.as_ref() else {
+            return;
+        };
+        let Some((ax, ay)) = session.anchor else {
+            return;
+        };
+        let sel = rect_from_corners(ax, ay, cx, cy);
+        if sel.size.w < 1 || sel.size.h < 1 {
+            self.cancel_screenshot();
+            return;
+        }
+        self.finalize_compositor_rect(sel);
+    }
+
+    /// Capture the window under the cursor and deliver it.
+    fn finalize_window(&mut self) {
+        let Some(rect) = self.layout.window_at(self.cursor_point()).map(|(_, r)| r) else {
+            self.cancel_screenshot();
+            return;
+        };
+        self.finalize_compositor_rect(rect);
+    }
+
+    /// Shared region/window finalize: resolve the output, map the rect to
+    /// its framebuffer pixels, then crop the frozen snapshot (freeze) or
+    /// enqueue a live capture, and deliver.
+    fn finalize_compositor_rect(&mut self, rect: smithay::utils::Rectangle<i32, Physical>) {
+        let center = rect.loc + Point::from((rect.size.w / 2, rect.size.h / 2));
+        let Some(geom) = self
+            .renderer
+            .output_at(center)
+            .or_else(|| self.renderer.output_at(rect.loc))
+        else {
+            warn!("screenshot: selection isn't on any output");
+            self.cancel_screenshot();
+            return;
+        };
+        let Some(clamped) = rect.intersection(geom.compositor) else {
+            self.cancel_screenshot();
+            return;
+        };
+        let phys = compositor_rect_to_physical(clamped, geom.compositor.loc, geom.scale);
+        if phys.size.w < 1 || phys.size.h < 1 {
+            self.cancel_screenshot();
+            return;
+        }
+        let Some(bind) = self.screenshot.as_ref().map(|s| s.bind.clone()) else {
+            return;
+        };
+        if bind.freeze {
+            let png = self
+                .screenshot
+                .as_ref()
+                .and_then(|s| s.frozen.get(&geom.name))
+                .and_then(|f| {
+                    screenshot::encode_region(&f.bytes, f.width, f.height, phys).ok()
+                });
+            if let Some(bytes) = png {
+                self.deliver_screenshot(&bytes, &bind);
+            } else {
+                warn!(output = %geom.name, "screenshot: freeze snapshot unavailable");
+            }
+        } else {
+            self.screenshot_pending.push(InternalCapture {
+                output: geom.name,
+                region: phys,
+                show_cursor: bind.show_cursor,
+                purpose: CapturePurpose::Finalize { bind },
+            });
+        }
+        self.end_screenshot();
+    }
+
+    /// Save a finished PNG to disk (if a directory is configured) and copy
+    /// it to the clipboard (if requested).
+    fn deliver_screenshot(&mut self, png: &[u8], bind: &config::ScreenshotBind) {
+        if let Some(dir) = &bind.directory {
+            let dir = screenshot::expand_dir(dir);
+            let filename = screenshot::timestamp_filename(self.local_offset);
+            match screenshot::save(&dir, &filename, png) {
+                Ok(path) => info!(path = %path.display(), "screenshot saved"),
+                Err(err) => warn!(error = %err, dir = %dir.display(), "screenshot save failed"),
+            }
+        }
+        if bind.clipboard {
+            self.clipboard.set_image(
+                smithay::wayland::selection::SelectionTarget::Clipboard,
+                "image/png".to_owned(),
+                png.to_vec(),
+            );
+            let dh = self.display_handle.clone();
+            smithay::wayland::selection::data_device::set_data_device_selection::<State>(
+                &dh,
+                &self.seat,
+                vec!["image/png".to_owned()],
+                (),
+            );
+            info!("screenshot copied to clipboard (image/png)");
+        }
+    }
+
+    /// Route a compositor-originated capture's pixels (serviced in the
+    /// vblank handler): store + display a freeze snapshot, or encode +
+    /// deliver a finished grab.
+    fn complete_internal_capture(&mut self, cap: InternalCapture, outcome: render::CaptureOutcome) {
+        let render::CaptureOutcome::Shm {
+            bytes,
+            width,
+            height,
+            flipped: _,
+        } = outcome
+        else {
+            warn!(output = %cap.output, "screenshot: internal capture failed");
+            return;
+        };
+        let (Ok(w_i), Ok(h_i)) = (i32::try_from(width), i32::try_from(height)) else {
+            return;
+        };
+        match cap.purpose {
+            CapturePurpose::Freeze => {
+                // Upload an upright, opaque RGBA copy as the backdrop; keep
+                // the raw bytes for cropping the final image.
+                let rgba = screenshot::to_rgba_topdown(&bytes, width, height);
+                self.renderer
+                    .set_freeze_texture(&cap.output, &rgba, w_i, h_i);
+                if let Some(session) = &mut self.screenshot {
+                    session.frozen.insert(cap.output, FrozenFrame { bytes, width, height });
+                }
+                // Reveal the dim overlay only once EVERY output's snapshot
+                // has landed — otherwise a not-yet-frozen output would bake
+                // the dim into its own snapshot.
+                let more_freezes = self
+                    .screenshot_pending
+                    .iter()
+                    .any(|c| matches!(c.purpose, CapturePurpose::Freeze));
+                if !more_freezes {
+                    self.update_screenshot_overlay();
+                }
+            }
+            CapturePurpose::Finalize { bind } => {
+                // The capture already read exactly the wanted region, so
+                // encode the whole buffer.
+                let full = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
+                    w_i, h_i,
+                )));
+                match screenshot::encode_region(&bytes, width, height, full) {
+                    Ok(png) => self.deliver_screenshot(&png, &bind),
+                    Err(err) => warn!(error = %err, "screenshot: PNG encode failed"),
+                }
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "init flow is naturally linear (session → udev → DRM → renderer → keyboard → libinput → Wayland → state → run); extracting sub-helpers would obscure ownership/order more than the function being long does"
@@ -1526,6 +1998,12 @@ fn main() -> Result<()> {
     // do NOT use `_` (anonymous) — that would drop it immediately.
     let _log_guard = init_tracing()?;
     info!("libreland starting");
+
+    // Capture the local UTC offset NOW, while we're still single-threaded:
+    // `time`'s local-offset lookup is unsound (and returns Err) once the
+    // process is multithreaded, which a compositor quickly becomes. Used
+    // for local-time screenshot filenames; falls back to UTC if unknown.
+    let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
 
     // Compositor configuration: load Lua from $XDG_CONFIG_HOME/libreland/
     // config.lua if present, else fall back to compiled-in defaults.
@@ -1873,6 +2351,9 @@ fn main() -> Result<()> {
         layout,
         drag: None,
         ws_scroll_accum: 0.0,
+        screenshot: None,
+        screenshot_pending: Vec::new(),
+        local_offset,
     };
     let mut loop_data = LoopData { state, display };
 
@@ -2186,35 +2667,55 @@ fn wire_event_sources(
                     // output this CRTC drives, so the renderer can read
                     // them off this frame's framebuffer.
                     let out_name = data.state.renderer.output_name_for_crtc(crtc);
+                    // Client zwlr_screencopy captures + compositor-internal
+                    // screenshot captures both ride this output's frame.
                     let mut captures: Vec<screencopy::PendingCapture> = Vec::new();
-                    if let Some(name) = out_name {
+                    let mut internal: Vec<InternalCapture> = Vec::new();
+                    if let Some(name) = out_name.as_deref() {
                         let pending = std::mem::take(&mut data.state.screencopy_pending);
                         let (mine, rest): (Vec<_>, Vec<_>) =
                             pending.into_iter().partition(|p| p.output == name);
                         data.state.screencopy_pending = rest;
                         captures = mine;
+
+                        let ipending = std::mem::take(&mut data.state.screenshot_pending);
+                        let (imine, irest): (Vec<_>, Vec<_>) =
+                            ipending.into_iter().partition(|c| c.output == name);
+                        data.state.screenshot_pending = irest;
+                        internal = imine;
                     }
-                    let specs: Vec<render::CaptureSpec> = captures
+                    // Client specs first (shm or zero-copy dmabuf blit),
+                    // then internal screenshot specs (always CPU shm).
+                    let mut specs: Vec<render::CaptureSpec> = captures
                         .iter()
                         .map(|c| render::CaptureSpec {
                             region: c.region,
                             fourcc: screencopy::CAPTURE_FOURCC,
-                            // A dmabuf-backed client buffer takes the
-                            // zero-copy GPU blit path; everything else
-                            // (wl_shm) takes the CPU read-back path.
                             target: match smithay::wayland::dmabuf::get_dmabuf(&c.buffer) {
                                 Ok(dmabuf) => render::CaptureTarget::Dmabuf(dmabuf.clone()),
                                 Err(_) => render::CaptureTarget::Shm,
                             },
                         })
                         .collect();
-                    // Hide our cursor while a game has the pointer
-                    // locked — it draws its own. Also hide it for a
-                    // capture when every pending request asked for no
-                    // cursor (e.g. a screenshot), so the grab is clean.
+                    for c in &internal {
+                        specs.push(render::CaptureSpec {
+                            region: c.region,
+                            fourcc: screencopy::CAPTURE_FOURCC,
+                            target: render::CaptureTarget::Shm,
+                        });
+                    }
+                    // Hide our cursor while a game holds a pointer lock (it
+                    // draws its own), for a client capture that asked for no
+                    // cursor, and for an internal screenshot capture unless
+                    // its bind set `show_cursor`.
                     let capture_hides_cursor =
                         !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
-                    let hide_cursor = data.state.pointer_locked() || capture_hides_cursor;
+                    let internal_hides_cursor =
+                        !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
+                    let hide_cursor = data.state.pointer_locked()
+                        || capture_hides_cursor
+                        || internal_hides_cursor;
+                    let client_n = captures.len();
                     match data.state.renderer.render_for_crtc(
                         crtc,
                         &placements,
@@ -2223,9 +2724,14 @@ fn wire_event_sources(
                         hide_cursor,
                         &specs,
                     ) {
-                        Ok(results) => {
+                        Ok(mut results) => {
+                            // Trailing results belong to the internal specs.
+                            let internal_results = results.split_off(client_n.min(results.len()));
                             for (pending, captured) in captures.iter().zip(results) {
                                 screencopy::complete(pending, captured);
+                            }
+                            for (cap, outcome) in internal.into_iter().zip(internal_results) {
+                                data.state.complete_internal_capture(cap, outcome);
                             }
                         }
                         Err(err) => {
@@ -2238,6 +2744,9 @@ fn wire_event_sources(
                             warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
                             for pending in &captures {
                                 screencopy::complete(pending, render::CaptureOutcome::Failed);
+                            }
+                            if !internal.is_empty() {
+                                warn!("screenshot: capture dropped (render failed)");
                             }
                         }
                     }

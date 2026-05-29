@@ -1,0 +1,170 @@
+//! Built-in screenshot tool — the pure edges.
+//!
+//! Pixel cropping + PNG encoding, the timestamped filename, save-path
+//! expansion, and writing the file. The interactive session (selection
+//! UI, freeze, capture wiring, clipboard) lives on [`crate::State`] in
+//! `main.rs`; this module is the stateless, testable parts that don't
+//! touch compositor state.
+
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+
+use smithay::utils::{Physical, Rectangle};
+use time::OffsetDateTime;
+use time::UtcOffset;
+use time::macros::format_description;
+
+/// Extract `region` (top-left origin, in the upright image) from a
+/// captured framebuffer read-back and encode it as a PNG (RGB, opaque).
+///
+/// `src` is `src_w * src_h * 4` bytes in memory order **B, G, R, X** (the
+/// `Xrgb8888` read-back; X is undefined padding, never alpha), in **natural
+/// top-down row order** (row 0 = top of the image — confirmed visually for
+/// our scanout framebuffers; no row reversal needed). The region is
+/// clamped to `src`.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "region/src dimensions are non-negative physical pixel counts bounded by output size, well within usize/u32"
+)]
+pub(crate) fn encode_region(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    region: Rectangle<i32, Physical>,
+) -> Result<Vec<u8>, png::EncodingError> {
+    let (sw, sh) = (src_w as usize, src_h as usize);
+    let src_stride = sw * 4;
+    let rx = (region.loc.x.max(0) as usize).min(sw);
+    let ry = (region.loc.y.max(0) as usize).min(sh);
+    let rw = (region.size.w.max(0) as usize).min(sw - rx);
+    let rh = (region.size.h.max(0) as usize).min(sh - ry);
+
+    let mut rgb = vec![0u8; rw * rh * 3];
+    for out_y in 0..rh {
+        let s = &src[(ry + out_y) * src_stride..];
+        let d = &mut rgb[out_y * rw * 3..out_y * rw * 3 + rw * 3];
+        for out_x in 0..rw {
+            let p = &s[(rx + out_x) * 4..(rx + out_x) * 4 + 4]; // B, G, R, X
+            let q = &mut d[out_x * 3..out_x * 3 + 3];
+            q[0] = p[2]; // R
+            q[1] = p[1]; // G
+            q[2] = p[0]; // B
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(Cursor::new(&mut out), rw as u32, rh as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header()?;
+        writer.write_image_data(&rgb)?;
+    } // writer dropped here — flushes IDAT/IEND into `out`
+    Ok(out)
+}
+
+/// Convert a captured BGRX read-back into a fully-opaque RGBA buffer for
+/// uploading as the freeze backdrop texture. The read-back is already
+/// top-down (natural row order); alpha is forced to 255 (the captured X
+/// byte is undefined, not real alpha) so the backdrop is opaque — same
+/// shape as the cursor sprite upload, the renderer's known-good
+/// `Abgr8888` / `flipped = false` path. Empty if `src` is too small.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "width/height are non-negative physical pixel counts bounded by output size, well within usize"
+)]
+pub(crate) fn to_rgba_topdown(src: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let cols = width as usize;
+    let rows = height as usize;
+    let stride = cols * 4;
+    if stride == 0 || src.len() < stride * rows {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; stride * rows];
+    for row in 0..rows {
+        let src_line = &src[row * stride..row * stride + stride];
+        let dst_line = &mut out[row * stride..row * stride + stride];
+        for col in 0..cols {
+            let i = col * 4; // pixel offset within the row
+            dst_line[i] = src_line[i + 2]; // R <- src R
+            dst_line[i + 1] = src_line[i + 1]; // G
+            dst_line[i + 2] = src_line[i]; // B <- src B
+            dst_line[i + 3] = 255; // opaque
+        }
+    }
+    out
+}
+
+/// `Screenshot_YYYYMMDD_HHMMSS.png` at the current time in `offset`
+/// (captured once at startup; see `State::local_offset`).
+pub(crate) fn timestamp_filename(offset: UtcOffset) -> String {
+    let now = OffsetDateTime::now_utc().to_offset(offset);
+    let fmt = format_description!("[year][month][day]_[hour][minute][second]");
+    let stamp = now
+        .format(&fmt)
+        .unwrap_or_else(|_| "00000000_000000".to_owned());
+    format!("Screenshot_{stamp}.png")
+}
+
+/// Expand a configured save directory: a leading `~` becomes `$HOME`, and
+/// `$VAR` / `${VAR}` are substituted from the environment (empty if unset).
+/// Lets the config use `~/Pictures/Screenshots` or
+/// `$XDG_PICTURES_DIR/Screenshots` directly.
+pub(crate) fn expand_dir(path: &Path) -> PathBuf {
+    PathBuf::from(expand(&path.to_string_lossy()))
+}
+
+fn expand(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let rest = match input.strip_prefix('~') {
+        Some(after) if after.is_empty() || after.starts_with('/') => {
+            if let Ok(home) = std::env::var("HOME") {
+                out.push_str(&home);
+            }
+            after
+        }
+        _ => input,
+    };
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let braced = chars.peek() == Some(&'{');
+        if braced {
+            chars.next();
+        }
+        let mut name = String::new();
+        while let Some(&n) = chars.peek() {
+            let part_of_name = if braced {
+                n != '}'
+            } else {
+                n.is_ascii_alphanumeric() || n == '_'
+            };
+            if part_of_name {
+                name.push(n);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if braced && chars.peek() == Some(&'}') {
+            chars.next();
+        }
+        if let Ok(val) = std::env::var(&name) {
+            out.push_str(&val);
+        }
+    }
+    out
+}
+
+/// Create `dir` (and parents) and write `bytes` to `dir/filename`.
+pub(crate) fn save(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(filename);
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}

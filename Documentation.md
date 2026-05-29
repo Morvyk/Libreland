@@ -83,9 +83,9 @@ re-applied on save — no restart needed for most settings. A save that
 fails to parse is logged and **ignored**, leaving the running config
 untouched, so a typo never breaks your session.
 
-Applied live: `binds`, `input.focus_model`, `misc.wallpaper`, the whole
-`border` section, and `layout` gaps. Changing these takes effect on the
-next frame / window reconfigure.
+Applied live: `binds`, `screenshot`, `input.focus_model`,
+`misc.wallpaper`, the whole `border` section, and `layout` gaps. Changing
+these takes effect on the next frame / window reconfigure.
 
 Needs a restart (a "restart to apply" line is logged when they change):
 `monitors` (mode/position/scale/primary), the keyboard/pointer
@@ -347,10 +347,48 @@ xkb-resolved keysyms, so it keeps working once a future DRM grab disables the
 kernel's Ctrl+C path. Until that grab exists, Ctrl+C on the host TTY also
 exits — but treat `Super+Shift+E` as the canonical exit.
 
+## Screenshots (built in)
+
+Libreland has its own screenshot tool — no `grim`/`slurp` needed. It's
+**off by default**; add a `screenshot` list to the config to enable it.
+Each entry binds a key (`key`, optional `mods`) to a capture:
+
+| Field       | Default | Notes                                                                                 |
+| ----------- | ------- | ------------------------------------------------------------------------------------- |
+| `key`       | —       | xkb keysym name, e.g. `"Print"`. Required.                                            |
+| `mods`      | none    | Optional modifier array (`{ "Super" }`).                                              |
+| `mode`      | —       | `"region"` (drag a rectangle), `"window"` (click a window), `"output"` (whole monitor under the cursor, instant). Required. |
+| `freeze`    | `false` | Pause the screen while selecting (so video/animation doesn't move under you). Ignored for `"output"`. |
+| `clipboard` | `false` | Copy the PNG to the clipboard as `image/png` (paste with `Ctrl+V`).                    |
+| `show_cursor` | `false` | Bake the pointer cursor into the capture.                                          |
+| `directory` | none    | Where to save a PNG; omit to not save. `~` and `$VAR`/`${VAR}` are expanded. Files are named `Screenshot_YYYYMMDD_HHMMSS.png` (local time). |
+
+During a region/window capture the screen dims, the selection is
+outlined, **Esc** (or right-click) cancels, and **Enter** confirms. The
+selection UI is never in the saved image, and the cursor is excluded
+unless `show_cursor = true`. Example —
+`Print` freezes, drags a rectangle, copies it, and saves under the XDG
+pictures dir:
+
+```lua
+screenshot = {
+    {
+        key = "Print",
+        mode = "region",
+        freeze = true,
+        clipboard = true,
+        directory = (os.getenv("XDG_PICTURES_DIR") or (os.getenv("HOME") .. "/Pictures")) .. "/Screenshots",
+    },
+}
+```
+
+(Region capture currently resolves to the single output the drag starts
+on; cross-monitor region grabs are a follow-up.)
+
 ## Screen capture & desktop portals
 
-Libreland implements `zwlr_screencopy_v1`, so output capture works
-directly — e.g. `grim` (whole screen) or `grim -g "$(slurp)"` (region).
+Libreland implements `zwlr_screencopy_v1`, so external capture also works
+— e.g. `grim` (whole screen) or, for sharing, the portal below.
 
 For app-facing functionality — screen **sharing** (OBS, Discord,
 browsers), **file dialogs**, dark-mode/appearance **settings** — install

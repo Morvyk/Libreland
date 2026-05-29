@@ -20,8 +20,13 @@ members = ["output-picker"]
 [dependencies]
 anyhow = "1.0.102"
 mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
+# Pure-Rust PNG encoder for the built-in screenshot tool (no C deps).
+png = "0.18.1"
 smithay = { version = "0.7.0", default-features = false, features = ["backend_drm", "backend_egl", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev", "renderer_gl", "wayland_frontend", "desktop"] }
-time = { version = "0.3.47", features = ["formatting", "macros"] }
+# `local-offset` lets screenshot filenames use local time; the UTC offset
+# is captured once at startup (on the main thread) because the per-call
+# now_local() is unreliable once the process is multithreaded.
+time = { version = "0.3.47", features = ["formatting", "macros", "local-offset"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

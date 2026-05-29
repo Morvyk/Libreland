@@ -109,6 +109,19 @@ impl Selections {
         };
         cache.and_then(|c| c.data.get(mime)).cloned()
     }
+
+    /// Put compositor-owned bytes (e.g. a screenshot PNG) on `ty` under
+    /// `mime`. Bumping the epoch invalidates any in-flight client read so
+    /// a copy that's still streaming can't clobber what we just stored.
+    /// The caller must follow up with `set_data_device_selection` (or the
+    /// primary equivalent) so clients see the offer and paste resolves
+    /// back through [`on_send_selection`].
+    pub(crate) fn set_image(&mut self, ty: SelectionTarget, mime: String, bytes: Vec<u8>) {
+        self.bump(ty);
+        let mut cache = CachedSelection::default();
+        cache.data.insert(mime, bytes);
+        self.store(ty, cache);
+    }
 }
 
 /// Accumulator shared across the per-mime read sources of one

@@ -14,6 +14,7 @@
 //! draw the cursor only when the hotspot falls within that output's
 //! rectangle.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
@@ -304,6 +305,22 @@ pub struct Renderer {
     /// the spec defines it as an unsigned 32-bit ms count expected
     /// to wrap freely.
     start: Instant,
+    /// Frozen snapshot per output (by connector name), drawn full-screen
+    /// while a freeze-mode screenshot session is selecting so the live
+    /// desktop appears paused. Empty when no session / not frozen.
+    /// `GlesTexture` is `Arc`-backed (cheap to clone out before the frame).
+    freeze_textures: HashMap<String, GlesTexture>,
+    /// Active screenshot selection overlay (dim wash + highlighted rect),
+    /// in absolute compositor coords. `None` when no session is running.
+    screenshot_overlay: Option<ScreenshotOverlay>,
+}
+
+/// What the screenshot selection UI should draw this frame. The
+/// rectangle is in absolute compositor coords; `None` means a session is
+/// active but nothing is selected yet (just dim every output).
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenshotOverlay {
+    pub selection: Option<Rectangle<i32, Physical>>,
 }
 
 /// One output's render state.
@@ -330,6 +347,30 @@ struct OutputRender {
     compositor_size: Size<i32, Physical>,
     /// Fractional scale; physical = compositor * scale (component-wise).
     scale: f64,
+}
+
+/// Public snapshot of one output's geometry for callers (the screenshot
+/// tool) that need to map between compositor and framebuffer pixels.
+#[derive(Debug, Clone)]
+pub struct OutputGeom {
+    pub name: String,
+    /// Area in absolute compositor (logical) coordinates.
+    pub compositor: Rectangle<i32, Physical>,
+    /// Fractional scale: physical = compositor * scale.
+    pub scale: f64,
+    /// Framebuffer size in physical pixels.
+    pub mode_size: Size<i32, Physical>,
+}
+
+impl From<&OutputRender> for OutputGeom {
+    fn from(o: &OutputRender) -> Self {
+        Self {
+            name: o.name.clone(),
+            compositor: Rectangle::new(o.compositor_position, o.compositor_size),
+            scale: o.scale,
+            mode_size: o.mode_size,
+        }
+    }
 }
 
 /// A cursor theme image uploaded to a GLES texture, plus the geometry
@@ -557,6 +598,8 @@ impl Renderer {
             )]
             cursor_size: cursor_size as i32,
             start: Instant::now(),
+            freeze_textures: HashMap::new(),
+            screenshot_overlay: None,
         })
     }
 
@@ -717,6 +760,27 @@ impl Renderer {
             .map(|o| Rectangle::new(o.compositor_position, o.compositor_size))
     }
 
+    /// Geometry of the output containing `point` (absolute compositor
+    /// px), if any — its name, compositor rect, fractional scale, and
+    /// physical mode size. Used by the screenshot tool to map a
+    /// selection in compositor space to one output's framebuffer pixels.
+    pub fn output_at(&self, point: Point<i32, Physical>) -> Option<OutputGeom> {
+        self.outputs
+            .iter()
+            .find(|o| {
+                let r = Rectangle::new(o.compositor_position, o.compositor_size);
+                let local = point - r.loc;
+                local.x >= 0 && local.y >= 0 && local.x < r.size.w && local.y < r.size.h
+            })
+            .map(OutputGeom::from)
+    }
+
+    /// Geometry of every output — used by the screenshot tool to snapshot
+    /// all outputs for a freeze.
+    pub fn output_geometries(&self) -> Vec<OutputGeom> {
+        self.outputs.iter().map(OutputGeom::from).collect()
+    }
+
     /// Connector name of the primary output. Used by the layer-shell
     /// reflow to attribute exclusive zones to the primary by name.
     pub fn primary_output_name(&self) -> &str {
@@ -731,6 +795,40 @@ impl Renderer {
     pub fn set_appearance(&mut self, wallpaper: Fill, border: BorderConfig) {
         self.wallpaper = wallpaper;
         self.border = border;
+    }
+
+    /// Set (or clear) the screenshot selection overlay drawn over every
+    /// output from the next frame on. The rectangle is in absolute
+    /// compositor coords; each output renders the part that falls on it.
+    pub fn set_screenshot_overlay(&mut self, overlay: Option<ScreenshotOverlay>) {
+        self.screenshot_overlay = overlay;
+    }
+
+    /// Upload a captured frame as the frozen backdrop for `output` (used
+    /// by freeze-mode screenshots). `rgba` is **top-down, fully-opaque
+    /// RGBA** (see `screenshot::to_rgba_topdown`) — the same byte order
+    /// and orientation as the cursor sprite, so it imports via the
+    /// renderer's known-good `Abgr8888` / `flipped = false` path and
+    /// displays upright + opaque. Returns whether the upload succeeded.
+    pub fn set_freeze_texture(&mut self, output: &str, rgba: &[u8], width: i32, height: i32) -> bool {
+        let size = Size::<i32, smithay::utils::Buffer>::from((width, height));
+        match self.gles.import_memory(rgba, Fourcc::Abgr8888, size, false) {
+            Ok(texture) => {
+                self.freeze_textures.insert(output.to_owned(), texture);
+                true
+            }
+            Err(err) => {
+                warn!(error = %err, output, "screenshot: freeze texture upload failed");
+                false
+            }
+        }
+    }
+
+    /// Tear down all screenshot state (overlay + frozen textures) when a
+    /// session ends or is cancelled, so the next frame renders live again.
+    pub fn clear_screenshot(&mut self) {
+        self.screenshot_overlay = None;
+        self.freeze_textures.clear();
     }
 
     /// GPU buffer (dmabuf) formats this renderer can import as
@@ -833,12 +931,16 @@ impl Renderer {
         let frame_shader = self.frame_shader.clone();
         let cursor_sprite = self.cursor.clone();
         let cursor_size = self.cursor_size;
+        let screenshot_overlay = self.screenshot_overlay;
         let output = &self.outputs[idx];
         let mode_size = output.mode_size;
         let compositor_position = output.compositor_position;
         let compositor_size = output.compositor_size;
         let scale = output.scale;
         let output_name = output.name.clone();
+        // Frozen backdrop for this output (freeze-mode screenshot). Cheap
+        // Arc-backed clone out before the `self.gles` frame borrow.
+        let freeze_texture = self.freeze_textures.get(&output_name).cloned();
 
         // No-op on the first call (no pending fb), the ack of the
         // previous frame's flip thereafter.
@@ -1133,6 +1235,42 @@ impl Renderer {
                     &full_damage,
                 )
                 .context("draw_render_elements (popup) failed")?;
+            }
+
+            // Screenshot session: cover the (possibly still-updating)
+            // scene with the frozen snapshot so selection happens against
+            // a paused image, then dim + outline the selection. Drawn
+            // after the scene and before the cursor so the pointer stays
+            // visible while you select.
+            if let Some(tex) = &freeze_texture {
+                let dst = Rectangle::from_size(mode_size);
+                let src = Rectangle::from_size(tex.size()).to_f64();
+                let damage = [dst];
+                frame
+                    .render_texture_from_to(
+                        tex,
+                        src,
+                        dst,
+                        &damage,
+                        // The captured frame is opaque (the X byte is not
+                        // alpha); mark it fully opaque so the garbage pad
+                        // never blends.
+                        &damage,
+                        Transform::Normal,
+                        1.0,
+                        None,
+                        &[],
+                    )
+                    .context("render_texture_from_to (freeze) failed")?;
+            }
+            if let Some(overlay) = screenshot_overlay {
+                draw_screenshot_overlay(
+                    &mut frame,
+                    &overlay,
+                    compositor_position,
+                    mode_size,
+                    scale,
+                )?;
             }
 
             // Skip the cursor entirely while the pointer is locked (a
@@ -1468,6 +1606,65 @@ fn scale_i(v: i32, scale: f64) -> i32 {
 )]
 fn scale_f(v: f64, scale: f64) -> i32 {
     (v * scale).round() as i32
+}
+
+/// Paint the screenshot selection UI onto one output: a translucent dim
+/// wash over everything outside the selection (or the whole output when
+/// the selection is elsewhere / not started yet), plus a bright outline
+/// around the selection. `selection` is in absolute compositor coords;
+/// it's converted to this output's physical pixels and clipped to it.
+fn draw_screenshot_overlay(
+    frame: &mut GlesFrame<'_, '_>,
+    overlay: &ScreenshotOverlay,
+    compositor_position: Point<i32, Physical>,
+    mode_size: Size<i32, Physical>,
+    scale: f64,
+) -> Result<()> {
+    const DIM: Color32F = Color32F::new(0.0, 0.0, 0.0, 0.45);
+    const OUTLINE: Color32F = Color32F::new(0.25, 0.62, 1.0, 1.0);
+    let (mode_w, mode_h) = (mode_size.w, mode_size.h);
+
+    let solid = |frame: &mut GlesFrame<'_, '_>, x: i32, y: i32, w: i32, h: i32, color: Color32F| {
+        if w <= 0 || h <= 0 {
+            return Ok(());
+        }
+        let rect = Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, h)));
+        frame
+            .draw_solid(rect, &[Rectangle::from_size(rect.size)], color)
+            .context("Frame::draw_solid (screenshot overlay) failed")
+    };
+
+    // The selection rect in this output's physical pixels, clipped to the
+    // output. `None`/no-intersection => dim the entire output.
+    let clip = overlay.selection.and_then(|sel| {
+        let sx = scale_i(sel.loc.x - compositor_position.x, scale);
+        let sy = scale_i(sel.loc.y - compositor_position.y, scale);
+        let x0 = sx.clamp(0, mode_w);
+        let y0 = sy.clamp(0, mode_h);
+        let x1 = (sx + scale_i(sel.size.w, scale)).clamp(0, mode_w);
+        let y1 = (sy + scale_i(sel.size.h, scale)).clamp(0, mode_h);
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+    });
+
+    let Some((x0, y0, x1, y1)) = clip else {
+        // No selection on this output: dim it whole.
+        return solid(frame, 0, 0, mode_w, mode_h, DIM);
+    };
+
+    // Dim everything except the selection (four bands).
+    solid(frame, 0, 0, mode_w, y0, DIM)?; // top
+    solid(frame, 0, y1, mode_w, mode_h - y1, DIM)?; // bottom
+    solid(frame, 0, y0, x0, y1 - y0, DIM)?; // left
+    solid(frame, x1, y0, mode_w - x1, y1 - y0, DIM)?; // right
+
+    // Bright outline framing the selection.
+    let t = scale_i(2, scale).max(2);
+    let (w, h) = (x1 - x0, y1 - y0);
+    solid(frame, x0, y0, w, t, OUTLINE)?; // top edge
+    solid(frame, x0, y1 - t, w, t, OUTLINE)?; // bottom edge
+    solid(frame, x0, y0, t, h, OUTLINE)?; // left edge
+    solid(frame, x1 - t, y0, t, h, OUTLINE)?; // right edge
+    Ok(())
 }
 
 /// Walk a surface tree and drain every queued `wl_callback`, firing
