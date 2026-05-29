@@ -313,6 +313,10 @@ pub struct Renderer {
     /// Active screenshot selection overlay (dim wash + highlighted rect),
     /// in absolute compositor coords. `None` when no session is running.
     screenshot_overlay: Option<ScreenshotOverlay>,
+    /// Drag-and-drop icon surface (role `dnd_icon`) to composite at the
+    /// cursor while a client drag is in progress; `None` otherwise. Set by
+    /// the `ClientDndGrabHandler`. Its buffer is read fresh each frame.
+    dnd_icon: Option<WlSurface>,
 }
 
 /// What the screenshot selection UI should draw this frame. The
@@ -600,6 +604,7 @@ impl Renderer {
             start: Instant::now(),
             freeze_textures: HashMap::new(),
             screenshot_overlay: None,
+            dnd_icon: None,
         })
     }
 
@@ -831,6 +836,12 @@ impl Renderer {
         self.freeze_textures.clear();
     }
 
+    /// Set (or clear) the drag-and-drop icon surface composited at the
+    /// cursor while a client drag is active.
+    pub fn set_dnd_icon(&mut self, icon: Option<WlSurface>) {
+        self.dnd_icon = icon;
+    }
+
     /// GPU buffer (dmabuf) formats this renderer can import as
     /// textures — advertised via `zwp_linux_dmabuf_v1` so clients
     /// (and Xwayland via xwayland-satellite) can hand us
@@ -932,6 +943,7 @@ impl Renderer {
         let cursor_sprite = self.cursor.clone();
         let cursor_size = self.cursor_size;
         let screenshot_overlay = self.screenshot_overlay;
+        let dnd_icon = self.dnd_icon.clone();
         let output = &self.outputs[idx];
         let mode_size = output.mode_size;
         let compositor_position = output.compositor_position;
@@ -1076,6 +1088,28 @@ impl Renderer {
                 )
             })
             .collect();
+
+        // Drag-and-drop icon: composite the drag surface at the cursor
+        // (only on the output the cursor is on). Pre-imported here while we
+        // still hold `&mut self.gles`, like the surface groups above.
+        let dnd_icon_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            match (dnd_icon.as_ref(), cursor_in_bounds) {
+                (Some(icon), true) => {
+                    let local_phys = Point::<i32, Physical>::from((
+                        scale_f(cursor_local_x, scale),
+                        scale_f(cursor_local_y, scale),
+                    ));
+                    render_elements_from_surface_tree(
+                        &mut self.gles,
+                        icon,
+                        local_phys,
+                        scale,
+                        1.0_f32,
+                        Kind::Unspecified,
+                    )
+                }
+                _ => Vec::new(),
+            };
 
         let mut target = self
             .gles
@@ -1271,6 +1305,17 @@ impl Renderer {
                     mode_size,
                     scale,
                 )?;
+            }
+
+            // Drag-and-drop icon, just under the cursor sprite.
+            if !dnd_icon_elements.is_empty() {
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    &dnd_icon_elements,
+                    &full_damage,
+                )
+                .context("draw_render_elements (dnd icon) failed")?;
             }
 
             // Skip the cursor entirely while the pointer is locked (a

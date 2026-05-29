@@ -776,7 +776,27 @@ impl SelectionHandler for State {
     }
 }
 
-impl ClientDndGrabHandler for State {}
+impl ClientDndGrabHandler for State {
+    /// A client started a drag. Smithay has already installed the
+    /// drag-and-drop pointer grab (which routes the offer to whatever
+    /// surface our pointer focus lands on); we just composite the drag
+    /// icon at the cursor for the duration.
+    fn started(
+        &mut self,
+        _source: Option<
+            smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
+        >,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        self.renderer.set_dnd_icon(icon);
+    }
+
+    /// The drag ended (dropped or cancelled) — remove the icon.
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.renderer.set_dnd_icon(None);
+    }
+}
 impl ServerDndGrabHandler for State {}
 
 impl DataDeviceHandler for State {

@@ -688,12 +688,18 @@ impl State {
         // compositors attribute the delta to where the pointer was.
         pointer.relative_motion(self, hit.clone(), &relative);
 
-        // Hover focus model: pull keyboard focus to the surface
-        // under the cursor — *unless* an exclusive-keyboard layer
-        // surface currently owns focus, in which case we leave it
-        // alone (otherwise opening rofi and moving the mouse would
-        // immediately yank focus back to kitty).
+        // Pull keyboard focus to the surface under the cursor in the Hover
+        // focus model — but NOT while a pointer grab is active. During a
+        // drag (DnD, or an interactive move/resize) the offer/grab is
+        // routed by pointer position alone, so changing keyboard focus is
+        // both unnecessary and disruptive: `focus_changed` re-points the
+        // data-device selection (`set_data_device_focus`), which would push
+        // the hovered client a clipboard offer mid-drag, and for a
+        // move/resize the cursor sweeps over windows that shouldn't grab
+        // focus. Never steal focus from an exclusive-keyboard layer surface
+        // (e.g. rofi) either.
         if matches!(self.config.input.focus_model, config::FocusModel::Hover)
+            && !pointer.is_grabbed()
             && !self.focus_locked_by_layer()
             && let Some(kbd) = self.seat.get_keyboard()
             && kbd.current_focus() != kbd_target
