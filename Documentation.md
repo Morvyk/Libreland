@@ -268,20 +268,30 @@ rounded corners — proper shader-based rounding is later polish.
 
 ## Keybindings
 
-Bindings are hard-coded in `src/main.rs` for now. They will move to the Lua
-config layer once that exists.
+Key bindings are configurable via [`binds`](#binds) (the table below lists the
+built-in defaults). Pointer gestures (drags and `Super`+scroll) are hard-coded
+in `src/main.rs`.
 
 | Combo           | Action                                              |
 | --------------- | --------------------------------------------------- |
 | `Super+Shift+E` | Exit the compositor cleanly.                        |
 | `Super+F`       | Toggle floating mode on the focused window.         |
-| `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled). |
+| `Super+C`       | Close the focused window (`xdg_toplevel.close`).    |
+| `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled; drop on another monitor to move it there). |
 | `Super+RMB`-drag | Interactively resize the window under the cursor from its bottom-right corner (auto-floats it if tiled). |
+| `Super`+scroll down / up | Switch to the next / previous workspace on the output **under the cursor**. |
+| `Super+Shift`+scroll down / up | Move the focused window to the next / previous workspace on **its** output and follow it there. |
 
-The hotkey is matched against raw libinput key codes, so it will keep working
-once a future DRM grab disables the kernel's Ctrl+C path. Until that grab
-exists, Ctrl+C on the host TTY also exits — but treat `Super+Shift+E` as the
-canonical exit.
+Workspaces are per-output and dynamic (niri-style): each output starts with
+one, scrolling down materializes a fresh empty workspace to move into, and
+empty workspaces are compacted away as you leave them (no wrap at the top).
+Only the active workspace of each output is rendered; each workspace keeps its
+own tiled tree and floating stack.
+
+Letter key bindings match case-insensitively, and the hotkey path uses
+xkb-resolved keysyms, so it keeps working once a future DRM grab disables the
+kernel's Ctrl+C path. Until that grab exists, Ctrl+C on the host TTY also
+exits — but treat `Super+Shift+E` as the canonical exit.
 
 ## Running
 

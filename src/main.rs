@@ -209,6 +209,12 @@ pub(crate) struct State {
     /// reaching its client, and intervening button events are
     /// swallowed.
     pub(crate) drag: Option<DragState>,
+    /// Accumulated high-resolution scroll (v120 units) for the
+    /// `Super`+scroll workspace gesture. One physical wheel notch is
+    /// 120 units; we fire one workspace step per ±120 accumulated so
+    /// a hi-res / free-spinning wheel that emits sub-notch events
+    /// doesn't switch several workspaces at once.
+    pub(crate) ws_scroll_accum: f64,
 }
 
 /// In-progress interactive drag. The dragged surface is always
@@ -606,6 +612,30 @@ impl State {
     /// per-axis relative direction, and emit a `stop` when a finger
     /// scroll ends so kinetic scrolling halts cleanly.
     fn forward_pointer_axis<B: InputBackend>(&mut self, evt: &B::PointerAxisEvent) {
+        // Super[+Shift] + vertical wheel is the workspace gesture, not
+        // a client scroll: intercept it (don't forward). We key off
+        // the discrete v120 wheel signal and accumulate to ±120 so one
+        // physical notch = exactly one workspace step. A touchpad
+        // (no v120) under Super falls through to normal forwarding.
+        let mods = self.seat.get_keyboard().map(|k| k.modifier_state());
+        if mods.as_ref().is_some_and(|m| m.logo)
+            && let Some(v120) = evt.amount_v120(Axis::Vertical)
+            && v120 != 0.0
+        {
+            let shift = mods.as_ref().is_some_and(|m| m.shift);
+            self.ws_scroll_accum += v120;
+            // Positive v120 = scroll-down = +1 workspace.
+            while self.ws_scroll_accum >= 120.0 {
+                self.ws_scroll_accum -= 120.0;
+                self.workspace_gesture(shift, 1);
+            }
+            while self.ws_scroll_accum <= -120.0 {
+                self.ws_scroll_accum += 120.0;
+                self.workspace_gesture(shift, -1);
+            }
+            return;
+        }
+
         // Continuous amount; for wheels that only report discrete
         // detents, synthesise a small continuous value from v120 so
         // clients that ignore v120 still scroll.
@@ -658,6 +688,41 @@ impl State {
         };
         pointer.axis(self, frame);
         pointer.frame(self);
+    }
+
+    /// One workspace step for the `Super`[+`Shift`]+scroll gesture.
+    /// `delta` is `+1` (scroll-down / next) or `-1` (scroll-up /
+    /// prev). With `shift`, move the keyboard-focused window to the
+    /// adjacent workspace on its own output and follow it; otherwise
+    /// switch the workspace on the output under the cursor and
+    /// re-derive focus (the previously-focused window is now hidden).
+    fn workspace_gesture(&mut self, shift: bool, delta: i32) {
+        if shift {
+            if let Some(surface) = self.seat.get_keyboard().and_then(|k| k.current_focus()) {
+                let moved = self.layout.move_focused_window(&surface, delta);
+                debug!(delta, moved, "move focused window to adjacent workspace");
+            }
+            return;
+        }
+        let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+        )]
+        let cursor = Point::<i32, Physical>::from((cx as i32, cy as i32));
+        if !self.layout.switch_at(cursor, delta) {
+            return;
+        }
+        // The switch hid the old focus; focus the window now under the
+        // cursor on the new workspace (or clear focus if it's empty
+        // there) so keyboard input and the active border follow.
+        let new_focus = self
+            .layout
+            .window_at(cursor)
+            .map(|w| w.toplevel.wl_surface().clone());
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, new_focus, SERIAL_COUNTER.next_serial());
+        }
     }
 
     /// Build one `LayerPlacement` per live layer surface for this
@@ -1167,6 +1232,7 @@ fn main() -> Result<()> {
         kbd_focus_before_layer: None,
         layout,
         drag: None,
+        ws_scroll_accum: 0.0,
     };
     let mut loop_data = LoopData { state, display };
 

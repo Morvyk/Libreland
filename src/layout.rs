@@ -15,11 +15,20 @@
 //! `Split` is replaced in place by the sibling subtree, which
 //! cascades upward as expected.
 //!
-//! Floating windows live in a separate `Vec` and always draw on
-//! top of the tree. Toggling a window between tiled and floating
-//! (`Super+F`) removes it from one set and inserts into the
-//! other; the tree-side promote applies a 70 % centre shrink so
-//! the transition reads as a smooth resize.
+//! Each output has a dynamic list of **workspaces** (niri-style):
+//! one dwindle tree + its own floating stack per workspace, and an
+//! active index. Only the active workspace of an output is rendered.
+//! `Super`+scroll switches the workspace on the output under the
+//! cursor (a fresh trailing-empty workspace is materialized on
+//! demand; empty non-active workspaces are compacted away);
+//! `Super`+`Shift`+scroll moves the focused window to the adjacent
+//! workspace on its own output and follows it.
+//!
+//! Floating windows live in a per-workspace `Vec` and always draw on
+//! top of that workspace's tree. Toggling a window between tiled and
+//! floating (`Super+F`) removes it from one set and inserts into the
+//! other on the same workspace; the tree-side promote applies a 70 %
+//! centre shrink so the transition reads as a smooth resize.
 //!
 //! Interactive **move** drags (`Super+LMB`) pull the window out
 //! of its current set into `in_transit`, where it follows the
@@ -79,31 +88,70 @@ pub enum DragSource {
 pub struct InTransit {
     pub window: Window,
     pub source: DragSource,
+    /// Output index the drag started on. The source workspace is
+    /// emptied at drag start but not normalized (the drag may abort
+    /// back), so `finish_move_drag` normalizes this output to reap a
+    /// workspace the drag emptied.
+    source_output: usize,
 }
 
-/// One output's tiling region: a stable connector name, that
-/// output's full rect in absolute compositor space, and the dwindle
-/// tree of windows tiled on it. A window's owning output is implicit
-/// in which `Outpane`'s tree holds it — no per-window output id is
-/// stored. The renderer paints each window on whichever CRTC its
-/// absolute rect falls on, so tiling a window inside output B's
-/// `bounds` is what makes it appear on monitor B.
+/// One workspace: a dwindle tree of tiled windows plus that
+/// workspace's own floating stack. A workspace is a self-contained
+/// scene — only the active workspace of each output is rendered, so
+/// floating windows are scoped here (not global) and don't bleed
+/// across workspaces.
+#[derive(Default)]
+struct Workspace {
+    tree: Option<Node>,
+    floating: Vec<Window>,
+}
+
+impl Workspace {
+    /// No tiled windows and no floats — a candidate for compaction
+    /// (and what the trailing scroll-into slot looks like).
+    fn is_empty(&self) -> bool {
+        self.tree.is_none() && self.floating.is_empty()
+    }
+}
+
+/// One output's region: a stable connector name, that output's full
+/// rect in absolute compositor space, and its dynamic list of
+/// workspaces. Invariants (maintained by `normalize_output`):
+/// `workspaces.len() >= 1`, `active < workspaces.len()`, and the
+/// last workspace is always empty (the trailing slot you scroll
+/// into). A window's owning output is implicit in which `Outpane`
+/// holds it; the renderer paints each window on whichever CRTC its
+/// absolute rect falls on.
 struct Outpane {
     name: String,
     bounds: Rectangle<i32, Physical>,
-    tree: Option<Node>,
+    workspaces: Vec<Workspace>,
+    active: usize,
 }
 
-/// One dwindle tree **per output** plus a global floating-window
-/// list. Tiled windows live in the `Outpane` whose tree holds them;
-/// floating windows and the in-transit drag are global and
-/// absolute-positioned, so they're painted on whichever output
-/// contains their rect. All coordinates are absolute compositor
-/// pixels. Per-output workspaces are a future milestone — `Outpane`
-/// is shaped so a later `Vec<Workspace>` wrap is mechanical.
+impl Outpane {
+    fn new(name: String, bounds: Rectangle<i32, Physical>) -> Self {
+        Self {
+            name,
+            bounds,
+            // A fresh output is one empty workspace; index 0 doubles
+            // as the active and the trailing-empty slot until a
+            // window lands on it.
+            workspaces: vec![Workspace::default()],
+            active: 0,
+        }
+    }
+}
+
+/// Per-output dynamic workspaces. Each output owns a `Vec<Workspace>`
+/// (each workspace owns its own tree + floating stack) and an active
+/// index. Only the active workspace of an output is emitted by
+/// [`Layout::placements`] / rendered. The in-transit drag is global
+/// and transient — it follows the cursor across outputs/workspaces
+/// and only commits to a concrete home on release. All coordinates
+/// are absolute compositor pixels.
 pub struct Layout {
     outputs: Vec<Outpane>,
-    floating: Vec<Window>,
     in_transit: Option<InTransit>,
     gaps: Gaps,
     border_width: i32,
@@ -164,13 +212,8 @@ impl Layout {
         Self {
             outputs: outputs
                 .into_iter()
-                .map(|(name, bounds)| Outpane {
-                    name,
-                    bounds,
-                    tree: None,
-                })
+                .map(|(name, bounds)| Outpane::new(name, bounds))
                 .collect(),
-            floating: Vec::new(),
             in_transit: None,
             gaps,
             border_width: border_width.max(0),
@@ -178,9 +221,23 @@ impl Layout {
     }
 
     /// Tile area of the output at `idx`: its bounds shrunk by the
-    /// outer gap.
+    /// outer gap. Every workspace of an output shares its tile area.
     fn tile_bounds(&self, idx: usize) -> Rectangle<i32, Physical> {
         shrink_for_outer(self.outputs[idx].bounds, self.gaps.outer)
+    }
+
+    /// The active (visible) workspace of output `oi`.
+    fn active_ws(&self, oi: usize) -> &Workspace {
+        let o = &self.outputs[oi];
+        &o.workspaces[o.active]
+    }
+
+    /// Mutable handle to the active workspace of output `oi`. Bind
+    /// this once when mutating, so the borrow checker doesn't choke
+    /// on `outputs[oi].workspaces[active]` being indexed twice.
+    fn active_ws_mut(&mut self, oi: usize) -> &mut Workspace {
+        let o = &mut self.outputs[oi];
+        &mut o.workspaces[o.active]
     }
 
     /// Index of the first output whose **full** bounds contain `p`.
@@ -220,7 +277,9 @@ impl Layout {
             rect: tile_bounds,
         };
         let leaf = Node::Leaf(window);
-        self.outputs[idx].tree = Some(match self.outputs[idx].tree.take() {
+        // Lands on the visible (active) workspace of that output.
+        let ws = self.active_ws_mut(idx);
+        ws.tree = Some(match ws.tree.take() {
             None => leaf,
             Some(root) => insert_at_cursor(root, leaf, tile_bounds, cursor, inner),
         });
@@ -232,20 +291,30 @@ impl Layout {
     /// something changed there. Silent no-op for surfaces we
     /// don't track.
     pub fn remove(&mut self, surface: &WlSurface) {
-        for op in &mut self.outputs {
-            if let Some(root) = op.tree.take() {
-                let (root_after, removed) = remove_from_tree(root, surface);
-                op.tree = root_after;
-                if removed.is_some() {
+        // A client may close while on a non-active workspace, so scan
+        // every workspace of every output (index loops because
+        // `normalize_output` needs `&mut self` afterwards).
+        for oi in 0..self.outputs.len() {
+            for wi in 0..self.outputs[oi].workspaces.len() {
+                let ws = &mut self.outputs[oi].workspaces[wi];
+                if let Some(root) = ws.tree.take() {
+                    let (root_after, removed) = remove_from_tree(root, surface);
+                    ws.tree = root_after;
+                    if removed.is_some() {
+                        self.normalize_output(oi);
+                        self.recompute_and_push();
+                        return;
+                    }
+                }
+                let ws = &mut self.outputs[oi].workspaces[wi];
+                let len = ws.floating.len();
+                ws.floating.retain(|w| w.toplevel.wl_surface() != surface);
+                if ws.floating.len() != len {
+                    self.normalize_output(oi);
                     self.recompute_and_push();
                     return;
                 }
             }
-        }
-        let len = self.floating.len();
-        self.floating.retain(|w| w.toplevel.wl_surface() != surface);
-        if self.floating.len() != len {
-            return;
         }
         if self
             .in_transit
@@ -270,13 +339,15 @@ impl Layout {
     ///
     /// Silent no-op for surfaces we don't track.
     pub fn toggle_floating(&mut self, surface: &WlSurface) {
-        // Tile -> float: find the window in whichever output's tree
-        // holds it. Non-matching outputs get their tree restored
-        // unchanged (remove_from_tree hands the node back on a miss).
-        for op in &mut self.outputs {
-            if let Some(root) = op.tree.take() {
+        // Toggling never crosses workspaces: the window stays on the
+        // active workspace it's currently visible on.
+        //
+        // Tile -> float: scan each output's ACTIVE workspace tree.
+        for oi in 0..self.outputs.len() {
+            let ws = self.active_ws_mut(oi);
+            if let Some(root) = ws.tree.take() {
                 let (root_after, removed) = remove_from_tree(root, surface);
-                op.tree = root_after;
+                ws.tree = root_after;
                 if let Some(mut window) = removed {
                     let prev = window.rect;
                     let new_size =
@@ -287,40 +358,40 @@ impl Layout {
                     );
                     window.rect = Rectangle::new(new_loc, new_size);
                     push_configure_for_floating(&window, self.border_width);
-                    self.floating.push(window);
+                    self.active_ws_mut(oi).floating.push(window);
                     self.recompute_and_push();
                     return;
                 }
             }
         }
-        // Float -> tile: re-tile on the output under the float's
-        // centre (a float straddling two outputs resolves by centre),
-        // else the first output.
-        let Some(fidx) = self
-            .floating
-            .iter()
-            .position(|w| w.toplevel.wl_surface() == surface)
-        else {
+        // Float -> tile: find the float on whichever output's active
+        // workspace holds it, and re-tile it into that same active
+        // workspace's tree.
+        for oi in 0..self.outputs.len() {
+            let ws = self.active_ws_mut(oi);
+            let Some(fidx) = ws
+                .floating
+                .iter()
+                .position(|w| w.toplevel.wl_surface() == surface)
+            else {
+                continue;
+            };
+            let window = ws.floating.remove(fidx);
+            let center = Point::<i32, Physical>::new(
+                window.rect.loc.x + window.rect.size.w / 2,
+                window.rect.loc.y + window.rect.size.h / 2,
+            );
+            let tile_bounds = self.tile_bounds(oi);
+            let inner = self.gaps.inner;
+            let leaf = Node::Leaf(window);
+            let ws = self.active_ws_mut(oi);
+            ws.tree = Some(match ws.tree.take() {
+                None => leaf,
+                Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(center), inner),
+            });
+            self.recompute_and_push();
             return;
-        };
-        let window = self.floating.remove(fidx);
-        let center = Point::<i32, Physical>::new(
-            window.rect.loc.x + window.rect.size.w / 2,
-            window.rect.loc.y + window.rect.size.h / 2,
-        );
-        let Some(idx) = self.outpane_for_point(Some(center)) else {
-            // No outputs: keep it floating so we don't drop it.
-            self.floating.push(window);
-            return;
-        };
-        let tile_bounds = self.tile_bounds(idx);
-        let inner = self.gaps.inner;
-        let leaf = Node::Leaf(window);
-        self.outputs[idx].tree = Some(match self.outputs[idx].tree.take() {
-            None => leaf,
-            Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(center), inner),
-        });
-        self.recompute_and_push();
+        }
     }
 
     /// Start an interactive *move* drag. Pulls the matched window
@@ -333,33 +404,41 @@ impl Layout {
         if self.in_transit.is_some() {
             return None;
         }
-        for op in &mut self.outputs {
-            if let Some(root) = op.tree.take() {
+        // Only a visible window can be dragged, so scan active
+        // workspaces only. We don't normalize the emptied source
+        // workspace here (the drag may abort back); finish_move_drag
+        // normalizes `source_output`.
+        for oi in 0..self.outputs.len() {
+            let ws = self.active_ws_mut(oi);
+            if let Some(root) = ws.tree.take() {
                 let (root_after, removed) = remove_from_tree(root, surface);
-                op.tree = root_after;
+                ws.tree = root_after;
                 if let Some(window) = removed {
                     let rect = window.rect;
                     self.in_transit = Some(InTransit {
                         window,
                         source: DragSource::Tiled,
+                        source_output: oi,
                     });
                     self.recompute_and_push();
                     return Some(rect);
                 }
             }
-        }
-        if let Some(idx) = self
-            .floating
-            .iter()
-            .position(|w| w.toplevel.wl_surface() == surface)
-        {
-            let window = self.floating.remove(idx);
-            let rect = window.rect;
-            self.in_transit = Some(InTransit {
-                window,
-                source: DragSource::Floating,
-            });
-            return Some(rect);
+            let ws = self.active_ws_mut(oi);
+            if let Some(fidx) = ws
+                .floating
+                .iter()
+                .position(|w| w.toplevel.wl_surface() == surface)
+            {
+                let window = ws.floating.remove(fidx);
+                let rect = window.rect;
+                self.in_transit = Some(InTransit {
+                    window,
+                    source: DragSource::Floating,
+                    source_output: oi,
+                });
+                return Some(rect);
+            }
         }
         None
     }
@@ -369,10 +448,13 @@ impl Layout {
     /// the caller can log + swallow the press. Returns the rect
     /// to use as the drag's start rect, or `None`.
     pub fn start_resize_drag(&self, surface: &WlSurface) -> Option<Rectangle<i32, Physical>> {
-        self.floating
-            .iter()
-            .find(|w| w.toplevel.wl_surface() == surface)
-            .map(|w| w.rect)
+        self.outputs.iter().find_map(|op| {
+            op.workspaces[op.active]
+                .floating
+                .iter()
+                .find(|w| w.toplevel.wl_surface() == surface)
+                .map(|w| w.rect)
+        })
     }
 
     /// Update the `in_transit` window's rect during a move drag
@@ -394,15 +476,18 @@ impl Layout {
     /// that aren't currently floating.
     pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
         let border = self.border_width;
-        let Some(window) = self
-            .floating
-            .iter_mut()
-            .find(|w| w.toplevel.wl_surface() == surface)
-        else {
-            return;
-        };
-        window.rect = rect;
-        push_configure_for_floating(window, border);
+        for op in &mut self.outputs {
+            let active = op.active;
+            if let Some(window) = op.workspaces[active]
+                .floating
+                .iter_mut()
+                .find(|w| w.toplevel.wl_surface() == surface)
+            {
+                window.rect = rect;
+                push_configure_for_floating(window, border);
+                return;
+            }
+        }
     }
 
     /// Finish an interactive move drag at `cursor`.
@@ -418,41 +503,51 @@ impl Layout {
         let Some(t) = self.in_transit.take() else {
             return;
         };
+        let source_output = t.source_output;
+        let center = Point::<i32, Physical>::new(
+            t.window.rect.loc.x + t.window.rect.size.w / 2,
+            t.window.rect.loc.y + t.window.rect.size.h / 2,
+        );
+        // Resolve the destination output: under the drop cursor, else
+        // under the window's centre (cursor in a monitor gap), else
+        // the first output. `None` only when there are no outputs.
+        let Some(idx) = self
+            .outpane_at(cursor)
+            .or_else(|| self.outpane_at(center))
+            .or_else(|| (!self.outputs.is_empty()).then_some(0))
+        else {
+            // No outputs at all: nowhere visible to home it.
+            push_configure_for_floating(&t.window, self.border_width);
+            return;
+        };
         match t.source {
             DragSource::Tiled => {
-                // Re-tile on the output under the drop cursor. If the
-                // cursor landed in a gap between monitors, fall back
-                // to the output under the window's centre, then to
-                // the first output. This is the cross-output move:
-                // dropping on monitor B re-tiles into B's tree.
-                let center = Point::<i32, Physical>::new(
-                    t.window.rect.loc.x + t.window.rect.size.w / 2,
-                    t.window.rect.loc.y + t.window.rect.size.h / 2,
-                );
-                let idx = self
-                    .outpane_at(cursor)
-                    .or_else(|| self.outpane_at(center))
-                    .or_else(|| (!self.outputs.is_empty()).then_some(0));
-                let Some(idx) = idx else {
-                    // No outputs: keep the window alive as floating.
-                    push_configure_for_floating(&t.window, self.border_width);
-                    self.floating.push(t.window);
-                    return;
-                };
+                // Re-tile into the destination output's ACTIVE
+                // workspace. Dropping on another monitor (or, mid-drag
+                // workspace switch, a different workspace) re-tiles
+                // into whatever is now visible there.
                 let tile_bounds = self.tile_bounds(idx);
                 let inner = self.gaps.inner;
                 let leaf = Node::Leaf(t.window);
-                self.outputs[idx].tree = Some(match self.outputs[idx].tree.take() {
+                let ws = self.active_ws_mut(idx);
+                ws.tree = Some(match ws.tree.take() {
                     None => leaf,
                     Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(cursor), inner),
                 });
-                self.recompute_and_push();
             }
             DragSource::Floating => {
                 push_configure_for_floating(&t.window, self.border_width);
-                self.floating.push(t.window);
+                self.active_ws_mut(idx).floating.push(t.window);
             }
         }
+        // Normalize both the destination (gained a window) and the
+        // source (its workspace was emptied at drag start, never
+        // reaped) so any phantom empty workspace is compacted.
+        self.normalize_output(idx);
+        if source_output != idx {
+            self.normalize_output(source_output);
+        }
+        self.recompute_and_push();
     }
 
     /// Renderer snapshot: every visible window with its cell rect
@@ -471,23 +566,27 @@ impl Layout {
     pub fn placements(&self, focused: Option<&WlSurface>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
         let mut out = Vec::new();
+        // Only the active workspace of each output is visible.
         for op in &self.outputs {
-            if let Some(tree) = &op.tree {
+            let ws = &op.workspaces[op.active];
+            if let Some(tree) = &ws.tree {
                 collect_placements(tree, &is_focused, &mut out);
             }
-        }
-        for w in &self.floating {
-            out.push(Placement {
-                surface: w.toplevel.wl_surface().clone(),
-                cell_rect: w.rect,
-                focused: is_focused(w.toplevel.wl_surface()),
-            });
+            for w in &ws.floating {
+                let surface = w.toplevel.wl_surface();
+                out.push(Placement {
+                    surface: surface.clone(),
+                    cell_rect: w.rect,
+                    focused: is_focused(surface),
+                });
+            }
         }
         if let Some(t) = &self.in_transit {
+            let surface = t.window.toplevel.wl_surface();
             out.push(Placement {
-                surface: t.window.toplevel.wl_surface().clone(),
+                surface: surface.clone(),
                 cell_rect: t.window.rect,
-                focused: is_focused(t.window.toplevel.wl_surface()),
+                focused: is_focused(surface),
             });
         }
         out
@@ -501,34 +600,42 @@ impl Layout {
     /// cursor" would just defeat focus changes for the duration
     /// of the drag.
     pub fn window_at(&self, pos: Point<i32, Physical>) -> Option<&Window> {
-        for w in self.floating.iter().rev() {
+        // Hit-test only the active workspace of the output `pos` falls
+        // in — windows on other workspaces aren't visible/clickable.
+        let i = self.outpane_at(pos)?;
+        let ws = self.active_ws(i);
+        for w in ws.floating.iter().rev() {
             if rect_contains(w.rect, pos) {
                 return Some(w);
             }
         }
-        // Tiled hit-test only the tree of the output `pos` falls in.
-        self.outpane_at(pos)
-            .and_then(|i| self.outputs[i].tree.as_ref())
-            .and_then(|t| leaf_at(t, pos))
+        ws.tree.as_ref().and_then(|t| leaf_at(t, pos))
     }
 
     fn recompute_and_push(&mut self) {
         let inner = self.gaps.inner;
         let outer = self.gaps.outer;
         let border = self.border_width;
+        // Reflow every workspace (not just the active one) so a parked
+        // workspace keeps correct saved sizes — switching to it is then
+        // paint-only with no reflow flash.
         for op in &mut self.outputs {
             let tile_bounds = shrink_for_outer(op.bounds, outer);
-            if let Some(tree) = &mut op.tree {
-                assign_rects(tree, tile_bounds, inner);
+            for ws in &mut op.workspaces {
+                if let Some(tree) = &mut ws.tree {
+                    assign_rects(tree, tile_bounds, inner);
+                }
             }
         }
         for op in &self.outputs {
-            if let Some(tree) = &op.tree {
-                push_configures_tree(tree, border);
+            for ws in &op.workspaces {
+                if let Some(tree) = &ws.tree {
+                    push_configures_tree(tree, border);
+                }
+                for w in &ws.floating {
+                    push_configure_for_floating(w, border);
+                }
             }
-        }
-        for w in &self.floating {
-            push_configure_for_floating(w, border);
         }
     }
 
@@ -547,6 +654,178 @@ impl Layout {
         }
         op.bounds = new_bounds;
         self.recompute_and_push();
+    }
+    /// Switch the active workspace on the output under `cursor` by
+    /// `delta` (`+1` = next / scroll-down, `-1` = previous /
+    /// scroll-up). No-op if the cursor is over no output. No wrap:
+    /// scrolling up past the first workspace stays put. Returns
+    /// whether the active workspace actually changed (so the caller
+    /// can re-derive keyboard focus only when it did).
+    pub fn switch_at(&mut self, cursor: Point<i32, Physical>, delta: i32) -> bool {
+        self.outpane_at(cursor)
+            .is_some_and(|oi| self.switch(oi, delta))
+    }
+
+    /// Switch output `oi`'s active workspace by `delta`. Materializes
+    /// a fresh trailing-empty workspace to scroll into when moving
+    /// past the end; `normalize_output` then compacts the workspace
+    /// we left if it became empty and trims back to one trailing
+    /// empty, so the list can't grow without bound. Returns whether
+    /// the active workspace changed.
+    fn switch(&mut self, oi: usize, delta: i32) -> bool {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "workspace index is a small Vec index, never near i32 bounds"
+        )]
+        let target = self.outputs[oi].active as i32 + delta;
+        if target < 0 {
+            return false; // scroll-up at workspace 0: no wrap, no-op.
+        }
+        #[allow(clippy::cast_sign_loss, reason = "target >= 0 checked just above")]
+        let target = target as usize;
+        while target >= self.outputs[oi].workspaces.len() {
+            self.outputs[oi].workspaces.push(Workspace::default());
+        }
+        if target == self.outputs[oi].active {
+            return false;
+        }
+        self.outputs[oi].active = target;
+        self.normalize_output(oi);
+        self.recompute_and_push();
+        true
+    }
+
+    /// Move the keyboard-focused window to the adjacent workspace on
+    /// **its own** output and follow it there (the destination
+    /// becomes active). Handles both tiled and floating focused
+    /// windows. No wrap: `Shift`+scroll-up while on workspace 0 is a
+    /// no-op. Returns `true` if a window actually moved; `false` if
+    /// `surface` isn't on any visible workspace or the move was a
+    /// no-op (at the top edge).
+    pub fn move_focused_window(&mut self, surface: &WlSurface, delta: i32) -> bool {
+        // Locate the window on a visible (active) workspace.
+        let mut found: Option<(usize, bool)> = None;
+        for (oi, op) in self.outputs.iter().enumerate() {
+            let ws = &op.workspaces[op.active];
+            if ws
+                .floating
+                .iter()
+                .any(|w| w.toplevel.wl_surface() == surface)
+            {
+                found = Some((oi, true));
+                break;
+            }
+            if ws.tree.as_ref().is_some_and(|t| tree_contains(t, surface)) {
+                found = Some((oi, false));
+                break;
+            }
+        }
+        let Some((oi, is_floating)) = found else {
+            return false;
+        };
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "workspace index is a small Vec index, never near i32 bounds"
+        )]
+        let dst = self.outputs[oi].active as i32 + delta;
+        if dst < 0 {
+            return false; // Shift+scroll-up at workspace 0: no-op.
+        }
+        #[allow(clippy::cast_sign_loss, reason = "dst >= 0 checked just above")]
+        let dst = dst as usize;
+        while dst >= self.outputs[oi].workspaces.len() {
+            self.outputs[oi].workspaces.push(Workspace::default());
+        }
+        if dst == self.outputs[oi].active {
+            return false;
+        }
+
+        // Extract from the source (active) workspace. The unwraps
+        // can't fire: the search loop above just confirmed `surface`
+        // lives on output `oi`'s active workspace (as float or tile),
+        // and nothing mutates the layout between then and here.
+        let window = if is_floating {
+            let ws = self.active_ws_mut(oi);
+            let pos = ws
+                .floating
+                .iter()
+                .position(|w| w.toplevel.wl_surface() == surface)
+                .expect("surface was just found in this floating list");
+            ws.floating.remove(pos)
+        } else {
+            let ws = self.active_ws_mut(oi);
+            let tree = ws.tree.take().expect("surface was just found in this tree");
+            let (root_after, removed) = remove_from_tree(tree, surface);
+            ws.tree = root_after;
+            removed.expect("surface was just found in this tree")
+        };
+
+        // Insert into the destination workspace, preserving kind.
+        if is_floating {
+            // Keeps its absolute rect — both workspaces share the
+            // output's bounds, so it stays visually put on the new
+            // scene.
+            self.outputs[oi].workspaces[dst].floating.push(window);
+        } else {
+            let tile_bounds = self.tile_bounds(oi);
+            let inner = self.gaps.inner;
+            let leaf = Node::Leaf(window);
+            let dws = &mut self.outputs[oi].workspaces[dst];
+            dws.tree = Some(match dws.tree.take() {
+                None => leaf,
+                Some(root) => insert_at_cursor(root, leaf, tile_bounds, None, inner),
+            });
+        }
+
+        // Follow the window: make the destination active, then
+        // normalize (compacts the now-possibly-empty source).
+        self.outputs[oi].active = dst;
+        self.normalize_output(oi);
+        self.recompute_and_push();
+        true
+    }
+
+    /// Re-establish output `oi`'s workspace invariants: drop empty
+    /// workspaces that are neither the active one nor the trailing
+    /// slot, keep `active` pointing at the same logical workspace
+    /// across the renumbering, and guarantee exactly one trailing
+    /// empty workspace (`len >= 1`). Idempotent.
+    fn normalize_output(&mut self, oi: usize) {
+        let o = &mut self.outputs[oi];
+        let old_active = o.active;
+
+        // Pass 1: keep the active workspace (always) and every
+        // non-empty workspace; drop empty non-active ones. Record
+        // where the active workspace lands in the compacted list.
+        let mut kept: Vec<Workspace> = Vec::with_capacity(o.workspaces.len());
+        let mut new_active = 0;
+        for (i, ws) in std::mem::take(&mut o.workspaces).into_iter().enumerate() {
+            if i == old_active {
+                new_active = kept.len();
+                kept.push(ws);
+            } else if !ws.is_empty() {
+                kept.push(ws);
+            }
+        }
+        o.workspaces = kept;
+        o.active = new_active;
+
+        // Pass 2: trim extra trailing empties beyond the active one,
+        // then ensure exactly one trailing empty exists (it may
+        // coincide with the active workspace when active is empty).
+        while o.workspaces.len() > o.active + 1
+            && o.workspaces.last().is_some_and(Workspace::is_empty)
+        {
+            o.workspaces.pop();
+        }
+        if !o.workspaces.last().is_some_and(Workspace::is_empty) {
+            o.workspaces.push(Workspace::default());
+        }
+        debug_assert!(o.active < o.workspaces.len());
+        debug_assert!(o.workspaces.last().is_some_and(Workspace::is_empty));
     }
 }
 
@@ -761,6 +1040,17 @@ fn leaf_at(node: &Node, pos: Point<i32, Physical>) -> Option<&Window> {
             }
         }
         Node::Split { first, second, .. } => leaf_at(first, pos).or_else(|| leaf_at(second, pos)),
+    }
+}
+
+/// True if any leaf in the tree is `surface`. Used to find which
+/// workspace's tree holds the focused window for the move gesture.
+fn tree_contains(node: &Node, surface: &WlSurface) -> bool {
+    match node {
+        Node::Leaf(w) => w.toplevel.wl_surface() == surface,
+        Node::Split { first, second, .. } => {
+            tree_contains(first, surface) || tree_contains(second, surface)
+        }
     }
 }
 
