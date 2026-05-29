@@ -20,6 +20,7 @@ use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_layer_shell;
+use smithay::delegate_viewporter;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
@@ -49,6 +50,7 @@ use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -91,6 +93,12 @@ pub struct WaylandInit {
     pub xdg_decoration_state: XdgDecorationState,
     pub output_manager_state: OutputManagerState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    /// `wp_viewporter` global. Fractional-scale-aware clients render
+    /// an oversized buffer and use `wp_viewport` to map it down to
+    /// the logical surface rect; without this global they can't, and
+    /// their content composites at the wrong size. Held so the global
+    /// stays alive (dropping it removes the global).
+    pub viewporter_state: ViewporterState,
     pub layer_shell_state: WlrLayerShellState,
     /// One smithay `Output` per DRM connector. Each carries its
     /// physical mode + configured scale and is advertised to
@@ -128,6 +136,12 @@ pub fn init(
     let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
     let fractional_scale_state = FractionalScaleManagerState::new::<State>(&dh);
+    // wp_viewporter: lets clients crop/scale a buffer to a different
+    // destination size. Required for fractional scaling — a client
+    // told scale 1.5 renders a 1.5x buffer and viewports it down to
+    // the logical size; smithay's surface state then composites it at
+    // the right size automatically.
+    let viewporter_state = ViewporterState::new::<State>(&dh);
     // wlr_layer_shell: panels, bars, lockscreens, launchers, OSDs.
     // We render layer surfaces above or below the tile area
     // depending on their `Layer`, and honour their exclusive
@@ -209,6 +223,7 @@ pub fn init(
         xdg_decoration_state,
         output_manager_state,
         fractional_scale_state,
+        viewporter_state,
         layer_shell_state,
         outputs,
         preferred_scale,
@@ -564,3 +579,4 @@ delegate_xdg_decoration!(State);
 delegate_output!(State);
 delegate_fractional_scale!(State);
 delegate_layer_shell!(State);
+delegate_viewporter!(State);

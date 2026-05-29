@@ -162,6 +162,16 @@ pub(crate) struct State {
     )]
     pub(crate) fractional_scale_state:
         smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    /// `wp_viewporter` global. Held so the global stays registered
+    /// (dropping it removes it) — `delegate_viewporter!` routes the
+    /// `wp_viewport` requests, and smithay's surface state applies
+    /// the viewport when the renderer composites each surface.
+    /// Required for fractional scaling to size client buffers right.
+    #[allow(
+        dead_code,
+        reason = "held so the wp_viewporter global stays alive and delegate_viewporter! can route through State; smithay reads the per-surface viewport during compositing"
+    )]
+    pub(crate) viewporter_state: smithay::wayland::viewporter::ViewporterState,
     /// Fractional scale to send to every new
     /// `wp_fractional_scale` object. Currently the primary
     /// output's configured scale; will become per-surface once
@@ -1039,6 +1049,7 @@ fn main() -> Result<()> {
         output_manager_state: wayland_init.output_manager_state,
         outputs: wayland_init.outputs,
         fractional_scale_state: wayland_init.fractional_scale_state,
+        viewporter_state: wayland_init.viewporter_state,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         kbd_focus_before_layer: None,
