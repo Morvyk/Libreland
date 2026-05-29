@@ -17,10 +17,11 @@
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::drm::{DrmDeviceFd, GbmBufferedSurface};
-use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::allocator::{Format, Fourcc};
+use smithay::backend::drm::{DrmDeviceFd, DrmNode, GbmBufferedSurface};
+use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
@@ -30,7 +31,7 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
-    Bind as _, Color32F, Frame as _, ImportMem as _, Renderer as _, Texture as _,
+    Bind as _, Color32F, Frame as _, ImportDma as _, ImportMem as _, Renderer as _, Texture as _,
 };
 use smithay::reexports::drm::control::crtc;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -611,6 +612,37 @@ impl Renderer {
     pub fn set_appearance(&mut self, wallpaper: Fill, border: BorderConfig) {
         self.wallpaper = wallpaper;
         self.border = border;
+    }
+
+    /// GPU buffer (dmabuf) formats this renderer can import as
+    /// textures — advertised via `zwp_linux_dmabuf_v1` so clients
+    /// (and Xwayland via xwayland-satellite) can hand us
+    /// GPU-rendered content. Without this, GPU-composited apps (e.g.
+    /// the Steam client) commit dmabuf buffers we can't sample and
+    /// render blank.
+    pub fn dmabuf_formats(&self) -> Vec<Format> {
+        self.gles.dmabuf_formats().into_iter().collect()
+    }
+
+    /// The render `DrmNode` backing our EGL context, used as the
+    /// dmabuf-feedback *main device* so clients (and Xwayland) know
+    /// which GPU to allocate dmabufs on. `None` if the EGL device
+    /// can't be resolved (then we advertise a v3 dmabuf global, which
+    /// modern Xwayland's glamor won't use — GPU X apps stay blank).
+    pub fn render_drm_node(&self) -> Option<DrmNode> {
+        EGLDevice::device_for_display(self.gles.egl_context().display())
+            .ok()?
+            .try_get_render_node()
+            .ok()
+            .flatten()
+    }
+
+    /// Try to import a client's dmabuf into the GLES renderer,
+    /// returning whether it succeeded. Used by the dmabuf protocol
+    /// handler to accept or reject a buffer up front; the texture is
+    /// cached internally so the per-frame render reuses it.
+    pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        self.gles.import_dmabuf(dmabuf, None).is_ok()
     }
 
     /// Per-output `(name, mode_size_physical, compositor_size,

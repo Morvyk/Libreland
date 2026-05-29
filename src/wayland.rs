@@ -19,6 +19,7 @@ use anyhow::{Context as _, Result};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_data_device;
+use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_kde_decoration;
 use smithay::delegate_layer_shell;
@@ -40,9 +41,15 @@ use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource as _};
 use smithay::utils::{SERIAL_COUNTER, Serial, Transform};
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{Buffer as _, Format};
+use smithay::backend::drm::DrmNode;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, with_states,
+};
+use smithay::wayland::dmabuf::{
+    DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
 };
 use smithay::wayland::fractional_scale::{
     self, FractionalScaleHandler, FractionalScaleManagerState,
@@ -119,6 +126,12 @@ pub struct WaylandInit {
     /// `gdk_seat_get_keyboard` criticals) and apps like Firefox crash
     /// when input focus arrives.
     pub data_device_state: DataDeviceState,
+    /// `zwp_linux_dmabuf_v1` global — lets clients hand us
+    /// GPU-rendered content as dmabuf buffers. Required for
+    /// GPU-composited apps (e.g. the Steam client via Xwayland) to
+    /// show anything; without it their surfaces render blank.
+    pub dmabuf_state: DmabufState,
+    pub dmabuf_global: DmabufGlobal,
     /// `wp_viewporter` global. Fractional-scale-aware clients render
     /// an oversized buffer and use `wp_viewport` to map it down to
     /// the logical surface rect; without this global they can't, and
@@ -147,6 +160,8 @@ pub fn init(
     config: &Config,
     output_descs: &[OutputDescriptor],
     preferred_scale: f64,
+    dmabuf_formats: Vec<Format>,
+    render_node: Option<DrmNode>,
 ) -> Result<WaylandInit> {
     let dh = display.handle();
 
@@ -170,6 +185,33 @@ pub fn init(
     // initialise their seat's clipboard through this; its absence
     // leaves GTK's seat half-set-up and crashes Firefox on focus.
     let data_device_state = DataDeviceState::new::<State>(&dh);
+    // zwp_linux_dmabuf_v1: advertise the GPU buffer formats our GLES
+    // renderer can import, so GPU-composited clients (and Xwayland's
+    // glamor-rendered windows via xwayland-satellite) can present
+    // dmabuf content instead of rendering blank. We advertise a *v4*
+    // global with default feedback (main render device + format
+    // table) — modern Xwayland/glamor needs the feedback to pick a
+    // render format and won't use a plain v3 global, leaving GPU X
+    // apps (the Steam client) blank. Falls back to v3 only if the
+    // render node or feedback can't be built.
+    let mut dmabuf_state = DmabufState::new();
+    let dmabuf_global = if let Some(node) = render_node {
+        match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
+            Ok(feedback) => {
+                info!(node = ?node, "advertising zwp_linux_dmabuf_v1 with default feedback (v4)");
+                dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback)
+            }
+            Err(err) => {
+                warn!(error = %err, "dmabuf feedback build failed; advertising v3 dmabuf global");
+                dmabuf_state.create_global::<State>(&dh, dmabuf_formats)
+            }
+        }
+    } else {
+        warn!(
+            "no render DRM node resolved; advertising v3 dmabuf global (GPU X apps may stay blank)"
+        );
+        dmabuf_state.create_global::<State>(&dh, dmabuf_formats)
+    };
     // wp_viewporter: lets clients crop/scale a buffer to a different
     // destination size. Required for fractional scaling — a client
     // told scale 1.5 renders a 1.5x buffer and viewports it down to
@@ -259,6 +301,8 @@ pub fn init(
         output_manager_state,
         fractional_scale_state,
         data_device_state,
+        dmabuf_state,
+        dmabuf_global,
         viewporter_state,
         layer_shell_state,
         outputs,
@@ -543,6 +587,41 @@ impl DataDeviceHandler for State {
         &self.data_device_state
     }
 }
+
+// GPU buffer sharing. When a client (or Xwayland via the satellite)
+// offers a dmabuf, try to import it into the GLES renderer and accept
+// or reject accordingly — a rejected buffer makes the client fall
+// back to another format rather than render blank.
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        let ok = self.renderer.import_dmabuf(&dmabuf);
+        info!(
+            format = ?dmabuf.format(),
+            planes = dmabuf.num_planes(),
+            ok,
+            "dmabuf import request"
+        );
+        if ok {
+            if let Err(err) = notifier.successful::<State>() {
+                warn!(error = %err, "dmabuf import succeeded but notifying the client failed");
+            }
+        } else {
+            warn!(format = ?dmabuf.format(), "rejected client dmabuf: renderer import failed");
+            notifier.failed();
+        }
+    }
+}
+
+delegate_dmabuf!(State);
 
 // KDE server-side decoration. We force Server for every decoration
 // object regardless of what the client asks for — Libreland is a

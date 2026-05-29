@@ -183,6 +183,16 @@ pub(crate) struct State {
     /// can route through it; `DataDeviceHandler::data_device_state`
     /// borrows it.
     pub(crate) data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
+    /// `zwp_linux_dmabuf_v1` substate + global. Held so the global
+    /// stays registered and `delegate_dmabuf!` / `DmabufHandler` can
+    /// route through it; the handler imports offered GPU buffers into
+    /// the renderer so GPU-composited (incl. Xwayland) apps display.
+    pub(crate) dmabuf_state: smithay::wayland::dmabuf::DmabufState,
+    #[allow(
+        dead_code,
+        reason = "held to keep the zwp_linux_dmabuf_v1 global alive for the compositor's lifetime"
+    )]
+    pub(crate) dmabuf_global: smithay::wayland::dmabuf::DmabufGlobal,
     /// Fractional scale to send to every new
     /// `wp_fractional_scale` object. Currently the primary
     /// output's configured scale; will become per-surface once
@@ -1182,8 +1192,28 @@ fn main() -> Result<()> {
     info!("phase: building Wayland frontend substate (post-renderer)");
     let output_descs = renderer.output_descriptors();
     let preferred_scale = renderer.primary_scale();
-    let wayland_init = wayland::init(&display, &config, &output_descs, preferred_scale)
-        .context("wayland substate init failed")?;
+    let dmabuf_formats = renderer.dmabuf_formats();
+    let render_node = renderer.render_drm_node();
+    info!(
+        count = dmabuf_formats.len(),
+        render_node = ?render_node,
+        "dmabuf import formats advertised to clients"
+    );
+    if dmabuf_formats.is_empty() {
+        warn!(
+            "renderer reports zero importable dmabuf formats; GPU clients (Steam, etc.) will \
+             render blank — likely an EGL/driver dmabuf-import limitation"
+        );
+    }
+    let wayland_init = wayland::init(
+        &display,
+        &config,
+        &output_descs,
+        preferred_scale,
+        dmabuf_formats,
+        render_node,
+    )
+    .context("wayland substate init failed")?;
     info!("Wayland substate ready");
 
     info!("phase: initialising xkbcommon keyboard");
@@ -1346,6 +1376,8 @@ fn main() -> Result<()> {
         fractional_scale_state: wayland_init.fractional_scale_state,
         viewporter_state: wayland_init.viewporter_state,
         data_device_state: wayland_init.data_device_state,
+        dmabuf_state: wayland_init.dmabuf_state,
+        dmabuf_global: wayland_init.dmabuf_global,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         kbd_focus_before_layer: None,
