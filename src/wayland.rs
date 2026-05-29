@@ -712,6 +712,11 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: xdg_toplevel destroyed");
+        // Snapshot the window's last frame for the close (fade + shrink)
+        // animation *before* it leaves the layout — once removed, its
+        // last drawn rect is gone. No-op if close animation is disabled
+        // or the buffer's already gone.
+        self.renderer.start_close(surface.wl_surface());
         // Pull from the tiler — its sibling takes the freed cell
         // and every remaining window receives a fresh configure.
         self.layout.remove(surface.wl_surface());

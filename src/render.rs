@@ -27,6 +27,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::gles::{
     GlesFrame, GlesPixelProgram, GlesRenderer, GlesTarget, GlesTexture, Uniform, UniformName,
     UniformType,
@@ -34,7 +35,7 @@ use smithay::backend::renderer::gles::{
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
     Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
-    Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
+    Offscreen as _, Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
 };
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::drm::control::crtc;
@@ -360,6 +361,20 @@ pub struct Renderer {
     /// 1:1 (no move animation) — otherwise it visibly trails the pointer.
     /// Cleared on drop, which lets the window animate into its final tile.
     no_anim_move: Option<ObjectId>,
+    /// Windows mid close-animation: a snapshot texture taken the moment
+    /// the toplevel was destroyed, fading + shrinking out where the
+    /// window last sat. Drained as each finishes.
+    closing: Vec<ClosingWindow>,
+}
+
+/// A window's last frame, captured at destroy time, animating out.
+struct ClosingWindow {
+    /// Snapshot of the window's content at close (physical pixels).
+    texture: GlesTexture,
+    /// Where the content sat on screen — absolute compositor pixels.
+    rect: Rectangle<i32, Physical>,
+    /// The fade/shrink-out timeline.
+    anim: Animation,
 }
 
 /// Fraction of full size a window starts at when it opens (and shrinks to
@@ -688,6 +703,7 @@ impl Renderer {
             win_anims: HashMap::new(),
             pending_open: HashSet::new(),
             no_anim_move: None,
+            closing: Vec::new(),
         })
     }
 
@@ -985,6 +1001,115 @@ impl Renderer {
         self.no_anim_move = surface.map(Resource::id);
     }
 
+    /// Begin a close animation for a toplevel that's being destroyed.
+    /// Snapshots the window's current content into a texture (while the
+    /// surface still has its last buffer) and registers a fading,
+    /// shrinking ghost where it last sat. A no-op (instant close) if the
+    /// close animation is disabled, the window isn't tracked, or its
+    /// buffer is already gone. Must run *before* the window leaves the
+    /// layout so its last drawn rect is still known.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "physical pixel sizes derived from output-bounded rects are small non-negative values"
+    )]
+    pub fn start_close(&mut self, surface: &WlSurface) {
+        let cfg = self.animations.clone();
+        if !(cfg.enabled && cfg.window_close.enabled) {
+            return;
+        }
+        let id = surface.id();
+        let Some(entry) = self.win_anims.remove(&id) else {
+            return;
+        };
+        let cell = entry.displayed;
+        // Content rect = cell minus the border ring (Normal windows). We
+        // don't track fill per window; a borderless maximized/fullscreen
+        // window closing would inset by a few px, which is invisible.
+        let bw = self.border.width.max(0);
+        let inner = Rectangle::<i32, Physical>::new(
+            Point::from((cell.loc.x + bw, cell.loc.y + bw)),
+            Size::from(((cell.size.w - 2 * bw).max(1), (cell.size.h - 2 * bw).max(1))),
+        );
+        let center = Point::<i32, Physical>::from((
+            inner.loc.x + inner.size.w / 2,
+            inner.loc.y + inner.size.h / 2,
+        ));
+        let scale = self.output_at(center).map_or(1.0, |o| o.scale);
+
+        // Build the surface's elements with its content origin at the
+        // texture's (0, 0) (shift past the CSD shadow margin).
+        let (geo_x, geo_y) = window_geometry_offset(surface);
+        let origin = Point::<i32, Physical>::from((
+            -scale_f(f64::from(geo_x), scale),
+            -scale_f(f64::from(geo_y), scale),
+        ));
+        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            render_elements_from_surface_tree(
+                &mut self.gles,
+                surface,
+                origin,
+                scale,
+                1.0_f32,
+                Kind::Unspecified,
+            );
+        if elements.is_empty() {
+            return; // no buffer left to snapshot — close instantly
+        }
+
+        let tex_size = Size::<i32, smithay::utils::Buffer>::from((
+            scale_f(f64::from(inner.size.w), scale).max(1),
+            scale_f(f64::from(inner.size.h), scale).max(1),
+        ));
+        let mut texture = match self.gles.create_buffer(Fourcc::Abgr8888, tex_size) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(error = %err, "close snapshot: create_buffer failed");
+                return;
+            }
+        };
+        let phys = Size::<i32, Physical>::from((tex_size.w, tex_size.h));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let mut target = match self.gles.bind(&mut texture) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(error = %err, "close snapshot: bind failed");
+                return;
+            }
+        };
+        match self.gles.render(&mut target, phys, Transform::Normal) {
+            Ok(mut frame) => {
+                let _ = frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full);
+                if let Err(err) =
+                    draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
+                {
+                    warn!(error = %err, "close snapshot: draw failed");
+                    return;
+                }
+                if let Err(err) = frame.finish() {
+                    warn!(error = %err, "close snapshot: finish failed");
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "close snapshot: render failed");
+                return;
+            }
+        }
+        drop(target);
+
+        let now = self.start.elapsed().as_secs_f64();
+        self.closing.push(ClosingWindow {
+            texture,
+            rect: inner,
+            anim: Animation::start(
+                now,
+                cfg.window_close.duration_secs(),
+                cfg.window_close.curve,
+            ),
+        });
+    }
+
     /// Advance per-window animations against `now` (seconds on the shared
     /// clock) and return the on-screen rect + opacity to draw each
     /// placement at, in placement order. Position/size interpolate toward
@@ -1062,9 +1187,10 @@ impl Renderer {
             draws.push(WinDraw { effective, alpha });
         }
 
-        // A closed window's surface dies; drop its (and any stale
-        // open-mark) state. The fade-out on close is a later change.
+        // Drop tracking for windows whose surface has died.
         self.win_anims.retain(|_, w| w.surface.alive());
+        // Drop finished close-out ghosts (frees their snapshot textures).
+        self.closing.retain(|c| !c.anim.done(now));
         draws
     }
 
@@ -1238,58 +1364,82 @@ impl Renderer {
         // composes the client buffer at the right size for
         // fractional displays.
         let bw_comp = border.width.max(0);
-        let grouped: Vec<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> = placements
-            .iter()
-            .zip(win_draws.iter())
-            .map(|(p, wd)| {
-                // CSD clients pad their buffer with an invisible
-                // drop-shadow margin and report the real window rect
-                // via xdg_surface.set_window_geometry. Shift the
-                // buffer up-left by that margin so the *visible*
-                // content (not the buffer's padded corner) lands at
-                // the cell origin; the shadow then falls outside the
-                // cell instead of pushing content down-right.
-                // Maximized/fullscreen windows have no border and fill
-                // their output flush at the cell origin — no border
-                // inset and no CSD shadow offset. A spec-compliant
-                // client zeroes its window geometry on the transition;
-                // gating here also defends against one that doesn't.
-                let (geo_x, geo_y) = if p.fill == FillMode::Normal {
-                    window_geometry_offset(&p.surface)
-                } else {
-                    (0, 0)
-                };
-                let bw_p = if p.fill == FillMode::Normal { bw_comp } else { 0 };
-                // Draw the window into its *animated* rect (`wd.effective`),
-                // scaling the surface's actual content to fill it. The
-                // denominator is the client's current geometry size (its
-                // real size right now), so a resize looks correct even
-                // while the client is a frame behind its new configure;
-                // when settled, `effective == cell_rect` and the scale is
-                // 1 (crisp, identical to the un-animated path).
-                let eff = wd.effective;
-                let (content_w, content_h) = window_geometry_size(&p.surface)
-                    .unwrap_or(((p.cell_rect.size.w - 2 * bw_p), (p.cell_rect.size.h - 2 * bw_p)));
-                let eff_inner_w = f64::from((eff.size.w - 2 * bw_p).max(1));
-                let eff_inner_h = f64::from((eff.size.h - 2 * bw_p).max(1));
-                let csx = eff_inner_w / f64::from(content_w.max(1));
-                let csy = eff_inner_h / f64::from(content_h.max(1));
-                let inner_x = f64::from(eff.loc.x + bw_p - compositor_position.x);
-                let inner_y = f64::from(eff.loc.y + bw_p - compositor_position.y);
-                let surface_local_phys = Point::<i32, Physical>::from((
-                    scale_f(inner_x, scale) - scale_f(f64::from(geo_x) * csx, scale),
-                    scale_f(inner_y, scale) - scale_f(f64::from(geo_y) * csy, scale),
-                ));
-                render_elements_from_surface_tree(
-                    &mut self.gles,
-                    &p.surface,
-                    surface_local_phys,
-                    Scale::from((scale * csx, scale * csy)),
-                    wd.alpha,
-                    Kind::Unspecified,
-                )
-            })
-            .collect();
+        #[allow(
+            clippy::type_complexity,
+            reason = "one frame's worth of per-window, rescale-wrapped surface elements"
+        )]
+        let grouped: Vec<Vec<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>> =
+            placements
+                .iter()
+                .zip(win_draws.iter())
+                .map(|(p, wd)| {
+                    // CSD clients pad their buffer with an invisible
+                    // drop-shadow margin and report the real window rect
+                    // via xdg_surface.set_window_geometry. Shift the
+                    // buffer up-left by that margin so the *visible*
+                    // content (not the buffer's padded corner) lands at
+                    // the cell origin; the shadow then falls outside the
+                    // cell. Maximized/fullscreen windows have no border
+                    // and fill their output flush at the cell origin — no
+                    // inset and no CSD shadow offset.
+                    let (geo_x, geo_y) = if p.fill == FillMode::Normal {
+                        window_geometry_offset(&p.surface)
+                    } else {
+                        (0, 0)
+                    };
+                    let bw_p = if p.fill == FillMode::Normal { bw_comp } else { 0 };
+                    // Draw the window into its *animated* rect
+                    // (`wd.effective`), scaling the surface's actual
+                    // content to fill it. `render_elements_from_surface_tree`'s
+                    // scale only positions subsurfaces — the drawn size
+                    // comes from the *draw* scale — so the surface is built
+                    // at the output scale (content origin on `origin`) and
+                    // then wrapped in a RescaleRenderElement that scales the
+                    // whole tree about that origin. The denominator is the
+                    // client's current geometry size (its real size right
+                    // now), so a resize looks correct even while the client
+                    // is a frame behind its configure; when settled,
+                    // `effective == cell_rect` and the scale is 1 (crisp).
+                    let eff = wd.effective;
+                    let (content_w, content_h) =
+                        window_geometry_size(&p.surface).unwrap_or((
+                            p.cell_rect.size.w - 2 * bw_p,
+                            p.cell_rect.size.h - 2 * bw_p,
+                        ));
+                    let eff_inner_w = f64::from((eff.size.w - 2 * bw_p).max(1));
+                    let eff_inner_h = f64::from((eff.size.h - 2 * bw_p).max(1));
+                    let csx = eff_inner_w / f64::from(content_w.max(1));
+                    let csy = eff_inner_h / f64::from(content_h.max(1));
+                    // Content origin on screen (effective inner origin),
+                    // output-local physical — the fixed point of the rescale.
+                    let inner_x = f64::from(eff.loc.x + bw_p - compositor_position.x);
+                    let inner_y = f64::from(eff.loc.y + bw_p - compositor_position.y);
+                    let origin = Point::<i32, Physical>::from((
+                        scale_f(inner_x, scale),
+                        scale_f(inner_y, scale),
+                    ));
+                    // Build at output scale so the content's geometry origin
+                    // lands on `origin`; the rescale below shrinks/grows it.
+                    let location = Point::<i32, Physical>::from((
+                        origin.x - scale_f(f64::from(geo_x), scale),
+                        origin.y - scale_f(f64::from(geo_y), scale),
+                    ));
+                    let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                        render_elements_from_surface_tree(
+                            &mut self.gles,
+                            &p.surface,
+                            location,
+                            scale,
+                            wd.alpha,
+                            Kind::Unspecified,
+                        );
+                    let content_scale = Scale::from((csx, csy));
+                    elements
+                        .into_iter()
+                        .map(|e| RescaleRenderElement::from_element(e, origin, content_scale))
+                        .collect()
+                })
+                .collect();
 
         // Layer surfaces: pre-import textures while we still
         // hold `&mut self.gles` outside the frame scope, like we
@@ -1394,6 +1544,41 @@ impl Renderer {
                 }
                 _ => Vec::new(),
             };
+
+        // Close-out ghosts whose snapshot sits on this output: a fading,
+        // shrinking copy of where the window last was. Cloned out
+        // (textures are Arc-backed) so they outlive the renderer borrow
+        // during the frame block below.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "eased progress in [0,1] casts to an f32 opacity exactly enough"
+        )]
+        let closing_draws: Vec<(GlesTexture, Rectangle<i32, Physical>, f32)> = self
+            .closing
+            .iter()
+            .filter_map(|c| {
+                let cx = c.rect.loc.x + c.rect.size.w / 2;
+                let cy = c.rect.loc.y + c.rect.size.h / 2;
+                let on_output = cx >= compositor_position.x
+                    && cy >= compositor_position.y
+                    && cx < compositor_position.x + compositor_size.w
+                    && cy < compositor_position.y + compositor_size.h;
+                if !on_output {
+                    return None;
+                }
+                let v = c.anim.value(now);
+                let alpha = (1.0 - v) as f32;
+                let eff = scale_rect_about_center(c.rect, lerp(1.0, OPEN_SCALE_FROM, v));
+                let dest = Rectangle::<i32, Physical>::new(
+                    Point::from((
+                        scale_i(eff.loc.x - compositor_position.x, scale),
+                        scale_i(eff.loc.y - compositor_position.y, scale),
+                    )),
+                    Size::from((scale_i(eff.size.w, scale), scale_i(eff.size.h, scale))),
+                );
+                Some((c.texture.clone(), dest, alpha))
+            })
+            .collect();
 
         let mut target = self
             .gles
@@ -1543,6 +1728,24 @@ impl Renderer {
                     &full_damage,
                 )
                 .context("draw_render_elements (fullscreen) failed")?;
+            }
+
+            // Closing windows: the fade/shrink-out snapshot, above the
+            // windows reflowing to fill the freed space, below popups.
+            for (texture, dest, alpha) in &closing_draws {
+                frame
+                    .render_texture_from_to(
+                        texture,
+                        Rectangle::from_size(texture.size()).to_f64(),
+                        *dest,
+                        &[Rectangle::from_size(dest.size)],
+                        &[],
+                        Transform::Normal,
+                        *alpha,
+                        None,
+                        &[],
+                    )
+                    .context("render_texture_from_to (closing window) failed")?;
             }
 
             // Popups draw above everything except the cursor — above
