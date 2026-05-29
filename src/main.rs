@@ -1003,6 +1003,67 @@ impl State {
             }
         }
     }
+
+    /// Re-read the config file and apply the settings that can change
+    /// at runtime. A parse/validation error keeps the currently
+    /// running config untouched (logged, never fatal) so the user can
+    /// fix and save to recover. Settings that can't be hot-applied
+    /// (monitor modes, env, input device/keymap setup) are flagged
+    /// with a "restart to apply" log when they change.
+    fn reload_config(&mut self, path: &std::path::Path) {
+        let new = match config::Config::load_from_file(path) {
+            Ok(new) => new,
+            Err(err) => {
+                warn!(error = %err, "config reload failed; keeping the running config");
+                return;
+            }
+        };
+
+        // Settings whose runtime consumers run once at startup.
+        if new.monitors != self.config.monitors {
+            warn!("monitor config changed; restart Libreland to apply mode/position/scale/primary");
+        }
+        if new.env != self.config.env {
+            warn!("env changed; restart to re-export environment variables");
+        }
+        if new.startup != self.config.startup {
+            info!("startup commands changed; they only run at launch");
+        }
+        let (old_in, new_in) = (&self.config.input, &new.input);
+        #[allow(
+            clippy::float_cmp,
+            reason = "exact change detection — did the configured accel speed differ at all, not 'is it approximately equal'"
+        )]
+        let input_changed = old_in.repeat_rate != new_in.repeat_rate
+            || old_in.repeat_delay != new_in.repeat_delay
+            || old_in.keyboard_layout != new_in.keyboard_layout
+            || old_in.mouse_accel_profile != new_in.mouse_accel_profile
+            || old_in.mouse_accel_speed != new_in.mouse_accel_speed;
+        if input_changed {
+            warn!(
+                "keyboard/pointer input settings changed; restart to apply (focus model applies live)"
+            );
+        }
+
+        // Hot-apply. Update the layout FIRST (it reflows and sends new
+        // configures to clients), the renderer LAST: the renderer's
+        // border width drives where it draws the surface and the
+        // border ring, so changing it only after the clients have been
+        // asked to resize avoids a one-frame window where a new border
+        // is drawn around an old-sized buffer. Binds and focus model
+        // are read live from `self.config`, so swapping it suffices.
+        self.layout.set_appearance(
+            layout::Gaps {
+                outer: new.layout.gaps_outer,
+                inner: new.layout.gaps_inner,
+            },
+            new.border.width,
+        );
+        self.renderer
+            .set_appearance(new.misc.wallpaper.clone(), new.border.clone());
+        self.config = new;
+        info!("config reloaded");
+    }
 }
 
 #[allow(
@@ -1020,8 +1081,11 @@ fn main() -> Result<()> {
     // Compositor configuration: load Lua from $XDG_CONFIG_HOME/libreland/
     // config.lua if present, else fall back to compiled-in defaults.
     // A missing file is fine (logged at info); a present-but-broken
-    // file aborts startup with a clear error chain.
-    let config = config::Config::load_or_default().context("config load failed")?;
+    // file logs the error and falls back to defaults rather than
+    // aborting — the same path live-reload uses, so the user can fix
+    // and save to recover. The file is watched for live reload below.
+    let config_path = config::Config::path();
+    let config = config::Config::load_or_default();
     info!("compositor config ready");
 
     // Apply the user's configured `env` table immediately — before the
@@ -1214,6 +1278,45 @@ fn main() -> Result<()> {
     // stderr inherit ours (so they share the file log via
     // descriptors, if relevant).
     wayland::spawn_startup(&config.startup);
+
+    // Live config reload: poll the config file once a second and
+    // re-apply on change. Polling (vs inotify) is dependency-free and
+    // robust to editors that save by atomic rename. A parse error is
+    // non-fatal — `reload_config` keeps the running config. Skip
+    // entirely if XDG couldn't resolve a config path.
+    if let Some(watch_path) = config_path {
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        // Change signal is `(mtime, size)`: mtime catches edits (ns
+        // resolution on ext4/btrfs); size is a cheap belt-and-braces
+        // for atomic-rename saves on filesystems with coarse mtime.
+        // `metadata()` returns both in one stat, so size is free.
+        let stamp = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .map(|m| (m.modified().ok(), m.len()))
+                .ok()
+        };
+        let poll = std::time::Duration::from_secs(1);
+        let mut last = stamp(&watch_path);
+        handle
+            .insert_source(
+                Timer::from_duration(poll),
+                move |_, (), data: &mut LoopData| {
+                    let current = stamp(&watch_path);
+                    if current != last {
+                        // Reload on edit / (re-)creation; ignore deletion
+                        // (keep the running config until a file returns).
+                        if current.is_some() {
+                            info!(path = %watch_path.display(), "config changed; reloading");
+                            data.state.reload_config(&watch_path);
+                        }
+                        last = current;
+                    }
+                    TimeoutAction::ToDuration(poll)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("failed to insert config-watch timer: {e}"))?;
+        info!("watching config file for live reload");
+    }
 
     let layout = layout::Layout::new(
         renderer.output_rects(),

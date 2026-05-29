@@ -603,6 +603,16 @@ impl Renderer {
         &self.outputs[self.primary_idx].name
     }
 
+    /// Swap the wallpaper + border styling used from the next frame
+    /// on (for live config reload). The frame shader and wallpaper
+    /// fill are read fresh each render, so the change shows up on the
+    /// next vblank with no further action. Border *width* also feeds
+    /// client window sizing, which the layout updates separately.
+    pub fn set_appearance(&mut self, wallpaper: Fill, border: BorderConfig) {
+        self.wallpaper = wallpaper;
+        self.border = border;
+    }
+
     /// Per-output `(name, mode_size_physical, compositor_size,
     /// position_compositor, scale)`. Used by the Wayland frontend
     /// to advertise `wl_output` globals to clients (one per DRM

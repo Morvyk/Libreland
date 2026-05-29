@@ -655,6 +655,17 @@ impl Layout {
         op.bounds = new_bounds;
         self.recompute_and_push();
     }
+
+    /// Swap the gap + border-width settings and reflow every
+    /// workspace (for live config reload). Tiles get re-laid-out with
+    /// the new gaps and re-configured to the new inside-border size;
+    /// no-op-cheap when the values are unchanged.
+    pub fn set_appearance(&mut self, gaps: Gaps, border_width: i32) {
+        self.gaps = gaps;
+        self.border_width = border_width.max(0);
+        self.recompute_and_push();
+    }
+
     /// Switch the active workspace on the output under `cursor` by
     /// `delta` (`+1` = next / scroll-down, `-1` = previous /
     /// scroll-up). No-op if the cursor is over no output. No wrap:

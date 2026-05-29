@@ -67,12 +67,31 @@ the corresponding default; anything you don't set keeps its default.
 
 - **No file present**: libreland logs `no config.lua found, using
   defaults` and starts with the defaults below.
-- **File present but Lua syntax or schema error**: libreland fails at
-  startup with the file path, the Lua error message (line + column
-  for syntax errors), and a breadcrumb chain through the schema
-  (`binds[2] → mods[0] → unknown modifier "Sper"`).
+- **File present but Lua syntax or schema error**: libreland logs the
+  error prominently — the file path, the Lua error message (line +
+  column for syntax errors), and a breadcrumb chain through the schema
+  (`binds[2] → mods[0] → unknown modifier "Sper"`) — and **falls back
+  to defaults rather than crashing**. Fix the file and save to
+  recover via live reload; no restart needed.
 - **File present and valid**: values flow into `Config` and propagate
   through the runtime.
+
+### Live reload
+
+The config file is watched (its mtime is polled once a second) and
+re-applied on save — no restart needed for most settings. A save that
+fails to parse is logged and **ignored**, leaving the running config
+untouched, so a typo never breaks your session.
+
+Applied live: `binds`, `input.focus_model`, `misc.wallpaper`, the whole
+`border` section, and `layout` gaps. Changing these takes effect on the
+next frame / window reconfigure.
+
+Needs a restart (a "restart to apply" line is logged when they change):
+`monitors` (mode/position/scale/primary), the keyboard/pointer
+`input` settings other than `focus_model` (`repeat_rate`,
+`repeat_delay`, `keyboard_layout`, `mouse_accel_*`), `env`, and
+`startup` (`env`/`startup` only act at launch).
 
 ### Complete example
 

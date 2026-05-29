@@ -75,7 +75,7 @@ pub struct LayoutConfig {
     pub gaps_inner: i32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MonitorsConfig {
     /// Per-output settings keyed by connector name (`"DP-1"`,
     /// `"HDMI-A-1"`, etc.). Outputs without an entry get
@@ -88,7 +88,7 @@ pub struct MonitorsConfig {
     pub primary: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputConfig {
     /// Mode override: `Some((width, height, refresh_mHz))` to force
     /// a specific mode; `None` uses the connector's `PREFERRED` flag
@@ -314,28 +314,53 @@ impl Default for Config {
 impl Config {
     /// Locate `$XDG_CONFIG_HOME/libreland/config.lua` (with the
     /// standard `$XDG_CONFIG_DIRS` fallback), parse it, and return
-    /// the resulting `Config`. If no file is found, return the
-    /// compiled-in defaults — silent fallback would mask typos in
-    /// the filename, so we log explicitly. If a file exists but
-    /// fails to parse or validate, return the error so `main` can
-    /// abort with a clear startup-time message rather than running
-    /// with a half-applied config.
-    pub fn load_or_default() -> Result<Self> {
+    /// the resulting `Config`. If no file is found, fall back to the
+    /// compiled-in defaults (logged). If a file exists but fails to
+    /// parse or validate, log the error prominently and *still* fall
+    /// back to defaults rather than aborting — a typo in the config
+    /// must never stop the compositor from coming up. The same error
+    /// is what live-reload surfaces, so the user can fix it and save
+    /// to recover without a restart.
+    #[must_use]
+    pub fn load_or_default() -> Self {
         let dirs = xdg::BaseDirectories::with_prefix("libreland");
         let Some(path) = dirs.find_config_file("config.lua") else {
-            info!("no config.lua found in XDG search path; using defaults");
-            return Ok(Self::default());
+            info!(
+                "no config.lua found in XDG search path; using defaults (create one to live-load it)"
+            );
+            return Self::default();
         };
         info!(path = %path.display(), "loading Lua config");
-        Self::load_from_file(&path)
-            .with_context(|| format!("failed to load Lua config from {}", path.display()))
+        match Self::load_from_file(&path) {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %err,
+                    "config failed to load; using defaults (fix the file and save to live-reload)"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// The path live-reload watches and the initial load reads: the
+    /// existing `config.lua` in the XDG search path, or — when none
+    /// exists yet — its canonical location under `$XDG_CONFIG_HOME`,
+    /// so creating it later is picked up. `None` only if XDG can't
+    /// resolve a config home at all.
+    #[must_use]
+    pub fn path() -> Option<std::path::PathBuf> {
+        let dirs = xdg::BaseDirectories::with_prefix("libreland");
+        dirs.find_config_file("config.lua")
+            .or_else(|| dirs.get_config_file("config.lua"))
     }
 
     /// Read `path`, execute it as a Lua chunk (which sets the
     /// top-level globals our schema reads), and walk the globals
     /// to build a `Config`. Anything the file doesn't set keeps
     /// its `Default` value.
-    fn load_from_file(path: &Path) -> Result<Self> {
+    pub(crate) fn load_from_file(path: &Path) -> Result<Self> {
         let source = std::fs::read_to_string(path).context("failed to read config file")?;
 
         let lua = Lua::new();
