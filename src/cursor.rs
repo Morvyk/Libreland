@@ -1,13 +1,16 @@
-//! `XCursor` theme loading for the compositor's own pointer.
+//! `XCursor` theme loading for the compositor's pointer.
 //!
-//! The compositor draws its own pointer cursor (clients only get a
-//! say via `wl_pointer.set_cursor`, which we don't honour yet). Rather
-//! than a hardcoded sprite we load a real `XCursor` theme the same way
-//! every other Wayland/X11 app does: read `$XCURSOR_THEME` /
-//! `$XCURSOR_SIZE` from the environment and pull the `default` cursor
-//! out of the matching theme on disk. This module is renderer-agnostic
-//! — it produces raw RGBA pixels; `render` uploads them to a texture.
+//! We load a real `XCursor` theme the same way every other Wayland/X11
+//! app does: read `$XCURSOR_THEME` / `$XCURSOR_SIZE` from the
+//! environment and pull cursors out of the matching theme on disk. The
+//! `default` arrow is loaded up front; *named* cursors (grabbing,
+//! crosshair, resize, …) are loaded on demand when a client requests a
+//! [`smithay::input::pointer::CursorImageStatus::Named`] cursor (via
+//! `wp_cursor_shape_v1`) or the compositor sets one for its own grabs.
+//! This module is renderer-agnostic — it produces raw RGBA pixels;
+//! `render` uploads them to a texture.
 
+use smithay::input::pointer::CursorIcon;
 use tracing::{info, warn};
 use xcursor::CursorTheme;
 use xcursor::parser::parse_xcursor;
@@ -46,22 +49,41 @@ pub fn configured_size() -> u32 {
         .unwrap_or(DEFAULT_SIZE)
 }
 
-/// Load the `default` pointer of the theme named by `$XCURSOR_THEME`
-/// (falling back to the theme literally named "default"), choosing
-/// the image whose nominal size is closest to `target_px` physical
-/// pixels. Returns `None` — leaving the caller to fall back to its
-/// built-in sprite — if the theme or icon can't be found or parsed.
+/// Load the `default` pointer (the standard arrow), choosing the image
+/// whose nominal size is closest to `target_px` physical pixels.
+/// Returns `None` — leaving the caller to fall back to its built-in
+/// sprite — if the theme or icon can't be found or parsed.
 pub fn load_default_cursor(target_px: u32) -> Option<CursorImage> {
+    // "default" is the modern CSS/X11 name for the standard arrow;
+    // older themes only ship the legacy "left_ptr" alias, so try both.
+    load_named(&["default", "left_ptr"], target_px, true)
+}
+
+/// Load a *named* cursor ([`CursorIcon`]) by its CSS name plus the
+/// theme-specific aliases the `cursor-icon` crate knows about (e.g.
+/// `grabbing` → `closedhand`, `crosshair` → `cross`). Returns `None`
+/// when the theme doesn't ship that cursor, so the caller can fall back
+/// to the default arrow rather than draw nothing.
+pub fn load_named_cursor(icon: CursorIcon, target_px: u32) -> Option<CursorImage> {
+    let mut names: Vec<&str> = Vec::with_capacity(1 + icon.alt_names().len());
+    names.push(icon.name());
+    names.extend_from_slice(icon.alt_names());
+    load_named(&names, target_px, false)
+}
+
+/// Load the first of `names` present in the `$XCURSOR_THEME` theme
+/// (falling back to the theme literally named "default"). `warn_missing`
+/// logs when none of the names resolve — used only for the default
+/// cursor, since a missing *named* cursor is expected and handled by
+/// falling back to the arrow.
+fn load_named(names: &[&str], target_px: u32, warn_missing: bool) -> Option<CursorImage> {
     let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_owned());
     let theme = CursorTheme::load(&theme_name);
 
-    // "default" is the modern CSS/X11 name for the standard arrow;
-    // older themes only ship the legacy "left_ptr" alias, so try both.
-    let Some(path) = theme
-        .load_icon("default")
-        .or_else(|| theme.load_icon("left_ptr"))
-    else {
-        warn!(theme = %theme_name, "no `default`/`left_ptr` cursor in XCursor theme; using built-in sprite");
+    let Some(path) = names.iter().find_map(|n| theme.load_icon(n)) else {
+        if warn_missing {
+            warn!(theme = %theme_name, ?names, "cursor not found in XCursor theme; using built-in sprite");
+        }
         return None;
     };
 

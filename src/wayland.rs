@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
+use smithay::delegate_cursor_shape;
 use smithay::delegate_data_device;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
@@ -71,6 +72,8 @@ use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
@@ -121,6 +124,11 @@ pub struct WaylandInit {
     pub shm_state: ShmState,
     pub seat_state: SeatState<State>,
     pub seat: Seat<State>,
+    /// `wp_cursor_shape_v1` global. Lets clients request a named cursor
+    /// shape (arrow, text, grab, …) instead of supplying a surface;
+    /// smithay funnels the request through `SeatHandler::cursor_image`
+    /// as a `CursorImageStatus::Named`. Held to keep the global alive.
+    pub cursor_shape_state: CursorShapeManagerState,
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
     /// KDE `org_kde_kwin_server_decoration` global, advertising a
@@ -184,6 +192,10 @@ pub struct WaylandInit {
 /// on the display, and bind keyboard + pointer capabilities to the
 /// seat (so clients see them advertised). Forwarding events to those
 /// capabilities is milestone 4c.
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat one-time build-up: construct + register each Wayland global in sequence. Splitting it would only scatter the single owner of the setup across helpers for no clarity gain."
+)]
 pub fn init(
     display: &Display<State>,
     config: &Config,
@@ -214,6 +226,8 @@ pub fn init(
     // initialise their seat's clipboard through this; its absence
     // leaves GTK's seat half-set-up and crashes Firefox on focus.
     let data_device_state = DataDeviceState::new::<State>(&dh);
+    // wp_cursor_shape_v1: clients request named cursor shapes we theme.
+    let cursor_shape_state = CursorShapeManagerState::new::<State>(&dh);
     // zwp_linux_dmabuf_v1: advertise the GPU buffer formats our GLES
     // renderer can import, so GPU-composited clients (and Xwayland's
     // glamor-rendered windows via xwayland-satellite) can present
@@ -344,6 +358,7 @@ pub fn init(
         shm_state,
         seat_state,
         seat,
+        cursor_shape_state,
         xdg_shell_state,
         xdg_decoration_state,
         kde_decoration_state,
@@ -528,12 +543,21 @@ impl SeatHandler for State {
         set_primary_focus(&dh, seat, client);
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {
-        // No-op in 4a; clients can request cursor images but we
-        // keep drawing our procedural cursor until cursor-shape /
-        // surface-cursor support lands.
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // The focused client set its pointer image — a surface
+        // (`wl_pointer.set_cursor`, used by toolkits and games incl.
+        // Xwayland via the satellite), a named shape
+        // (`wp_cursor_shape_v1`, which smithay funnels here as
+        // `Named`), or `Hidden`. The renderer draws it next frame,
+        // unless a compositor grab override is active.
+        self.renderer.set_cursor_status(image);
     }
 }
+
+// `wp_cursor_shape_v1` covers tablet tools too, so the delegate
+// requires this. We don't advertise tablets, so the default no-op
+// (ignore tablet-tool cursor requests) is all we need.
+impl TabletSeatHandler for State {}
 
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
@@ -988,4 +1012,5 @@ delegate_data_device!(State);
 delegate_kde_decoration!(State);
 delegate_relative_pointer!(State);
 delegate_pointer_constraints!(State);
+delegate_cursor_shape!(State);
 delegate_primary_selection!(State);

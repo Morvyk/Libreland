@@ -36,9 +36,10 @@ use smithay::backend::renderer::{
     Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
     Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
 };
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::drm::control::crtc;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::{
     SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
@@ -290,15 +291,35 @@ pub struct Renderer {
     /// `Arc`-backed so it's cheap to clone out before borrowing
     /// the renderer for the frame.
     frame_shader: GlesPixelProgram,
-    /// Loaded `XCursor` sprite for the pointer. `None` (no theme found)
+    /// Loaded `XCursor` `default` arrow sprite. `None` (no theme found)
     /// falls back to the built-in triangle. `Arc`-backed texture, so
     /// it's cheap to clone out before borrowing the renderer for the
-    /// frame.
+    /// frame. Also the fallback when a requested *named* cursor isn't
+    /// in the theme.
     cursor: Option<CursorSprite>,
     /// Requested cursor size in **logical** pixels (`$XCURSOR_SIZE`,
     /// default 24). The loaded sprite is normalised back to this size
     /// regardless of which physical-pixel image the theme provided.
     cursor_size: i32,
+    /// Physical-pixel target the theme images are chosen for
+    /// (`cursor_size * max output scale`), so on-demand named cursors
+    /// load at the same crispness as the default.
+    cursor_target_px: u32,
+    /// What the *focused client* last asked the pointer to look like
+    /// (`wl_pointer.set_cursor` / `wp_cursor_shape_v1`); default is the
+    /// themed arrow. Overridden by [`Self::cursor_override`] while a
+    /// compositor grab is active.
+    cursor_status: CursorImageStatus,
+    /// A compositor-imposed cursor that takes precedence over the
+    /// client's while set — e.g. the grabbing hand during a move/resize
+    /// drag, the crosshair during a screenshot selection. `None` =
+    /// honour the client's [`Self::cursor_status`].
+    cursor_override: Option<CursorImageStatus>,
+    /// Lazily-loaded + uploaded sprites for *named* theme cursors other
+    /// than the default. A cached `None` means "not in the theme" (so
+    /// we don't retry the disk every frame) and the renderer falls back
+    /// to the default arrow.
+    named_cursors: HashMap<CursorIcon, Option<CursorSprite>>,
     /// Origin used for the monotonic ms timestamp fed into
     /// `wl_callback.done` after each output is queued for scanout.
     /// Clients use this value to schedule their next frame's draw —
@@ -601,6 +622,10 @@ impl Renderer {
                 reason = "cursor_size is a small positive pixel count"
             )]
             cursor_size: cursor_size as i32,
+            cursor_target_px: target_px,
+            cursor_status: CursorImageStatus::default_named(),
+            cursor_override: None,
+            named_cursors: HashMap::new(),
             start: Instant::now(),
             freeze_textures: HashMap::new(),
             screenshot_overlay: None,
@@ -614,6 +639,15 @@ impl Renderer {
     /// a missing cursor must never be fatal.
     fn upload_cursor(gles: &mut GlesRenderer, target_px: u32) -> Option<CursorSprite> {
         let image = crate::cursor::load_default_cursor(target_px)?;
+        Self::upload_cursor_image(gles, &image)
+    }
+
+    /// Upload a decoded [`crate::cursor::CursorImage`] as a GLES texture.
+    /// Returns `None` on upload failure (the caller falls back).
+    fn upload_cursor_image(
+        gles: &mut GlesRenderer,
+        image: &crate::cursor::CursorImage,
+    ) -> Option<CursorSprite> {
         let size = Size::<i32, smithay::utils::Buffer>::from((image.width, image.height));
         // `pixels_rgba` is byte order R,G,B,A, which DRM names
         // `Abgr8888` (little-endian, alpha in the MSB). `flipped =
@@ -632,6 +666,38 @@ impl Renderer {
                 None
             }
         }
+    }
+
+    /// Record the cursor the focused client requested (via
+    /// `wl_pointer.set_cursor` or `wp_cursor_shape_v1`). Takes effect
+    /// next frame unless a compositor override is active.
+    pub fn set_cursor_status(&mut self, status: CursorImageStatus) {
+        self.cursor_status = status;
+    }
+
+    /// Impose (or clear, with `None`) a compositor cursor that overrides
+    /// the client's — used for the grabbing hand during a move/resize
+    /// and the crosshair during a screenshot selection.
+    pub fn set_cursor_override(&mut self, status: Option<CursorImageStatus>) {
+        self.cursor_override = status;
+    }
+
+    /// Resolve a named cursor to an uploaded sprite, loading + caching it
+    /// from the theme on first use. Falls back to the default arrow when
+    /// the theme doesn't ship the requested cursor.
+    fn named_cursor_sprite(&mut self, icon: CursorIcon) -> Option<CursorSprite> {
+        if icon == CursorIcon::Default {
+            return self.cursor.clone();
+        }
+        if !self.named_cursors.contains_key(&icon) {
+            let sprite = crate::cursor::load_named_cursor(icon, self.cursor_target_px)
+                .and_then(|image| Self::upload_cursor_image(&mut self.gles, &image));
+            self.named_cursors.insert(icon, sprite);
+        }
+        self.named_cursors
+            .get(&icon)
+            .and_then(Clone::clone)
+            .or_else(|| self.cursor.clone())
     }
 
     /// Render every output's initial frame to prime its swapchain.
@@ -940,8 +1006,21 @@ impl Renderer {
         let wallpaper = self.wallpaper.clone();
         let border = self.border.clone();
         let frame_shader = self.frame_shader.clone();
-        let cursor_sprite = self.cursor.clone();
         let cursor_size = self.cursor_size;
+        // The effective cursor this frame: a compositor override (grab /
+        // screenshot) wins over the client's request. For a Named cursor
+        // we resolve (and lazily upload) its themed sprite now, while we
+        // still hold `&mut self`. A client Surface cursor is drawn as a
+        // surface tree further down (it needs `cursor_in_bounds` first).
+        let cursor_status = self
+            .cursor_override
+            .clone()
+            .unwrap_or_else(|| self.cursor_status.clone());
+        let cursor_sprite = match &cursor_status {
+            CursorImageStatus::Named(icon) => self.named_cursor_sprite(*icon),
+            // Hidden → no sprite; Surface → drawn separately below.
+            _ => None,
+        };
         let screenshot_overlay = self.screenshot_overlay;
         let dnd_icon = self.dnd_icon.clone();
         let output = &self.outputs[idx];
@@ -1106,6 +1185,39 @@ impl Renderer {
                         scale,
                         1.0_f32,
                         Kind::Unspecified,
+                    )
+                }
+                _ => Vec::new(),
+            };
+
+        // Client surface cursor (`wl_pointer.set_cursor` with a surface;
+        // this is how native and Xwayland games supply their own
+        // pointer). Positioned so the surface's hotspot — stored in the
+        // cursor-image role data — sits on the pointer. Pre-imported here
+        // while we still hold `&mut self.gles`, like the DnD icon above.
+        let cursor_surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            match &cursor_status {
+                CursorImageStatus::Surface(surface)
+                    if cursor_in_bounds && !hide_cursor && surface.alive() =>
+                {
+                    let hotspot = with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<CursorImageSurfaceData>()
+                            .map(|attrs| attrs.lock().unwrap().hotspot)
+                            .unwrap_or_default()
+                    });
+                    let origin = Point::<i32, Physical>::from((
+                        scale_f(cursor_local_x, scale) - scale_f(f64::from(hotspot.x), scale),
+                        scale_f(cursor_local_y, scale) - scale_f(f64::from(hotspot.y), scale),
+                    ));
+                    render_elements_from_surface_tree(
+                        &mut self.gles,
+                        surface,
+                        origin,
+                        scale,
+                        1.0_f32,
+                        Kind::Cursor,
                     )
                 }
                 _ => Vec::new(),
@@ -1320,20 +1432,42 @@ impl Renderer {
 
             // Skip the cursor entirely while the pointer is locked (a
             // game with an active pointer lock draws its own crosshair;
-            // ours would sit frozen at the lock point).
+            // ours would sit frozen at the lock point). Otherwise draw
+            // whatever the effective cursor status calls for: a client
+            // surface (its own pointer image), a themed named sprite, or
+            // — when Hidden — nothing.
             if cursor_in_bounds && !hide_cursor {
-                // Pointer hotspot in this output's physical pixels.
-                let hotspot = Point::<i32, Physical>::from((
-                    scale_f(cursor_local_x, scale),
-                    scale_f(cursor_local_y, scale),
-                ));
-                draw_cursor(
-                    &mut frame,
-                    cursor_sprite.as_ref(),
-                    cursor_size,
-                    hotspot,
-                    scale,
-                )?;
+                match &cursor_status {
+                    CursorImageStatus::Hidden => {}
+                    CursorImageStatus::Surface(_) => {
+                        // An empty element list (surface with no committed
+                        // buffer) is the client's way of hiding the
+                        // cursor — draw nothing in that case.
+                        if !cursor_surface_elements.is_empty() {
+                            draw_render_elements::<GlesRenderer, _, _>(
+                                &mut frame,
+                                scale,
+                                &cursor_surface_elements,
+                                &full_damage,
+                            )
+                            .context("draw_render_elements (cursor surface) failed")?;
+                        }
+                    }
+                    CursorImageStatus::Named(_) => {
+                        // Pointer hotspot in this output's physical pixels.
+                        let hotspot = Point::<i32, Physical>::from((
+                            scale_f(cursor_local_x, scale),
+                            scale_f(cursor_local_y, scale),
+                        ));
+                        draw_cursor(
+                            &mut frame,
+                            cursor_sprite.as_ref(),
+                            cursor_size,
+                            hotspot,
+                            scale,
+                        )?;
+                    }
+                }
             }
 
             frame.finish().context("Frame::finish failed")?

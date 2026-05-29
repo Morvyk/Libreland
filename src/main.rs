@@ -34,7 +34,9 @@ use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::input::keyboard::FilterResult;
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, MotionEvent, RelativeMotionEvent,
+};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
@@ -187,6 +189,15 @@ pub(crate) struct State {
     /// can route through it; `DataDeviceHandler::data_device_state`
     /// borrows it.
     pub(crate) data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
+    /// `wp_cursor_shape_v1` global. Held so the global stays registered
+    /// for the process lifetime and `delegate_cursor_shape!` can route
+    /// through it; the cursor-shape requests themselves arrive via
+    /// `SeatHandler::cursor_image`, so the instance is never read.
+    #[allow(
+        dead_code,
+        reason = "owns the wp_cursor_shape_v1 global registration; dispatch routes through State, not this handle"
+    )]
+    pub(crate) cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     /// `zwp_linux_dmabuf_v1` substate + global. Held so the global
     /// stays registered and `delegate_dmabuf!` / `DmabufHandler` can
     /// route through it; the handler imports offered GPU buffers into
@@ -800,6 +811,9 @@ impl State {
                     let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
                     self.layout.finish_move_drag(cursor_i);
                 }
+                // Drop the gesture-cursor override; the client under the
+                // pointer drives the cursor again from here.
+                self.renderer.set_cursor_override(None);
             }
             return;
         }
@@ -873,6 +887,16 @@ impl State {
                             cursor_start: (cx, cy),
                             rect_start,
                         });
+                        // Show the gesture cursor for the drag: the
+                        // grabbing hand while moving, a resize cursor
+                        // while resizing. Overrides the client's cursor
+                        // until the drag ends.
+                        let icon = match mode {
+                            DragMode::Move => CursorIcon::Grabbing,
+                            DragMode::Resize => CursorIcon::SeResize,
+                        };
+                        self.renderer
+                            .set_cursor_override(Some(CursorImageStatus::Named(icon)));
                     } else if matches!(mode, DragMode::Resize) {
                         warn!(
                             surface = ?surface.id(),
@@ -1740,6 +1764,9 @@ impl State {
                     // Live selection: dim immediately.
                     self.update_screenshot_overlay();
                 }
+                // Crosshair while selecting a region/window.
+                self.renderer
+                    .set_cursor_override(Some(CursorImageStatus::Named(CursorIcon::Crosshair)));
                 info!("screenshot: session started");
             }
         }
@@ -1751,6 +1778,7 @@ impl State {
         self.screenshot = None;
         self.screenshot_pending.clear();
         self.renderer.clear_screenshot();
+        self.renderer.set_cursor_override(None);
         info!("screenshot: cancelled");
     }
 
@@ -1762,6 +1790,7 @@ impl State {
         self.screenshot_pending
             .retain(|c| matches!(c.purpose, CapturePurpose::Finalize { .. }));
         self.renderer.clear_screenshot();
+        self.renderer.set_cursor_override(None);
     }
 
     /// Recompute the selection from the cursor + session state and hand it
@@ -2332,6 +2361,7 @@ fn main() -> Result<()> {
         shm_state: wayland_init.shm_state,
         seat_state: wayland_init.seat_state,
         seat: wayland_init.seat,
+        cursor_shape_state: wayland_init.cursor_shape_state,
         xdg_shell_state: wayland_init.xdg_shell_state,
         xdg_decoration_state: wayland_init.xdg_decoration_state,
         kde_decoration_state: wayland_init.kde_decoration_state,
