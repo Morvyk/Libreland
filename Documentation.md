@@ -170,6 +170,9 @@ startup = {
     "kitty",
     -- "sh -c 'swaybg -i ~/wallpapers/blue.png &'",
 }
+
+-- Run xwayland-satellite at startup for X11 app support (default true).
+xwayland = true
 ```
 
 ### env
@@ -188,6 +191,21 @@ compositor reads the env once at startup, so a change needs a restart.
 | Field     | Default      | State | Notes                                                                          |
 | --------- | ------------ | ----- | ------------------------------------------------------------------------------ |
 | `startup` | `{}` (empty) | ✅    | Vec of command strings spawned once the Wayland socket is up. Whitespace-split into program + args. |
+
+### xwayland
+
+| Field      | Default | State | Notes |
+| ---------- | ------- | ----- | ----- |
+| `xwayland` | `true`  | ✅    | Run [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite) at startup so X11 apps work. The compositor picks a free X display (`:0`..`:32`), launches the satellite on it, and exports `$DISPLAY`. If the binary isn't installed it's logged and skipped (never fatal). Toggling needs a restart. |
+
+XWayland runs **rootless** via `xwayland-satellite`: it connects to
+Libreland as an ordinary Wayland client, so X windows arrive as normal
+`xdg_toplevel`s and tile/float like any other window. The satellite
+scales X apps itself through `wp_fractional_scale` + `wp_viewporter`
+(on a mixed-scale multi-monitor setup it uses the *smallest* output's
+scale). Cursors stay consistent because Libreland draws its own pointer
+over every surface and exports `XCURSOR_THEME`/`XCURSOR_SIZE` to the
+satellite. Requires `xwayland-satellite` (and `Xwayland`) installed.
 
 ### Modifier names (case-insensitive)
 

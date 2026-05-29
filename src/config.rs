@@ -61,6 +61,14 @@ pub struct Config {
     /// features. Children inherit the compositor's environment
     /// (notably `$WAYLAND_DISPLAY`).
     pub startup: Vec<String>,
+    /// Run `xwayland-satellite` at startup so X11 apps work (rootless
+    /// Xwayland as a normal Wayland client). When `true` (default) and
+    /// the binary is installed, the compositor picks a free X display,
+    /// launches the satellite on it, and exports `$DISPLAY` so X
+    /// clients connect. The satellite scales X apps itself via
+    /// `wp_fractional_scale` + `wp_viewporter`. Toggling needs a
+    /// restart (the satellite is spawned once at launch).
+    pub xwayland: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +315,7 @@ impl Default for Config {
             },
             env: Vec::new(),
             startup: Vec::new(),
+            xwayland: true,
         }
     }
 }
@@ -398,6 +407,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("startup")? {
             config.startup = parse_startup(&t).context("startup")?;
+        }
+        if let Some(x) = globals.get::<Option<bool>>("xwayland")? {
+            config.xwayland = x;
         }
 
         Ok(config)

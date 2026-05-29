@@ -1039,6 +1039,9 @@ impl State {
         if new.startup != self.config.startup {
             info!("startup commands changed; they only run at launch");
         }
+        if new.xwayland != self.config.xwayland {
+            warn!("xwayland setting changed; restart to start/stop xwayland-satellite");
+        }
         let (old_in, new_in) = (&self.config.input, &new.input);
         #[allow(
             clippy::float_cmp,
@@ -1257,6 +1260,29 @@ fn main() -> Result<()> {
     // SAFETY: see #[allow] above.
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    }
+
+    // XWayland via xwayland-satellite: a rootless Xwayland that
+    // connects to *our* socket as a normal Wayland client (so X
+    // windows arrive as ordinary xdg_toplevels) and serves X11 on a
+    // display we pick. It must start after WAYLAND_DISPLAY is set (it
+    // inherits it) and before X clients. It scales X apps itself via
+    // wp_fractional_scale + wp_viewporter; cursors stay consistent
+    // because we draw our own over everything and export XCURSOR_*.
+    if config.xwayland
+        && let Some(disp) = start_xwayland_satellite()
+    {
+        // SAFETY: same single-threaded-init reasoning as the
+        // WAYLAND_DISPLAY set_var above — still pre-event-loop.
+        #[allow(
+            unsafe_code,
+            reason = "set_var is unsafe due to multi-threaded env races; called in single-threaded init before the event loop, same as WAYLAND_DISPLAY"
+        )]
+        // SAFETY: see #[allow] above.
+        unsafe {
+            std::env::set_var("DISPLAY", &disp);
+        }
+        info!(x_display = %disp, "XWayland ready; $DISPLAY exported for X11 clients");
     }
 
     // Snapshot the Display's poll fd so calloop can register a
@@ -1539,6 +1565,48 @@ fn apply_input_config(device: &mut libinput::Device, input_config: &config::Inpu
     if let Err(err) = device.config_accel_set_speed(input_config.mouse_accel_speed) {
         warn!(?err, ?device, "failed to set libinput accel speed");
     }
+}
+
+/// Launch `xwayland-satellite` on the first free X display and return
+/// that display (e.g. `":1"`) so the caller can export `$DISPLAY`.
+/// Returns `None` if no display is free or the binary isn't installed
+/// — in both cases X11 support is simply absent (logged), never fatal.
+/// The satellite inherits our environment, so it connects to
+/// `$WAYLAND_DISPLAY` and inherits `$XCURSOR_*` for its cursor theme.
+fn start_xwayland_satellite() -> Option<String> {
+    let Some(n) = first_free_x_display() else {
+        warn!("no free X display in :0..:32; not starting xwayland-satellite");
+        return None;
+    };
+    let disp = format!(":{n}");
+    match std::process::Command::new("xwayland-satellite")
+        .arg(&disp)
+        .spawn()
+    {
+        Ok(child) => {
+            info!(pid = child.id(), x_display = %disp, "spawned xwayland-satellite");
+            Some(disp)
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "could not start xwayland-satellite (is it installed?); X11 apps unavailable"
+            );
+            None
+        }
+    }
+}
+
+/// Lowest X display number `N` in `0..=32` whose socket
+/// (`/tmp/.X11-unix/XN`) and lock (`/tmp/.XN-lock`) are both absent,
+/// i.e. free for a new X server. There's a benign TOCTOU window
+/// between this check and the satellite claiming it; on a contended
+/// system the satellite simply fails to bind and logs.
+fn first_free_x_display() -> Option<u32> {
+    (0u32..=32).find(|n| {
+        !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
+            && !std::path::Path::new(&format!("/tmp/.X{n}-lock")).exists()
+    })
 }
 
 /// Pick a `/dev/dri/cardN` node from a udev enumeration — render nodes
