@@ -200,6 +200,12 @@ pub enum Action {
     /// floating window is centred at ~70 % of its previous tiled
     /// cell; a newly tiled window rejoins the dwindle flow.
     ToggleFloating,
+    /// Ask the keyboard-focused toplevel to close, via
+    /// `xdg_toplevel.close`. This is a polite request — the client
+    /// runs its own close path (e.g. "save before quit?"), so the
+    /// window may not disappear immediately, and a client is free to
+    /// ignore it. No focused toplevel = silent no-op.
+    Close,
     /// Spawn a child process from the configured command string.
     /// The string is whitespace-split into program + args; wrap in
     /// `"sh -c '…'"` for shell features. Inherits the compositor's
@@ -271,6 +277,11 @@ impl Default for Config {
                         mods: keyboard::MOD_SUPER,
                         keysym: Keysym::F,
                         action: Action::ToggleFloating,
+                    },
+                    KeyBinding {
+                        mods: keyboard::MOD_SUPER,
+                        keysym: Keysym::C,
+                        action: Action::Close,
                     },
                 ],
             },
@@ -537,6 +548,7 @@ fn parse_action(t: &Table) -> mlua::Result<Action> {
     match name.to_lowercase().as_str() {
         "exit" => Ok(Action::Exit),
         "togglefloating" | "toggle_floating" => Ok(Action::ToggleFloating),
+        "close" | "closewindow" | "close_window" | "kill" => Ok(Action::Close),
         "spawn" => {
             let command: String = t
                 .get("command")
@@ -547,7 +559,7 @@ fn parse_action(t: &Table) -> mlua::Result<Action> {
             Ok(Action::Spawn(Arc::from(command)))
         }
         other => lua_bail!(
-            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"spawn\""
+            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"close\", \"spawn\""
         ),
     }
 }

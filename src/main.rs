@@ -785,6 +785,26 @@ impl State {
                     self.layout.toggle_floating(&surface);
                 }
             }
+            config::Action::Close => {
+                // Politely ask the focused toplevel to close. Match
+                // the keyboard-focused surface against the live
+                // toplevels and send xdg_toplevel.close; the client
+                // drives its own teardown (which destroys the
+                // surface, and our XdgShellHandler removes it from
+                // the layout). No focus / no matching toplevel (e.g.
+                // a layer surface like rofi is focused) = no-op.
+                let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+                if let Some(surface) = focus
+                    && let Some(toplevel) = self
+                        .xdg_shell_state
+                        .toplevel_surfaces()
+                        .iter()
+                        .find(|t| t.wl_surface() == &surface)
+                {
+                    info!(surface = ?surface.id(), "close action fired");
+                    toplevel.send_close();
+                }
+            }
             config::Action::Spawn(cmd) => {
                 // Identical semantics to `wayland::spawn_startup`
                 // but runs at bind-press time: whitespace-split

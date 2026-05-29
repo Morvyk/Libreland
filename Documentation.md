@@ -180,6 +180,7 @@ Anything xkbcommon's `xkb_keysym_from_name` accepts — `"E"`,
 | ------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `"exit"`            | Cleanly exit the compositor.                                                                                 |
 | `"togglefloating"`  | Flip the focused window between tiled and floating. A newly floating window centres at ~70% of its previous cell. |
+| `"close"`           | Politely ask the focused toplevel to close (`xdg_toplevel.close`). The client runs its own close path, so it may prompt or ignore the request. Aliases: `"closewindow"`, `"kill"`. |
 | `"spawn"`           | Run an arbitrary command. Requires an additional `command = "…"` field on the bind table; the string is whitespace-split into program + args, children inherit our env (so `$WAYLAND_DISPLAY` reaches them). Wrap with `"sh -c '…'"` for shell features (pipes, env, `&`). |
 
 (More actions land as features grow: `"reload"`, `"change_vt"`, …)
@@ -220,6 +221,7 @@ Built-in defaults:
 
 - `Super+Shift+E → exit`
 - `Super+F → togglefloating`
+- `Super+C → close`
 
 Your `binds` table is **merged on top of** these defaults, not
 swapped in for them: a bind whose trigger (`mods` + `key`) matches a
@@ -227,8 +229,8 @@ default overrides that default's action, and any default you don't
 touch stays active. So adding a single `Super+Space` bind keeps
 `Super+Shift+E` and `Super+F` working.
 
-Available actions today: `exit`, `togglefloating`, `spawn`. The list
-grows as we add `reload`, `change_vt`, …
+Available actions today: `exit`, `togglefloating`, `close`, `spawn`.
+The list grows as we add `reload`, `change_vt`, …
 
 ### misc
 
