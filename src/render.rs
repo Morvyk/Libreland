@@ -581,6 +581,28 @@ impl Renderer {
         Rectangle::new(o.compositor_position, o.compositor_size)
     }
 
+    /// Every output's `(connector name, compositor rect)` in absolute
+    /// compositor pixels. The layout consumes this to build one
+    /// tiling tree per output, so windows can tile on any monitor —
+    /// not just the primary.
+    pub fn output_rects(&self) -> Vec<(String, Rectangle<i32, Physical>)> {
+        self.outputs
+            .iter()
+            .map(|o| {
+                (
+                    o.name.clone(),
+                    Rectangle::new(o.compositor_position, o.compositor_size),
+                )
+            })
+            .collect()
+    }
+
+    /// Connector name of the primary output. Used by the layer-shell
+    /// reflow to attribute exclusive zones to the primary by name.
+    pub fn primary_output_name(&self) -> &str {
+        &self.outputs[self.primary_idx].name
+    }
+
     /// Per-output `(name, mode_size_physical, compositor_size,
     /// position_compositor, scale)`. Used by the Wayland frontend
     /// to advertise `wl_output` globals to clients (one per DRM

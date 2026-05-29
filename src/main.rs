@@ -805,7 +805,6 @@ impl State {
     /// always renders below).
     pub(crate) fn recompute_layer_layout(&mut self) {
         use smithay::wayland::shell::wlr_layer::Anchor;
-        let primary = self.renderer.primary_output_rect();
         let mut top = 0_i32;
         let mut bottom = 0_i32;
         let mut left = 0_i32;
@@ -836,14 +835,27 @@ impl State {
                 right = right.max(exclusive);
             }
         }
-        let new_bounds = smithay::utils::Rectangle::<i32, smithay::utils::Physical>::new(
-            smithay::utils::Point::new(primary.loc.x + left, primary.loc.y + top),
-            smithay::utils::Size::new(
-                (primary.size.w - left - right).max(1),
-                (primary.size.h - top - bottom).max(1),
-            ),
-        );
-        self.layout.set_bounds(new_bounds);
+        // Layer surfaces still land on the primary output only (see
+        // snapshot_layer_placements), so the exclusive zones shrink
+        // the primary's tile area; every other output gets its full
+        // bounds. The per-output loop shape is in place so per-output
+        // layer zones become a small follow-up once layers are
+        // multi-output.
+        let primary_name = self.renderer.primary_output_name().to_owned();
+        for (name, rect) in self.renderer.output_rects() {
+            let new_bounds = if name == primary_name {
+                smithay::utils::Rectangle::<i32, smithay::utils::Physical>::new(
+                    smithay::utils::Point::new(rect.loc.x + left, rect.loc.y + top),
+                    smithay::utils::Size::new(
+                        (rect.size.w - left - right).max(1),
+                        (rect.size.h - top - bottom).max(1),
+                    ),
+                )
+            } else {
+                rect
+            };
+            self.layout.set_output_bounds(&name, new_bounds);
+        }
     }
 
     /// Run a bound action. Grows as we add more actions (`reload`,
@@ -1123,7 +1135,7 @@ fn main() -> Result<()> {
     wayland::spawn_startup(&config.startup);
 
     let layout = layout::Layout::new(
-        renderer.primary_output_rect(),
+        renderer.output_rects(),
         layout::Gaps {
             outer: config.layout.gaps_outer,
             inner: config.layout.gaps_inner,

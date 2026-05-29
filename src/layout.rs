@@ -36,12 +36,14 @@
 //! a separate "drag the split divider" gesture, which is later
 //! polish. Resize on a tile is a logged no-op.
 //!
-//! Coordinates are stored as `Physical` because the renderer
-//! consumes physical pixels. For `scale = 1.0` outputs (the only
-//! case 4d covers) `Physical` and `Logical` coincide numerically,
-//! so the `Logical`-typed size we ship to `xdg_toplevel.configure`
-//! can be built component-wise. Per-output fractional scale lands
-//! with later polish.
+//! Coordinates are stored in **compositor** (= logical) pixels but
+//! carry the `Physical` type tag — a historical quirk. Every output
+//! occupies a rect in this one shared compositor space; the layout
+//! keeps a separate dwindle tree per output and a window tiles only
+//! within its output's rect. The renderer multiplies these
+//! coordinates by the target output's fractional scale when it
+//! composites (so `HiDPI` works) and ships the same values as the
+//! `Logical`-typed `xdg_toplevel.configure` size.
 
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource as _;
@@ -79,14 +81,30 @@ pub struct InTransit {
     pub source: DragSource,
 }
 
-/// Binary tree of cells + a floating-window list. One `Layout`
-/// covers a single rectangle of virtual-layout space; per-output
-/// workspaces are a future milestone.
-pub struct Layout {
+/// One output's tiling region: a stable connector name, that
+/// output's full rect in absolute compositor space, and the dwindle
+/// tree of windows tiled on it. A window's owning output is implicit
+/// in which `Outpane`'s tree holds it — no per-window output id is
+/// stored. The renderer paints each window on whichever CRTC its
+/// absolute rect falls on, so tiling a window inside output B's
+/// `bounds` is what makes it appear on monitor B.
+struct Outpane {
+    name: String,
+    bounds: Rectangle<i32, Physical>,
     tree: Option<Node>,
+}
+
+/// One dwindle tree **per output** plus a global floating-window
+/// list. Tiled windows live in the `Outpane` whose tree holds them;
+/// floating windows and the in-transit drag are global and
+/// absolute-positioned, so they're painted on whichever output
+/// contains their rect. All coordinates are absolute compositor
+/// pixels. Per-output workspaces are a future milestone — `Outpane`
+/// is shaped so a later `Vec<Workspace>` wrap is mechanical.
+pub struct Layout {
+    outputs: Vec<Outpane>,
     floating: Vec<Window>,
     in_transit: Option<InTransit>,
-    bounds: Rectangle<i32, Physical>,
     gaps: Gaps,
     border_width: i32,
 }
@@ -103,7 +121,7 @@ pub struct Placement {
 }
 
 /// Gap configuration. `outer` is empty space between the tile
-/// area and each edge of [`Layout::bounds`]; `inner` is empty
+/// area and each edge of an output's bounds; `inner` is empty
 /// space between adjacent tile cells, centred on each split.
 /// Floating windows are unaffected by both — they're positioned
 /// freely by the user.
@@ -134,19 +152,51 @@ enum SplitAxis {
 }
 
 impl Layout {
-    pub fn new(bounds: Rectangle<i32, Physical>, gaps: Gaps, border_width: i32) -> Self {
+    /// Build a layout spanning every output. `outputs` pairs each
+    /// output's stable connector name with its full rect in absolute
+    /// compositor pixels. Windows tile within the output the cursor
+    /// is over at spawn / drop time.
+    pub fn new(
+        outputs: impl IntoIterator<Item = (String, Rectangle<i32, Physical>)>,
+        gaps: Gaps,
+        border_width: i32,
+    ) -> Self {
         Self {
-            tree: None,
+            outputs: outputs
+                .into_iter()
+                .map(|(name, bounds)| Outpane {
+                    name,
+                    bounds,
+                    tree: None,
+                })
+                .collect(),
             floating: Vec::new(),
             in_transit: None,
-            bounds,
             gaps,
             border_width: border_width.max(0),
         }
     }
 
-    fn tile_bounds(&self) -> Rectangle<i32, Physical> {
-        shrink_for_outer(self.bounds, self.gaps.outer)
+    /// Tile area of the output at `idx`: its bounds shrunk by the
+    /// outer gap.
+    fn tile_bounds(&self, idx: usize) -> Rectangle<i32, Physical> {
+        shrink_for_outer(self.outputs[idx].bounds, self.gaps.outer)
+    }
+
+    /// Index of the first output whose **full** bounds contain `p`.
+    /// Full bounds (not the gap-shrunk tile area) so a point in an
+    /// output's outer-gap margin still resolves to that output
+    /// instead of falling through to the fallback.
+    fn outpane_at(&self, p: Point<i32, Physical>) -> Option<usize> {
+        self.outputs.iter().position(|o| rect_contains(o.bounds, p))
+    }
+
+    /// Pick the output a new / dropped window belongs to: the one
+    /// the cursor is over, else the first output as a sensible
+    /// default, else `None` when there are no outputs at all.
+    fn outpane_for_point(&self, p: Option<Point<i32, Physical>>) -> Option<usize> {
+        p.and_then(|c| self.outpane_at(c))
+            .or_else(|| (!self.outputs.is_empty()).then_some(0))
     }
 
     /// Insert a freshly-mapped toplevel. When `cursor` is `Some`,
@@ -157,14 +207,20 @@ impl Layout {
     /// window splits the deepest leaf as a fallback. The first
     /// window in an empty layout becomes the root, full bounds.
     pub fn insert(&mut self, toplevel: ToplevelSurface, cursor: Option<Point<i32, Physical>>) {
+        // Tile the new window on the output under the cursor (else
+        // the first output). With no outputs at all there's nowhere
+        // to put it — silent no-op.
+        let Some(idx) = self.outpane_for_point(cursor) else {
+            return;
+        };
+        let tile_bounds = self.tile_bounds(idx);
+        let inner = self.gaps.inner;
         let window = Window {
             toplevel,
-            rect: self.tile_bounds(),
+            rect: tile_bounds,
         };
         let leaf = Node::Leaf(window);
-        let tile_bounds = self.tile_bounds();
-        let inner = self.gaps.inner;
-        self.tree = Some(match self.tree.take() {
+        self.outputs[idx].tree = Some(match self.outputs[idx].tree.take() {
             None => leaf,
             Some(root) => insert_at_cursor(root, leaf, tile_bounds, cursor, inner),
         });
@@ -176,12 +232,14 @@ impl Layout {
     /// something changed there. Silent no-op for surfaces we
     /// don't track.
     pub fn remove(&mut self, surface: &WlSurface) {
-        if let Some(root) = self.tree.take() {
-            let (root_after, removed) = remove_from_tree(root, surface);
-            self.tree = root_after;
-            if removed.is_some() {
-                self.recompute_and_push();
-                return;
+        for op in &mut self.outputs {
+            if let Some(root) = op.tree.take() {
+                let (root_after, removed) = remove_from_tree(root, surface);
+                op.tree = root_after;
+                if removed.is_some() {
+                    self.recompute_and_push();
+                    return;
+                }
             }
         }
         let len = self.floating.len();
@@ -212,42 +270,53 @@ impl Layout {
     ///
     /// Silent no-op for surfaces we don't track.
     pub fn toggle_floating(&mut self, surface: &WlSurface) {
-        // Tile -> float.
-        if let Some(root) = self.tree.take() {
-            let (root_after, removed) = remove_from_tree(root, surface);
-            self.tree = root_after;
-            if let Some(mut window) = removed {
-                let prev = window.rect;
-                let new_size =
-                    Size::<i32, Physical>::new((prev.size.w * 7) / 10, (prev.size.h * 7) / 10);
-                let new_loc = Point::<i32, Physical>::new(
-                    prev.loc.x + (prev.size.w - new_size.w) / 2,
-                    prev.loc.y + (prev.size.h - new_size.h) / 2,
-                );
-                window.rect = Rectangle::new(new_loc, new_size);
-                push_configure_for_floating(&window, self.border_width);
-                self.floating.push(window);
-                self.recompute_and_push();
-                return;
+        // Tile -> float: find the window in whichever output's tree
+        // holds it. Non-matching outputs get their tree restored
+        // unchanged (remove_from_tree hands the node back on a miss).
+        for op in &mut self.outputs {
+            if let Some(root) = op.tree.take() {
+                let (root_after, removed) = remove_from_tree(root, surface);
+                op.tree = root_after;
+                if let Some(mut window) = removed {
+                    let prev = window.rect;
+                    let new_size =
+                        Size::<i32, Physical>::new((prev.size.w * 7) / 10, (prev.size.h * 7) / 10);
+                    let new_loc = Point::<i32, Physical>::new(
+                        prev.loc.x + (prev.size.w - new_size.w) / 2,
+                        prev.loc.y + (prev.size.h - new_size.h) / 2,
+                    );
+                    window.rect = Rectangle::new(new_loc, new_size);
+                    push_configure_for_floating(&window, self.border_width);
+                    self.floating.push(window);
+                    self.recompute_and_push();
+                    return;
+                }
             }
         }
-        // Float -> tile.
-        let Some(idx) = self
+        // Float -> tile: re-tile on the output under the float's
+        // centre (a float straddling two outputs resolves by centre),
+        // else the first output.
+        let Some(fidx) = self
             .floating
             .iter()
             .position(|w| w.toplevel.wl_surface() == surface)
         else {
             return;
         };
-        let window = self.floating.remove(idx);
+        let window = self.floating.remove(fidx);
         let center = Point::<i32, Physical>::new(
             window.rect.loc.x + window.rect.size.w / 2,
             window.rect.loc.y + window.rect.size.h / 2,
         );
-        let leaf = Node::Leaf(window);
-        let tile_bounds = self.tile_bounds();
+        let Some(idx) = self.outpane_for_point(Some(center)) else {
+            // No outputs: keep it floating so we don't drop it.
+            self.floating.push(window);
+            return;
+        };
+        let tile_bounds = self.tile_bounds(idx);
         let inner = self.gaps.inner;
-        self.tree = Some(match self.tree.take() {
+        let leaf = Node::Leaf(window);
+        self.outputs[idx].tree = Some(match self.outputs[idx].tree.take() {
             None => leaf,
             Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(center), inner),
         });
@@ -264,17 +333,19 @@ impl Layout {
         if self.in_transit.is_some() {
             return None;
         }
-        if let Some(root) = self.tree.take() {
-            let (root_after, removed) = remove_from_tree(root, surface);
-            self.tree = root_after;
-            if let Some(window) = removed {
-                let rect = window.rect;
-                self.in_transit = Some(InTransit {
-                    window,
-                    source: DragSource::Tiled,
-                });
-                self.recompute_and_push();
-                return Some(rect);
+        for op in &mut self.outputs {
+            if let Some(root) = op.tree.take() {
+                let (root_after, removed) = remove_from_tree(root, surface);
+                op.tree = root_after;
+                if let Some(window) = removed {
+                    let rect = window.rect;
+                    self.in_transit = Some(InTransit {
+                        window,
+                        source: DragSource::Tiled,
+                    });
+                    self.recompute_and_push();
+                    return Some(rect);
+                }
             }
         }
         if let Some(idx) = self
@@ -349,10 +420,29 @@ impl Layout {
         };
         match t.source {
             DragSource::Tiled => {
-                let leaf = Node::Leaf(t.window);
-                let tile_bounds = self.tile_bounds();
+                // Re-tile on the output under the drop cursor. If the
+                // cursor landed in a gap between monitors, fall back
+                // to the output under the window's centre, then to
+                // the first output. This is the cross-output move:
+                // dropping on monitor B re-tiles into B's tree.
+                let center = Point::<i32, Physical>::new(
+                    t.window.rect.loc.x + t.window.rect.size.w / 2,
+                    t.window.rect.loc.y + t.window.rect.size.h / 2,
+                );
+                let idx = self
+                    .outpane_at(cursor)
+                    .or_else(|| self.outpane_at(center))
+                    .or_else(|| (!self.outputs.is_empty()).then_some(0));
+                let Some(idx) = idx else {
+                    // No outputs: keep the window alive as floating.
+                    push_configure_for_floating(&t.window, self.border_width);
+                    self.floating.push(t.window);
+                    return;
+                };
+                let tile_bounds = self.tile_bounds(idx);
                 let inner = self.gaps.inner;
-                self.tree = Some(match self.tree.take() {
+                let leaf = Node::Leaf(t.window);
+                self.outputs[idx].tree = Some(match self.outputs[idx].tree.take() {
                     None => leaf,
                     Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(cursor), inner),
                 });
@@ -381,8 +471,10 @@ impl Layout {
     pub fn placements(&self, focused: Option<&WlSurface>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
         let mut out = Vec::new();
-        if let Some(tree) = &self.tree {
-            collect_placements(tree, &is_focused, &mut out);
+        for op in &self.outputs {
+            if let Some(tree) = &op.tree {
+                collect_placements(tree, &is_focused, &mut out);
+            }
         }
         for w in &self.floating {
             out.push(Placement {
@@ -414,44 +506,46 @@ impl Layout {
                 return Some(w);
             }
         }
-        self.tree.as_ref().and_then(|t| leaf_at(t, pos))
+        // Tiled hit-test only the tree of the output `pos` falls in.
+        self.outpane_at(pos)
+            .and_then(|i| self.outputs[i].tree.as_ref())
+            .and_then(|t| leaf_at(t, pos))
     }
 
     fn recompute_and_push(&mut self) {
-        let tile_bounds = self.tile_bounds();
         let inner = self.gaps.inner;
+        let outer = self.gaps.outer;
         let border = self.border_width;
-        if let Some(tree) = &mut self.tree {
-            assign_rects(tree, tile_bounds, inner);
+        for op in &mut self.outputs {
+            let tile_bounds = shrink_for_outer(op.bounds, outer);
+            if let Some(tree) = &mut op.tree {
+                assign_rects(tree, tile_bounds, inner);
+            }
         }
-        if let Some(tree) = &self.tree {
-            push_configures_tree(tree, border);
+        for op in &self.outputs {
+            if let Some(tree) = &op.tree {
+                push_configures_tree(tree, border);
+            }
         }
         for w in &self.floating {
             push_configure_for_floating(w, border);
         }
     }
 
-    /// Update the rectangle every tiled window is laid out inside
-    /// and reflow. Calling this with the output rect minus
-    /// any exclusive zones (e.g. a `wlr_layer_shell` panel at the
-    /// top or bottom of the screen) makes the tile area shrink to
-    /// avoid the panel. Layer-shell isn't wired up yet; this hook
-    /// exists so the eventual layer-shell handler can call it
-    /// without touching the layout's internals.
-    #[allow(
-        dead_code,
-        reason = "the layer-shell handler that will call this lands in a separate milestone; the hook is committed now so the eventual change is a one-liner instead of also changing Layout's surface"
-    )]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "API takes owned for symmetry with Rectangle::new"
-    )]
-    pub fn set_bounds(&mut self, new_bounds: Rectangle<i32, Physical>) {
-        if self.bounds == new_bounds {
+    /// Update the rectangle a specific output's tiles lay out inside,
+    /// then reflow. Called when an output's usable area changes — e.g.
+    /// a `wlr_layer_shell` panel reserves an exclusive zone, shrinking
+    /// the tile area to avoid it. The output is keyed by connector
+    /// name; an unknown name is a silent no-op so the renderer's and
+    /// layout's output sets can drift without panicking.
+    pub fn set_output_bounds(&mut self, name: &str, new_bounds: Rectangle<i32, Physical>) {
+        let Some(op) = self.outputs.iter_mut().find(|o| o.name == name) else {
+            return;
+        };
+        if op.bounds == new_bounds {
             return;
         }
-        self.bounds = new_bounds;
+        op.bounds = new_bounds;
         self.recompute_and_push();
     }
 }
