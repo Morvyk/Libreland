@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
+use smithay::delegate_data_device;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_layer_shell;
 use smithay::delegate_viewporter;
@@ -46,6 +47,10 @@ use smithay::wayland::fractional_scale::{
     self, FractionalScaleHandler, FractionalScaleManagerState,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::data_device::{
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+};
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
@@ -93,6 +98,12 @@ pub struct WaylandInit {
     pub xdg_decoration_state: XdgDecorationState,
     pub output_manager_state: OutputManagerState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    /// `wl_data_device_manager` global — clipboard and drag-and-drop.
+    /// GTK/Qt toolkits set up their seat's clipboard through this on
+    /// startup; without it, GDK's seat is left half-initialised (the
+    /// `gdk_seat_get_keyboard` criticals) and apps like Firefox crash
+    /// when input focus arrives.
+    pub data_device_state: DataDeviceState,
     /// `wp_viewporter` global. Fractional-scale-aware clients render
     /// an oversized buffer and use `wp_viewport` to map it down to
     /// the logical surface rect; without this global they can't, and
@@ -136,6 +147,10 @@ pub fn init(
     let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
     let fractional_scale_state = FractionalScaleManagerState::new::<State>(&dh);
+    // wl_data_device_manager: clipboard + drag-and-drop. Toolkits
+    // initialise their seat's clipboard through this; its absence
+    // leaves GTK's seat half-set-up and crashes Firefox on focus.
+    let data_device_state = DataDeviceState::new::<State>(&dh);
     // wp_viewporter: lets clients crop/scale a buffer to a different
     // destination size. Required for fractional scaling — a client
     // told scale 1.5 renders a 1.5x buffer and viewports it down to
@@ -223,6 +238,7 @@ pub fn init(
         xdg_decoration_state,
         output_manager_state,
         fractional_scale_state,
+        data_device_state,
         viewporter_state,
         layer_shell_state,
         outputs,
@@ -488,6 +504,26 @@ impl XdgDecorationHandler for State {
     }
 }
 
+// Clipboard + drag-and-drop. We don't drive selections from the
+// compositor side (no programmatic copy/paste yet) and don't add
+// compositor behaviour to DnD, so `SelectionHandler` keeps its
+// default no-op methods and the grab handlers are empty. The point
+// is purely to advertise `wl_data_device_manager` so toolkits can
+// set up their seat's clipboard; smithay routes data offers between
+// clients on its own.
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
 impl WlrLayerShellHandler for State {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
@@ -580,3 +616,4 @@ delegate_output!(State);
 delegate_fractional_scale!(State);
 delegate_layer_shell!(State);
 delegate_viewporter!(State);
+delegate_data_device!(State);

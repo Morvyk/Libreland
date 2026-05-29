@@ -172,6 +172,11 @@ pub(crate) struct State {
         reason = "held so the wp_viewporter global stays alive and delegate_viewporter! can route through State; smithay reads the per-surface viewport during compositing"
     )]
     pub(crate) viewporter_state: smithay::wayland::viewporter::ViewporterState,
+    /// `wl_data_device_manager` global — clipboard + drag-and-drop.
+    /// Held so the global stays registered and `delegate_data_device!`
+    /// can route through it; `DataDeviceHandler::data_device_state`
+    /// borrows it.
+    pub(crate) data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
     /// Fractional scale to send to every new
     /// `wp_fractional_scale` object. Currently the primary
     /// output's configured scale; will become per-surface once
@@ -1070,6 +1075,7 @@ fn main() -> Result<()> {
         outputs: wayland_init.outputs,
         fractional_scale_state: wayland_init.fractional_scale_state,
         viewporter_state: wayland_init.viewporter_state,
+        data_device_state: wayland_init.data_device_state,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         kbd_focus_before_layer: None,
