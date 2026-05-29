@@ -84,8 +84,9 @@ fails to parse is logged and **ignored**, leaving the running config
 untouched, so a typo never breaks your session.
 
 Applied live: `binds`, `screenshot`, `input.focus_model`,
-`misc.wallpaper`, the whole `border` section, and `layout` gaps. Changing
-these takes effect on the next frame / window reconfigure.
+`misc.wallpaper`, the whole `border` section, `layout` gaps, and the
+whole `animations` section. Changing these takes effect on the next
+frame / window reconfigure.
 
 Needs a restart (a "restart to apply" line is logged when they change):
 `monitors` (mode/position/scale/primary), the keyboard/pointer
@@ -152,6 +153,16 @@ border = {
         bottom = { 0.30, 0.55, 0.95 },
     },
     inactive = { type = "solid", color = { 0.30, 0.30, 0.30 } },
+}
+
+-- Window + workspace motion. All on by default; this block just
+-- restates the defaults. `enabled = false` disables everything;
+-- each animation can be tuned or disabled individually.
+animations = {
+    window_open  = { duration = 250, curve = "ease-out"    }, -- fade + scale-in
+    window_close = { duration = 200, curve = "ease-in"     }, -- fade + scale-out
+    window_move  = { duration = 250, curve = "ease-out"    }, -- reflow / move / resize
+    workspace    = { duration = 300, curve = "ease-in-out" }, -- vertical slide
 }
 
 -- Environment variables exported into the compositor's own process
@@ -318,6 +329,46 @@ configure so the buffer doesn't overlap the border. Rounded
 corners are masked with the wallpaper after the border + surface
 draw, so floats over tiles show wallpaper (not the tile) at the
 rounded corners — proper shader-based rounding is later polish.
+
+### animations
+
+Window and workspace motion. All on by default with sane, brief
+timings; tune or disable per animation, or kill the lot with
+`enabled = false`. Each animation is `{ enabled, duration, curve }`;
+omitted fields fall back to the section-level `duration` / `curve`,
+which in turn default per the table.
+
+| Field          | Default                  | State | Notes                                                                                                       |
+| -------------- | ------------------------ | ----- | ----------------------------------------------------------------------------------------------------------- |
+| `enabled`      | `true`                   | ✅    | Master switch. `false` disables every animation regardless of the per-animation flags.                     |
+| `duration`     | per-animation (see below)| ✅    | Section-level default duration in **milliseconds**, inherited by any animation that doesn't set its own.    |
+| `curve`        | per-animation (see below)| ✅    | Section-level default easing, inherited likewise.                                                           |
+| `window_open`  | `250ms`, `ease-out`      | ✅    | A window mapping: fades + scales in.                                                                        |
+| `window_close` | `200ms`, `ease-in`       | ✅    | A window closing: a snapshot of its last frame fades + scales out. Falls back to an instant close if the client tears its buffer down before the toplevel is destroyed. |
+| `window_move`  | `250ms`, `ease-out`      | ✅    | A window's tile changing position/size — reflow on open/close, fullscreen toggle, or the drop after an interactive move/resize. Slides + scales to the new rect. The window under an active drag tracks the cursor 1:1 (no animation) and eases into place on release. |
+| `workspace`    | `300ms`, `ease-in-out`   | ✅    | Switching workspaces: the outgoing and incoming workspaces slide vertically. Next slides up (incoming from the bottom), previous slides down. |
+
+A `curve` is either a **named** string — `"linear"`, `"ease-in"`,
+`"ease-out"`, `"ease-in-out"` (`_` and `-` are interchangeable, case
+insensitive) — or a **`{x1, y1, x2, y2}`** cubic-Bézier with CSS
+semantics (the `x` control points must be in `[0, 1]`).
+
+```lua
+animations = {
+    -- enabled = false,        -- uncomment to turn everything off
+    duration = 250,            -- default ms for any animation below
+    curve = "ease-out",        -- default easing
+
+    window_open  = { duration = 250, curve = "ease-out"    },
+    window_close = { duration = 200, curve = "ease-in"     },
+    window_move  = { duration = 250, curve = "ease-out"    },
+    workspace    = { duration = 300, curve = "ease-in-out" },
+
+    -- e.g. a snappier, custom-bezier move; disable the workspace slide:
+    -- window_move = { duration = 200, curve = { 0.05, 0.9, 0.1, 1.0 } },
+    -- workspace   = { enabled = false },
+}
+```
 
 ## Keybindings
 
