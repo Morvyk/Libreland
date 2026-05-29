@@ -57,6 +57,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod config;
+mod cursor;
 mod drm;
 mod keyboard;
 mod layout;

@@ -26,10 +26,12 @@ use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
 use smithay::backend::renderer::gles::{
-    GlesFrame, GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
+    GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexture, Uniform, UniformName, UniformType,
 };
 use smithay::backend::renderer::utils::draw_render_elements;
-use smithay::backend::renderer::{Bind as _, Color32F, Frame as _, Renderer as _};
+use smithay::backend::renderer::{
+    Bind as _, Color32F, Frame as _, ImportMem as _, Renderer as _, Texture as _,
+};
 use smithay::reexports::drm::control::crtc;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
@@ -223,6 +225,15 @@ pub struct Renderer {
     /// `Arc`-backed so it's cheap to clone out before borrowing
     /// the renderer for the frame.
     frame_shader: GlesPixelProgram,
+    /// Loaded `XCursor` sprite for the pointer. `None` (no theme found)
+    /// falls back to the built-in triangle. `Arc`-backed texture, so
+    /// it's cheap to clone out before borrowing the renderer for the
+    /// frame.
+    cursor: Option<CursorSprite>,
+    /// Requested cursor size in **logical** pixels (`$XCURSOR_SIZE`,
+    /// default 24). The loaded sprite is normalised back to this size
+    /// regardless of which physical-pixel image the theme provided.
+    cursor_size: i32,
     /// Origin used for the monotonic ms timestamp fed into
     /// `wl_callback.done` after each output is queued for scanout.
     /// Clients use this value to schedule their next frame's draw —
@@ -255,6 +266,25 @@ struct OutputRender {
     compositor_size: Size<i32, Physical>,
     /// Fractional scale; physical = compositor * scale (component-wise).
     scale: f64,
+}
+
+/// A cursor theme image uploaded to a GLES texture, plus the geometry
+/// needed to place it. Cheap to clone (texture is `Arc`-backed).
+#[derive(Clone)]
+struct CursorSprite {
+    texture: GlesTexture,
+    /// Texture dimensions in its own pixels.
+    width: i32,
+    height: i32,
+    /// Hotspot in texture pixels — the point that sits exactly on the
+    /// pointer position.
+    xhot: i32,
+    yhot: i32,
+    /// Nominal size the artwork was authored for. The draw scale is
+    /// `cursor_size / nominal * output_scale`, so the sprite always
+    /// renders at the requested logical size however many physical
+    /// pixels the chosen theme image carried.
+    nominal: i32,
 }
 
 impl Renderer {
@@ -433,6 +463,19 @@ impl Renderer {
         let cursor_y =
             f64::from(primary.compositor_position.y) + f64::from(primary.compositor_size.h) / 2.0;
 
+        // Load the pointer cursor from the configured XCursor theme.
+        // Pick the image sized for the sharpest output (highest scale)
+        // so it stays crisp there; lower-scale outputs downscale it.
+        let cursor_size = crate::cursor::configured_size();
+        let max_scale = outputs.iter().map(|o| o.scale).fold(1.0_f64, f64::max);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "cursor_size and scale are small positive values; the product is a sane pixel count well within u32"
+        )]
+        let target_px = (f64::from(cursor_size) * max_scale).round() as u32;
+        let cursor = Self::upload_cursor(&mut gles, target_px);
+
         Ok(Self {
             gles,
             outputs,
@@ -443,8 +486,40 @@ impl Renderer {
             wallpaper,
             border,
             frame_shader,
+            cursor,
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "cursor_size is a small positive pixel count"
+            )]
+            cursor_size: cursor_size as i32,
             start: Instant::now(),
         })
+    }
+
+    /// Load the configured `XCursor` theme's pointer and upload it as a
+    /// GLES texture. Returns `None` (caller falls back to the built-in
+    /// triangle) if no theme/image is found, or if the upload fails —
+    /// a missing cursor must never be fatal.
+    fn upload_cursor(gles: &mut GlesRenderer, target_px: u32) -> Option<CursorSprite> {
+        let image = crate::cursor::load_default_cursor(target_px)?;
+        let size = Size::<i32, smithay::utils::Buffer>::from((image.width, image.height));
+        // `pixels_rgba` is byte order R,G,B,A, which DRM names
+        // `Abgr8888` (little-endian, alpha in the MSB). `flipped =
+        // false`: XCursor rows run top-to-bottom, same as our render.
+        match gles.import_memory(&image.rgba, Fourcc::Abgr8888, size, false) {
+            Ok(texture) => Some(CursorSprite {
+                texture,
+                width: image.width,
+                height: image.height,
+                xhot: image.xhot,
+                yhot: image.yhot,
+                nominal: image.nominal,
+            }),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to upload cursor texture; using built-in sprite");
+                None
+            }
+        }
     }
 
     /// Render every output's initial frame to prime its swapchain.
@@ -556,6 +631,8 @@ impl Renderer {
         let wallpaper = self.wallpaper.clone();
         let border = self.border.clone();
         let frame_shader = self.frame_shader.clone();
+        let cursor_sprite = self.cursor.clone();
+        let cursor_size = self.cursor_size;
         let output = &self.outputs[idx];
         let mode_size = output.mode_size;
         let compositor_position = output.compositor_position;
@@ -752,11 +829,18 @@ impl Renderer {
             }
 
             if cursor_in_bounds {
-                let cursor_origin = Point::<i32, Physical>::from((
+                // Pointer hotspot in this output's physical pixels.
+                let hotspot = Point::<i32, Physical>::from((
                     scale_f(cursor_local_x, scale),
                     scale_f(cursor_local_y, scale),
                 ));
-                draw_cursor(&mut frame, cursor_origin, scale)?;
+                draw_cursor(
+                    &mut frame,
+                    cursor_sprite.as_ref(),
+                    cursor_size,
+                    hotspot,
+                    scale,
+                )?;
             }
 
             frame.finish().context("Frame::finish failed")?
@@ -988,22 +1072,74 @@ fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
     );
 }
 
-/// Draw the 24×24 white right-triangle cursor with its apex at
-/// `local_origin` (top-left of the bbox = hotspot). Damage stripes
-/// are anchored at `(0, row)` relative to `dst.loc` — see the long
-/// note in milestone 2c about `Frame::draw_solid`'s damage-coordinate
-/// semantics.
+/// Draw the pointer with its hotspot at `hotspot` (this output's
+/// physical pixels). When an `XCursor` theme loaded, render its sprite;
+/// otherwise fall back to the built-in white right-triangle so the
+/// pointer is always visible.
+///
+/// `cursor_size` is the requested logical size; `scale` is this
+/// output's fractional scale. The themed sprite is scaled by
+/// `cursor_size / nominal * scale` so it lands at the requested
+/// logical size in physical pixels no matter which image the theme
+/// supplied, with the hotspot offset scaled to match.
 fn draw_cursor(
     frame: &mut GlesFrame<'_, '_>,
-    local_origin: Point<i32, Physical>,
+    sprite: Option<&CursorSprite>,
+    cursor_size: i32,
+    hotspot: Point<i32, Physical>,
     scale: f64,
 ) -> Result<()> {
+    if let Some(sprite) = sprite {
+        // Image px → physical px: normalise to the requested logical
+        // size, then apply the output scale.
+        let factor = f64::from(cursor_size) / f64::from(sprite.nominal) * scale;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "cursor dimensions and scale factor are small positive values; products stay well within i32"
+        )]
+        let (dst_w, dst_h, off_x, off_y) = (
+            (f64::from(sprite.width) * factor).round() as i32,
+            (f64::from(sprite.height) * factor).round() as i32,
+            (f64::from(sprite.xhot) * factor).round() as i32,
+            (f64::from(sprite.yhot) * factor).round() as i32,
+        );
+        // Position the sprite so its hotspot sits on the pointer.
+        let origin = Point::<i32, Physical>::from((hotspot.x - off_x, hotspot.y - off_y));
+        let dst = Rectangle::new(origin, Size::new(dst_w.max(1), dst_h.max(1)));
+        let src = Rectangle::from_size(sprite.texture.size()).to_f64();
+        let damage = [Rectangle::from_size(dst.size)];
+        frame
+            .render_texture_from_to(
+                &sprite.texture,
+                src,
+                dst,
+                &damage,
+                // Cursors have transparent regions: no opaque hint, and
+                // the renderer's premultiplied-alpha blend handles the
+                // edges.
+                &[],
+                Transform::Normal,
+                1.0,
+                // No custom shader override; default texture program
+                // with no extra uniforms.
+                None,
+                &[],
+            )
+            .context("render_texture_from_to (cursor) failed")?;
+        return Ok(());
+    }
+
+    // Fallback: built-in white right-triangle, apex at the hotspot.
+    // Damage stripes are anchored at `(0, row)` relative to `dst.loc`
+    // — see the long note in milestone 2c about `Frame::draw_solid`'s
+    // damage-coordinate semantics.
     #[allow(
         clippy::cast_possible_truncation,
         reason = "CURSOR_SIZE is 24 and scale is bounded; product stays in i32"
     )]
     let size = ((f64::from(CURSOR_SIZE) * scale).round() as i32).max(1);
-    let cursor_bbox = Rectangle::new(local_origin, Size::new(size, size));
+    let cursor_bbox = Rectangle::new(hotspot, Size::new(size, size));
     let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..size)
         .map(|row| Rectangle::new(Point::from((0, row)), Size::new(row + 1, 1)))
         .collect();

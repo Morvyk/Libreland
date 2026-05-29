@@ -14,9 +14,12 @@ Pre-alpha. Each `cargo run` currently:
    preferred mode, then sets up a **GBM + EGL + GLES2 render pipeline**
    over it (via smithay's `GbmBufferedSurface`).
 3. Each vblank renders the configured wallpaper (default: vertical
-   sky-blue → navy gradient via 256 horizontal stripes) with a 24×24
-   white right-triangle cursor that follows mouse motion. Frame GPU
-   work is fenced before scanout (tearing-free).
+   sky-blue → navy gradient via 256 horizontal stripes) with a pointer
+   cursor that follows mouse motion. The cursor is loaded from the
+   `XCursor` theme named by `$XCURSOR_THEME` (size from `$XCURSOR_SIZE`,
+   default 24), falling back to a built-in white right-triangle when no
+   theme is found. Frame GPU work is fenced before scanout
+   (tearing-free).
 4. Routes every key event through **xkbcommon** for layout-aware
    keysym + modifier handling, then matches against the keybind list
    in [`config.binds`](#binds). The default binding fires the `Exit`

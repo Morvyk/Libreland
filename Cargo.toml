@@ -16,6 +16,11 @@ time = { version = "0.3.47", features = ["formatting", "macros"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# XCursor theme loading for the compositor's own pointer cursor. We
+# read $XCURSOR_THEME / $XCURSOR_SIZE (same env the rest of the
+# desktop uses) and render the theme's `default` cursor instead of a
+# hardcoded sprite.
+xcursor = "0.3.10"
 xdg = "3.0.0"
 xkbcommon = "0.8"
 
