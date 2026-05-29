@@ -126,6 +126,14 @@ border = {
     inactive = { type = "solid", color = { 0.30, 0.30, 0.30 } },
 }
 
+-- Environment variables exported into the compositor's own process
+-- before any client is launched, so every child (startup commands,
+-- `spawn` binds, shells) inherits them. Handy for theming hints.
+env = {
+    XCURSOR_THEME = "Breeze_Light",
+    QT_QPA_PLATFORMTHEME = "kde",
+}
+
 -- Commands to spawn once the Wayland socket is listening. Each
 -- string is whitespace-split into program + args; children inherit
 -- $WAYLAND_DISPLAY so they connect to *our* compositor. For shell
@@ -135,6 +143,17 @@ startup = {
     -- "sh -c 'swaybg -i ~/wallpapers/blue.png &'",
 }
 ```
+
+### env
+
+| Field | Default      | State | Notes                                                                          |
+| ----- | ------------ | ----- | ------------------------------------------------------------------------------ |
+| `env` | `{}` (empty) | ✅    | Map of `NAME = "value"` pairs exported via `setenv` at startup, before any child is spawned, so all clients inherit them. Applied before `WAYLAND_DISPLAY` (which can't be overridden). Names can't be empty or contain `=`/NUL. Changing them needs a restart. |
+
+`XCURSOR_THEME` and `XCURSOR_SIZE` set here do double duty: clients
+inherit them *and* the compositor reads them for its own pointer
+cursor, so `env = { XCURSOR_THEME = "Breeze_Light" }` themes both. The
+compositor reads the env once at startup, so a change needs a restart.
 
 ### startup
 

@@ -822,6 +822,29 @@ fn main() -> Result<()> {
     let config = config::Config::load_or_default().context("config load failed")?;
     info!("compositor config ready");
 
+    // Apply the user's configured `env` table immediately — before the
+    // renderer (which reads `$XCURSOR_THEME` / `$XCURSOR_SIZE` for its
+    // pointer cursor) and before any child is spawned, so both the
+    // compositor itself and every client inherit these. `WAYLAND_DISPLAY`
+    // is set later, once the socket name is known.
+    //
+    // SAFETY: `std::env::set_var` is `unsafe` because changing the
+    // process environment races with concurrent readers. We're at the
+    // very top of `main`, still single-threaded apart from the
+    // tracing-appender worker (which never reads env), so there's no
+    // race window.
+    #[allow(
+        unsafe_code,
+        reason = "set_var is unsafe due to multi-threaded env races; we call it at the top of main before spawning any thread that reads env (tracing-appender, the only background thread, never does), so the race window doesn't exist"
+    )]
+    // SAFETY: see #[allow] above.
+    unsafe {
+        for (name, value) in &config.env {
+            info!(name, value, "applying configured env var");
+            std::env::set_var(name, value);
+        }
+    }
+
     // Wayland frontend bootstrap. Display must exist before the
     // EventLoop because the EventLoop's user-data type
     // (`LoopData`) contains the `Display<State>`.
@@ -927,8 +950,10 @@ fn main() -> Result<()> {
     // (only the tracing-appender worker exists, and it doesn't read
     // env vars), so the call is safe here. We set `WAYLAND_DISPLAY`
     // so child processes spawned via `wayland::spawn_startup`
-    // (below) and ad-hoc shell launches from the same login session
-    // connect to *our* socket.
+    // (below), `spawn` binds, and ad-hoc shell launches from the same
+    // login session connect to *our* socket. The user's `env` table
+    // was applied far earlier (right after config load) so the
+    // renderer's cursor-theme lookup sees it.
     #[allow(
         unsafe_code,
         reason = "set_var is unsafe due to multi-threaded env races; we call it before spawning any non-trivial thread (tracing-appender is the only background thread and never reads env), so the race window doesn't exist"

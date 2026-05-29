@@ -59,6 +59,14 @@ pub struct Config {
     pub misc: MiscConfig,
     pub layout: LayoutConfig,
     pub border: BorderConfig,
+    /// Environment variables to export into the compositor's own
+    /// process before spawning any children, so every client we
+    /// launch (startup commands, `spawn` binds, ad-hoc shells in
+    /// the same session) inherits them. Typical use is theming
+    /// hints like `XCURSOR_THEME` or `QT_QPA_PLATFORMTHEME`. Sorted
+    /// by name for deterministic application/logging. Applied once
+    /// at startup; changing them needs a restart.
+    pub env: Vec<(String, String)>,
     /// Commands to spawn as children once the Wayland socket is
     /// listening. Each entry is whitespace-split into program +
     /// args; needs a shell wrapper (`"sh -c '…'"`) for shell
@@ -298,6 +306,7 @@ impl Default for Config {
                 // bigger is taste.
                 rounded_corners: 4,
             },
+            env: Vec::new(),
             startup: Vec::new(),
         }
     }
@@ -359,6 +368,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("border")? {
             config.border = parse_border(&t, config.border).context("border")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("env")? {
+            config.env = parse_env(&t).context("env")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("startup")? {
             config.startup = parse_startup(&t).context("startup")?;
@@ -615,6 +627,32 @@ fn parse_fill(t: &Table) -> mlua::Result<Fill> {
             lua_bail!("unknown fill type {other:?}; expected \"solid\" or \"vertical_gradient\"")
         }
     }
+}
+
+fn parse_env(t: &Table) -> mlua::Result<Vec<(String, String)>> {
+    let mut vars = Vec::new();
+    for pair in t.pairs::<String, String>() {
+        let (name, value) =
+            pair.context("env entries must be `NAME = \"value\"` (string keys and values)")?;
+        // POSIX names can't be empty or contain `=`; both would
+        // make `setenv` behave surprisingly. NUL is rejected by
+        // `env::set_var` with a panic, so catch it here with a
+        // readable message instead.
+        if name.is_empty() {
+            lua_bail!("env variable name is empty");
+        }
+        if name.contains('=') || name.contains('\0') {
+            lua_bail!("env variable name {name:?} is invalid (must not contain '=' or NUL)");
+        }
+        if value.contains('\0') {
+            lua_bail!("env value for {name:?} contains a NUL byte");
+        }
+        vars.push((name, value));
+    }
+    // Deterministic order so logging and application don't depend on
+    // Lua's hash-table iteration order.
+    vars.sort();
+    Ok(vars)
 }
 
 fn parse_startup(t: &Table) -> mlua::Result<Vec<String>> {
