@@ -139,6 +139,11 @@ pub(crate) struct State {
         reason = "held so delegate_xdg_decoration! can route global dispatch through it; the global is the only externally-visible effect"
     )]
     pub(crate) xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
+    /// KDE `org_kde_kwin_server_decoration` substate. Held so the
+    /// global stays registered and `KdeDecorationHandler` can borrow
+    /// it; advertising it with a Server default mode is what stops
+    /// GTK/Firefox from drawing a client-side titlebar.
+    pub(crate) kde_decoration_state: smithay::wayland::shell::kde::decoration::KdeDecorationState,
     /// `wl_output` substate. The `OutputManagerState` carries the
     /// `xdg_output_manager_v1` global; per-output `wl_output`
     /// globals live on the individual `Output`s in `outputs`.
@@ -1074,6 +1079,7 @@ fn main() -> Result<()> {
         seat: wayland_init.seat,
         xdg_shell_state: wayland_init.xdg_shell_state,
         xdg_decoration_state: wayland_init.xdg_decoration_state,
+        kde_decoration_state: wayland_init.kde_decoration_state,
         output_manager_state: wayland_init.output_manager_state,
         outputs: wayland_init.outputs,
         fractional_scale_state: wayland_init.fractional_scale_state,

@@ -26,9 +26,15 @@ Pre-alpha. Each `cargo run` currently:
    action on `Super+Shift+E`.
 5. Brings up a minimal **Wayland frontend** — `wl_compositor`,
    `wl_subcompositor`, `wl_shm`, `wl_seat` (with keyboard + pointer
-   capabilities advertised), `wl_output`, and `xdg_wm_base`/
-   `xdg_toplevel`/`xdg_surface`. Sets `$WAYLAND_DISPLAY` and spawns
-   every `config.startup` command as a child.
+   capabilities advertised), `wl_output`, `xdg_wm_base`/
+   `xdg_toplevel`/`xdg_surface`, `wl_data_device_manager` (clipboard +
+   drag-and-drop), `wp_viewporter` + `wp_fractional_scale_manager_v1`
+   (fractional scaling), and `wlr_layer_shell`. Sets `$WAYLAND_DISPLAY`
+   and spawns every `config.startup` command as a child.
+   Decorations are forced **server-side** (and Libreland draws none, so
+   windows are bare): both `zxdg_decoration_manager_v1` and the legacy
+   KDE `org_kde_kwin_server_decoration` are advertised with a Server
+   default, since some toolkits (GTK/Firefox) only honour the KDE one.
 6. Composites every live `xdg_toplevel`'s surface onto the
    framebuffer between wallpaper and cursor, by uploading each
    client buffer as a GLES texture and drawing it through smithay's

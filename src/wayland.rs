@@ -20,6 +20,7 @@ use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_data_device;
 use smithay::delegate_fractional_scale;
+use smithay::delegate_kde_decoration;
 use smithay::delegate_layer_shell;
 use smithay::delegate_viewporter;
 use smithay::delegate_output;
@@ -54,6 +55,12 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
+use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
+    Mode as KdeMode, OrgKdeKwinServerDecoration,
+};
+use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDefaultMode;
+use smithay::reexports::wayland_server::WEnum;
+use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::shell::xdg::{
@@ -96,6 +103,14 @@ pub struct WaylandInit {
     pub seat: Seat<State>,
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
+    /// KDE `org_kde_kwin_server_decoration` global, advertising a
+    /// default mode of *Server*. Toolkits (notably GTK/Firefox) read
+    /// this manager's `default_mode` on bind to decide whether to
+    /// draw their own client-side decorations; advertising Server
+    /// suppresses their titlebar even when they never touch
+    /// `zxdg_decoration` (which Firefox doesn't). This is the same
+    /// trick wlroots compositors use for "prefer no CSD".
+    pub kde_decoration_state: KdeDecorationState,
     pub output_manager_state: OutputManagerState,
     pub fractional_scale_state: FractionalScaleManagerState,
     /// `wl_data_device_manager` global — clipboard and drag-and-drop.
@@ -145,6 +160,10 @@ pub fn init(
     // client requesting ClientSide is overridden — we don't
     // accept CSD.
     let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
+    // KDE server-decoration: advertise a *Server* default so toolkits
+    // that ignore zxdg_decoration (Firefox/GTK) still drop their CSD
+    // titlebar. We draw nothing, so the result is a bare window.
+    let kde_decoration_state = KdeDecorationState::new::<State>(&dh, KdeDefaultMode::Server);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
     let fractional_scale_state = FractionalScaleManagerState::new::<State>(&dh);
     // wl_data_device_manager: clipboard + drag-and-drop. Toolkits
@@ -236,6 +255,7 @@ pub fn init(
         seat,
         xdg_shell_state,
         xdg_decoration_state,
+        kde_decoration_state,
         output_manager_state,
         fractional_scale_state,
         data_device_state,
@@ -524,6 +544,31 @@ impl DataDeviceHandler for State {
     }
 }
 
+// KDE server-side decoration. We force Server for every decoration
+// object regardless of what the client asks for — Libreland is a
+// tiler and draws no decorations, so "server-side" here means "no
+// titlebar at all". Combined with the manager's Server default mode,
+// this stops GTK/Firefox from drawing a client-side titlebar.
+impl KdeDecorationHandler for State {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration_state
+    }
+
+    fn new_decoration(&mut self, _surface: &WlSurface, decoration: &OrgKdeKwinServerDecoration) {
+        decoration.mode(KdeMode::Server);
+    }
+
+    fn request_mode(
+        &mut self,
+        _surface: &WlSurface,
+        decoration: &OrgKdeKwinServerDecoration,
+        _mode: WEnum<KdeMode>,
+    ) {
+        // Ignore the client's preference; always server-side.
+        decoration.mode(KdeMode::Server);
+    }
+}
+
 impl WlrLayerShellHandler for State {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
@@ -617,3 +662,4 @@ delegate_fractional_scale!(State);
 delegate_layer_shell!(State);
 delegate_viewporter!(State);
 delegate_data_device!(State);
+delegate_kde_decoration!(State);
