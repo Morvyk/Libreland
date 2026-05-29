@@ -45,10 +45,6 @@ use crate::config::{BorderConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
 use crate::layout::Placement;
 
-/// Per-output metadata the Wayland frontend needs to advertise
-/// `wl_output` and seed `wp_fractional_scale_manager_v1`. Mirrors
-/// the renderer's internal `OutputRender` but exposes only the
-/// fields the frontend cares about (no GBM surface handle).
 /// A layer surface to render this frame. Pre-computed by main
 /// before calling `render_for_crtc` so the renderer doesn't need
 /// to know about `wlr_layer_shell` types or per-output
@@ -77,6 +73,10 @@ pub enum LayerBucket {
     Overlay,
 }
 
+/// Per-output metadata the Wayland frontend needs to advertise
+/// `wl_output` and seed `wp_fractional_scale_manager_v1`. Mirrors
+/// the renderer's internal `OutputRender` but exposes only the
+/// fields the frontend cares about (no GBM surface handle).
 #[derive(Debug, Clone)]
 pub struct OutputDescriptor {
     pub name: String,
@@ -1109,16 +1109,6 @@ fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
     );
 }
 
-/// Draw the pointer with its hotspot at `hotspot` (this output's
-/// physical pixels). When an `XCursor` theme loaded, render its sprite;
-/// otherwise fall back to the built-in white right-triangle so the
-/// pointer is always visible.
-///
-/// `cursor_size` is the requested logical size; `scale` is this
-/// output's fractional scale. The themed sprite is scaled by
-/// `cursor_size / nominal * scale` so it lands at the requested
-/// logical size in physical pixels no matter which image the theme
-/// supplied, with the hotspot offset scaled to match.
 /// Read a toplevel's `xdg_surface.set_window_geometry` origin, in
 /// compositor (logical) pixels. CSD clients set this to the top-left
 /// of their visible window inside a larger, shadow-padded buffer;
@@ -1137,6 +1127,16 @@ fn window_geometry_offset(surface: &WlSurface) -> (i32, i32) {
     })
 }
 
+/// Draw the pointer with its hotspot at `hotspot` (this output's
+/// physical pixels). When an `XCursor` theme loaded, render its sprite;
+/// otherwise fall back to the built-in white right-triangle so the
+/// pointer is always visible.
+///
+/// `cursor_size` is the requested logical size; `scale` is this
+/// output's fractional scale. The themed sprite is scaled by
+/// `cursor_size / nominal * scale` so it lands at the requested
+/// logical size in physical pixels no matter which image the theme
+/// supplied, with the hotspot offset scaled to match.
 fn draw_cursor(
     frame: &mut GlesFrame<'_, '_>,
     sprite: Option<&CursorSprite>,

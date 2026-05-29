@@ -3,24 +3,12 @@
 //! One place that holds every runtime setting the user can influence.
 //! Populated with [`Default`] at startup and then optionally
 //! overridden by a Lua file at `$XDG_CONFIG_HOME/libreland/config.lua`
-//! (loaded by [`Config::load_or_default`]).
-//!
-//! Not every field is *applied* at runtime yet — `repeat_rate` /
-//! `repeat_delay` wait for the Wayland frontend (key-repeat is a
-//! client-facing thing), and the per-output `mode` override is held
-//! for a follow-up that lets us request specific modes from DRM
-//! instead of taking the EDID-preferred one. Lua can set all these
-//! today; the values just live in `Config` until their runtime
-//! consumer ships.
-
-#![allow(
-    dead_code,
-    reason = "config schema is intentionally complete ahead of consumption; \
-              fields/variants get wired into the runtime as later milestones \
-              land (3b: per-output position/scale/mode/primary; Wayland frontend: \
-              repeat_rate / repeat_delay. Keeping the schema stable saves Lua \
-              users from breaking re-runs when we wire new bits up.)"
-)]
+//! (loaded by [`Config::load_or_default`]). Every field here is
+//! applied at runtime: monitors (`mode`/`position`/`scale`/`primary`)
+//! by [`crate::drm`] + [`crate::render`], `repeat_rate`/`repeat_delay`
+//! and `keyboard_layout` by the seat in [`crate::wayland`], the input
+//! accel/focus settings per pointer device, and the rest by the
+//! layout / renderer.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -686,6 +674,11 @@ fn parse_rgb_triple(t: &Table) -> mlua::Result<[f32; 3]> {
             "RGB triple must have exactly 3 components (got {}); expected {{r, g, b}}",
             values.len()
         );
+    }
+    for v in &values {
+        if !(0.0..=1.0).contains(v) {
+            lua_bail!("RGB component {v} out of range; expected [0.0, 1.0]");
+        }
     }
     Ok([values[0], values[1], values[2]])
 }

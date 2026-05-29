@@ -1017,11 +1017,14 @@ fn collect_placements(
     out: &mut Vec<Placement>,
 ) {
     match node {
-        Node::Leaf(w) => out.push(Placement {
-            surface: w.toplevel.wl_surface().clone(),
-            cell_rect: w.rect,
-            focused: is_focused(w.toplevel.wl_surface()),
-        }),
+        Node::Leaf(w) => {
+            let surface = w.toplevel.wl_surface();
+            out.push(Placement {
+                surface: surface.clone(),
+                cell_rect: w.rect,
+                focused: is_focused(surface),
+            });
+        }
         Node::Split { first, second, .. } => {
             collect_placements(first, is_focused, out);
             collect_placements(second, is_focused, out);
@@ -1161,7 +1164,10 @@ fn split_bounds(
                 reason = "bounds.size.w is bounded by layout_bounds (i32); ratio is 0..1; product fits in i32 with room to spare"
             )]
             let split = ((bounds.size.w as f32) * ratio.clamp(0.0, 1.0)) as i32;
-            let split = split.clamp(1, bounds.size.w.max(1) - 1);
+            // `.max(1)` on the upper bound keeps it >= the lower bound
+            // (1), so `clamp` never sees min > max — which would panic
+            // for a 0/1-px-wide cell.
+            let split = split.clamp(1, (bounds.size.w - 1).max(1));
             let a_w = (split - half_a).max(1);
             let b_w = (bounds.size.w - split - half_b).max(1);
             let a = Rectangle::new(bounds.loc, Size::new(a_w, bounds.size.h));
@@ -1179,7 +1185,9 @@ fn split_bounds(
                 reason = "bounds.size.h is bounded by layout_bounds (i32); ratio is 0..1; product fits in i32 with room to spare"
             )]
             let split = ((bounds.size.h as f32) * ratio.clamp(0.0, 1.0)) as i32;
-            let split = split.clamp(1, bounds.size.h.max(1) - 1);
+            // See the LeftRight arm: `.max(1)` keeps min <= max so
+            // `clamp` can't panic on a 0/1-px-tall cell.
+            let split = split.clamp(1, (bounds.size.h - 1).max(1));
             let a_h = (split - half_a).max(1);
             let b_h = (bounds.size.h - split - half_b).max(1);
             let a = Rectangle::new(bounds.loc, Size::new(bounds.size.w, a_h));

@@ -80,12 +80,17 @@ pub fn load_default_cursor(target_px: u32) -> Option<CursorImage> {
 
     // An XCursor file holds every size (and animation frame). Pick the
     // image whose nominal size is nearest the target; on a tie, the
-    // first wins (which for animated cursors is the first frame — we
-    // render a static cursor, so frame 0 is the right pick).
-    let image = images.iter().min_by_key(|img| {
-        let diff = i64::from(img.size).abs_diff(i64::from(target_px));
-        (diff, img.delay)
-    })?;
+    // earliest in file order wins — for animated cursors that's frame
+    // 0, which is what we want for a static cursor. (Tie-breaking on
+    // `delay` would pick an arbitrary frame, not the first.)
+    let image = images
+        .iter()
+        .enumerate()
+        .min_by_key(|(idx, img)| {
+            let diff = i64::from(img.size).abs_diff(i64::from(target_px));
+            (diff, *idx)
+        })
+        .map(|(_, img)| img)?;
 
     info!(
         theme = %theme_name,

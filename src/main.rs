@@ -747,33 +747,49 @@ impl State {
         for layer_surface in self.layer_shell_state.layer_surfaces() {
             let surface = layer_surface.wl_surface();
             let cached = crate::wayland::layer_cached_state(surface);
-            let mut width = cached.size.w;
-            let mut height = cached.size.h;
-            if width <= 0 {
-                width = primary.size.w;
-            }
-            if height <= 0 {
-                height = primary.size.h;
-            }
-            // Default: centre the surface on the output.
-            let mut x = primary.loc.x + (primary.size.w - width) / 2;
-            let mut y = primary.loc.y + (primary.size.h - height) / 2;
-            // Anchor pulls each axis to an edge or stretches across.
             let anchor = cached.anchor;
-            if anchor.contains(Anchor::LEFT) && !anchor.contains(Anchor::RIGHT) {
-                x = primary.loc.x + cached.margin.left;
-            } else if anchor.contains(Anchor::RIGHT) && !anchor.contains(Anchor::LEFT) {
-                x = primary.loc.x + primary.size.w - width - cached.margin.right;
-            } else if anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT) {
-                x = primary.loc.x + cached.margin.left;
-            }
-            if anchor.contains(Anchor::TOP) && !anchor.contains(Anchor::BOTTOM) {
-                y = primary.loc.y + cached.margin.top;
-            } else if anchor.contains(Anchor::BOTTOM) && !anchor.contains(Anchor::TOP) {
-                y = primary.loc.y + primary.size.h - height - cached.margin.bottom;
-            } else if anchor.contains(Anchor::TOP) && anchor.contains(Anchor::BOTTOM) {
-                y = primary.loc.y + cached.margin.top;
-            }
+            // Anchoring to BOTH opposite edges stretches the surface
+            // across that axis (output minus the two margins) — e.g.
+            // a waybar anchored top+left+right spans the full width.
+            let stretch_x = anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT);
+            let stretch_y = anchor.contains(Anchor::TOP) && anchor.contains(Anchor::BOTTOM);
+            // Size: stretched span, else the client's requested size,
+            // else the full output dimension when it asked the
+            // compositor to choose (size 0). Clamp to the output so a
+            // misbehaving client can't drive a negative offset below.
+            let mut width = if stretch_x {
+                primary.size.w - cached.margin.left - cached.margin.right
+            } else if cached.size.w > 0 {
+                cached.size.w
+            } else {
+                primary.size.w
+            };
+            let mut height = if stretch_y {
+                primary.size.h - cached.margin.top - cached.margin.bottom
+            } else if cached.size.h > 0 {
+                cached.size.h
+            } else {
+                primary.size.h
+            };
+            width = width.clamp(1, primary.size.w);
+            height = height.clamp(1, primary.size.h);
+            // Position: pinned to an anchored edge (+ its margin), else
+            // centred. When stretched, LEFT/TOP is set so the surface
+            // starts at the margin and spans to the far margin.
+            let x = if anchor.contains(Anchor::LEFT) {
+                primary.loc.x + cached.margin.left
+            } else if anchor.contains(Anchor::RIGHT) {
+                primary.loc.x + primary.size.w - width - cached.margin.right
+            } else {
+                primary.loc.x + (primary.size.w - width) / 2
+            };
+            let y = if anchor.contains(Anchor::TOP) {
+                primary.loc.y + cached.margin.top
+            } else if anchor.contains(Anchor::BOTTOM) {
+                primary.loc.y + primary.size.h - height - cached.margin.bottom
+            } else {
+                primary.loc.y + (primary.size.h - height) / 2
+            };
             let bucket = match cached.layer {
                 Layer::Background => render::LayerBucket::Background,
                 Layer::Bottom => render::LayerBucket::Bottom,
