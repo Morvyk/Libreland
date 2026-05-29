@@ -26,14 +26,15 @@
 use anyhow::{Context as _, Result};
 use smithay::backend::drm::DrmDevice;
 use smithay::backend::input::{
-    Event as _, InputEvent, KeyState, KeyboardKeyEvent as _, PointerButtonEvent as _,
+    Axis, AxisSource, Event as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
+    PointerAxisEvent as _, PointerButtonEvent as _,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::input::keyboard::FilterResult;
-use smithay::input::pointer::{ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
@@ -592,6 +593,70 @@ impl State {
                 time,
             },
         );
+        pointer.frame(self);
+    }
+
+    /// Forward a scroll (axis) event to the pointer-focused client.
+    /// Without this, scrollable surfaces never receive
+    /// `wl_pointer.axis` and can't scroll at all.
+    ///
+    /// Mirrors smithay's anvil reference: send the continuous `value`
+    /// (touchpads and high-resolution wheels) alongside discrete
+    /// `v120` steps (notched mouse wheels), tag the axis source and
+    /// per-axis relative direction, and emit a `stop` when a finger
+    /// scroll ends so kinetic scrolling halts cleanly.
+    fn forward_pointer_axis<B: InputBackend>(&mut self, evt: &B::PointerAxisEvent) {
+        // Continuous amount; for wheels that only report discrete
+        // detents, synthesise a small continuous value from v120 so
+        // clients that ignore v120 still scroll.
+        let amount = |axis: Axis| {
+            evt.amount(axis)
+                .unwrap_or_else(|| evt.amount_v120(axis).unwrap_or(0.0) * 3.0 / 120.0)
+        };
+        let horizontal = amount(Axis::Horizontal);
+        let vertical = amount(Axis::Vertical);
+        let source = evt.source();
+
+        let mut frame = AxisFrame::new(evt.time_msec()).source(source);
+        if horizontal == 0.0 {
+            if source == AxisSource::Finger {
+                frame = frame.stop(Axis::Horizontal);
+            }
+        } else {
+            frame = frame
+                .relative_direction(Axis::Horizontal, evt.relative_direction(Axis::Horizontal))
+                .value(Axis::Horizontal, horizontal);
+            if let Some(v120) = evt.amount_v120(Axis::Horizontal) {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "v120 is an integer detent count (multiple of 120) carried as f64"
+                )]
+                let steps = v120 as i32;
+                frame = frame.v120(Axis::Horizontal, steps);
+            }
+        }
+        if vertical == 0.0 {
+            if source == AxisSource::Finger {
+                frame = frame.stop(Axis::Vertical);
+            }
+        } else {
+            frame = frame
+                .relative_direction(Axis::Vertical, evt.relative_direction(Axis::Vertical))
+                .value(Axis::Vertical, vertical);
+            if let Some(v120) = evt.amount_v120(Axis::Vertical) {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "v120 is an integer detent count (multiple of 120) carried as f64"
+                )]
+                let steps = v120 as i32;
+                frame = frame.v120(Axis::Vertical, steps);
+            }
+        }
+
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        pointer.axis(self, frame);
         pointer.frame(self);
     }
 
@@ -1349,6 +1414,9 @@ fn wire_event_sources(
                 InputEvent::PointerButton { event: pb } => {
                     data.state
                         .forward_pointer_button(pb.button_code(), pb.state(), pb.time_msec());
+                }
+                InputEvent::PointerAxis { event: pa } => {
+                    data.state.forward_pointer_axis::<LibinputInputBackend>(&pa);
                 }
                 InputEvent::DeviceAdded { mut device } => {
                     apply_input_config(&mut device, &data.state.config.input);
