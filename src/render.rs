@@ -14,7 +14,7 @@
 //! draw the cursor only when the hotspot falls within that output's
 //! rectangle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
@@ -39,14 +39,17 @@ use smithay::backend::renderer::{
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::drm::control::crtc;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Size, Transform};
+use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::backend::ObjectId;
+use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{
     SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::{debug, info, warn};
 
-use crate::config::{BorderConfig, Fill, MonitorsConfig};
+use crate::anim::{Animation, lerp};
+use crate::config::{AnimationsConfig, BorderConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
 
@@ -338,6 +341,57 @@ pub struct Renderer {
     /// cursor while a client drag is in progress; `None` otherwise. Set by
     /// the `ClientDndGrabHandler`. Its buffer is read fresh each frame.
     dnd_icon: Option<WlSurface>,
+    /// Animation timing/curves, read fresh each frame; updated live on
+    /// config reload via [`Self::set_animations`].
+    animations: AnimationsConfig,
+    /// Per-window animation state keyed by surface id: the rect we're
+    /// drawing at vs. the layout's target, plus any in-flight open/move
+    /// animations. Persists across workspace switches (entries are pruned
+    /// only when the surface dies) so hidden windows keep their settled
+    /// position instead of replaying an open animation when shown again.
+    win_anims: HashMap<ObjectId, WindowAnim>,
+    /// Surfaces that just mapped (via [`Self::mark_open`]) and should play
+    /// an open animation the next time they appear in a frame's
+    /// placements. Keyed separately from `win_anims` so a workspace switch
+    /// (which surfaces a window without a fresh map) never triggers it.
+    pending_open: HashSet<ObjectId>,
+    /// Surface currently under an interactive move/resize drag, if any.
+    /// Its rect changes every frame to track the cursor, so it must draw
+    /// 1:1 (no move animation) — otherwise it visibly trails the pointer.
+    /// Cleared on drop, which lets the window animate into its final tile.
+    no_anim_move: Option<ObjectId>,
+}
+
+/// Fraction of full size a window starts at when it opens (and shrinks to
+/// when it closes): a subtle pop, not a dramatic zoom.
+const OPEN_SCALE_FROM: f64 = 0.90;
+
+/// Per-window animation state. Rects are absolute compositor pixels (the
+/// same space as [`Placement::cell_rect`]).
+struct WindowAnim {
+    /// Kept to prune the entry once the window is gone (`!alive()`).
+    surface: WlSurface,
+    /// The layout's current target rect (last seen `cell_rect`).
+    target: Rectangle<i32, Physical>,
+    /// The rect actually drawn last frame — the start point a new move
+    /// animation interpolates *from*, so retargets mid-flight stay smooth.
+    displayed: Rectangle<i32, Physical>,
+    /// Rect a running move animation interpolates from.
+    move_from: Rectangle<i32, Physical>,
+    /// In-flight position/size animation, if any.
+    move_anim: Option<Animation>,
+    /// In-flight open (fade + scale-in) animation, if any.
+    open_anim: Option<Animation>,
+}
+
+/// What to draw for one placement this frame, after animation: the
+/// on-screen rect (interpolated position/size) and opacity. The element
+/// builder derives the surface's content scale from `effective` vs the
+/// placement's target `cell_rect`.
+#[derive(Debug, Clone, Copy)]
+struct WinDraw {
+    effective: Rectangle<i32, Physical>,
+    alpha: f32,
 }
 
 /// What the screenshot selection UI should draw this frame. The
@@ -630,6 +684,10 @@ impl Renderer {
             freeze_textures: HashMap::new(),
             screenshot_overlay: None,
             dnd_icon: None,
+            animations: AnimationsConfig::default(),
+            win_anims: HashMap::new(),
+            pending_open: HashSet::new(),
+            no_anim_move: None,
         })
     }
 
@@ -908,6 +966,108 @@ impl Renderer {
         self.dnd_icon = icon;
     }
 
+    /// Replace the animation timing/curves (live config reload). Takes
+    /// effect next frame; animations already in flight keep their timing.
+    pub fn set_animations(&mut self, cfg: AnimationsConfig) {
+        self.animations = cfg;
+    }
+
+    /// Mark a freshly-mapped toplevel so it plays an open animation the
+    /// next time it appears in a frame's placements (not on a later
+    /// workspace switch that merely surfaces it again).
+    pub fn mark_open(&mut self, surface: &WlSurface) {
+        self.pending_open.insert(surface.id());
+    }
+
+    /// Set (`Some`) or clear (`None`) the window being interactively
+    /// moved/resized, which draws 1:1 instead of animating its rect.
+    pub fn set_no_anim_move(&mut self, surface: Option<&WlSurface>) {
+        self.no_anim_move = surface.map(Resource::id);
+    }
+
+    /// Advance per-window animations against `now` (seconds on the shared
+    /// clock) and return the on-screen rect + opacity to draw each
+    /// placement at, in placement order. Position/size interpolate toward
+    /// the layout's target; a just-mapped window fades + scales in.
+    fn animate_placements(&mut self, now: f64, placements: &[Placement]) -> Vec<WinDraw> {
+        let cfg = self.animations.clone();
+        let move_enabled = cfg.enabled && cfg.window_move.enabled;
+        let open_enabled = cfg.enabled && cfg.window_open.enabled;
+        let no_anim_move = self.no_anim_move.clone();
+
+        let mut draws = Vec::with_capacity(placements.len());
+        for p in placements {
+            let id = p.surface.id();
+            let target = p.cell_rect;
+            // The interactively dragged window tracks the cursor 1:1.
+            let snap = no_anim_move.as_ref() == Some(&id);
+            let entry = self.win_anims.entry(id.clone()).or_insert_with(|| WindowAnim {
+                surface: p.surface.clone(),
+                target,
+                displayed: target,
+                move_from: target,
+                move_anim: None,
+                open_anim: None,
+            });
+
+            // Target moved (reflow / interactive move / fullscreen
+            // toggle): start or retarget a move animation from where the
+            // window is being drawn right now, so retargets stay smooth.
+            if target != entry.target {
+                entry.move_anim = (move_enabled && !snap).then(|| {
+                    entry.move_from = entry.displayed;
+                    Animation::start(now, cfg.window_move.duration_secs(), cfg.window_move.curve)
+                });
+                entry.target = target;
+            }
+
+            // A just-mapped window starts opening the first frame it's
+            // here. Consume the mark regardless so a disabled open
+            // animation doesn't leave it pending forever.
+            if self.pending_open.remove(&id) && open_enabled {
+                entry.open_anim = Some(Animation::start(
+                    now,
+                    cfg.window_open.duration_secs(),
+                    cfg.window_open.curve,
+                ));
+            }
+
+            // Position/size: interpolate displayed → target.
+            if let Some(a) = entry.move_anim {
+                entry.displayed = lerp_rect(entry.move_from, entry.target, a.value(now));
+                if a.done(now) {
+                    entry.move_anim = None;
+                    entry.displayed = entry.target;
+                }
+            } else {
+                entry.displayed = entry.target;
+            }
+
+            // Open: fade + scale-about-centre layered on the displayed
+            // rect.
+            let (mut effective, mut alpha) = (entry.displayed, 1.0_f32);
+            if let Some(a) = entry.open_anim {
+                let v = a.value(now);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "eased progress is in [0,1]; the f32 cast is exact enough for an opacity"
+                )]
+                let a32 = v as f32;
+                alpha = a32;
+                effective = scale_rect_about_center(entry.displayed, lerp(OPEN_SCALE_FROM, 1.0, v));
+                if a.done(now) {
+                    entry.open_anim = None;
+                }
+            }
+            draws.push(WinDraw { effective, alpha });
+        }
+
+        // A closed window's surface dies; drop its (and any stale
+        // open-mark) state. The fade-out on close is a later change.
+        self.win_anims.retain(|_, w| w.surface.alive());
+        draws
+    }
+
     /// GPU buffer (dmabuf) formats this renderer can import as
     /// textures — advertised via `zwp_linux_dmabuf_v1` so clients
     /// (and Xwayland via xwayland-satellite) can hand us
@@ -1023,6 +1183,11 @@ impl Renderer {
         };
         let screenshot_overlay = self.screenshot_overlay;
         let dnd_icon = self.dnd_icon.clone();
+        // Advance window animations and resolve each placement's on-screen
+        // rect + opacity for this frame (before the immutable `outputs`
+        // borrow below). `now` is seconds on the shared render clock.
+        let now = self.start.elapsed().as_secs_f64();
+        let win_draws = self.animate_placements(now, placements);
         let output = &self.outputs[idx];
         let mode_size = output.mode_size;
         let compositor_position = output.compositor_position;
@@ -1075,7 +1240,8 @@ impl Renderer {
         let bw_comp = border.width.max(0);
         let grouped: Vec<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> = placements
             .iter()
-            .map(|p| {
+            .zip(win_draws.iter())
+            .map(|(p, wd)| {
                 // CSD clients pad their buffer with an invisible
                 // drop-shadow margin and report the real window rect
                 // via xdg_surface.set_window_geometry. Shift the
@@ -1093,27 +1259,33 @@ impl Renderer {
                 } else {
                     (0, 0)
                 };
-                let bw_p = if p.fill == FillMode::Normal {
-                    bw_comp
-                } else {
-                    0
-                };
+                let bw_p = if p.fill == FillMode::Normal { bw_comp } else { 0 };
+                // Draw the window into its *animated* rect (`wd.effective`),
+                // scaling the surface's actual content to fill it. The
+                // denominator is the client's current geometry size (its
+                // real size right now), so a resize looks correct even
+                // while the client is a frame behind its new configure;
+                // when settled, `effective == cell_rect` and the scale is
+                // 1 (crisp, identical to the un-animated path).
+                let eff = wd.effective;
+                let (content_w, content_h) = window_geometry_size(&p.surface)
+                    .unwrap_or(((p.cell_rect.size.w - 2 * bw_p), (p.cell_rect.size.h - 2 * bw_p)));
+                let eff_inner_w = f64::from((eff.size.w - 2 * bw_p).max(1));
+                let eff_inner_h = f64::from((eff.size.h - 2 * bw_p).max(1));
+                let csx = eff_inner_w / f64::from(content_w.max(1));
+                let csy = eff_inner_h / f64::from(content_h.max(1));
+                let inner_x = f64::from(eff.loc.x + bw_p - compositor_position.x);
+                let inner_y = f64::from(eff.loc.y + bw_p - compositor_position.y);
                 let surface_local_phys = Point::<i32, Physical>::from((
-                    scale_i(
-                        p.cell_rect.loc.x + bw_p - compositor_position.x - geo_x,
-                        scale,
-                    ),
-                    scale_i(
-                        p.cell_rect.loc.y + bw_p - compositor_position.y - geo_y,
-                        scale,
-                    ),
+                    scale_f(inner_x, scale) - scale_f(f64::from(geo_x) * csx, scale),
+                    scale_f(inner_y, scale) - scale_f(f64::from(geo_y) * csy, scale),
                 ));
                 render_elements_from_surface_tree(
                     &mut self.gles,
                     &p.surface,
                     surface_local_phys,
-                    scale,
-                    1.0_f32,
+                    Scale::from((scale * csx, scale * csy)),
+                    wd.alpha,
                     Kind::Unspecified,
                 )
             })
@@ -1270,19 +1442,22 @@ impl Renderer {
             let radius_comp = border.rounded_corners.max(0);
             // Normal (tiled/floating) windows: surface, then the border
             // ring + rounded-corner cutout painted over it.
-            for (p, elements) in placements
+            for ((p, elements), wd) in placements
                 .iter()
                 .zip(grouped.iter())
-                .filter(|(p, _)| p.fill == FillMode::Normal)
+                .zip(win_draws.iter())
+                .filter(|((p, _), _)| p.fill == FillMode::Normal)
             {
+                // Border tracks the window's *animated* rect so it slides
+                // and scales with the surface, and fades with it on open.
                 let cell_local_phys = Rectangle::<i32, Physical>::new(
                     Point::new(
-                        scale_i(p.cell_rect.loc.x - compositor_position.x, scale),
-                        scale_i(p.cell_rect.loc.y - compositor_position.y, scale),
+                        scale_i(wd.effective.loc.x - compositor_position.x, scale),
+                        scale_i(wd.effective.loc.y - compositor_position.y, scale),
                     ),
                     Size::new(
-                        scale_i(p.cell_rect.size.w, scale),
-                        scale_i(p.cell_rect.size.h, scale),
+                        scale_i(wd.effective.size.w, scale),
+                        scale_i(wd.effective.size.h, scale),
                     ),
                 );
                 // Surface first; the frame shader will overpaint
@@ -1314,6 +1489,7 @@ impl Renderer {
                         fill,
                         &wallpaper,
                         mode_size,
+                        wd.alpha,
                     )?;
                 }
             }
@@ -1716,6 +1892,7 @@ fn draw_window_frame(
     border_fill: &Fill,
     wallpaper: &Fill,
     output_size: Size<i32, Physical>,
+    alpha: f32,
 ) -> Result<()> {
     let max_half = (cell_rect_phys.size.w / 2).min(cell_rect_phys.size.h / 2);
     let radius = radius_phys.min(max_half).max(0);
@@ -1763,7 +1940,7 @@ fn draw_window_frame(
         cell_rect_phys.size.h,
     ));
     frame
-        .render_pixel_shader_to(shader, src, cell_rect_phys, size, None, 1.0, &uniforms)
+        .render_pixel_shader_to(shader, src, cell_rect_phys, size, None, alpha, &uniforms)
         .context("render_pixel_shader_to (window frame) failed")?;
     Ok(())
 }
@@ -1884,6 +2061,62 @@ fn window_geometry_offset(surface: &WlSurface) -> (i32, i32) {
             .geometry
             .map_or((0, 0), |g| (g.loc.x, g.loc.y))
     })
+}
+
+/// The surface's current visible content size (`set_window_geometry`),
+/// in compositor pixels, if the client set one and it's non-degenerate.
+/// Used as the denominator when scaling a window's *actual* buffer to its
+/// animated rect — so a resize stays correct even while the client is a
+/// frame or two behind reconfiguring.
+fn window_geometry_size(surface: &WlSurface) -> Option<(i32, i32)> {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map(|g| (g.size.w, g.size.h))
+            .filter(|&(w, h)| w > 0 && h > 0)
+    })
+}
+
+/// Interpolate every component of two rects by eased `t`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "interpolated pixel coordinates are bounded by output size, well within i32"
+)]
+fn lerp_rect(
+    a: Rectangle<i32, Physical>,
+    b: Rectangle<i32, Physical>,
+    t: f64,
+) -> Rectangle<i32, Physical> {
+    Rectangle::new(
+        Point::from((
+            lerp(f64::from(a.loc.x), f64::from(b.loc.x), t).round() as i32,
+            lerp(f64::from(a.loc.y), f64::from(b.loc.y), t).round() as i32,
+        )),
+        Size::from((
+            lerp(f64::from(a.size.w), f64::from(b.size.w), t).round() as i32,
+            lerp(f64::from(a.size.h), f64::from(b.size.h), t).round() as i32,
+        )),
+    )
+}
+
+/// Shrink/grow a rect about its centre by factor `s` (keeps the centre
+/// fixed) — the geometry of an open/close scale-in/out.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "scaled pixel coordinates are bounded by output size, well within i32"
+)]
+fn scale_rect_about_center(r: Rectangle<i32, Physical>, s: f64) -> Rectangle<i32, Physical> {
+    let cx = f64::from(r.loc.x) + f64::from(r.size.w) / 2.0;
+    let cy = f64::from(r.loc.y) + f64::from(r.size.h) / 2.0;
+    let w = f64::from(r.size.w) * s;
+    let h = f64::from(r.size.h) * s;
+    Rectangle::new(
+        Point::from(((cx - w / 2.0).round() as i32, (cy - h / 2.0).round() as i32)),
+        Size::from((w.round() as i32, h.round() as i32)),
+    )
 }
 
 /// Draw the pointer with its hotspot at `hotspot` (this output's

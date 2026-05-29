@@ -609,6 +609,9 @@ impl XdgShellHandler for State {
         let cursor =
             smithay::utils::Point::<i32, smithay::utils::Physical>::from((cx as i32, cy as i32));
         self.layout.insert(surface.clone(), Some(cursor));
+        // Play the open (fade + scale-in) animation the first frame this
+        // toplevel is drawn.
+        self.renderer.mark_open(surface.wl_surface());
         // Promote the new toplevel to keyboard focus. For both
         // hover and click models a fresh window should start with
         // focus so the user can type into it immediately, even if

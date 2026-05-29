@@ -60,6 +60,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod anim;
 mod clipboard;
 mod config;
 mod cursor;
@@ -814,6 +815,9 @@ impl State {
                 // Drop the gesture-cursor override; the client under the
                 // pointer drives the cursor again from here.
                 self.renderer.set_cursor_override(None);
+                // Re-enable move animation for the window so it eases into
+                // its final tile (move) or stays put (resize).
+                self.renderer.set_no_anim_move(None);
             }
             return;
         }
@@ -881,6 +885,10 @@ impl State {
                             surface = ?surface.id(),
                             "drag start"
                         );
+                        // Draw the dragged window 1:1 with the cursor
+                        // (no move-animation lag); it animates into place
+                        // on drop when the override is cleared.
+                        self.renderer.set_no_anim_move(Some(&surface));
                         self.drag = Some(DragState {
                             surface,
                             mode,
@@ -1666,6 +1674,7 @@ impl State {
         );
         self.renderer
             .set_appearance(new.misc.wallpaper.clone(), new.border.clone());
+        self.renderer.set_animations(new.animations.clone());
         self.config = new;
         info!("config reloaded");
     }
@@ -2147,6 +2156,7 @@ fn main() -> Result<()> {
         &config.monitors,
     )
     .context("render pipeline init failed")?;
+    renderer.set_animations(config.animations.clone());
 
     info!("phase: priming swapchains (one initial frame per output)");
     renderer.render_initial().context("initial render failed")?;

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use mlua::{ErrorContext as _, Lua, Table};
@@ -20,6 +21,7 @@ use tracing::info;
 use xkbcommon::xkb;
 use xkbcommon::xkb::Keysym;
 
+use crate::anim::Curve;
 use crate::keyboard;
 
 /// Build a `mlua::Error::RuntimeError` for a schema mismatch we want
@@ -47,6 +49,9 @@ pub struct Config {
     pub misc: MiscConfig,
     pub layout: LayoutConfig,
     pub border: BorderConfig,
+    /// Window/workspace motion. Applied live on reload; the renderer
+    /// reads it fresh each frame.
+    pub animations: AnimationsConfig,
     /// Environment variables to export into the compositor's own
     /// process before spawning any children, so every client we
     /// launch (startup commands, `spawn` binds, ad-hoc shells in
@@ -85,6 +90,75 @@ pub struct LayoutConfig {
     /// Centred on each split divider — each cell gives up
     /// `inner / 2` on the dividing side. Default `3`.
     pub gaps_inner: i32,
+}
+
+/// One animation's timing: whether it plays, how long, and its easing.
+#[derive(Debug, Clone, Copy)]
+pub struct AnimSpec {
+    /// Per-animation switch. The animation plays only when this *and*
+    /// the master [`AnimationsConfig::enabled`] are true.
+    pub enabled: bool,
+    /// How long the animation runs.
+    pub duration: Duration,
+    /// Easing curve shaping progress over the duration.
+    pub curve: Curve,
+}
+
+impl AnimSpec {
+    /// Duration in seconds, for the renderer's `f64` clock.
+    #[must_use]
+    pub fn duration_secs(&self) -> f64 {
+        self.duration.as_secs_f64()
+    }
+}
+
+/// Window + workspace motion. A master switch plus one [`AnimSpec`] per
+/// animation. Sane defaults: brief, decelerating motion that settles
+/// into place; disable any piece (or the lot) from the config.
+#[derive(Debug, Clone)]
+pub struct AnimationsConfig {
+    /// Master switch. When `false`, nothing animates regardless of the
+    /// per-animation flags.
+    pub enabled: bool,
+    /// A window appearing (map): fade + scale-in.
+    pub window_open: AnimSpec,
+    /// A window disappearing (unmap/close): fade + scale-out of a
+    /// snapshot taken just before it goes.
+    pub window_close: AnimSpec,
+    /// A window's tile changing position/size — reflow on open/close,
+    /// interactive move/resize, fullscreen toggles: slide + scale to the
+    /// new rect.
+    pub window_move: AnimSpec,
+    /// Switching workspaces: the outgoing + incoming sets slide across.
+    pub workspace: AnimSpec,
+}
+
+impl Default for AnimationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_open: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(250),
+                curve: Curve::EaseOut,
+            },
+            window_close: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(200),
+                curve: Curve::EaseIn,
+            },
+            window_move: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(250),
+                curve: Curve::EaseOut,
+            },
+            workspace: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(300),
+                curve: Curve::EaseInOut,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -367,6 +441,7 @@ impl Default for Config {
                 // bigger is taste.
                 rounded_corners: 4,
             },
+            animations: AnimationsConfig::default(),
             env: Vec::new(),
             startup: Vec::new(),
             screenshot: None,
@@ -456,6 +531,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("border")? {
             config.border = parse_border(&t, config.border).context("border")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("animations")? {
+            config.animations = parse_animations(&t, config.animations).context("animations")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("env")? {
             config.env = parse_env(&t).context("env")?;
@@ -757,6 +835,101 @@ fn parse_border(t: &Table, defaults: BorderConfig) -> mlua::Result<BorderConfig>
     Ok(cfg)
 }
 
+fn parse_animations(t: &Table, defaults: AnimationsConfig) -> mlua::Result<AnimationsConfig> {
+    let mut cfg = defaults;
+    if let Some(e) = t.get::<Option<bool>>("enabled")? {
+        cfg.enabled = e;
+    }
+
+    // Top-level `duration` / `curve` shift the inherited defaults that
+    // each per-animation table then falls back to (or overrides).
+    let base = |mut spec: AnimSpec| -> mlua::Result<AnimSpec> {
+        if let Some(d) = parse_duration_ms(t, "duration")? {
+            spec.duration = d;
+        }
+        if let Some(c) = parse_opt_curve(t, "curve")? {
+            spec.curve = c;
+        }
+        Ok(spec)
+    };
+    cfg.window_open = parse_anim_spec(t, "window_open", base(cfg.window_open)?)?;
+    cfg.window_close = parse_anim_spec(t, "window_close", base(cfg.window_close)?)?;
+    cfg.window_move = parse_anim_spec(t, "window_move", base(cfg.window_move)?)?;
+    cfg.workspace = parse_anim_spec(t, "workspace", base(cfg.workspace)?)?;
+    Ok(cfg)
+}
+
+/// Parse one per-animation sub-table (`{ enabled, duration, curve }`)
+/// over `default`, returning `default` unchanged if `key` is absent.
+fn parse_anim_spec(parent: &Table, key: &str, default: AnimSpec) -> mlua::Result<AnimSpec> {
+    let Some(t) = parent.get::<Option<Table>>(key)? else {
+        return Ok(default);
+    };
+    let mut spec = default;
+    if let Some(e) = t.get::<Option<bool>>("enabled")? {
+        spec.enabled = e;
+    }
+    if let Some(d) = parse_duration_ms(&t, "duration").context(key.to_owned())? {
+        spec.duration = d;
+    }
+    if let Some(c) = parse_opt_curve(&t, "curve").context(key.to_owned())? {
+        spec.curve = c;
+    }
+    Ok(spec)
+}
+
+/// Read a millisecond duration (`>= 0`) from `key`, if present.
+fn parse_duration_ms(t: &Table, key: &str) -> mlua::Result<Option<Duration>> {
+    let Some(ms) = t.get::<Option<i64>>(key)? else {
+        return Ok(None);
+    };
+    if ms < 0 {
+        lua_bail!("animation {key} {ms} out of range; expected >= 0 (milliseconds)");
+    }
+    Ok(Some(Duration::from_millis(u64::try_from(ms).unwrap_or(0))))
+}
+
+/// Read an easing curve from `key`, if present.
+fn parse_opt_curve(t: &Table, key: &str) -> mlua::Result<Option<Curve>> {
+    match t.get::<Option<mlua::Value>>(key)? {
+        None | Some(mlua::Value::Nil) => Ok(None),
+        Some(v) => Ok(Some(parse_curve(&v)?)),
+    }
+}
+
+/// A curve is either a named string (`"ease-out"`, `_`/`-` interchangeable)
+/// or a `{x1, y1, x2, y2}` cubic-Bézier (CSS semantics; x's in `[0,1]`).
+fn parse_curve(v: &mlua::Value) -> mlua::Result<Curve> {
+    if let Some(tbl) = v.as_table() {
+        let pts: [f64; 4] = [tbl.get(1)?, tbl.get(2)?, tbl.get(3)?, tbl.get(4)?];
+        if !(0.0..=1.0).contains(&pts[0]) || !(0.0..=1.0).contains(&pts[2]) {
+            lua_bail!(
+                "bezier x control points must be in [0, 1]; got x1={}, x2={}",
+                pts[0],
+                pts[2]
+            );
+        }
+        return Ok(Curve::Bezier(pts[0], pts[1], pts[2], pts[3]));
+    }
+    if let Some(s) = v.as_string().and_then(|s| s.to_str().ok()) {
+        let norm: String = s
+            .chars()
+            .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
+            .collect();
+        return match norm.as_str() {
+            "linear" => Ok(Curve::Linear),
+            "ease-in" | "easein" => Ok(Curve::EaseIn),
+            "ease-out" | "easeout" => Ok(Curve::EaseOut),
+            "ease-in-out" | "easeinout" => Ok(Curve::EaseInOut),
+            "ease" => Ok(Curve::Bezier(0.25, 0.1, 0.25, 1.0)),
+            other => lua_bail!(
+                "unknown animation curve {other:?}; expected linear, ease-in, ease-out, ease-in-out, or a {{x1,y1,x2,y2}} bezier"
+            ),
+        };
+    }
+    lua_bail!("animation curve must be a string or a {{x1,y1,x2,y2}} bezier table")
+}
+
 fn parse_fill(t: &Table) -> mlua::Result<Fill> {
     let kind: String = t
         .get("type")
@@ -838,4 +1011,97 @@ fn parse_rgb_triple(t: &Table) -> mlua::Result<[f32; 3]> {
         }
     }
     Ok([values[0], values[1], values[2]])
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn parse(src: &str) -> Config {
+        let lua = Lua::new();
+        lua.load(src).exec().expect("lua exec");
+        Config::populate_from_globals(&lua.globals()).expect("populate")
+    }
+
+    #[test]
+    fn defaults_when_absent() {
+        let c = parse("");
+        assert!(c.animations.enabled);
+        assert_eq!(c.animations.window_open.duration, Duration::from_millis(250));
+        assert_eq!(c.animations.window_open.curve, Curve::EaseOut);
+        assert_eq!(c.animations.workspace.curve, Curve::EaseInOut);
+    }
+
+    #[test]
+    fn master_switch_and_top_level_inheritance() {
+        let c = parse(
+            r#"animations = { enabled = false, duration = 100, curve = "linear" }"#,
+        );
+        assert!(!c.animations.enabled);
+        // Top-level duration/curve flow into every per-type spec.
+        for s in [
+            c.animations.window_open,
+            c.animations.window_close,
+            c.animations.window_move,
+            c.animations.workspace,
+        ] {
+            assert_eq!(s.duration, Duration::from_millis(100));
+            assert_eq!(s.curve, Curve::Linear);
+        }
+    }
+
+    #[test]
+    fn per_type_override_beats_top_level() {
+        let c = parse(
+            r#"animations = {
+                duration = 100,
+                window_open = { duration = 400, curve = "ease-in" },
+                window_close = { enabled = false },
+            }"#,
+        );
+        assert_eq!(c.animations.window_open.duration, Duration::from_millis(400));
+        assert_eq!(c.animations.window_open.curve, Curve::EaseIn);
+        // window_close inherits top-level duration but disables itself.
+        assert_eq!(c.animations.window_close.duration, Duration::from_millis(100));
+        assert!(!c.animations.window_close.enabled);
+        // untouched type keeps inherited top-level duration + default curve.
+        assert_eq!(c.animations.window_move.duration, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn bezier_curve_and_name_normalization() {
+        let c = parse(
+            r#"animations = {
+                window_open = { curve = {0.1, 0.7, 0.1, 1.0} },
+                window_move = { curve = "EASE_IN_OUT" },
+            }"#,
+        );
+        assert_eq!(c.animations.window_open.curve, Curve::Bezier(0.1, 0.7, 0.1, 1.0));
+        assert_eq!(c.animations.window_move.curve, Curve::EaseInOut);
+    }
+
+    #[test]
+    fn rejects_bad_bezier_x() {
+        let lua = Lua::new();
+        lua.load(r#"animations = { window_open = { curve = {1.5, 0, 0.5, 1} } }"#)
+            .exec()
+            .unwrap();
+        assert!(Config::populate_from_globals(&lua.globals()).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_curve_and_negative_duration() {
+        for src in [
+            r#"animations = { curve = "boing" }"#,
+            r#"animations = { duration = -5 }"#,
+        ] {
+            let lua = Lua::new();
+            lua.load(src).exec().unwrap();
+            assert!(
+                Config::populate_from_globals(&lua.globals()).is_err(),
+                "expected error for: {src}"
+            );
+        }
+    }
 }
