@@ -666,6 +666,14 @@ impl Layout {
         self.recompute_and_push();
     }
 
+    /// Current border width. A placement's surface buffer (0,0) is
+    /// painted at `cell_rect.loc + border_width`, so a popup parent's
+    /// window-geometry origin (which xdg popups are positioned
+    /// relative to) is `cell_rect.loc + border_width`.
+    pub fn border_width(&self) -> i32 {
+        self.border_width
+    }
+
     /// Switch the active workspace on the output under `cursor` by
     /// `delta` (`+1` = next / scroll-down, `-1` = previous /
     /// scroll-up). No-op if the cursor is over no output. No wrap:

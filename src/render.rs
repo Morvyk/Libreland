@@ -63,6 +63,20 @@ pub struct LayerPlacement {
     pub layer: LayerBucket,
 }
 
+/// An `xdg_popup` (menu / submenu) to render this frame. Built by main
+/// from the live popup trees. Drawn with no border, **above every
+/// window and layer** (just below the cursor), so menus never hide
+/// behind tiled windows. `buffer_origin` is where the popup buffer's
+/// `(0, 0)` lands in absolute compositor coords (the popup's own
+/// window-geometry offset already subtracted); `rect` is the visible
+/// popup rect (for frame callbacks / hit-testing on the main side).
+#[derive(Debug, Clone)]
+pub struct PopupPlacement {
+    pub surface: WlSurface,
+    pub buffer_origin: Point<i32, Physical>,
+    pub rect: Rectangle<i32, Physical>,
+}
+
 /// Renderer-side mirror of `smithay::wayland::shell::wlr_layer::Layer`.
 /// Defined here so render.rs doesn't depend on smithay's shell
 /// module types beyond what's needed.
@@ -531,7 +545,7 @@ impl Renderer {
     /// an empty placement slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
-            self.render_output(idx, &[], &[])
+            self.render_output(idx, &[], &[], &[])
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -546,13 +560,14 @@ impl Renderer {
         crtc: crtc::Handle,
         placements: &[Placement],
         layers: &[LayerPlacement],
+        popups: &[PopupPlacement],
     ) -> Result<()> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx, placements, layers)
+        self.render_output(idx, placements, layers, popups)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -685,6 +700,7 @@ impl Renderer {
         idx: usize,
         placements: &[Placement],
         layers: &[LayerPlacement],
+        popups: &[PopupPlacement],
     ) -> Result<()> {
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in. All
@@ -802,6 +818,30 @@ impl Renderer {
                 })
                 .collect();
 
+        // Popups (menus/submenus): pre-import like layers. Each
+        // `buffer_origin` is already absolute compositor px with the
+        // popup's own geometry offset folded in, so this is just the
+        // local-space + scale conversion (no border, no extra
+        // geometry subtraction). Snapshot order is parent-before-child
+        // so nested submenus draw on top in iteration order.
+        let popup_groups: Vec<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> = popups
+            .iter()
+            .map(|pp| {
+                let local_phys = Point::<i32, Physical>::from((
+                    scale_i(pp.buffer_origin.x - compositor_position.x, scale),
+                    scale_i(pp.buffer_origin.y - compositor_position.y, scale),
+                ));
+                render_elements_from_surface_tree(
+                    &mut self.gles,
+                    &pp.surface,
+                    local_phys,
+                    scale,
+                    1.0_f32,
+                    Kind::Unspecified,
+                )
+            })
+            .collect();
+
         let sync = {
             let mut target = self
                 .gles
@@ -907,6 +947,20 @@ impl Renderer {
                 }
             }
 
+            // Popups draw above everything except the cursor — above
+            // tiled/floating windows AND above Top/Overlay layers, so a
+            // menu opened from a panel is never occluded. Parent-first
+            // snapshot order means nested submenus land on top.
+            for elements in &popup_groups {
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    elements,
+                    &full_damage,
+                )
+                .context("draw_render_elements (popup) failed")?;
+            }
+
             if cursor_in_bounds {
                 // Pointer hotspot in this output's physical pixels.
                 let hotspot = Point::<i32, Physical>::from((
@@ -946,6 +1000,9 @@ impl Renderer {
         }
         for l in layers {
             send_frame_callbacks(&l.surface, elapsed_ms);
+        }
+        for p in popups {
+            send_frame_callbacks(&p.surface, elapsed_ms);
         }
         Ok(())
     }

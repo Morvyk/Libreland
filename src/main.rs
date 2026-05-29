@@ -212,6 +212,12 @@ pub(crate) struct State {
     /// this each frame; xdg handlers in [`crate::wayland`] insert
     /// + remove entries on toplevel map / destroy.
     pub(crate) layout: layout::Layout,
+    /// Tracks `xdg_popup` parent→child trees (smithay owns the
+    /// per-surface `PopupTree`; this manager holds the bookkeeping +
+    /// the `cleanup` entry point). The vblank handler reads it each
+    /// frame via `PopupManager::popups_for_surface` to render menus /
+    /// submenus on top of their parent window.
+    pub(crate) popup_manager: smithay::desktop::PopupManager,
     /// Active interactive drag (Super + LMB to move, Super + RMB
     /// to resize). `Some` only between the initiating press and
     /// the matching release; during that window, pointer motion
@@ -401,11 +407,12 @@ impl State {
 
         // Snapshot the hit surface + its top-left into owned values
         // so the layout borrow ends before the mut-borrow on self
-        // (via kbd.set_focus / pointer.motion). Layer surfaces
-        // (rofi, panels, OSDs) are hit-tested first so the pointer
-        // reaches them when the cursor is over them; otherwise we
-        // fall through to the tile / floating layout as before.
-        let hit = self
+        // (via kbd.set_focus / pointer.motion). A popup under the
+        // cursor wins the *pointer* (menus draw on top of everything),
+        // then layer surfaces (rofi, panels, OSDs), then the tile /
+        // floating layout.
+        let popup_hit = self.popup_at(cursor_i);
+        let surface_hit = self
             .layer_at(cursor_i)
             .map(|(surface, rect)| {
                 (
@@ -424,7 +431,11 @@ impl State {
                     )
                 })
             });
-        let kbd_target = hit.as_ref().map(|(surface, _)| surface.clone());
+        // Keyboard focus follows windows / layers only — never popups.
+        // We don't run a popup grab yet, and a menu shouldn't pull
+        // keyboard focus off its parent toplevel.
+        let kbd_target = surface_hit.as_ref().map(|(surface, _)| surface.clone());
+        let hit = popup_hit.or(surface_hit);
 
         // Hover focus model: pull keyboard focus to the surface
         // under the cursor — *unless* an exclusive-keyboard layer
@@ -498,6 +509,22 @@ impl State {
                 }
             }
             return;
+        }
+
+        // Dismiss-on-click-outside: a press that lands outside every
+        // open popup closes the whole menu chain (pragmatic stand-in
+        // for a real popup grab). The press still forwards below to
+        // whatever's under the cursor, so the click also lands.
+        if matches!(state, smithay::backend::input::ButtonState::Pressed) {
+            let (cx, cy) = self.renderer.cursor_pos();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+            )]
+            let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+            if self.popup_at(cursor_i).is_none() {
+                self.dismiss_all_popups();
+            }
         }
 
         // Drag start: Super + (LMB or RMB) press on a window.
@@ -581,18 +608,23 @@ impl State {
                 reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
             )]
             let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
-            // Prefer a layer surface under the cursor (rofi / OSDs)
-            // over a tile so click-to-focus on a panel works without
-            // a separate path.
-            let target = self.layer_at(cursor_i).map(|(s, _)| s).or_else(|| {
-                self.layout
-                    .window_at(cursor_i)
-                    .map(|w| w.toplevel.wl_surface().clone())
-            });
-            if let Some(kbd) = self.seat.get_keyboard()
-                && kbd.current_focus() != target
-            {
-                kbd.set_focus(self, target, SERIAL_COUNTER.next_serial());
+            // Clicking inside a popup must not re-home keyboard focus
+            // to the window/layer beneath it — leave focus on the
+            // popup's parent.
+            if self.popup_at(cursor_i).is_none() {
+                // Prefer a layer surface under the cursor (rofi / OSDs)
+                // over a tile so click-to-focus on a panel works without
+                // a separate path.
+                let target = self.layer_at(cursor_i).map(|(s, _)| s).or_else(|| {
+                    self.layout
+                        .window_at(cursor_i)
+                        .map(|w| w.toplevel.wl_surface().clone())
+                });
+                if let Some(kbd) = self.seat.get_keyboard()
+                    && kbd.current_focus() != target
+                {
+                    kbd.set_focus(self, target, SERIAL_COUNTER.next_serial());
+                }
             }
         }
 
@@ -816,6 +848,203 @@ impl State {
             });
         }
         out
+    }
+
+    /// Snapshot every live `xdg_popup` (menus, submenus, combo
+    /// dropdowns) to draw this frame. xdg-shell positions a popup
+    /// relative to its parent's *window geometry*: for a
+    /// toplevel/floating window we paint the surface buffer (0,0) at
+    /// `cell_rect.loc + border_width` after folding out the client's
+    /// own geometry offset, so the parent's window-geometry origin is
+    /// exactly `cell_rect.loc + border_width`; for a layer surface it
+    /// is the surface rect origin.
+    ///
+    /// `PopupManager::popups_for_surface(root)` yields each popup in
+    /// the tree with its cumulative location relative to that origin,
+    /// so the popup's window-geometry top-left is `origin + location`
+    /// and its buffer (0,0) is that minus the popup's own geometry
+    /// offset. Each popup is then clamped fully inside its parent's
+    /// output (slide, never resize) so a menu opened near an edge — or
+    /// a client requesting an off-screen / negative position — stays
+    /// visible and as close to its intended spot as the output allows.
+    pub(crate) fn snapshot_popup_placements(
+        &self,
+        placements: &[layout::Placement],
+        layers: &[render::LayerPlacement],
+    ) -> Vec<render::PopupPlacement> {
+        use smithay::desktop::{PopupKind, PopupManager};
+        use smithay::utils::{Physical, Point, Rectangle};
+
+        // A popup parent: its root surface, window-geometry origin
+        // (raw i32 so the Logical-tagged popup offsets from smithay
+        // compose with our Physical-tagged compositor coords without a
+        // unit cast), and the output to clamp its popups into.
+        struct Parent {
+            root: WlSurface,
+            gx: i32,
+            gy: i32,
+            clamp: Option<Rectangle<i32, Physical>>,
+        }
+
+        let bw = self.layout.border_width();
+        let outputs = self.renderer.output_rects();
+        // Output rect containing `(x, y)`; falls back to the first
+        // output so a popup whose anchor sits in an inter-output gap is
+        // never dropped entirely.
+        let output_for = |x: i32, y: i32| -> Option<Rectangle<i32, Physical>> {
+            outputs
+                .iter()
+                .find(|(_, r)| {
+                    x >= r.loc.x && x < r.loc.x + r.size.w && y >= r.loc.y && y < r.loc.y + r.size.h
+                })
+                .or_else(|| outputs.first())
+                .map(|(_, r)| *r)
+        };
+
+        let mut parents: Vec<Parent> = Vec::new();
+        for p in placements {
+            let (gx, gy) = (p.cell_rect.loc.x + bw, p.cell_rect.loc.y + bw);
+            parents.push(Parent {
+                root: p.surface.clone(),
+                gx,
+                gy,
+                clamp: output_for(gx, gy),
+            });
+        }
+        for l in layers {
+            let (gx, gy) = (l.rect.loc.x, l.rect.loc.y);
+            parents.push(Parent {
+                root: l.surface.clone(),
+                gx,
+                gy,
+                clamp: output_for(gx, gy),
+            });
+        }
+
+        let mut out = Vec::new();
+        for Parent {
+            root,
+            gx,
+            gy,
+            clamp,
+        } in &parents
+        {
+            for (popup, location) in PopupManager::popups_for_surface(root) {
+                let PopupKind::Xdg(_) = popup else { continue };
+                let surface = popup.wl_surface().clone();
+                let pgeo = popup.geometry();
+                // The popup's window-geometry rect within its buffer
+                // (loc = buffer→visible offset, size = visible extent).
+                // XWayland (xwayland-satellite) menus never call
+                // set_window_geometry, so popup.geometry() is a zero
+                // rect there; fall back to the actual committed surface
+                // extent (loc AND size, per xdg-shell: an unset window
+                // geometry is the full surface bounds). Without this the
+                // hit rect is empty and clicks fall *through* the menu
+                // (it just dismisses instead of activating the item).
+                let (geo_loc, geo_size) = if pgeo.size.w > 0 && pgeo.size.h > 0 {
+                    (pgeo.loc, pgeo.size)
+                } else {
+                    let bbox = smithay::desktop::utils::bbox_from_surface_tree(&surface, (0, 0));
+                    (bbox.loc, bbox.size)
+                };
+                // Window-geometry top-left of the popup (the rect we
+                // keep on-screen).
+                let mut left = gx + location.x;
+                let mut top = gy + location.y;
+                let (w, h) = (geo_size.w, geo_size.h);
+                if let Some(o) = clamp {
+                    // Slide back on-screen; if the popup is larger than
+                    // the output on an axis, the final `.max` pins the
+                    // near (top/left) edge so the anchor stays visible.
+                    if left + w > o.loc.x + o.size.w {
+                        left = o.loc.x + o.size.w - w;
+                    }
+                    if top + h > o.loc.y + o.size.h {
+                        top = o.loc.y + o.size.h - h;
+                    }
+                    left = left.max(o.loc.x);
+                    top = top.max(o.loc.y);
+                }
+                out.push(render::PopupPlacement {
+                    surface,
+                    // Buffer (0,0) = clamped window-geometry top-left
+                    // minus the geometry offset within the buffer.
+                    buffer_origin: Point::new(left - geo_loc.x, top - geo_loc.y),
+                    rect: Rectangle::new(Point::new(left, top), smithay::utils::Size::new(w, h)),
+                });
+            }
+        }
+        out
+    }
+
+    /// Topmost popup whose visible rect contains `pos`, paired with
+    /// the logical point where that popup's surface buffer (0,0)
+    /// sits, so the pointer path can forward motion / clicks into the
+    /// popup's subsurface tree. Popups are hit-tested before layers
+    /// and windows because they draw on top of both; iterating the
+    /// snapshot in reverse yields nested submenus (pushed last) before
+    /// their parents.
+    pub(crate) fn popup_at(
+        &self,
+        pos: smithay::utils::Point<i32, smithay::utils::Physical>,
+    ) -> Option<(
+        WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )> {
+        let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        let placements = self.layout.placements(focused.as_ref());
+        let layers = self.snapshot_layer_placements();
+        let popups = self.snapshot_popup_placements(&placements, &layers);
+        popups.iter().rev().find_map(|pp| {
+            let r = pp.rect;
+            let inside = r.size.w > 0
+                && r.size.h > 0
+                && pos.x >= r.loc.x
+                && pos.x < r.loc.x + r.size.w
+                && pos.y >= r.loc.y
+                && pos.y < r.loc.y + r.size.h;
+            inside.then(|| {
+                (
+                    pp.surface.clone(),
+                    smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                        f64::from(pp.buffer_origin.x),
+                        f64::from(pp.buffer_origin.y),
+                    )),
+                )
+            })
+        })
+    }
+
+    /// Send `xdg_popup.popup_done` to every open popup (deepest child
+    /// first, via `dismiss_popup`'s recursion) so a click outside any
+    /// menu closes the whole chain. This is the pragmatic
+    /// dismiss-on-click-outside path — we don't run a real popup grab
+    /// yet. Errors (already-dead popups) are ignored.
+    fn dismiss_all_popups(&mut self) {
+        use smithay::desktop::PopupManager;
+        let mut roots: Vec<WlSurface> = self
+            .layout
+            .placements(None)
+            .into_iter()
+            .map(|p| p.surface)
+            .collect();
+        roots.extend(
+            self.layer_shell_state
+                .layer_surfaces()
+                .map(|l| l.wl_surface().clone()),
+        );
+        // Collect (root, popup) pairs before dismissing so we aren't
+        // walking each tree while `dismiss_popup` mutates it.
+        let mut pairs = Vec::new();
+        for root in &roots {
+            for (popup, _) in PopupManager::popups_for_surface(root) {
+                pairs.push((root.clone(), popup));
+            }
+        }
+        for (root, popup) in pairs {
+            let _ = PopupManager::dismiss_popup(&root, &popup);
+        }
     }
 
     /// Walk the layer-surface list in top-down z-order (`Overlay`
@@ -1406,6 +1635,7 @@ fn main() -> Result<()> {
         dmabuf_global: wayland_init.dmabuf_global,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
+        popup_manager: wayland_init.popup_manager,
         kbd_focus_before_layer: None,
         layout,
         drag: None,
@@ -1679,11 +1909,15 @@ fn wire_event_sources(
                         .and_then(|k| k.current_focus());
                     let placements = data.state.layout.placements(focused.as_ref());
                     let layer_placements = data.state.snapshot_layer_placements();
-                    if let Err(err) =
-                        data.state
-                            .renderer
-                            .render_for_crtc(crtc, &placements, &layer_placements)
-                    {
+                    let popup_placements = data
+                        .state
+                        .snapshot_popup_placements(&placements, &layer_placements);
+                    if let Err(err) = data.state.renderer.render_for_crtc(
+                        crtc,
+                        &placements,
+                        &layer_placements,
+                        &popup_placements,
+                    ) {
                         // Don't kill the event loop on a render hiccup —
                         // log and let the next vblank try again. A
                         // persistent failure on one CRTC freezes that

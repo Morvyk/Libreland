@@ -44,6 +44,7 @@ use smithay::utils::{SERIAL_COUNTER, Serial, Transform};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Format};
 use smithay::backend::drm::DrmNode;
+use smithay::desktop::{PopupKind, PopupManager};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, with_states,
@@ -139,6 +140,8 @@ pub struct WaylandInit {
     /// stays alive (dropping it removes the global).
     pub viewporter_state: ViewporterState,
     pub layer_shell_state: WlrLayerShellState,
+    /// Tracks `xdg_popup` parent→child trees (menus / submenus).
+    pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
     /// physical mode + configured scale and is advertised to
     /// clients as a `wl_output` global so they can pick a target
@@ -223,6 +226,10 @@ pub fn init(
     // depending on their `Layer`, and honour their exclusive
     // zones by shrinking the layout's bounds.
     let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
+    // xdg_popup tracking (menus / submenus). No global of its own —
+    // popups arrive through xdg_wm_base; this just bookkeeps the
+    // parent→child trees so we can position + render them.
+    let popup_manager = PopupManager::default();
 
     // One smithay `Output` per DRM connector. Each becomes a
     // `wl_output` global the client can bind to learn the mode
@@ -305,6 +312,7 @@ pub fn init(
         dmabuf_global,
         viewporter_state,
         layer_shell_state,
+        popup_manager,
         outputs,
         preferred_scale,
     })
@@ -370,6 +378,11 @@ impl CompositorHandler for State {
         // everything right.
         on_commit_buffer_handler::<State>(surface);
         maybe_handle_layer_commit(self, surface);
+        // Promote a freshly-mapped popup into its parent's tree (and
+        // let smithay send its initial configure if needed), then reap
+        // popups whose surfaces died so they stop being rendered.
+        self.popup_manager.commit(surface);
+        self.popup_manager.cleanup();
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
@@ -486,25 +499,53 @@ impl XdgShellHandler for State {
         }
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         info!(surface = ?surface.wl_surface().id(), "wayland: new xdg_popup");
+        // Stamp the positioner-computed geometry into pending state
+        // before the first configure so the popup reports the right
+        // size/anchor; then track it so it joins its parent's tree
+        // (and so the renderer can find + place it).
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        if let Err(err) = self
+            .popup_manager
+            .track_popup(PopupKind::Xdg(surface.clone()))
+        {
+            warn!(?err, "track_popup failed (dead popup surface)");
+            return;
+        }
         if let Err(err) = surface.send_configure() {
             warn!(?err, "xdg_popup send_configure failed");
         }
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // Popup grabs require pointer-focus plumbing; 4c.
+        // A real seat grab needs `SeatHandler::KeyboardFocus: From<PopupKind>`
+        // (ours is `WlSurface`), so smithay's PopupGrab can't be used
+        // without a focus-type refactor. Dismiss-on-click-outside is
+        // handled pragmatically in `forward_pointer_button` instead;
+        // keyboard menu navigation is deferred.
     }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
-        // Repositioning needs the same window-management machinery
-        // we don't have until 4d.
+        // Recompute geometry from the new positioner and tell the
+        // client (send_repositioned must precede the configure so it
+        // can correlate the new geometry with its token).
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+        if let Err(err) = surface.send_configure() {
+            warn!(?err, "xdg_popup reposition send_configure failed");
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
