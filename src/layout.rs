@@ -61,6 +61,22 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use tracing::debug;
 
+/// How a window fills its output. `Maximized` and `Fullscreen` both
+/// cover the window's whole output with no border or rounded corners
+/// and draw on top of normal windows; the state lives on the `Window`
+/// so it travels when the window is moved between workspaces (a
+/// maximized/fullscreen window stays that way). The two differ only
+/// in the `xdg_toplevel` state flag we send (clients render
+/// differently) and in z-order: a fullscreen window draws above
+/// layer-shell panels too, a maximized one stays below them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillMode {
+    #[default]
+    Normal,
+    Maximized,
+    Fullscreen,
+}
+
 /// One window managed by the layout, plus its current placement.
 /// The `rect` is the cell the layout has assigned (refreshed by
 /// every reflow) — clients see the same size via
@@ -69,6 +85,10 @@ use tracing::debug;
 pub struct Window {
     pub toplevel: ToplevelSurface,
     pub rect: Rectangle<i32, Physical>,
+    /// Maximized/fullscreen override: when set, the window fills its
+    /// output (ignoring `rect`), drops its border/corners, and draws
+    /// on top. Travels with the window across workspaces.
+    pub fill: FillMode,
 }
 
 /// Origin of an in-flight interactive move. Decides what happens
@@ -124,21 +144,57 @@ impl Workspace {
 /// absolute rect falls on.
 struct Outpane {
     name: String,
+    /// Entire physical output rect. Fullscreen windows fill this so
+    /// they cover layer-shell panels.
+    full: Rectangle<i32, Physical>,
+    /// Usable work area — `full` minus any layer-shell exclusive zones
+    /// (panels). Tiling lays out inside this and maximized windows
+    /// fill it, so a panel stays visible.
     bounds: Rectangle<i32, Physical>,
     workspaces: Vec<Workspace>,
     active: usize,
+}
+
+/// The two rects a fill mode can target: `full` (entire output, for
+/// fullscreen) and `work` (output minus exclusive zones, for maximized
+/// + tiling). Bundled so the configure helpers can resolve per-window.
+#[derive(Clone, Copy)]
+struct OutputArea {
+    full: Rectangle<i32, Physical>,
+    work: Rectangle<i32, Physical>,
+}
+
+impl OutputArea {
+    /// The rect a window with the given fill mode should occupy.
+    /// `Normal` callers never use the result (they keep their cell).
+    fn fill(self, mode: FillMode) -> Rectangle<i32, Physical> {
+        match mode {
+            FillMode::Fullscreen => self.full,
+            FillMode::Maximized | FillMode::Normal => self.work,
+        }
+    }
 }
 
 impl Outpane {
     fn new(name: String, bounds: Rectangle<i32, Physical>) -> Self {
         Self {
             name,
+            // A fresh output has no panels, so the work area is the
+            // full output until an exclusive zone shrinks `bounds`.
+            full: bounds,
             bounds,
             // A fresh output is one empty workspace; index 0 doubles
             // as the active and the trailing-empty slot until a
             // window lands on it.
             workspaces: vec![Workspace::default()],
             active: 0,
+        }
+    }
+
+    fn area(&self) -> OutputArea {
+        OutputArea {
+            full: self.full,
+            work: self.bounds,
         }
     }
 }
@@ -166,6 +222,10 @@ pub struct Placement {
     pub surface: WlSurface,
     pub cell_rect: Rectangle<i32, Physical>,
     pub focused: bool,
+    /// Fill mode — the renderer suppresses the border/rounded corners
+    /// for non-`Normal` placements and draws them in a higher z-bucket
+    /// (maximized above windows, fullscreen above panels too).
+    pub fill: FillMode,
 }
 
 /// Gap configuration. `outer` is empty space between the tile
@@ -275,6 +335,7 @@ impl Layout {
         let window = Window {
             toplevel,
             rect: tile_bounds,
+            fill: FillMode::Normal,
         };
         let leaf = Node::Leaf(window);
         // Lands on the visible (active) workspace of that output.
@@ -344,6 +405,7 @@ impl Layout {
         //
         // Tile -> float: scan each output's ACTIVE workspace tree.
         for oi in 0..self.outputs.len() {
+            let area = self.outputs[oi].area();
             let ws = self.active_ws_mut(oi);
             if let Some(root) = ws.tree.take() {
                 let (root_after, removed) = remove_from_tree(root, surface);
@@ -357,7 +419,7 @@ impl Layout {
                         prev.loc.y + (prev.size.h - new_size.h) / 2,
                     );
                     window.rect = Rectangle::new(new_loc, new_size);
-                    push_configure_for_floating(&window, self.border_width);
+                    push_configure_for_floating(&window, self.border_width, area);
                     self.active_ws_mut(oi).floating.push(window);
                     self.recompute_and_push();
                     return;
@@ -404,6 +466,12 @@ impl Layout {
         if self.in_transit.is_some() {
             return None;
         }
+        // A maximized/fullscreen window owns its whole output; moving
+        // it is meaningless (and would desync its filled configure), so
+        // refuse the drag — the user unmaximizes first.
+        if self.is_filled(surface) {
+            return None;
+        }
         // Only a visible window can be dragged, so scan active
         // workspaces only. We don't normalize the emptied source
         // workspace here (the drag may abort back); finish_move_drag
@@ -448,6 +516,10 @@ impl Layout {
     /// the caller can log + swallow the press. Returns the rect
     /// to use as the drag's start rect, or `None`.
     pub fn start_resize_drag(&self, surface: &WlSurface) -> Option<Rectangle<i32, Physical>> {
+        // Can't drag-resize a window that's pinned to fill its output.
+        if self.is_filled(surface) {
+            return None;
+        }
         self.outputs.iter().find_map(|op| {
             op.workspaces[op.active]
                 .floating
@@ -461,13 +533,27 @@ impl Layout {
     /// and ship the corresponding configure. Silent no-op when
     /// nothing is in transit.
     pub fn update_in_transit_rect(&mut self, rect: Rectangle<i32, Physical>) {
+        // Drag-start refuses filled windows, so the in-transit window
+        // is always Normal here and the area goes unused by the
+        // floating configure; resolve it from the source output anyway.
+        let area = self
+            .in_transit
+            .as_ref()
+            .and_then(|t| self.outputs.get(t.source_output))
+            .map_or_else(
+                || OutputArea {
+                    full: Rectangle::default(),
+                    work: Rectangle::default(),
+                },
+                Outpane::area,
+            );
         if let Some(t) = &mut self.in_transit {
             t.window.rect = rect;
             // An in-transit window is conceptually floating until
             // it either drops onto a tile cell or rejoins the
             // float stack, so configure it as such (no Tiled*
             // states, free-form resize).
-            push_configure_for_floating(&t.window, self.border_width);
+            push_configure_for_floating(&t.window, self.border_width, area);
         }
     }
 
@@ -478,13 +564,14 @@ impl Layout {
         let border = self.border_width;
         for op in &mut self.outputs {
             let active = op.active;
+            let area = op.area();
             if let Some(window) = op.workspaces[active]
                 .floating
                 .iter_mut()
                 .find(|w| w.toplevel.wl_surface() == surface)
             {
                 window.rect = rect;
-                push_configure_for_floating(window, border);
+                push_configure_for_floating(window, border, area);
                 return;
             }
         }
@@ -516,8 +603,17 @@ impl Layout {
             .or_else(|| self.outpane_at(center))
             .or_else(|| (!self.outputs.is_empty()).then_some(0))
         else {
-            // No outputs at all: nowhere visible to home it.
-            push_configure_for_floating(&t.window, self.border_width);
+            // No outputs at all: nowhere visible to home it. The
+            // in-transit window is always Normal (drag-start refuses
+            // filled windows), so the area here goes unused.
+            push_configure_for_floating(
+                &t.window,
+                self.border_width,
+                OutputArea {
+                    full: Rectangle::default(),
+                    work: Rectangle::default(),
+                },
+            );
             return;
         };
         match t.source {
@@ -536,7 +632,7 @@ impl Layout {
                 });
             }
             DragSource::Floating => {
-                push_configure_for_floating(&t.window, self.border_width);
+                push_configure_for_floating(&t.window, self.border_width, self.outputs[idx].area());
                 self.active_ws_mut(idx).floating.push(t.window);
             }
         }
@@ -568,16 +664,25 @@ impl Layout {
         let mut out = Vec::new();
         // Only the active workspace of each output is visible.
         for op in &self.outputs {
+            let area = op.area();
             let ws = &op.workspaces[op.active];
             if let Some(tree) = &ws.tree {
-                collect_placements(tree, &is_focused, &mut out);
+                collect_placements(tree, &is_focused, area, &mut out);
             }
             for w in &ws.floating {
                 let surface = w.toplevel.wl_surface();
                 out.push(Placement {
                     surface: surface.clone(),
-                    cell_rect: w.rect,
+                    // A maximized float covers the work area, a
+                    // fullscreen one the whole output; both ignore the
+                    // floating rect.
+                    cell_rect: if w.fill == FillMode::Normal {
+                        w.rect
+                    } else {
+                        area.fill(w.fill)
+                    },
                     focused: is_focused(surface),
+                    fill: w.fill,
                 });
             }
         }
@@ -587,29 +692,64 @@ impl Layout {
                 surface: surface.clone(),
                 cell_rect: t.window.rect,
                 focused: is_focused(surface),
+                fill: t.window.fill,
             });
         }
         out
     }
 
-    /// Hit-test the topmost window at `pos`. Floating windows win
-    /// over tiled (they're on top), and within floating the
-    /// top-of-stack (last-clicked / last-floated) wins. The
-    /// in-transit window is intentionally skipped — it tracks
-    /// the cursor by construction, so reporting it as "under the
-    /// cursor" would just defeat focus changes for the duration
-    /// of the drag.
-    pub fn window_at(&self, pos: Point<i32, Physical>) -> Option<&Window> {
+    /// Hit-test the topmost window at `pos`, returning it together
+    /// with its *effective* on-screen rect (the full output for a
+    /// maximized/fullscreen window, otherwise its cell). The rect is
+    /// what the caller uses as the surface origin for pointer events.
+    ///
+    /// A maximized/fullscreen window covers its whole output and draws
+    /// on top, so it captures the pointer anywhere on that output
+    /// (fullscreen beats maximized; later-drawn beats earlier). Below
+    /// that, floating windows win over tiled, and within floating the
+    /// top-of-stack (last-clicked / last-floated) wins. The in-transit
+    /// window is intentionally skipped — it tracks the cursor by
+    /// construction, so reporting it as "under the cursor" would just
+    /// defeat focus changes for the duration of the drag.
+    pub fn window_at(
+        &self,
+        pos: Point<i32, Physical>,
+    ) -> Option<(&Window, Rectangle<i32, Physical>)> {
         // Hit-test only the active workspace of the output `pos` falls
         // in — windows on other workspaces aren't visible/clickable.
         let i = self.outpane_at(pos)?;
+        let area = self.outputs[i].area();
         let ws = self.active_ws(i);
+
+        // Filled windows first. Collect in draw order (tree leaves,
+        // then floating) and pick the topmost fullscreen, else the
+        // topmost maximized — `rfind` within a tier is the one drawn
+        // on top. The effective rect must match what the renderer
+        // draws (`area.fill`): the full output for fullscreen, the work
+        // area for maximized — otherwise the surface origin handed to
+        // the pointer is offset by any panel's exclusive zone.
+        let mut filled: Vec<&Window> = Vec::new();
+        if let Some(tree) = &ws.tree {
+            collect_filled(tree, &mut filled);
+        }
+        filled.extend(ws.floating.iter().filter(|w| w.fill != FillMode::Normal));
+        if let Some(w) = filled
+            .iter()
+            .rfind(|w| w.fill == FillMode::Fullscreen)
+            .or_else(|| filled.iter().rfind(|w| w.fill == FillMode::Maximized))
+        {
+            return Some((w, area.fill(w.fill)));
+        }
+
         for w in ws.floating.iter().rev() {
             if rect_contains(w.rect, pos) {
-                return Some(w);
+                return Some((w, w.rect));
             }
         }
-        ws.tree.as_ref().and_then(|t| leaf_at(t, pos))
+        ws.tree
+            .as_ref()
+            .and_then(|t| leaf_at(t, pos))
+            .map(|w| (w, w.rect))
     }
 
     fn recompute_and_push(&mut self) {
@@ -628,31 +768,39 @@ impl Layout {
             }
         }
         for op in &self.outputs {
+            let area = op.area();
             for ws in &op.workspaces {
                 if let Some(tree) = &ws.tree {
-                    push_configures_tree(tree, border);
+                    push_configures_tree(tree, border, area);
                 }
                 for w in &ws.floating {
-                    push_configure_for_floating(w, border);
+                    push_configure_for_floating(w, border, area);
                 }
             }
         }
     }
 
-    /// Update the rectangle a specific output's tiles lay out inside,
-    /// then reflow. Called when an output's usable area changes — e.g.
-    /// a `wlr_layer_shell` panel reserves an exclusive zone, shrinking
-    /// the tile area to avoid it. The output is keyed by connector
-    /// name; an unknown name is a silent no-op so the renderer's and
-    /// layout's output sets can drift without panicking.
-    pub fn set_output_bounds(&mut self, name: &str, new_bounds: Rectangle<i32, Physical>) {
+    /// Update an output's full rect and usable work area, then reflow.
+    /// Called when the geometry changes — e.g. a `wlr_layer_shell`
+    /// panel reserves an exclusive zone, shrinking `work_area` below
+    /// `full` (tiling + maximized avoid the panel; fullscreen still
+    /// covers `full`). The output is keyed by connector name; an
+    /// unknown name is a silent no-op so the renderer's and layout's
+    /// output sets can drift without panicking.
+    pub fn set_output_bounds(
+        &mut self,
+        name: &str,
+        full: Rectangle<i32, Physical>,
+        work_area: Rectangle<i32, Physical>,
+    ) {
         let Some(op) = self.outputs.iter_mut().find(|o| o.name == name) else {
             return;
         };
-        if op.bounds == new_bounds {
+        if op.full == full && op.bounds == work_area {
             return;
         }
-        op.bounds = new_bounds;
+        op.full = full;
+        op.bounds = work_area;
         self.recompute_and_push();
     }
 
@@ -672,6 +820,86 @@ impl Layout {
     /// relative to) is `cell_rect.loc + border_width`.
     pub fn border_width(&self) -> i32 {
         self.border_width
+    }
+
+    /// Set a window's fill mode (normal / maximized / fullscreen) and
+    /// reflow so it picks up its new size, border state, and z-order.
+    /// The state lives on the `Window`, so it survives moves between
+    /// workspaces. Returns whether `surface` was found. Always reflows
+    /// (even for a redundant request) so the client gets the
+    /// configure xdg-shell expects in response.
+    pub fn set_fill(&mut self, surface: &WlSurface, fill: FillMode) -> bool {
+        let Some(w) = self.window_mut(surface) else {
+            return false;
+        };
+        w.fill = fill;
+        self.recompute_and_push();
+        true
+    }
+
+    /// Whether `surface` is a tracked window that's maximized or
+    /// fullscreen (used to refuse interactive move/resize on it).
+    fn is_filled(&self, surface: &WlSurface) -> bool {
+        self.window_ref(surface)
+            .is_some_and(|w| w.fill != FillMode::Normal)
+    }
+
+    /// Find a window by surface anywhere it can live (any output's any
+    /// workspace tree or floating stack, or the in-transit drag).
+    fn window_ref(&self, surface: &WlSurface) -> Option<&Window> {
+        if let Some(t) = &self.in_transit
+            && t.window.toplevel.wl_surface() == surface
+        {
+            return Some(&t.window);
+        }
+        for op in &self.outputs {
+            for ws in &op.workspaces {
+                if let Some(w) = ws
+                    .floating
+                    .iter()
+                    .find(|w| w.toplevel.wl_surface() == surface)
+                {
+                    return Some(w);
+                }
+                if let Some(t) = &ws.tree
+                    && let Some(w) = leaf_ref(t, surface)
+                {
+                    return Some(w);
+                }
+            }
+        }
+        None
+    }
+
+    /// Mutable [`Self::window_ref`]. In-transit is checked first so the
+    /// loops are the function tail — the borrow checker rejects
+    /// reborrowing `self` after a loop that conditionally returns a
+    /// `&mut` from inside it.
+    fn window_mut(&mut self, surface: &WlSurface) -> Option<&mut Window> {
+        if self
+            .in_transit
+            .as_ref()
+            .is_some_and(|t| t.window.toplevel.wl_surface() == surface)
+        {
+            return Some(&mut self.in_transit.as_mut().expect("checked Some above").window);
+        }
+        for op in &mut self.outputs {
+            for ws in &mut op.workspaces {
+                if let Some(w) = ws
+                    .floating
+                    .iter_mut()
+                    .find(|w| w.toplevel.wl_surface() == surface)
+                {
+                    return Some(w);
+                }
+                if let Some(t) = ws.tree.as_mut()
+                    && let Some(w) = leaf_mut(t, surface)
+                {
+                    return Some(w);
+                }
+            }
+        }
+        None
     }
 
     /// Switch the active workspace on the output under `cursor` by
@@ -1029,10 +1257,13 @@ fn assign_rects(node: &mut Node, bounds: Rectangle<i32, Physical>, inner: i32) {
     }
 }
 
-/// Walk the tree and emit a `Placement` for every leaf.
+/// Walk the tree and emit a `Placement` for every leaf. A maximized
+/// or fullscreen leaf reports `output_bounds` as its cell so it covers
+/// the whole output instead of its tiled slot.
 fn collect_placements(
     node: &Node,
     is_focused: &impl Fn(&WlSurface) -> bool,
+    area: OutputArea,
     out: &mut Vec<Placement>,
 ) {
     match node {
@@ -1040,13 +1271,18 @@ fn collect_placements(
             let surface = w.toplevel.wl_surface();
             out.push(Placement {
                 surface: surface.clone(),
-                cell_rect: w.rect,
+                cell_rect: if w.fill == FillMode::Normal {
+                    w.rect
+                } else {
+                    area.fill(w.fill)
+                },
                 focused: is_focused(surface),
+                fill: w.fill,
             });
         }
         Node::Split { first, second, .. } => {
-            collect_placements(first, is_focused, out);
-            collect_placements(second, is_focused, out);
+            collect_placements(first, is_focused, area, out);
+            collect_placements(second, is_focused, area, out);
         }
     }
 }
@@ -1062,6 +1298,47 @@ fn leaf_at(node: &Node, pos: Point<i32, Physical>) -> Option<&Window> {
             }
         }
         Node::Split { first, second, .. } => leaf_at(first, pos).or_else(|| leaf_at(second, pos)),
+    }
+}
+
+/// Push every maximized/fullscreen leaf onto `out` in tree (draw)
+/// order — used by `window_at` to find the topmost filled window.
+fn collect_filled<'a>(node: &'a Node, out: &mut Vec<&'a Window>) {
+    match node {
+        Node::Leaf(w) => {
+            if w.fill != FillMode::Normal {
+                out.push(w);
+            }
+        }
+        Node::Split { first, second, .. } => {
+            collect_filled(first, out);
+            collect_filled(second, out);
+        }
+    }
+}
+
+/// Find the leaf whose window is `surface` (shared borrow).
+fn leaf_ref<'a>(node: &'a Node, surface: &WlSurface) -> Option<&'a Window> {
+    match node {
+        Node::Leaf(w) => (w.toplevel.wl_surface() == surface).then_some(w),
+        Node::Split { first, second, .. } => {
+            leaf_ref(first, surface).or_else(|| leaf_ref(second, surface))
+        }
+    }
+}
+
+/// Find the leaf whose window is `surface` (mutable borrow). `first`
+/// and `second` are disjoint fields, so the early-return-then-reborrow
+/// is accepted by the borrow checker.
+fn leaf_mut<'a>(node: &'a mut Node, surface: &WlSurface) -> Option<&'a mut Window> {
+    match node {
+        Node::Leaf(w) => (w.toplevel.wl_surface() == surface).then_some(w),
+        Node::Split { first, second, .. } => {
+            if let Some(w) = leaf_mut(first, surface) {
+                return Some(w);
+            }
+            leaf_mut(second, surface)
+        }
     }
 }
 
@@ -1081,14 +1358,53 @@ fn tree_contains(node: &Node, surface: &WlSurface) -> bool {
 /// Bottom}` so that clients (notably kitty) treat the cell as a
 /// hard size to fill, without leaving margins for their own
 /// resize handles or rounding to a font grid.
-fn push_configures_tree(node: &Node, border: i32) {
+fn push_configures_tree(node: &Node, border: i32, area: OutputArea) {
     match node {
-        Node::Leaf(w) => push_configure_for_tile(w, border),
+        Node::Leaf(w) => push_configure_for_tile(w, border, area),
         Node::Split { first, second, .. } => {
-            push_configures_tree(first, border);
-            push_configures_tree(second, border);
+            push_configures_tree(first, border, area);
+            push_configures_tree(second, border, area);
         }
     }
+}
+
+/// Configure a maximized/fullscreen window to fill `rect` (the work
+/// area for maximized, the full output for fullscreen — already
+/// resolved by the caller) with no border inset and no `Tiled*` flags
+/// (the client owns every edge), and set the matching `xdg_toplevel`
+/// state so the client drops its own decorations/shadow and sizes to
+/// the target. Shared by the tiled and floating paths — fill mode
+/// dominates either home.
+fn push_configure_filled(w: &Window, rect: Rectangle<i32, Physical>) {
+    let size = Size::<i32, Logical>::from((rect.size.w.max(1), rect.size.h.max(1)));
+    w.toplevel.with_pending_state(|state| {
+        state.size = Some(size);
+        state.states.set(xdg_toplevel::State::Activated);
+        state.states.unset(xdg_toplevel::State::TiledLeft);
+        state.states.unset(xdg_toplevel::State::TiledRight);
+        state.states.unset(xdg_toplevel::State::TiledTop);
+        state.states.unset(xdg_toplevel::State::TiledBottom);
+        match w.fill {
+            FillMode::Maximized => {
+                state.states.set(xdg_toplevel::State::Maximized);
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            }
+            FillMode::Fullscreen => {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+            // Caller only reaches here for non-Normal fills.
+            FillMode::Normal => {}
+        }
+    });
+    w.toplevel.send_configure();
+    debug!(
+        surface = ?w.toplevel.wl_surface().id(),
+        w = rect.size.w,
+        h = rect.size.h,
+        fill = ?w.fill,
+        "layout: fullscreen/maximized configure sent",
+    );
 }
 
 /// Shrink `cell_size` by `2 * border` on each axis (clamped to a
@@ -1109,7 +1425,11 @@ fn surface_size(cell_size: Size<i32, Physical>, border: i32) -> Size<i32, Logica
 /// client "the X edge is shared with the compositor / another
 /// window, so don't draw a resize handle or border on that side".
 /// A tiling WM cell is tiled on every side.
-fn push_configure_for_tile(w: &Window, border: i32) {
+fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
+    if w.fill != FillMode::Normal {
+        push_configure_filled(w, area.fill(w.fill));
+        return;
+    }
     let size = surface_size(w.rect.size, border);
     w.toplevel.with_pending_state(|state| {
         state.size = Some(size);
@@ -1118,6 +1438,9 @@ fn push_configure_for_tile(w: &Window, border: i32) {
         state.states.set(xdg_toplevel::State::TiledRight);
         state.states.set(xdg_toplevel::State::TiledTop);
         state.states.set(xdg_toplevel::State::TiledBottom);
+        // Clear any prior fill so unmaximize/unfullscreen → tile works.
+        state.states.unset(xdg_toplevel::State::Maximized);
+        state.states.unset(xdg_toplevel::State::Fullscreen);
     });
     w.toplevel.send_configure();
     debug!(
@@ -1135,7 +1458,11 @@ fn push_configure_for_tile(w: &Window, border: i32) {
 /// border size, clear the `Tiled*` flags so the client knows it
 /// can resize freely, but still set `Activated` so the focused
 /// float doesn't dim or hide its content.
-fn push_configure_for_floating(w: &Window, border: i32) {
+fn push_configure_for_floating(w: &Window, border: i32, area: OutputArea) {
+    if w.fill != FillMode::Normal {
+        push_configure_filled(w, area.fill(w.fill));
+        return;
+    }
     let size = surface_size(w.rect.size, border);
     w.toplevel.with_pending_state(|state| {
         state.size = Some(size);
@@ -1144,6 +1471,9 @@ fn push_configure_for_floating(w: &Window, border: i32) {
         state.states.unset(xdg_toplevel::State::TiledRight);
         state.states.unset(xdg_toplevel::State::TiledTop);
         state.states.unset(xdg_toplevel::State::TiledBottom);
+        // Clear any prior fill so unmaximize/unfullscreen → float works.
+        state.states.unset(xdg_toplevel::State::Maximized);
+        state.states.unset(xdg_toplevel::State::Fullscreen);
     });
     w.toplevel.send_configure();
     debug!(

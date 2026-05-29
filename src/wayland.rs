@@ -79,6 +79,7 @@ use tracing::{debug, info, warn};
 
 use crate::State;
 use crate::config::Config;
+use crate::layout::FillMode;
 use crate::render::OutputDescriptor;
 
 /// Per-client state attached to every Wayland client at
@@ -496,6 +497,45 @@ impl XdgShellHandler for State {
         let wl_surface = surface.wl_surface().clone();
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        info!(surface = ?surface.wl_surface().id(), "wayland: maximize request");
+        if !self
+            .layout
+            .set_fill(surface.wl_surface(), FillMode::Maximized)
+        {
+            // Untracked surface (shouldn't happen — insert runs at
+            // toplevel creation); still answer with a configure as the
+            // protocol requires.
+            surface.send_configure();
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        info!(surface = ?surface.wl_surface().id(), "wayland: unmaximize request");
+        if !self.layout.set_fill(surface.wl_surface(), FillMode::Normal) {
+            surface.send_configure();
+        }
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        info!(surface = ?surface.wl_surface().id(), "wayland: fullscreen request");
+        // We fullscreen on the output the window already lives on, so
+        // the requested `output` hint is ignored.
+        if !self
+            .layout
+            .set_fill(surface.wl_surface(), FillMode::Fullscreen)
+        {
+            surface.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        info!(surface = ?surface.wl_surface().id(), "wayland: unfullscreen request");
+        if !self.layout.set_fill(surface.wl_surface(), FillMode::Normal) {
+            surface.send_configure();
         }
     }
 

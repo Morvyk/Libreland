@@ -421,13 +421,12 @@ impl State {
                 )
             })
             .or_else(|| {
-                self.layout.window_at(cursor_i).map(|w| {
+                self.layout.window_at(cursor_i).map(|(w, rect)| {
                     (
                         w.toplevel.wl_surface().clone(),
-                        Point::<f64, Logical>::from((
-                            f64::from(w.rect.loc.x),
-                            f64::from(w.rect.loc.y),
-                        )),
+                        // Effective rect origin: the output origin for a
+                        // fullscreen/maximized window, else its cell.
+                        Point::<f64, Logical>::from((f64::from(rect.loc.x), f64::from(rect.loc.y))),
                     )
                 })
             });
@@ -552,7 +551,7 @@ impl State {
                 let hit_surface = self
                     .layout
                     .window_at(cursor_i)
-                    .map(|w| w.toplevel.wl_surface().clone());
+                    .map(|(w, _)| w.toplevel.wl_surface().clone());
                 if let Some(surface) = hit_surface {
                     // Focus the dragged window before the grab so
                     // releases-after-drag still find the right
@@ -618,7 +617,7 @@ impl State {
                 let target = self.layer_at(cursor_i).map(|(s, _)| s).or_else(|| {
                     self.layout
                         .window_at(cursor_i)
-                        .map(|w| w.toplevel.wl_surface().clone())
+                        .map(|(w, _)| w.toplevel.wl_surface().clone())
                 });
                 if let Some(kbd) = self.seat.get_keyboard()
                     && kbd.current_focus() != target
@@ -761,7 +760,7 @@ impl State {
         let new_focus = self
             .layout
             .window_at(cursor)
-            .map(|w| w.toplevel.wl_surface().clone());
+            .map(|(w, _)| w.toplevel.wl_surface().clone());
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, new_focus, SERIAL_COUNTER.next_serial());
         }
@@ -1174,7 +1173,10 @@ impl State {
             } else {
                 rect
             };
-            self.layout.set_output_bounds(&name, new_bounds);
+            // `rect` is the full output; `new_bounds` is the work area
+            // (full minus exclusive zones). Fullscreen fills the
+            // former, tiling/maximized the latter.
+            self.layout.set_output_bounds(&name, rect, new_bounds);
         }
     }
 

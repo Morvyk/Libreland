@@ -44,7 +44,7 @@ use tracing::{debug, info};
 
 use crate::config::{BorderConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
-use crate::layout::Placement;
+use crate::layout::{FillMode, Placement};
 
 /// A layer surface to render this frame. Pre-computed by main
 /// before calling `render_for_crtc` so the renderer doesn't need
@@ -771,14 +771,28 @@ impl Renderer {
                 // content (not the buffer's padded corner) lands at
                 // the cell origin; the shadow then falls outside the
                 // cell instead of pushing content down-right.
-                let (geo_x, geo_y) = window_geometry_offset(&p.surface);
+                // Maximized/fullscreen windows have no border and fill
+                // their output flush at the cell origin — no border
+                // inset and no CSD shadow offset. A spec-compliant
+                // client zeroes its window geometry on the transition;
+                // gating here also defends against one that doesn't.
+                let (geo_x, geo_y) = if p.fill == FillMode::Normal {
+                    window_geometry_offset(&p.surface)
+                } else {
+                    (0, 0)
+                };
+                let bw_p = if p.fill == FillMode::Normal {
+                    bw_comp
+                } else {
+                    0
+                };
                 let surface_local_phys = Point::<i32, Physical>::from((
                     scale_i(
-                        p.cell_rect.loc.x + bw_comp - compositor_position.x - geo_x,
+                        p.cell_rect.loc.x + bw_p - compositor_position.x - geo_x,
                         scale,
                     ),
                     scale_i(
-                        p.cell_rect.loc.y + bw_comp - compositor_position.y - geo_y,
+                        p.cell_rect.loc.y + bw_p - compositor_position.y - geo_y,
                         scale,
                     ),
                 ));
@@ -887,7 +901,13 @@ impl Renderer {
                 }
             }
             let radius_comp = border.rounded_corners.max(0);
-            for (p, elements) in placements.iter().zip(grouped.iter()) {
+            // Normal (tiled/floating) windows: surface, then the border
+            // ring + rounded-corner cutout painted over it.
+            for (p, elements) in placements
+                .iter()
+                .zip(grouped.iter())
+                .filter(|(p, _)| p.fill == FillMode::Normal)
+            {
                 let cell_local_phys = Rectangle::<i32, Physical>::new(
                     Point::new(
                         scale_i(p.cell_rect.loc.x - compositor_position.x, scale),
@@ -931,6 +951,24 @@ impl Renderer {
                 }
             }
 
+            // Maximized windows: borderless, no corners, drawn above
+            // normal windows but below Top/Overlay panels (which stay
+            // visible). Fullscreen windows are drawn later, above the
+            // panels too.
+            for (_p, elements) in placements
+                .iter()
+                .zip(grouped.iter())
+                .filter(|(p, _)| p.fill == FillMode::Maximized)
+            {
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    elements,
+                    &full_damage,
+                )
+                .context("draw_render_elements (maximized) failed")?;
+            }
+
             // Top + Overlay layer surfaces go above windows but
             // below the cursor, matching common compositor
             // behaviour (rofi above kitty, status bar above
@@ -945,6 +983,23 @@ impl Renderer {
                     )
                     .context("draw_render_elements (layer top/overlay) failed")?;
                 }
+            }
+
+            // Fullscreen windows: borderless and above everything,
+            // including Top/Overlay panels (a fullscreen game/video
+            // covers the bar), but still below popups and the cursor.
+            for (_p, elements) in placements
+                .iter()
+                .zip(grouped.iter())
+                .filter(|(p, _)| p.fill == FillMode::Fullscreen)
+            {
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    elements,
+                    &full_damage,
+                )
+                .context("draw_render_elements (fullscreen) failed")?;
             }
 
             // Popups draw above everything except the cursor — above
