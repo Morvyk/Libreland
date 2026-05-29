@@ -8,6 +8,15 @@ license = "MIT"
 description = "A Wayland compositor in pure Rust, configured in Lua."
 publish = false
 
+# The compositor is the workspace root; `output-picker` is a sibling
+# member — a tiny Wayland *client* (the screencast output chooser), kept
+# separate so it doesn't pull the compositor's server-side smithay deps.
+# Members share this manifest's profiles, lockfile, target dir, and the
+# lint policy below.
+[workspace]
+resolver = "3"
+members = ["output-picker"]
+
 [dependencies]
 anyhow = "1.0.102"
 mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
@@ -24,17 +33,22 @@ xcursor = "0.3.10"
 xdg = "3.0.0"
 xkbcommon = "0.8"
 
-# Unsafe code is forbidden by default. When unsafe is genuinely required,
+# Lint policy is defined once at the workspace level and pulled into every
+# member via `[lints] workspace = true`, so the compositor and the picker
+# share it. Unsafe code is forbidden by default; when genuinely required,
 # override at the smallest scope with
 #   #[allow(unsafe_code, reason = "…")]
 # alongside a `// SAFETY:` comment on the block itself.
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "deny"
 
 # clippy::all is treated as hard errors; clippy::pedantic as warnings we
 # are expected to fix at the source. Reach for #[allow(name, reason = "…")]
 # only when satisfying the lint is genuinely impossible or actively wrong.
-[lints.clippy]
+[workspace.lints.clippy]
 all      = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 

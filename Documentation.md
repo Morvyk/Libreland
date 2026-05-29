@@ -186,6 +186,22 @@ inherit them *and* the compositor reads them for its own pointer
 cursor, so `env = { XCURSOR_THEME = "Breeze_Light" }` themes both. The
 compositor reads the env once at startup, so a change needs a restart.
 
+**Session defaults.** Libreland sets these session-identity vars at
+startup so apps and the desktop portal know what they're in — you don't
+need to add them, and your `env` table overrides any of them:
+
+| Variable              | Default     |
+| --------------------- | ----------- |
+| `XDG_CURRENT_DESKTOP`  | `libreland` |
+| `XDG_SESSION_TYPE`     | `wayland`   |
+| `XDG_SESSION_DESKTOP`  | `libreland` |
+
+They're also pushed (with `WAYLAND_DISPLAY` / `DISPLAY`) into the D-Bus
++ systemd-user activation environment via
+`dbus-update-activation-environment`, so D-Bus-activated services like
+`xdg-desktop-portal` see them. (The XDG *base directories* and
+`XDG_RUNTIME_DIR` are left untouched — those are the system's to set.)
+
 ### startup
 
 | Field     | Default      | State | Notes                                                                          |
@@ -313,6 +329,7 @@ in `src/main.rs`.
 | --------------- | --------------------------------------------------- |
 | `Super+Shift+E` | Exit the compositor cleanly.                        |
 | `Super+F`       | Toggle floating mode on the focused window.         |
+| `Super+F11`     | Toggle fullscreen on the focused window.             |
 | `Super+C`       | Close the focused window (`xdg_toplevel.close`).    |
 | `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled; drop on another monitor to move it there). |
 | `Super+RMB`-drag | Interactively resize the window under the cursor from its bottom-right corner (auto-floats it if tiled). |
@@ -329,6 +346,50 @@ Letter key bindings match case-insensitively, and the hotkey path uses
 xkb-resolved keysyms, so it keeps working once a future DRM grab disables the
 kernel's Ctrl+C path. Until that grab exists, Ctrl+C on the host TTY also
 exits — but treat `Super+Shift+E` as the canonical exit.
+
+## Screen capture & desktop portals
+
+Libreland implements `zwlr_screencopy_v1`, so output capture works
+directly — e.g. `grim` (whole screen) or `grim -g "$(slurp)"` (region).
+
+For app-facing functionality — screen **sharing** (OBS, Discord,
+browsers), **file dialogs**, dark-mode/appearance **settings** — install
+`xdg-desktop-portal` plus the wlroots and a generic backend, and route
+them with a portals config:
+
+1. Install `xdg-desktop-portal`, `xdg-desktop-portal-wlr`, and
+   `xdg-desktop-portal-gtk` (or `-kde` to match `QT_QPA_PLATFORMTHEME`).
+2. Route the portal backends: copy
+   [`contrib/libreland-portals.conf`](contrib/libreland-portals.conf)
+   to `~/.config/xdg-desktop-portal/libreland-portals.conf`. That routes
+   `ScreenCast` + `Screenshot` to `xdg-desktop-portal-wlr` (which uses
+   Libreland's screencopy) and everything else to the generic backend.
+
+   Libreland already sets `XDG_CURRENT_DESKTOP=libreland` (see
+   [env defaults](#env)) and exports it to the D-Bus activation
+   environment, so this config is selected automatically — no manual
+   env needed.
+3. Pick which monitor to share via the portal's **output chooser**.
+   Libreland ships its own: `libreland-output-picker` (the `output-picker`
+   workspace member) — a `wlr-layer-shell` overlay that dims every monitor,
+   highlights + labels the one under the cursor, and prints its connector
+   name on click (Esc cancels). Install it and point xdpw at it:
+
+       cargo install --path output-picker     # -> ~/.cargo/bin/libreland-output-picker
+
+   then copy [`contrib/xdg-desktop-portal-wlr.config`](contrib/xdg-desktop-portal-wlr.config)
+   to `~/.config/xdg-desktop-portal-wlr/config` (its `chooser_cmd` is the
+   picker; use an absolute path if `~/.cargo/bin` isn't on the portal's
+   `PATH`). It replaces `slurp`, which crashes here: slurp 1.5.0 has an
+   unguarded NULL deref in its `wl_pointer.motion` handler (no released
+   fix). A text menu also works (`chooser_type=dmenu` + `chooser_cmd=fuzzel
+   --dmenu`) if you prefer picking a name from a list.
+
+`xdg-desktop-portal-wlr` drives screen sharing off the same screencopy
+implementation, so OBS / Discord / browser screen-share work once the
+above is in place. Global shortcuts (the `GlobalShortcuts` portal) are
+not yet provided — no off-the-shelf backend covers them for us, so they
+need a dedicated Libreland backend (planned).
 
 ## Running
 

@@ -1,0 +1,22 @@
+[package]
+name = "libreland-output-picker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["Morvyk <Morvyk@proton.me>"]
+license = "MIT"
+description = "Screencast output chooser for Libreland — a wlr-layer-shell overlay that prints the clicked output's name (xdg-desktop-portal-wlr simple chooser)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure-Rust Wayland client toolkit. Default features pull `calloop` (unused
+# here — we use a plain blocking dispatch loop) so we trim to just
+# `xkbcommon`, which KeyboardHandler/Keysym need to recognise Escape.
+smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
+wayland-client = "0.31.14"
+# Embedded public-domain 8x8 bitmap font (no system font / fontconfig /
+# cairo) for the per-monitor labels.
+font8x8 = "0.3.1"
