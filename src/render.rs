@@ -36,8 +36,9 @@ use smithay::reexports::drm::control::crtc;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::{
-    SurfaceAttributes, TraversalAction, with_surface_tree_downward,
+    SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
+use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::{debug, info};
 
 use crate::config::{BorderConfig, Fill, MonitorsConfig};
@@ -683,9 +684,23 @@ impl Renderer {
         let grouped: Vec<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> = placements
             .iter()
             .map(|p| {
+                // CSD clients pad their buffer with an invisible
+                // drop-shadow margin and report the real window rect
+                // via xdg_surface.set_window_geometry. Shift the
+                // buffer up-left by that margin so the *visible*
+                // content (not the buffer's padded corner) lands at
+                // the cell origin; the shadow then falls outside the
+                // cell instead of pushing content down-right.
+                let (geo_x, geo_y) = window_geometry_offset(&p.surface);
                 let surface_local_phys = Point::<i32, Physical>::from((
-                    scale_i(p.cell_rect.loc.x + bw_comp - compositor_position.x, scale),
-                    scale_i(p.cell_rect.loc.y + bw_comp - compositor_position.y, scale),
+                    scale_i(
+                        p.cell_rect.loc.x + bw_comp - compositor_position.x - geo_x,
+                        scale,
+                    ),
+                    scale_i(
+                        p.cell_rect.loc.y + bw_comp - compositor_position.y - geo_y,
+                        scale,
+                    ),
                 ));
                 render_elements_from_surface_tree(
                     &mut self.gles,
@@ -1082,6 +1097,24 @@ fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
 /// `cursor_size / nominal * scale` so it lands at the requested
 /// logical size in physical pixels no matter which image the theme
 /// supplied, with the hotspot offset scaled to match.
+/// Read a toplevel's `xdg_surface.set_window_geometry` origin, in
+/// compositor (logical) pixels. CSD clients set this to the top-left
+/// of their visible window inside a larger, shadow-padded buffer;
+/// returns `(0, 0)` when the client never set a geometry (e.g. SSD
+/// apps with no shadow). Returned as a raw `(i32, i32)` so the caller
+/// can fold it straight into the compositor-pixel position math
+/// without juggling the `Logical`/`Physical` unit tags.
+fn window_geometry_offset(surface: &WlSurface) -> (i32, i32) {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map_or((0, 0), |g| (g.loc.x, g.loc.y))
+    })
+}
+
 fn draw_cursor(
     frame: &mut GlesFrame<'_, '_>,
     sprite: Option<&CursorSprite>,
