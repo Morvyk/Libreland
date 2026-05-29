@@ -247,10 +247,12 @@ impl Default for Config {
                 focus_model: FocusModel::Hover,
             },
             binds: BindsConfig {
-                // Default bindings. Anything else the user wants
-                // comes from Lua. Order matters because the first
-                // match wins, but neither default overlaps the
-                // other so the order here is just readability.
+                // Default bindings. The user's `binds` table is
+                // merged *on top* of these (see `parse_binds`):
+                // unmatched defaults stay, matching triggers get
+                // overridden. Order matters because the first match
+                // wins, but neither default overlaps the other so
+                // the order here is just readability.
                 bindings: vec![
                     KeyBinding {
                         mods: keyboard::MOD_SHIFT | keyboard::MOD_SUPER,
@@ -347,7 +349,7 @@ impl Config {
             config.input = parse_input(&t, config.input).context("input")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("binds")? {
-            config.binds = parse_binds(&t).context("binds")?;
+            config.binds = parse_binds(&t, config.binds).context("binds")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("misc")? {
             config.misc = parse_misc(&t, config.misc).context("misc")?;
@@ -450,12 +452,24 @@ fn parse_input(t: &Table, defaults: InputConfig) -> mlua::Result<InputConfig> {
     Ok(cfg)
 }
 
-fn parse_binds(t: &Table) -> mlua::Result<BindsConfig> {
-    let mut bindings = Vec::new();
+/// Merge the user's `binds` table onto the built-in defaults. A
+/// user bind whose trigger (mods + keysym) matches a default
+/// *overrides* that default's action; any default the user never
+/// touches stays active. So setting `binds` to add `Super+Space`
+/// doesn't silently disable `Super+Shift+E` (exit) etc.
+fn parse_binds(t: &Table, defaults: BindsConfig) -> mlua::Result<BindsConfig> {
+    let mut bindings = defaults.bindings;
     for (i, entry) in t.sequence_values::<Table>().enumerate() {
         let bind_table = entry.with_context(|_| format!("binds[{i}] not a table"))?;
         let bind = parse_bind(&bind_table).with_context(|_| format!("binds[{i}]"))?;
-        bindings.push(bind);
+        if let Some(existing) = bindings
+            .iter_mut()
+            .find(|b| b.mods == bind.mods && b.keysym == bind.keysym)
+        {
+            existing.action = bind.action;
+        } else {
+            bindings.push(bind);
+        }
     }
     Ok(BindsConfig { bindings })
 }

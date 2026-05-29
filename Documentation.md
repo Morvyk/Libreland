@@ -196,11 +196,17 @@ held. Extras like `NumLock` are tolerated. First match wins.
 
 Built-in defaults:
 
-- `Super+Shift+E → Action::Exit`
-- `Super+F → Action::ToggleFloating`
+- `Super+Shift+E → exit`
+- `Super+F → togglefloating`
 
-Available actions today: `Exit`, `ToggleFloating`. The list grows
-as we add `Reload`, `Spawn`, `ChangeVt`, …
+Your `binds` table is **merged on top of** these defaults, not
+swapped in for them: a bind whose trigger (`mods` + `key`) matches a
+default overrides that default's action, and any default you don't
+touch stays active. So adding a single `Super+Space` bind keeps
+`Super+Shift+E` and `Super+F` working.
+
+Available actions today: `exit`, `togglefloating`, `spawn`. The list
+grows as we add `reload`, `change_vt`, …
 
 ### misc
 
