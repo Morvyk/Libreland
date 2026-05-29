@@ -274,11 +274,57 @@ impl CompositorHandler for State {
         // invisible (no texture) even though the client did
         // everything right.
         on_commit_buffer_handler::<State>(surface);
+        maybe_handle_layer_commit(self, surface);
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
         info!(surface = ?surface.id(), "wayland: surface destroyed");
     }
+}
+
+/// Layer-surface focus + layout reflow happens on commit
+/// (not on `new_layer_surface`) because the client's
+/// `keyboard_interactivity` / `anchor` / `exclusive_zone`
+/// are only readable from `LayerSurfaceCachedState` after
+/// they've been committed. Doing it here means the very
+/// first time rofi (or anything else requesting an
+/// exclusive overlay) commits its state, the seat hands
+/// it focus, and the layout reflows around its zone.
+fn maybe_handle_layer_commit(state: &mut State, surface: &WlSurface) {
+    use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
+    let is_layer = state
+        .layer_shell_state
+        .layer_surfaces()
+        .any(|l| l.wl_surface() == surface);
+    if !is_layer {
+        return;
+    }
+    let cached = layer_cached_state(surface);
+    state.recompute_layer_layout();
+    let wants_exclusive_kbd = matches!(
+        cached.keyboard_interactivity,
+        KeyboardInteractivity::Exclusive
+    ) && matches!(cached.layer, Layer::Top | Layer::Overlay);
+    if !wants_exclusive_kbd {
+        return;
+    }
+    let Some(kbd) = state.seat.get_keyboard() else {
+        return;
+    };
+    if kbd.current_focus().as_ref() == Some(surface) {
+        return;
+    }
+    // Save the focus we're displacing, but only the first time —
+    // repeated commits from the same exclusive layer shouldn't
+    // overwrite the saved "before" with itself.
+    if state.kbd_focus_before_layer.is_none() {
+        state.kbd_focus_before_layer = kbd.current_focus();
+    }
+    info!(
+        surface = ?surface.id(),
+        "wayland: exclusive layer surface grabbing keyboard focus"
+    );
+    kbd.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
 }
 
 impl ShmHandler for State {
@@ -452,6 +498,10 @@ impl WlrLayerShellHandler for State {
         // cycle. Clients that requested an explicit size (rofi:
         // anchored centre, 800x600) keep that; clients that asked
         // for "0" in some axis get the matching output dimension.
+        // Initial configure with the primary output's compositor
+        // rect as a size hint. The client-side keyboard / anchor /
+        // exclusive-zone state isn't readable yet — that gets
+        // looked at on the first commit, in `CompositorHandler::commit`.
         let primary = self.renderer.primary_output_rect();
         let bounds_size = primary.size;
         surface.with_pending_state(|state| {
@@ -460,26 +510,6 @@ impl WlrLayerShellHandler for State {
             ));
         });
         surface.send_configure();
-        // Recompute the tile area so any exclusive zone this layer
-        // declares (set by the first commit) is honoured.
-        self.recompute_layer_layout();
-        // If the layer requested exclusive keyboard focus, hand it
-        // over now. Restoring focus on destroy lands in
-        // `layer_destroyed` below.
-        let cached = layer_cached_state(surface.wl_surface());
-        if matches!(
-            cached.keyboard_interactivity,
-            smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive
-        ) && matches!(layer, Layer::Top | Layer::Overlay)
-            && let Some(kbd) = self.seat.get_keyboard()
-        {
-            self.kbd_focus_before_layer = kbd.current_focus();
-            kbd.set_focus(
-                self,
-                Some(surface.wl_surface().clone()),
-                SERIAL_COUNTER.next_serial(),
-            );
-        }
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
