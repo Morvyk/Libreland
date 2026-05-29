@@ -1197,6 +1197,15 @@ impl State {
                     self.layout.toggle_floating(&surface);
                 }
             }
+            config::Action::ToggleFullscreen => {
+                // Flip the keyboard-focused window in/out of fullscreen.
+                // No focus = nothing to toggle, silent no-op.
+                let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+                if let Some(surface) = focus {
+                    info!(surface = ?surface.id(), "togglefullscreen action fired");
+                    self.layout.toggle_fullscreen(&surface);
+                }
+            }
             config::Action::Close => {
                 // Politely ask the focused toplevel to close. Match
                 // the keyboard-focused surface against the live

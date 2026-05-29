@@ -837,6 +837,23 @@ impl Layout {
         true
     }
 
+    /// Flip `surface` between fullscreen and normal (the Super+F11
+    /// gesture). A maximized window becomes fullscreen; anything else
+    /// toggles against fullscreen. Returns whether `surface` was
+    /// found.
+    pub fn toggle_fullscreen(&mut self, surface: &WlSurface) -> bool {
+        let Some(w) = self.window_mut(surface) else {
+            return false;
+        };
+        w.fill = if w.fill == FillMode::Fullscreen {
+            FillMode::Normal
+        } else {
+            FillMode::Fullscreen
+        };
+        self.recompute_and_push();
+        true
+    }
+
     /// Whether `surface` is a tracked window that's maximized or
     /// fullscreen (used to refuse interactive move/resize on it).
     fn is_filled(&self, surface: &WlSurface) -> bool {

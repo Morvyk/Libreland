@@ -196,6 +196,10 @@ pub enum Action {
     /// floating window is centred at ~70 % of its previous tiled
     /// cell; a newly tiled window rejoins the dwindle flow.
     ToggleFloating,
+    /// Flip the focused window between fullscreen and normal. A
+    /// fullscreen window fills its whole output with no border /
+    /// rounded corners and draws on top of everything (incl. panels).
+    ToggleFullscreen,
     /// Ask the keyboard-focused toplevel to close, via
     /// `xdg_toplevel.close`. This is a polite request — the client
     /// runs its own close path (e.g. "save before quit?"), so the
@@ -273,6 +277,11 @@ impl Default for Config {
                         mods: keyboard::MOD_SUPER,
                         keysym: Keysym::F,
                         action: Action::ToggleFloating,
+                    },
+                    KeyBinding {
+                        mods: keyboard::MOD_SUPER,
+                        keysym: Keysym::F11,
+                        action: Action::ToggleFullscreen,
                     },
                     KeyBinding {
                         mods: keyboard::MOD_SUPER,
@@ -573,6 +582,7 @@ fn parse_action(t: &Table) -> mlua::Result<Action> {
     match name.to_lowercase().as_str() {
         "exit" => Ok(Action::Exit),
         "togglefloating" | "toggle_floating" => Ok(Action::ToggleFloating),
+        "togglefullscreen" | "toggle_fullscreen" | "fullscreen" => Ok(Action::ToggleFullscreen),
         "close" | "closewindow" | "close_window" | "kill" => Ok(Action::Close),
         "spawn" => {
             let command: String = t
@@ -584,7 +594,7 @@ fn parse_action(t: &Table) -> mlua::Result<Action> {
             Ok(Action::Spawn(Arc::from(command)))
         }
         other => lua_bail!(
-            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"close\", \"spawn\""
+            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"togglefullscreen\", \"close\", \"spawn\""
         ),
     }
 }
