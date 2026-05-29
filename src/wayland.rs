@@ -26,6 +26,7 @@ use smithay::delegate_layer_shell;
 use smithay::delegate_viewporter;
 use smithay::delegate_output;
 use smithay::delegate_pointer_constraints;
+use smithay::delegate_primary_selection;
 use smithay::delegate_relative_pointer;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
@@ -62,10 +63,14 @@ use smithay::wayland::pointer_constraints::{
     PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint,
 };
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
-use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus,
 };
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
@@ -155,6 +160,9 @@ pub struct WaylandInit {
     /// pointer (FPS games lock it in place and read relative motion).
     /// Held so the global stays alive.
     pub pointer_constraints_state: PointerConstraintsState,
+    /// `zwp_primary_selection_v1` — the primary (middle-click) selection.
+    /// Held so the global stays alive.
+    pub primary_selection_state: PrimarySelectionState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -249,6 +257,11 @@ pub fn init(
     // which is what makes the view spin).
     let relative_pointer_state = RelativePointerManagerState::new::<State>(&dh);
     let pointer_constraints_state = PointerConstraintsState::new::<State>(&dh);
+    // zwp_primary_selection_v1: the middle-click "primary" selection.
+    // Both it and the regular clipboard are persisted compositor-side
+    // (see crate::clipboard) so a copied buffer survives the source app
+    // exiting.
+    let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -337,6 +350,7 @@ pub fn init(
         layer_shell_state,
         relative_pointer_state,
         pointer_constraints_state,
+        primary_selection_state,
         popup_manager,
         outputs,
         preferred_scale,
@@ -483,8 +497,17 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {
-        // No-op in 4a; 4c wires this up to actually shift focus.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Hand clipboard + primary-selection *focus* to the keyboard-
+        // focused client. Smithay only delivers selection offers (and
+        // thus enables paste) to the client holding data-device focus,
+        // and it does NOT derive that from keyboard focus on its own —
+        // without this, no client ever receives the selection and paste
+        // silently does nothing.
+        let client = focused.and_then(smithay::reexports::wayland_server::Resource::client);
+        let dh = self.display_handle.clone();
+        set_data_device_focus(&dh, seat, client.clone());
+        set_primary_focus(&dh, seat, client);
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {
@@ -703,15 +726,36 @@ impl XdgDecorationHandler for State {
     }
 }
 
-// Clipboard + drag-and-drop. We don't drive selections from the
-// compositor side (no programmatic copy/paste yet) and don't add
-// compositor behaviour to DnD, so `SelectionHandler` keeps its
-// default no-op methods and the grab handlers are empty. The point
-// is purely to advertise `wl_data_device_manager` so toolkits can
-// set up their seat's clipboard; smithay routes data offers between
-// clients on its own.
+// Clipboard + primary selection. Beyond advertising the globals (so
+// toolkits set up their seat clipboard and smithay routes offers
+// between clients), we persist every selection compositor-side: on
+// each copy we cache the data and take ownership as a server-side
+// source, so a buffer survives the source app closing (see
+// `crate::clipboard`). `SelectionUserData` stays `()` — there's one
+// cache per target, looked up by `SelectionTarget` in `send_selection`.
+// DnD adds no compositor behaviour, so the grab handlers are empty.
 impl SelectionHandler for State {
     type SelectionUserData = ();
+
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<State>,
+    ) {
+        crate::clipboard::on_new_selection(self, ty, source.map(|s| s.mime_types()));
+    }
+
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<State>,
+        _user_data: &(),
+    ) {
+        crate::clipboard::on_send_selection(self, ty, &mime_type, fd);
+    }
 }
 
 impl ClientDndGrabHandler for State {}
@@ -720,6 +764,12 @@ impl ServerDndGrabHandler for State {}
 impl DataDeviceHandler for State {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
+    }
+}
+
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
     }
 }
 
@@ -879,3 +929,4 @@ delegate_data_device!(State);
 delegate_kde_decoration!(State);
 delegate_relative_pointer!(State);
 delegate_pointer_constraints!(State);
+delegate_primary_selection!(State);

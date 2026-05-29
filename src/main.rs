@@ -58,6 +58,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod clipboard;
 mod config;
 mod cursor;
 mod drm;
@@ -215,6 +216,17 @@ pub(crate) struct State {
     #[allow(dead_code, reason = "held to keep the global alive")]
     pub(crate) pointer_constraints_state:
         smithay::wayland::pointer_constraints::PointerConstraintsState,
+    /// `zwp_primary_selection_v1` global — read by the
+    /// `PrimarySelectionHandler` impl; held so the global stays alive.
+    pub(crate) primary_selection_state:
+        smithay::wayland::selection::primary_selection::PrimarySelectionState,
+    /// Compositor-side clipboard + primary-selection caches, so a
+    /// copied buffer survives the source client closing. See
+    /// [`crate::clipboard`].
+    pub(crate) clipboard: clipboard::Selections,
+    /// Calloop handle, used to register the async pipe reads/writes
+    /// that drain and serve cached selections without blocking.
+    pub(crate) loop_handle: smithay::reexports::calloop::LoopHandle<'static, LoopData>,
     /// Keyboard focus saved when a layer-shell surface grabs
     /// exclusive focus (e.g. rofi), restored when that surface
     /// is destroyed.
@@ -1773,6 +1785,9 @@ fn main() -> Result<()> {
         layer_shell_state: wayland_init.layer_shell_state,
         relative_pointer_state: wayland_init.relative_pointer_state,
         pointer_constraints_state: wayland_init.pointer_constraints_state,
+        primary_selection_state: wayland_init.primary_selection_state,
+        clipboard: clipboard::Selections::default(),
+        loop_handle: handle.clone(),
         popup_manager: wayland_init.popup_manager,
         kbd_focus_before_layer: None,
         layout,
