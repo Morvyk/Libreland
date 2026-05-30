@@ -137,6 +137,9 @@ misc = {
     },
     -- Or a solid colour:
     -- wallpaper = { type = "solid", color = { 0.20, 0.40, 0.80 } },
+    -- Or any image/gif/video (needs the ffmpeg package; videos loop).
+    -- Paths are literal — use os.getenv for $HOME, like the screenshot dir:
+    -- wallpaper = { type = "media", path = os.getenv("HOME") .. "/Pictures/bg.mp4", mode = "fill" },
 }
 
 layout = {
@@ -312,9 +315,40 @@ The list grows as we add `reload`, `change_vt`, …
 
 ### misc
 
-| Field        | Default            | State | Notes                                                                                                          |
-| ------------ | ------------------ | ----- | -------------------------------------------------------------------------------------------------------------- |
-| `wallpaper`  | vertical gradient  | ✅    | `Solid([r, g, b])` or `VerticalGradient { top, bottom }`. RGB components in `[0, 1]`. Drawn every frame.       |
+| Field        | Default            | State | Notes                                                       |
+| ------------ | ------------------ | ----- | ----------------------------------------------------------- |
+| `wallpaper`  | vertical gradient  | ✅    | A flat fill, or a media file (image/gif/video). See below.  |
+
+`misc.wallpaper` is a table whose `type` selects the kind:
+
+- **`"solid"`** — `{ type = "solid", color = { r, g, b } }`. RGB in `[0, 1]`.
+- **`"vertical_gradient"`** — `{ type = "vertical_gradient", top = { r, g, b }, bottom = { r, g, b } }`.
+- **`"media"`** — `{ type = "media", path = "…", mode = "fill" }`. Decodes any
+  file FFmpeg can read (png/jpg/webp/… , gif, mp4/webm/…) via libav and draws
+  it per output. Videos and gifs **animate and loop**; a still image is decoded
+  once. `mode` (default `"fill"`) controls fitting:
+  - `"fill"` / `"cover"` — scale to cover the screen, cropping the overflow (no bars).
+  - `"fit"` / `"contain"` — scale to fit entirely, letterboxing the remainder.
+  - `"stretch"` — fill exactly, ignoring aspect ratio.
+  - `"center"` — native size, centred (cropped if larger than the output).
+
+  Requires the **`ffmpeg`** package at runtime. Decoding is software (CPU) for
+  now. The source is downscaled to your largest output, then scaled per-monitor
+  on the GPU. The rounded-corner cutout falls back to black behind a media
+  wallpaper; a decode failure falls back to a flat fill (logged) rather than a
+  black screen. Live-reloads on change.
+
+```lua
+-- a flat fill
+misc = { wallpaper = { type = "solid", color = { 0.10, 0.10, 0.12 } } }
+
+-- an image, gif, or video
+misc = { wallpaper = {
+    type = "media",
+    path = "/home/me/Pictures/wallpaper.jpg",  -- or a .mp4 / .gif / .webm
+    mode = "fill",
+} }
+```
 
 ### layout
 

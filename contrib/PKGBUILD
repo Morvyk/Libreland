@@ -10,15 +10,16 @@
 
 pkgname=libreland
 # Placeholder; pkgver() rewrites this to a git snapshot at build time.
-pkgver=0.1.0.r61.gae2fe0e
+pkgver=0.1.0.r63.gac1bea1
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua'
 arch=('x86_64')
 license=('MIT')
 # Runtime libraries the binaries actually link (from DT_NEEDED): libgbm
-# (mesa), libseat (seatd), libudev (systemd-libs), libinput, libxkbcommon.
-# Lua is statically vendored and Wayland is pure-Rust, so neither is a dep.
-# xwayland-satellite is launched by default (config `xwayland = true`).
+# (mesa), libseat (seatd), libudev (systemd-libs), libinput, libxkbcommon,
+# and libav* (ffmpeg) for media wallpapers. Lua is statically vendored and
+# Wayland is pure-Rust, so neither is a dep. xwayland-satellite is launched
+# by default (config `xwayland = true`).
 depends=(
     'glibc'
     'gcc-libs'
@@ -27,10 +28,13 @@ depends=(
     'libxkbcommon'
     'seatd'
     'systemd-libs'
+    'ffmpeg'
     'xwayland-satellite'
 )
 # `rust` provides cargo; the project's .cargo/config.toml links through mold.
-makedepends=('rust' 'mold' 'git')
+# clang (libclang) + pkgconf build the ffmpeg-sys bindings (bindgen +
+# pkg-config against the system ffmpeg).
+makedepends=('rust' 'mold' 'git' 'clang' 'pkgconf')
 optdepends=(
     'xdg-desktop-portal: desktop integration frontend (file dialogs, screen sharing)'
     'xdg-desktop-portal-wlr: screen sharing + screenshots via PipeWire'
