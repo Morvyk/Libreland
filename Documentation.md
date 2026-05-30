@@ -526,6 +526,103 @@ above is in place. Global shortcuts (the `GlobalShortcuts` portal) are
 not yet provided — no off-the-shelf backend covers them for us, so they
 need a dedicated Libreland backend (planned).
 
+## Control IPC
+
+Libreland exposes a control socket for querying and driving the
+compositor — the same idea as `swaymsg` / `hyprctl` / `niri msg`. The
+bundled `libreland msg` subcommand is the client; bars and scripts can
+also speak the wire protocol directly.
+
+### Socket & protocol
+
+On startup the compositor binds a Unix socket at
+`$XDG_RUNTIME_DIR/libreland-<wayland-display>.sock` and exports its path
+as `$LIBRELAND_SOCKET`, which every child (terminals, `spawn` binds,
+startup commands) inherits — so `libreland msg` run from inside the
+session finds it with no configuration.
+
+The protocol is newline-delimited JSON: one request object per line in,
+one reply per line out. Each reply is a serialized `Result`: `{"Ok":…}`
+on success, `{"Err":"message"}` on failure. A request is tagged on a
+`cmd` field, e.g. `{"cmd":"windows"}`. You can drive it by hand:
+
+    echo '{"cmd":"focused-window"}' | socat - UNIX-CONNECT:$LIBRELAND_SOCKET
+
+### `libreland msg`
+
+    libreland msg [--json] <command> [args…]
+
+`--json` prints the raw JSON reply instead of formatted text (for
+scripting). Actions succeed silently and fail with a message on stderr +
+a non-zero exit. Run `libreland msg --help` (or `… <command> --help`) for
+the full usage.
+
+**Queries**
+
+| Command            | Result                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| `version`          | Compositor name + version.                                                                  |
+| `outputs`          | Connected outputs: make/model, mode, refresh, scale, logical position/size, active workspace. |
+| `workspaces`       | Every workspace across all outputs: output, index, active, window count.                    |
+| `windows`          | Every managed window: stable id, app-id, title, output, workspace, geometry, state flags.   |
+| `focused-window`   | The keyboard-focused window (alias `focused`).                                               |
+| `binds`            | The configured keybindings.                                                                  |
+
+**Actions** — windows are addressed by the stable **id** from `windows`
+(or the focused window when the id is omitted):
+
+| Command                                      | Effect                                                              |
+| -------------------------------------------- | ------------------------------------------------------------------- |
+| `focus-window <id>`                          | Focus a window, revealing its workspace first.                      |
+| `close [id]`                                 | Ask a window to close.                                              |
+| `toggle-floating [id]`                       | Flip tiled ↔ floating.                                              |
+| `toggle-fullscreen [id]`                     | Flip fullscreen.                                                    |
+| `toggle-maximized [id]`                      | Flip maximized.                                                     |
+| `focus-workspace <N\|next\|prev> [--output NAME]` | Switch a workspace (the primary output unless `--output` is given). |
+| `move-to-workspace <N\|next\|prev> [id]`     | Move a window to a workspace and follow it.                          |
+| `spawn <cmd…>`                               | Run a program (everything after `spawn` is the argv).               |
+| `reload`                                     | Re-read the config file now.                                        |
+| `exit`                                       | Quit the compositor.                                                |
+
+`move-to-workspace` only acts on a window that's currently on a visible
+(active) workspace.
+
+### Event stream
+
+    libreland msg subscribe [KINDS…]
+
+Holds the connection open and prints one event per line as state changes
+(add `--json` for raw JSON lines — what a bar consumes). On connect you
+immediately get a snapshot (`window-focused` + `workspaces-changed`) so a
+bar renders correctly from the start. With no kinds listed every event is
+streamed; otherwise only the named ones.
+
+| Event                | Fires when                                                                       |
+| -------------------- | -------------------------------------------------------------------------------- |
+| `window-opened`      | A window maps. Payload: the window.                                               |
+| `window-closed`      | A window unmaps. Payload: its id.                                                 |
+| `window-focused`     | Keyboard focus moves (and when the focused window's *title* changes). Payload: the window or null. |
+| `workspaces-changed` | A workspace is switched, added, removed, or its window count changes. Payload: the full workspace list. |
+
+Raw event lines are internally tagged on an `event` field, e.g.
+`{"event":"window-focused","window":{…}}`. For a full window list, query
+`windows` once and then track `window-opened` / `window-closed`.
+
+### Examples
+
+    libreland msg windows                 # list windows + their ids
+    libreland msg focus-window 3          # focus window id 3
+    libreland msg focus-workspace next    # next workspace on the primary output
+    libreland msg move-to-workspace 2     # move the focused window to workspace 2
+    libreland msg spawn kitty --hold      # launch a program
+    libreland msg --json subscribe        # live event feed for a bar
+
+A minimal "focused window title" bar module:
+
+    libreland msg --json subscribe window-focused | while read -l line
+        echo $line | jq -r '.window.title // "—"'
+    end
+
 ## Running
 
 Switch to a free TTY (e.g. `Ctrl+Alt+F2`), log in, then:
