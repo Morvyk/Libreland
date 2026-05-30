@@ -50,9 +50,7 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
-use crate::config::{
-    AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig,
-};
+use crate::config::{AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
 
@@ -435,19 +433,27 @@ pub struct Renderer {
     blur_scratch: HashMap<usize, BlurScratch>,
 }
 
-/// Offscreen textures backing one output's backdrop blur. `scene` holds
-/// the freshly-rendered backdrop at full resolution; `levels[0]` is the
-/// full-resolution blurred result, `levels[k]` the `1/2^k` mip used as
-/// the dual-filter pyramid shrinks and grows. Both [`GlesTexture`]s are
-/// `Arc`-backed, so the final blurred frame is cheap to clone out.
+/// Number of backdrop blur tiers: 0 = base (wallpaper + lower layers,
+/// behind tiled windows), 1 = base + tiled windows (behind floating
+/// windows), 2 = full backdrop (behind Top/Overlay layers). Each is the
+/// scene accumulated up to that z-band, blurred and saved.
+const BLUR_TIERS: usize = 3;
+
+/// Offscreen textures backing one output's backdrop blur. `scene` is the
+/// progressive backdrop accumulator (each z-band drawn on top of the
+/// previous, no clear); `levels` is the dual-filter mip working chain
+/// (`levels[k]` at `size >> k`); `tiers[i]` holds the full-resolution
+/// blurred backdrop saved for z-band `i`. All `Arc`-backed, so the saved
+/// tiers are cheap to clone out for the frame.
 struct BlurScratch {
     /// Full-output buffer size the chain was built for (= `mode_size`).
     size: Size<i32, smithay::utils::Buffer>,
-    /// The backdrop scene rendered this frame (unblurred, full res).
+    /// The backdrop scene accumulated this frame (unblurred, full res).
     scene: GlesTexture,
-    /// Mip chain, `levels[k]` at `size >> k`. `levels[0]` is reused as
-    /// the final full-resolution blurred output after the upsample pass.
+    /// Mip chain, `levels[k]` at `size >> k` (full res at `k = 0`).
     levels: Vec<GlesTexture>,
+    /// Per-tier full-resolution blurred backdrops (see [`BLUR_TIERS`]).
+    tiers: Vec<GlesTexture>,
 }
 
 /// A window's last frame, captured at destroy time, animating out.
@@ -1140,8 +1146,25 @@ impl Renderer {
                 }
             }
         }
-        self.blur_scratch
-            .insert(idx, BlurScratch { size, scene, levels });
+        let mut tiers = Vec::with_capacity(BLUR_TIERS);
+        for _ in 0..BLUR_TIERS {
+            match make(size.w, size.h) {
+                Ok(t) => tiers.push(t),
+                Err(err) => {
+                    warn!(error = %err, "blur: tier buffer alloc failed");
+                    return false;
+                }
+            }
+        }
+        self.blur_scratch.insert(
+            idx,
+            BlurScratch {
+                size,
+                scene,
+                levels,
+                tiers,
+            },
+        );
         true
     }
 
@@ -1752,11 +1775,13 @@ impl Renderer {
 
         let full_damage = [Rectangle::<i32, Physical>::from_size(mode_size)];
         let radius_comp = border.rounded_corners.max(0);
-        // Everything that sits *behind* a Top/Overlay layer: wallpaper,
-        // Background/Bottom layers, then Normal + Maximized windows (with
-        // their border rings). Shared by the blur snapshot and the
-        // no-blur direct path so the two can never drift apart.
-        let draw_backdrop = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
+        // --- Backdrop bands, factored so the same draw logic feeds both
+        // the on-screen frame and the offscreen blur snapshots. ---
+        //
+        // `draw_base`   : wallpaper + Background/Bottom layers.
+        // `cell_local`  : a window's animated rect → output-local physical.
+        // `draw_window` : one window's surface + (Normal-only) border ring.
+        let draw_base = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
             draw_fill(frame, &wallpaper, mode_size, mode_size)?;
             for (bucket, elements) in &layer_groups {
                 if matches!(bucket, LayerBucket::Background | LayerBucket::Bottom) {
@@ -1764,103 +1789,168 @@ impl Renderer {
                         .context("draw_render_elements (layer bg/bottom) failed")?;
                 }
             }
+            Ok(())
+        };
+        let cell_local = |eff: Rectangle<i32, Physical>| {
+            Rectangle::<i32, Physical>::new(
+                Point::new(
+                    scale_i(eff.loc.x - compositor_position.x, scale),
+                    scale_i(eff.loc.y - compositor_position.y, scale),
+                ),
+                Size::new(scale_i(eff.size.w, scale), scale_i(eff.size.h, scale)),
+            )
+        };
+        let draw_window = |frame: &mut GlesFrame<'_, '_>,
+                           p: &Placement,
+                           elements: &[RescaleRenderElement<
+            WaylandSurfaceRenderElement<GlesRenderer>,
+        >],
+                           wd: &WinDraw|
+         -> Result<()> {
+            // Surface first; the frame shader overpaints the border ring
+            // and rounded-corner cutout on top. Border tracks the window's
+            // *animated* rect so it slides/scales/fades with the surface.
+            // Maximized/fullscreen are borderless.
+            draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
+                .context("draw_render_elements failed")?;
+            if p.fill == FillMode::Normal && (bw_comp > 0 || radius_comp > 0) {
+                let fill = if p.focused {
+                    &border.active
+                } else {
+                    &border.inactive
+                };
+                draw_window_frame(
+                    frame,
+                    &frame_shader,
+                    cell_local(wd.effective),
+                    scale_i(bw_comp, scale),
+                    scale_i(radius_comp, scale),
+                    fill,
+                    &wallpaper,
+                    mode_size,
+                    // Border fades with the window opacity too.
+                    wd.alpha * window_opacity,
+                )?;
+            }
+            Ok(())
+        };
+        // Scene stages replayed into the blur accumulator (each on top of
+        // the previous): the tiled band, then the floating + maximized band.
+        let draw_tiled = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
             for ((p, elements), wd) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Normal)
+                .filter(|((p, _), _)| p.fill == FillMode::Normal && !p.floating)
             {
-                // Border tracks the window's *animated* rect so it slides
-                // and scales with the surface, and fades with it on open.
-                let cell_local_phys = Rectangle::<i32, Physical>::new(
-                    Point::new(
-                        scale_i(wd.effective.loc.x - compositor_position.x, scale),
-                        scale_i(wd.effective.loc.y - compositor_position.y, scale),
-                    ),
-                    Size::new(
-                        scale_i(wd.effective.size.w, scale),
-                        scale_i(wd.effective.size.h, scale),
-                    ),
-                );
-                // Surface first; the frame shader overpaints the border
-                // ring and corner cutout on top.
-                draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
-                    .context("draw_render_elements failed")?;
-                if bw_comp > 0 || radius_comp > 0 {
-                    let fill = if p.focused {
-                        &border.active
-                    } else {
-                        &border.inactive
-                    };
-                    draw_window_frame(
-                        frame,
-                        &frame_shader,
-                        cell_local_phys,
-                        scale_i(bw_comp, scale),
-                        scale_i(radius_comp, scale),
-                        fill,
-                        &wallpaper,
-                        mode_size,
-                        // Border fades with the window opacity too (this
-                        // loop is Normal windows only).
-                        wd.alpha * window_opacity,
-                    )?;
-                }
+                draw_window(frame, p, elements, wd)?;
             }
-            for (_p, elements) in placements
+            Ok(())
+        };
+        let draw_floating_max = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
+            for ((p, elements), wd) in placements
                 .iter()
                 .zip(grouped.iter())
-                .filter(|(p, _)| p.fill == FillMode::Maximized)
+                .zip(win_draws.iter())
+                .filter(|((p, _), _)| p.fill == FillMode::Normal && p.floating)
             {
-                draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
-                    .context("draw_render_elements (maximized) failed")?;
+                draw_window(frame, p, elements, wd)?;
+            }
+            for ((p, elements), wd) in placements
+                .iter()
+                .zip(grouped.iter())
+                .zip(win_draws.iter())
+                .filter(|((p, _), _)| p.fill == FillMode::Maximized)
+            {
+                draw_window(frame, p, elements, wd)?;
             }
             Ok(())
         };
 
-        // Backdrop blur (Kawase dual filter). Default config blurs behind
-        // Top/Overlay layer surfaces (panels, launchers, notifications) —
-        // the common case — sampling everything beneath them. Only run
-        // when such a layer is actually mapped this frame. (We don't probe
-        // per-surface alpha, so an opaque panel still pays for the blur
-        // while it's up; the cost is bounded.)
+        // Backdrop blur (Kawase dual filter). Three z-tiers, each computed
+        // only when something above it needs it:
+        //   tier 0 = base                        → behind tiled windows
+        //   tier 1 = base + tiled windows        → behind floating windows
+        //   tier 2 = base + tiled + floating/max → behind Top/Overlay layers
+        // Window blur (decoration.blur.windows) drives tiers 0/1; layer
+        // blur drives tier 2. We don't probe per-surface alpha, so a mapped
+        // opaque panel/window still pays while it's up; the cost is bounded.
         let blur = self.decoration.blur;
+        let passes_ok = blur.enabled && blur.passes > 0;
+        let any_normal = placements.iter().any(|p| p.fill == FillMode::Normal);
         let has_top_layer = layer_groups
             .iter()
             .any(|(b, _)| matches!(b, LayerBucket::Top | LayerBucket::Overlay));
-        let do_layer_blur = blur.enabled && blur.layers && blur.passes > 0 && has_top_layer;
-        // `blurred` (sampled behind each Top/Overlay layer) + `scene` (the
-        // sharp backdrop copied to the framebuffer to stand in for the
-        // backdrop bands). On any GPU failure we fall back to the direct,
-        // blur-free path. Pull the scratch out of the map so the blur
-        // helper only borrows `self.gles`.
-        let blurred_layer: Option<(GlesTexture, GlesTexture)> =
-            if do_layer_blur && self.ensure_blur_scratch(idx, mode_size, blur.passes) {
-                let mut scratch = self
-                    .blur_scratch
-                    .remove(&idx)
-                    .expect("ensure_blur_scratch inserted it");
-                let res = render_and_blur(
-                    &mut self.gles,
-                    &mut scratch,
-                    mode_size,
-                    blur,
-                    &draw_backdrop,
-                    &self.blur_down,
-                    &self.blur_up,
-                );
-                let out = match res {
-                    Ok(()) => Some((scratch.levels[0].clone(), scratch.scene.clone())),
-                    Err(err) => {
-                        warn!(error = %err, output = %output_name, "backdrop blur failed; rendering sharp");
-                        None
-                    }
-                };
-                self.blur_scratch.insert(idx, scratch);
-                out
-            } else {
-                None
-            };
+        let need_window = passes_ok && blur.windows && any_normal;
+        let need_layer = passes_ok && blur.layers && has_top_layer;
+        // Saved per-tier blurred backdrops. Pull the scratch out of the map
+        // so the blur helpers borrow only `self.gles`; on any GPU failure
+        // we clear the tiers and fall back to sharp rendering. Programs are
+        // `Arc`-cloned so the staging closure captures only `self.gles`.
+        let mut tier_tiled: Option<GlesTexture> = None;
+        let mut tier_float: Option<GlesTexture> = None;
+        let mut tier_layer: Option<GlesTexture> = None;
+        if (need_window || need_layer) && self.ensure_blur_scratch(idx, mode_size, blur.passes) {
+            let down = self.blur_down.clone();
+            let up = self.blur_up.clone();
+            let passes = blur.passes as usize;
+            let radius = blur.radius;
+            let mut scratch = self
+                .blur_scratch
+                .remove(&idx)
+                .expect("ensure_blur_scratch inserted it");
+            let res: Result<()> = (|| {
+                render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_base)?;
+                if need_window {
+                    run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 0)?;
+                    tier_tiled = Some(scratch.tiers[0].clone());
+                }
+                // The tiled band feeds both the floating tier and the layer tier.
+                if need_window || need_layer {
+                    render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_tiled)?;
+                }
+                if need_window {
+                    run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 1)?;
+                    tier_float = Some(scratch.tiers[1].clone());
+                }
+                if need_layer {
+                    render_scene_stage(
+                        &mut self.gles,
+                        &mut scratch,
+                        mode_size,
+                        &draw_floating_max,
+                    )?;
+                    run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 2)?;
+                    tier_layer = Some(scratch.tiers[2].clone());
+                }
+                Ok(())
+            })();
+            if let Err(err) = res {
+                warn!(error = %err, output = %output_name, "backdrop blur failed; rendering sharp");
+                tier_tiled = None;
+                tier_float = None;
+                tier_layer = None;
+            }
+            self.blur_scratch.insert(idx, scratch);
+        }
+        // Paint a full-res tier's sub-rect (opaque) behind a translucent
+        // surface. The tier texture is 1:1 with the framebuffer, so the
+        // source sub-rect matches the on-screen destination rect.
+        let blur_rect = |frame: &mut GlesFrame<'_, '_>,
+                         tier: &GlesTexture,
+                         dst: Rectangle<i32, Physical>|
+         -> Result<()> {
+            let src = Rectangle::<f64, smithay::utils::Buffer>::new(
+                Point::from((f64::from(dst.loc.x), f64::from(dst.loc.y))),
+                Size::from((f64::from(dst.size.w), f64::from(dst.size.h))),
+            );
+            frame
+                .render_texture_from_to(
+                    tier, src, dst, &[dst], &[dst], Transform::Normal, 1.0, None, &[],
+                )
+                .context("blur: backdrop sub-rect")?;
+            Ok(())
+        };
 
         let mut target = self
             .gles
@@ -1872,52 +1962,59 @@ impl Renderer {
                 .render(&mut target, mode_size, Transform::Normal)
                 .with_context(|| format!("GlesRenderer::render failed for {output_name}"))?;
 
-            // Layer-shell render order, per wlr-layer-shell spec:
+            // Backdrop bands drawn fresh, interleaving the blurred tiers so
+            // each translucent surface reveals a blurred copy of whatever
+            // sits beneath it. Layer-shell order (wlr-layer-shell spec):
             //   wallpaper → Background → Bottom → windows → Top → Overlay → cursor.
-            // The backdrop bands (wallpaper, Background/Bottom layers,
-            // Normal + Maximized windows with borders) are produced by
-            // `draw_backdrop`. When blurring behind a layer we already
-            // rendered them offscreen, so copy that sharp snapshot back in
-            // a single textured quad; otherwise draw them straight onto
-            // the framebuffer. Each surface keeps its own
-            // `draw_render_elements` call (single-element slice) so
-            // smithay's opaque-region culling can't skip floats behind
-            // earlier tiles.
-            if let Some((_, scene)) = &blurred_layer {
-                let dst = Rectangle::<i32, Physical>::from_size(mode_size);
-                let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(
-                    Size::<f64, smithay::utils::Buffer>::from((
-                        f64::from(mode_size.w),
-                        f64::from(mode_size.h),
-                    )),
-                );
-                frame
-                    .render_texture_from_to(
-                        scene,
-                        src,
-                        dst,
-                        &full_damage,
-                        &full_damage,
-                        Transform::Normal,
-                        1.0,
-                        None,
-                        &[],
-                    )
-                    .context("blur: scene copy to framebuffer")?;
-            } else {
-                draw_backdrop(&mut frame)?;
+            // Each window keeps its own `draw_render_elements` call
+            // (single-element slice) so smithay's opaque-region culling
+            // can't skip floats behind earlier tiles.
+            draw_base(&mut frame)?;
+            // Tiled windows blur against the base (tier 0).
+            for ((p, elements), wd) in placements
+                .iter()
+                .zip(grouped.iter())
+                .zip(win_draws.iter())
+                .filter(|((p, _), _)| p.fill == FillMode::Normal && !p.floating)
+            {
+                if let Some(t) = &tier_tiled {
+                    blur_rect(&mut frame, t, cell_local(wd.effective))?;
+                }
+                draw_window(&mut frame, p, elements, wd)?;
+            }
+            // Floating windows draw above tiled and blur against base +
+            // tiled (tier 1), so a float reveals the windows beneath it.
+            for ((p, elements), wd) in placements
+                .iter()
+                .zip(grouped.iter())
+                .zip(win_draws.iter())
+                .filter(|((p, _), _)| p.fill == FillMode::Normal && p.floating)
+            {
+                if let Some(t) = &tier_float {
+                    blur_rect(&mut frame, t, cell_local(wd.effective))?;
+                }
+                draw_window(&mut frame, p, elements, wd)?;
+            }
+            // Maximized windows: borderless, above normal windows but below
+            // Top/Overlay panels. Opaque — no backdrop blur.
+            for ((p, elements), wd) in placements
+                .iter()
+                .zip(grouped.iter())
+                .zip(win_draws.iter())
+                .filter(|((p, _), _)| p.fill == FillMode::Maximized)
+            {
+                draw_window(&mut frame, p, elements, wd)?;
             }
 
             // Top + Overlay layer surfaces go above windows but below the
-            // cursor (rofi above kitty, status bar above everything but
-            // the cursor). When blur is on, paint the blurred backdrop
-            // into each layer's rect first so the layer's translucent
-            // pixels reveal a blurred scene instead of the sharp one.
+            // cursor (rofi above kitty, status bar above everything but the
+            // cursor). Blur against the full backdrop (tier 2) so a
+            // translucent panel/launcher reveals a frosted desktop.
             for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
                 if !matches!(bucket, LayerBucket::Top | LayerBucket::Overlay) {
                     continue;
                 }
-                if let Some((blurred, _)) = &blurred_layer {
+                if let Some(t) = &tier_layer {
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -1925,25 +2022,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    // The blurred texture is 1:1 with the framebuffer, so
-                    // the source sub-rect matches the on-screen rect.
-                    let src = Rectangle::<f64, smithay::utils::Buffer>::new(
-                        Point::from((f64::from(dst.loc.x), f64::from(dst.loc.y))),
-                        Size::from((f64::from(dst.size.w), f64::from(dst.size.h))),
-                    );
-                    frame
-                        .render_texture_from_to(
-                            blurred,
-                            src,
-                            dst,
-                            &[dst],
-                            &[dst],
-                            Transform::Normal,
-                            1.0,
-                            None,
-                            &[],
-                        )
-                        .context("blur: backdrop behind layer")?;
+                    blur_rect(&mut frame, t, dst)?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
                     .context("draw_render_elements (layer top/overlay) failed")?;
@@ -2224,42 +2303,47 @@ fn capture_dmabuf(
     }
 }
 
-/// Render the backdrop scene into `scratch.scene`, then run the Kawase
-/// dual-filter pyramid (`passes` downsamples followed by `passes`
-/// upsamples) so `scratch.levels[0]` ends up holding the full-resolution
-/// blurred backdrop. `draw_backdrop` paints everything that sits *behind*
-/// the surfaces being blurred (wallpaper + lower layers + windows).
-///
-/// All work is render-to-texture (never a raw blit), so orientation
-/// stays consistent with the closing-window snapshot path: every pass is
-/// a sample-then-re-encode, and the final composite samples it once more
-/// to land upright on the framebuffer.
-fn render_and_blur(
+/// Draw one z-band of the backdrop into `scratch.scene`, *accumulating*
+/// on top of whatever earlier bands already painted (GLES `render` never
+/// clears). The first band's wallpaper fill covers the whole output, so
+/// no explicit clear is needed before it.
+fn render_scene_stage(
     gles: &mut GlesRenderer,
     scratch: &mut BlurScratch,
     mode_size: Size<i32, Physical>,
-    blur: BlurConfig,
-    draw_backdrop: &dyn Fn(&mut GlesFrame<'_, '_>) -> Result<()>,
+    draw: &dyn Fn(&mut GlesFrame<'_, '_>) -> Result<()>,
+) -> Result<()> {
+    let mut target = gles
+        .bind(&mut scratch.scene)
+        .context("blur: bind scene buffer")?;
+    let mut frame = gles
+        .render(&mut target, mode_size, Transform::Normal)
+        .context("blur: render scene stage")?;
+    draw(&mut frame)?;
+    // Same-context sequential GL: the next pass that samples this texture
+    // is ordered after these writes, so the fence is dropped.
+    let _ = frame.finish().context("blur: finish scene stage")?;
+    Ok(())
+}
+
+/// Run the Kawase dual-filter pyramid over the current `scratch.scene`
+/// (`passes` downsamples then `passes` upsamples) and save the blurred
+/// full-resolution result into `scratch.tiers[tier]`.
+///
+/// All work is render-to-texture (never a raw blit), so orientation stays
+/// consistent with the closing-window snapshot path: every pass samples
+/// then re-encodes, and the final composite samples once more to land
+/// upright on the framebuffer.
+fn run_pyramid(
+    gles: &mut GlesRenderer,
+    scratch: &mut BlurScratch,
+    passes: usize,
+    radius: f32,
     down: &GlesTexProgram,
     up: &GlesTexProgram,
+    tier: usize,
 ) -> Result<()> {
-    let (passes, radius) = (blur.passes, blur.radius);
-    // 1. Render the backdrop into the full-res scene texture. The
-    //    wallpaper fill covers the whole output first, so no clear.
-    {
-        let mut target = gles
-            .bind(&mut scratch.scene)
-            .context("blur: bind scene buffer")?;
-        let mut frame = gles
-            .render(&mut target, mode_size, Transform::Normal)
-            .context("blur: render scene")?;
-        draw_backdrop(&mut frame)?;
-        // Same-context sequential GL: the next pass that samples this
-        // texture is ordered after these writes, so the fence is dropped.
-        let _ = frame.finish().context("blur: finish scene")?;
-    }
-    let passes = passes as usize;
-    // 2. Downsample: scene → level1 → level2 → … → level(passes).
+    // Downsample: scene → level1 → level2 → … → level(passes).
     for k in 1..=passes {
         let src = if k == 1 {
             scratch.scene.clone()
@@ -2268,11 +2352,15 @@ fn render_and_blur(
         };
         blur_pass(gles, &src, &mut scratch.levels[k], down, radius)?;
     }
-    // 3. Upsample back down the chain into level0 (the blurred output).
-    for k in (0..passes).rev() {
+    // Upsample back up the chain; the last step lands in tiers[tier]
+    // (full resolution) instead of overwriting level0, so the saved tier
+    // survives the next pyramid run.
+    for k in (1..passes).rev() {
         let src = scratch.levels[k + 1].clone();
         blur_pass(gles, &src, &mut scratch.levels[k], up, radius)?;
     }
+    let src = scratch.levels[1].clone();
+    blur_pass(gles, &src, &mut scratch.tiers[tier], up, radius)?;
     Ok(())
 }
 

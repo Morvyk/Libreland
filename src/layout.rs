@@ -248,6 +248,11 @@ pub struct Placement {
     /// for non-`Normal` placements and draws them in a higher z-bucket
     /// (maximized above windows, fullscreen above panels too).
     pub fill: FillMode,
+    /// `true` for floating (and in-transit) windows, which draw above the
+    /// tiled tree. The renderer uses this to pick the blur backdrop tier:
+    /// tiled windows blur against the base (wallpaper + lower layers),
+    /// floating windows against the base *plus* the tiled windows beneath.
+    pub floating: bool,
     /// Extra vertical offset (compositor px) the renderer adds *after*
     /// per-window animation, used for the workspace slide so both the
     /// outgoing and incoming workspaces translate together without
@@ -728,6 +733,8 @@ impl Layout {
                 cell_rect: t.window.rect,
                 focused: is_focused(surface),
                 fill: t.window.fill,
+                // A window being dragged floats freely over everything.
+                floating: true,
                 slide_dy: 0,
             });
         }
@@ -1365,6 +1372,7 @@ fn collect_placements(
                 },
                 focused: is_focused(surface),
                 fill: w.fill,
+                floating: false,
                 slide_dy: 0,
             });
         }
@@ -1399,6 +1407,7 @@ fn collect_workspace(
             },
             focused: is_focused(surface),
             fill: w.fill,
+            floating: true,
             slide_dy: 0,
         });
     }
