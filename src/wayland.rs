@@ -476,6 +476,30 @@ fn maybe_handle_layer_commit(state: &mut State, surface: &WlSurface) {
     }
     let cached = layer_cached_state(surface);
     state.recompute_layer_layout();
+    // Configure the client with its real size — honouring anchors/stretch/
+    // margins — so an anchored bar (which requests a 0-size "stretch" axis)
+    // renders at the right size instead of the full output. Re-configure
+    // only on an actual size change, or every commit would send a configure
+    // and loop with the client's re-render.
+    if let Some(layer) = state
+        .layer_shell_state
+        .layer_surfaces()
+        .find(|l| l.wl_surface() == surface)
+    {
+        let (w, h) = layer_size(state.layer_output_rect(surface), &cached);
+        let new_size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from((w, h)));
+        let changed = layer.with_pending_state(|st| {
+            if st.size == new_size {
+                false
+            } else {
+                st.size = new_size;
+                true
+            }
+        });
+        if changed {
+            layer.send_configure();
+        }
+    }
     let wants_exclusive_kbd = matches!(
         cached.keyboard_interactivity,
         KeyboardInteractivity::Exclusive
@@ -956,28 +980,12 @@ impl WlrLayerShellHandler for State {
             surface = ?surface.wl_surface().id(),
             "wayland: new layer surface"
         );
-        // Send the initial configure carrying the layout area the
-        // surface can occupy. Anchor + size + exclusive-zone math
-        // is handled by the renderer / layout once the client
-        // commits a buffer; here we just bootstrap the configure
-        // cycle. Clients that requested an explicit size (rofi:
-        // anchored centre, 800x600) keep that; clients that asked
-        // for "0" in some axis get the matching output dimension.
-        // Initial configure with the primary output's compositor
-        // rect as a size hint. The client-side keyboard / anchor /
-        // exclusive-zone state isn't readable yet — that gets
-        // looked at on the first commit, in `CompositorHandler::commit`.
-        let bounds = output_name
-            .as_deref()
-            .and_then(|name| self.renderer.output_rect(name))
-            .unwrap_or_else(|| self.renderer.primary_output_rect());
-        let bounds_size = bounds.size;
-        surface.with_pending_state(|state| {
-            state.size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from(
-                (bounds_size.w, bounds_size.h),
-            ));
-        });
-        surface.send_configure();
+        // No configure here: per the wlr-layer-shell handshake the client
+        // performs an initial (bufferless) commit AFTER setting its anchor /
+        // size / exclusive-zone, and only then can we read that state and
+        // reply with a correctly-sized configure — which we do in
+        // `maybe_handle_layer_commit`. Sending one now (before the state is
+        // readable) is what forced bars to the full output size.
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
@@ -1018,6 +1026,39 @@ pub fn layer_cached_state(
         out = *cached.current();
     });
     out
+}
+
+/// The size (in compositor/logical px) a layer surface should be configured
+/// and rendered at, within its output `area`: a stretched span across two
+/// anchored opposite edges (minus margins), else the client's explicit size,
+/// else the full output dimension when it left an axis at 0 for the
+/// compositor to choose. Clamped to the output. Shared by the renderer's
+/// placement and the `configure` we send the client, so the size we tell the
+/// client and the size we draw it at can never disagree — the bug that made
+/// an anchored bar (which asks for a 0-width "stretch" surface) render at the
+/// full output until we started sending this on commit.
+pub(crate) fn layer_size(
+    area: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    cached: &smithay::wayland::shell::wlr_layer::LayerSurfaceCachedState,
+) -> (i32, i32) {
+    use smithay::wayland::shell::wlr_layer::Anchor;
+    let stretch_x = cached.anchor.contains(Anchor::LEFT) && cached.anchor.contains(Anchor::RIGHT);
+    let stretch_y = cached.anchor.contains(Anchor::TOP) && cached.anchor.contains(Anchor::BOTTOM);
+    let width = if stretch_x {
+        area.size.w - cached.margin.left - cached.margin.right
+    } else if cached.size.w > 0 {
+        cached.size.w
+    } else {
+        area.size.w
+    };
+    let height = if stretch_y {
+        area.size.h - cached.margin.top - cached.margin.bottom
+    } else if cached.size.h > 0 {
+        cached.size.h
+    } else {
+        area.size.h
+    };
+    (width.clamp(1, area.size.w), height.clamp(1, area.size.h))
 }
 
 impl FractionalScaleHandler for State {

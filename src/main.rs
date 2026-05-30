@@ -1366,31 +1366,9 @@ impl State {
             let area = self.layer_output_rect(surface);
             let cached = crate::wayland::layer_cached_state(surface);
             let anchor = cached.anchor;
-            // Anchoring to BOTH opposite edges stretches the surface
-            // across that axis (output minus the two margins) — e.g.
-            // a waybar anchored top+left+right spans the full width.
-            let stretch_x = anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT);
-            let stretch_y = anchor.contains(Anchor::TOP) && anchor.contains(Anchor::BOTTOM);
-            // Size: stretched span, else the client's requested size,
-            // else the full output dimension when it asked the
-            // compositor to choose (size 0). Clamp to the output so a
-            // misbehaving client can't drive a negative offset below.
-            let mut width = if stretch_x {
-                area.size.w - cached.margin.left - cached.margin.right
-            } else if cached.size.w > 0 {
-                cached.size.w
-            } else {
-                area.size.w
-            };
-            let mut height = if stretch_y {
-                area.size.h - cached.margin.top - cached.margin.bottom
-            } else if cached.size.h > 0 {
-                cached.size.h
-            } else {
-                area.size.h
-            };
-            width = width.clamp(1, area.size.w);
-            height = height.clamp(1, area.size.h);
+            // Size honours anchors/stretch/margins, shared with the
+            // `configure` we send the client so the two can't disagree.
+            let (width, height) = crate::wayland::layer_size(area, &cached);
             // Position: pinned to an anchored edge (+ its margin), else
             // centred. When stretched, LEFT/TOP is set so the surface
             // starts at the margin and spans to the far margin.
