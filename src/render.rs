@@ -21,7 +21,7 @@ use anyhow::{Context as _, Result};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Format, Fourcc};
-use smithay::backend::drm::{DrmDeviceFd, DrmNode, GbmBufferedSurface};
+use smithay::backend::drm::{DrmDeviceFd, DrmNode, GbmBufferedSurface, VrrSupport};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
@@ -51,7 +51,7 @@ use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
 use crate::config::{
-    AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode,
+    AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode, VrrMode,
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
@@ -561,6 +561,12 @@ struct OutputRender {
     compositor_size: Size<i32, Physical>,
     /// Fractional scale; physical = compositor * scale (component-wise).
     scale: f64,
+    /// Configured Variable Refresh Rate policy for this output.
+    vrr_mode: VrrMode,
+    /// Whether this output's connector advertises adaptive-sync, queried
+    /// once at init. `NotSupported` outputs ignore `vrr_mode` entirely
+    /// (we never touch their `VRR_ENABLED` property).
+    vrr_support: VrrSupport,
 }
 
 /// Public snapshot of one output's geometry for callers (the screenshot
@@ -724,6 +730,9 @@ impl Renderer {
                 auto_x = auto_x.saturating_add(compositor_size.w);
             }
 
+            // Grab the connector before the surface is moved into the
+            // GBM swapchain — adaptive-sync support is a connector property.
+            let connector = drm_output.connector;
             let surface = GbmBufferedSurface::new(
                 drm_output.surface,
                 allocator.clone(),
@@ -737,6 +746,14 @@ impl Renderer {
                 )
             })?;
 
+            let vrr_mode = output_cfg.map_or_else(VrrMode::default, |c| c.vrr);
+            // Query once: the connector's advertised adaptive-sync support.
+            // Errors (inactive device, missing property) degrade to
+            // NotSupported so the output simply never uses VRR.
+            let vrr_support = surface
+                .vrr_supported(connector)
+                .unwrap_or(VrrSupport::NotSupported);
+
             info!(
                 output = %drm_output.name,
                 pos_x = compositor_position.x,
@@ -747,6 +764,8 @@ impl Renderer {
                 phys_h = mode_size.h,
                 refresh_mhz,
                 scale,
+                ?vrr_mode,
+                ?vrr_support,
                 "output swapchain ready"
             );
 
@@ -759,6 +778,8 @@ impl Renderer {
                 compositor_position,
                 compositor_size,
                 scale,
+                vrr_mode,
+                vrr_support,
             });
         }
 
@@ -918,7 +939,10 @@ impl Renderer {
     /// an empty placement slice — only the wallpaper + cursor land.
     pub fn render_initial(&mut self) -> Result<()> {
         for idx in 0..self.outputs.len() {
-            self.render_output(idx, &[], &[], &[], false, &[])
+            // Followup ignored: each output is primed once, then parks until
+            // a redraw is queued (a flip is now in flight, acked on vblank).
+            let _ = self
+                .render_output(idx, &[], &[], &[], false, &[])
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -980,13 +1004,39 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
-    ) -> Result<Vec<CaptureOutcome>> {
+    ) -> Result<(Vec<CaptureOutcome>, bool)> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
         self.render_output(idx, placements, layers, popups, hide_cursor, captures)
+    }
+
+    /// Ack a completed page-flip for `crtc` so its swapchain frees the
+    /// scanned-out buffer. Called from the vblank handler; lets the
+    /// on-demand driver acknowledge a flip without being forced to render
+    /// the next frame (the free-run loop used to do both at once).
+    pub fn frame_submitted(&mut self, crtc: crtc::Handle) {
+        if let Some(o) = self.outputs.iter_mut().find(|o| o.crtc == crtc)
+            && let Err(err) = o.surface.frame_submitted()
+        {
+            warn!(error = %err, crtc = ?crtc, "frame_submitted failed");
+        }
+    }
+
+    /// Every output's CRTC, for the driver to iterate when scheduling
+    /// redraws across all outputs.
+    pub fn crtcs(&self) -> Vec<crtc::Handle> {
+        self.outputs.iter().map(|o| o.crtc).collect()
+    }
+
+    /// CRTC of the output named `name` (connector name), if present.
+    pub fn crtc_for_output_name(&self, name: &str) -> Option<crtc::Handle> {
+        self.outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.crtc)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -1548,6 +1598,45 @@ impl Renderer {
         self.outputs[self.primary_idx].scale
     }
 
+    /// Settle one output's Variable Refresh Rate state for the frame about
+    /// to be queued, per its configured [`VrrMode`].
+    ///
+    /// Idempotent and cheap to call every vblank: smithay's `use_vrr`
+    /// early-returns when the pending adaptive-sync state already matches,
+    /// so we only do work on an actual transition. Outputs whose connector
+    /// doesn't advertise adaptive-sync are left untouched.
+    fn apply_vrr(&self, idx: usize, placements: &[Placement]) {
+        let output = &self.outputs[idx];
+        if output.vrr_support == VrrSupport::NotSupported {
+            return;
+        }
+        let desired = match output.vrr_mode {
+            VrrMode::Off => false,
+            VrrMode::Always => true,
+            // Auto: enabled only while a fullscreen/maximized window fills
+            // this output.
+            VrrMode::Auto => self.output_has_fill_window(idx, placements),
+        };
+        if output.surface.vrr_enabled() == desired {
+            return;
+        }
+        let support = output.vrr_support;
+        match output.surface.use_vrr(desired) {
+            Ok(()) => info!(
+                output = %output.name,
+                enabled = desired,
+                ?support,
+                "adaptive-sync (VRR) state changed"
+            ),
+            Err(err) => warn!(
+                output = %output.name,
+                enabled = desired,
+                error = %err,
+                "could not set adaptive-sync (VRR)"
+            ),
+        }
+    }
+
     /// Render one output's frame: wallpaper, then per window in
     /// bottom-up draw order render its border + surface, then the
     /// cursor sprite on top if its hotspot falls in this output.
@@ -1565,7 +1654,7 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
-    ) -> Result<Vec<CaptureOutcome>> {
+    ) -> Result<(Vec<CaptureOutcome>, bool)> {
         // Upload the latest media-wallpaper frame (if the decode thread has
         // produced one) before snapshotting the drawable below, so animated
         // wallpapers advance each vblank.
@@ -1618,13 +1707,9 @@ impl Renderer {
         // Arc-backed clone out before the `self.gles` frame borrow.
         let freeze_texture = self.freeze_textures.get(&output_name).cloned();
 
-        // No-op on the first call (no pending fb), the ack of the
-        // previous frame's flip thereafter.
-        let _ = self.outputs[idx]
-            .surface
-            .frame_submitted()
-            .with_context(|| format!("frame_submitted failed for {output_name}"))?;
-
+        // The previous frame's flip is acked separately, on its vblank
+        // (see `Renderer::frame_submitted`), so the on-demand driver can
+        // ack a completed flip without being forced to render another.
         let (mut dmabuf, _age) = self.outputs[idx]
             .surface
             .next_buffer()
@@ -2311,6 +2396,12 @@ impl Renderer {
             .collect();
         drop(target);
 
+        // Settle this output's adaptive-sync state for the frame we're
+        // about to queue. Must run before `queue_buffer` so the commit it
+        // triggers carries the right VRR_ENABLED (smithay promotes the
+        // commit to a modeset itself when the toggle demands one).
+        self.apply_vrr(idx, placements);
+
         self.outputs[idx]
             .surface
             .queue_buffer(Some(sync), None, ())
@@ -2318,25 +2409,71 @@ impl Renderer {
         debug!(output = %output_name, "frame queued for scanout");
 
         // Fire wl_callback.done on every surface we rendered. The
-        // callback queue is drained per surface, so calling this
-        // again from a second output's render is a harmless no-op
-        // (which is what we want — one done() per frame, not one
-        // per output).
+        // callback queue is drained per surface, so calling this again from
+        // a second output's render is a no-op. We deliberately fire only for
+        // surfaces visible on THIS output, though: otherwise a fast output
+        // (a fullscreen game) would drive the clients on every other output
+        // at its own rate, and the resulting cross-output feedback loop
+        // would peg every panel back at max refresh — defeating VRR.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
         )]
         let elapsed_ms = self.start.elapsed().as_millis() as u32;
+        let out_rect = Rectangle::new(compositor_position, compositor_size);
         for p in placements {
-            send_frame_callbacks(&p.surface, elapsed_ms);
+            if p.cell_rect.overlaps(out_rect) {
+                send_frame_callbacks(&p.surface, elapsed_ms);
+            }
         }
         for l in layers {
-            send_frame_callbacks(&l.surface, elapsed_ms);
+            if l.rect.overlaps(out_rect) {
+                send_frame_callbacks(&l.surface, elapsed_ms);
+            }
         }
+        // Popups are tiny, transient, and tied to a parent already covered
+        // above; fire unconditionally rather than track their output.
         for p in popups {
             send_frame_callbacks(&p.surface, elapsed_ms);
         }
-        Ok(capture_results)
+
+        // Tell the on-demand driver whether this output still produces
+        // frames on its own — an in-flight window/close/open animation, or
+        // a visible media wallpaper (which advances every frame). When
+        // none hold, the output may park until the next external trigger.
+        // A media wallpaper hidden behind a fullscreen/maximized window is
+        // occluded, so it doesn't count (letting a fullscreen game's output
+        // park between the game's own commits — the whole point of VRR).
+        let wallpaper_live = self
+            .wallpaper_media
+            .as_ref()
+            .is_some_and(|m| m.anim.is_live());
+        // `win_anims` holds one entry per *tracked* window (for smooth move
+        // retargeting), so it's non-empty whenever any window exists — check
+        // for an actually-running move/open animation instead, or every
+        // output would free-run forever the moment a window maps.
+        let anim_running = self
+            .win_anims
+            .values()
+            .any(|w| w.move_anim.is_some() || w.open_anim.is_some());
+        let followup = anim_running
+            || !self.closing.is_empty()
+            || !self.pending_open.is_empty()
+            || (wallpaper_live && !self.output_has_fill_window(idx, placements));
+        Ok((capture_results, followup))
+    }
+
+    /// Whether a fullscreen or maximized window currently covers this
+    /// output — the windows for which `Auto` VRR engages, and behind which
+    /// the media wallpaper is fully occluded.
+    fn output_has_fill_window(&self, idx: usize, placements: &[Placement]) -> bool {
+        let rect = Rectangle::new(
+            self.outputs[idx].compositor_position,
+            self.outputs[idx].compositor_size,
+        );
+        placements
+            .iter()
+            .any(|p| p.fill != FillMode::Normal && p.cell_rect.overlaps(rect))
     }
 }
 

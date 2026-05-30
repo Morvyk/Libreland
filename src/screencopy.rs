@@ -285,6 +285,9 @@ impl Dispatch<ZwlrScreencopyFrameV1, FrameData> for State {
                     return;
                 }
 
+                // Wake the captured output so the pending grab is serviced;
+                // an idle on-demand output would never flip on its own.
+                let crtc = state.renderer.crtc_for_output_name(&output);
                 state.screencopy_pending.push(PendingCapture {
                     frame: frame.clone(),
                     buffer,
@@ -292,6 +295,9 @@ impl Dispatch<ZwlrScreencopyFrameV1, FrameData> for State {
                     region,
                     overlay_cursor,
                 });
+                if let Some(crtc) = crtc {
+                    state.queue_redraw(crtc);
+                }
             }
             zwlr_screencopy_frame_v1::Request::Destroy => {
                 state.screencopy_pending.retain(|p| &p.frame != frame);

@@ -444,6 +444,12 @@ impl CompositorHandler for State {
         // popups whose surfaces died so they stop being rendered.
         self.popup_manager.commit(surface);
         self.popup_manager.cleanup();
+        // On-demand render: a committed buffer is new pixels — redraw the
+        // output this surface is on. This is the hot path that lets a
+        // fullscreen client's output flip at the client's frame rate (the
+        // basis of working VRR), while a background or off-output commit
+        // leaves an unrelated output asleep.
+        self.queue_redraw_for_surface(surface);
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
@@ -551,6 +557,10 @@ impl SeatHandler for State {
         // `Named`), or `Hidden`. The renderer draws it next frame,
         // unless a compositor grab override is active.
         self.renderer.set_cursor_status(image);
+        // The cursor sprite changed in place (no motion). Redraw so it
+        // updates; skip fullscreen outputs (the cursor is hidden there and
+        // we don't want to disturb a game's VRR).
+        self.queue_redraw_nonfullscreen();
     }
 }
 
@@ -620,6 +630,8 @@ impl XdgShellHandler for State {
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
         }
+        // New window reflows the layout + starts its open animation.
+        self.queue_redraw_all();
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
@@ -633,6 +645,7 @@ impl XdgShellHandler for State {
             // protocol requires.
             surface.send_configure();
         }
+        self.queue_redraw_all();
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
@@ -640,6 +653,7 @@ impl XdgShellHandler for State {
         if !self.layout.set_fill(surface.wl_surface(), FillMode::Normal) {
             surface.send_configure();
         }
+        self.queue_redraw_all();
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
@@ -652,6 +666,9 @@ impl XdgShellHandler for State {
         {
             surface.send_configure();
         }
+        // Redraw so the window goes fullscreen and the output re-evaluates
+        // VRR (Auto engages adaptive-sync now that a window fills it).
+        self.queue_redraw_all();
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
@@ -659,6 +676,7 @@ impl XdgShellHandler for State {
         if !self.layout.set_fill(surface.wl_surface(), FillMode::Normal) {
             surface.send_configure();
         }
+        self.queue_redraw_all();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -735,6 +753,8 @@ impl XdgShellHandler for State {
                 kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
             }
         }
+        // Reflow + close animation need to be drawn.
+        self.queue_redraw_all();
     }
 }
 
@@ -824,11 +844,14 @@ impl ClientDndGrabHandler for State {
         _seat: Seat<Self>,
     ) {
         self.renderer.set_dnd_icon(icon);
+        // Show/hide the drag icon (it then follows the cursor via motion).
+        self.queue_redraw_nonfullscreen();
     }
 
     /// The drag ended (dropped or cancelled) — remove the icon.
     fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
         self.renderer.set_dnd_icon(None);
+        self.queue_redraw_nonfullscreen();
     }
 }
 impl ServerDndGrabHandler for State {}
@@ -975,6 +998,9 @@ impl WlrLayerShellHandler for State {
             kbd.set_focus(self, restore, SERIAL_COUNTER.next_serial());
         }
         self.recompute_layer_layout();
+        // A panel vanished: its exclusive zone is reclaimed and windows
+        // reflow into it.
+        self.queue_redraw_all();
     }
 }
 

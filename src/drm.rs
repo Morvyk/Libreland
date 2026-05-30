@@ -46,6 +46,10 @@ pub struct DrmOutput {
     /// the CRTC, so the renderer uses this to look up which output
     /// to re-render.
     pub crtc: crtc::Handle,
+    /// Connector this output scans out on. Kept so the renderer can
+    /// query `vrr_capable` (adaptive-sync support is a connector
+    /// property, not a CRTC one) before deciding whether VRR is usable.
+    pub connector: connector::Handle,
     /// CRTC + connector + mode tuple, consumed by the renderer to
     /// build a GBM swapchain over this output.
     pub surface: DrmSurface,
@@ -137,6 +141,7 @@ pub fn open_display(
         outputs.push(DrmOutput {
             name,
             crtc,
+            connector: conn_handle,
             surface,
             mode,
         });

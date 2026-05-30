@@ -222,6 +222,21 @@ pub struct MonitorsConfig {
     pub primary: Option<String>,
 }
 
+/// Per-output Variable Refresh Rate (adaptive-sync) policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VrrMode {
+    /// Enable VRR only while a window fills this output (fullscreen or
+    /// maximized) — the case adaptive-sync actually helps (games,
+    /// fullscreen video), without the desktop-wide flicker some panels
+    /// show under VRR. The default on every output that supports it.
+    #[default]
+    Auto,
+    /// Keep VRR enabled at all times (on outputs that support it).
+    Always,
+    /// Never enable VRR on this output.
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputConfig {
     /// Mode override: `Some((width, height, refresh_mHz))` to force
@@ -239,6 +254,10 @@ pub struct OutputConfig {
     /// for legacy clients) and `wp_fractional_scale_manager_v1`
     /// (full fractional value, for clients that support it).
     pub scale: f64,
+    /// Variable Refresh Rate policy. Defaults to [`VrrMode::Auto`];
+    /// a no-op on outputs whose connector doesn't advertise
+    /// adaptive-sync.
+    pub vrr: VrrMode,
 }
 
 impl Default for OutputConfig {
@@ -247,6 +266,7 @@ impl Default for OutputConfig {
             mode: None,
             position: None,
             scale: 1.0,
+            vrr: VrrMode::default(),
         }
     }
 }
@@ -676,7 +696,21 @@ fn parse_output(t: &Table) -> mlua::Result<OutputConfig> {
         }
         cfg.scale = scale;
     }
+    if let Some(vrr) = t.get::<Option<String>>("vrr")? {
+        cfg.vrr = parse_vrr_mode(&vrr)?;
+    }
     Ok(cfg)
+}
+
+fn parse_vrr_mode(s: &str) -> mlua::Result<VrrMode> {
+    Ok(match s.to_lowercase().as_str() {
+        "auto" => VrrMode::Auto,
+        "always" | "on" => VrrMode::Always,
+        "off" | "never" => VrrMode::Off,
+        other => {
+            lua_bail!("unknown vrr mode {other:?}; expected \"auto\", \"always\", or \"off\"")
+        }
+    })
 }
 
 fn parse_input(t: &Table, defaults: InputConfig) -> mlua::Result<InputConfig> {
@@ -1316,5 +1350,51 @@ mod decoration_tests {
                 "expected error for: {src}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod monitors_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Config {
+        let lua = Lua::new();
+        lua.load(src).exec().expect("lua exec");
+        Config::populate_from_globals(&lua.globals()).expect("populate")
+    }
+
+    #[test]
+    fn vrr_defaults_to_auto() {
+        // An output with no `vrr` key — and the implicit default for an
+        // output not listed at all — both resolve to Auto.
+        let c = parse(r#"monitors = { outputs = { ["DP-1"] = { scale = 1.0 } } }"#);
+        assert_eq!(c.monitors.outputs["DP-1"].vrr, VrrMode::Auto);
+        assert_eq!(OutputConfig::default().vrr, VrrMode::Auto);
+    }
+
+    #[test]
+    fn vrr_parses_each_mode() {
+        for (lua_val, want) in [
+            ("auto", VrrMode::Auto),
+            ("always", VrrMode::Always),
+            ("on", VrrMode::Always),
+            ("off", VrrMode::Off),
+            ("never", VrrMode::Off),
+            ("OFF", VrrMode::Off), // case-insensitive
+        ] {
+            let c = parse(&format!(
+                r#"monitors = {{ outputs = {{ ["DP-1"] = {{ vrr = "{lua_val}" }} }} }}"#
+            ));
+            assert_eq!(c.monitors.outputs["DP-1"].vrr, want, "vrr = {lua_val:?}");
+        }
+    }
+
+    #[test]
+    fn vrr_rejects_unknown() {
+        let lua = Lua::new();
+        lua.load(r#"monitors = { outputs = { ["DP-1"] = { vrr = "sometimes" } } }"#)
+            .exec()
+            .unwrap();
+        assert!(Config::populate_from_globals(&lua.globals()).is_err());
     }
 }

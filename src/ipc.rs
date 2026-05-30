@@ -598,7 +598,20 @@ mod server {
     /// [`Reply`]. Queries can't fail; actions return `Err(message)` when
     /// the target can't be resolved.
     fn dispatch(state: &mut State, req: Request) -> Reply {
-        match req {
+        // Requests that change what's on screen need an on-demand redraw.
+        // (Reload redraws itself via reload_config; Spawn's new window
+        // redraws when it maps; queries change nothing.)
+        let mutating = matches!(
+            req,
+            Request::FocusWindow { .. }
+                | Request::Close { .. }
+                | Request::ToggleFloating { .. }
+                | Request::ToggleFullscreen { .. }
+                | Request::ToggleMaximized { .. }
+                | Request::FocusWorkspace { .. }
+                | Request::MoveToWorkspace { .. }
+        );
+        let reply = match req {
             Request::Version => Ok(Response::Version(VersionInfo {
                 name: "libreland".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -628,7 +641,11 @@ mod server {
             Request::Subscribe { .. } => {
                 Err("subscribe must be used as a streaming connection".to_owned())
             }
+        };
+        if mutating {
+            state.queue_redraw_all();
         }
+        reply
     }
 
     /// Resolve a window target: the surface for `id`, or the focused

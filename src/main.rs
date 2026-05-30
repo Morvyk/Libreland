@@ -40,6 +40,7 @@ use smithay::input::pointer::{
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use smithay::reexports::drm::control::crtc;
 use smithay::reexports::input as libinput;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
@@ -89,6 +90,34 @@ mod wayland;
     clippy::struct_field_names,
     reason = "the *_state suffix is smithay's convention and matches each field's type name; renaming would just diverge from upstream docs"
 )]
+/// Walk subsurface parents up to the root surface, so a subsurface commit
+/// resolves to the toplevel (or layer surface) it belongs to.
+fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+        root = parent;
+    }
+    root
+}
+
+/// Per-output render-scheduling state for on-demand rendering. The
+/// compositor renders an output only when [`State::queue_redraw`] marks it,
+/// rather than flipping every vblank — so an idle output draws nothing, and
+/// a fullscreen client's output flips at the client's pace (which is what
+/// makes Variable Refresh Rate actually take effect).
+#[derive(Debug, Clone, Copy)]
+enum RedrawState {
+    /// No flip in flight and nothing scheduled — waiting for a trigger.
+    Idle,
+    /// A render is queued to run on the next event-loop turn (an idle
+    /// callback is live); further triggers coalesce into it.
+    Scheduled,
+    /// A flip is in flight; `dirty` records whether a trigger arrived while
+    /// we waited, so the vblank re-renders instead of parking. We must
+    /// never queue a second flip before the first completes.
+    WaitingForVblank { dirty: bool },
+}
+
 pub(crate) struct State {
     /// The libseat session is retained so future code can query its
     /// active flag and switch VTs. libinput already holds an internal
@@ -258,6 +287,9 @@ pub(crate) struct State {
     /// Calloop handle, used to register the async pipe reads/writes
     /// that drain and serve cached selections without blocking.
     pub(crate) loop_handle: smithay::reexports::calloop::LoopHandle<'static, LoopData>,
+    /// Per-output on-demand render state, keyed by CRTC. See
+    /// [`RedrawState`] and [`State::queue_redraw`].
+    pub(crate) redraw: std::collections::HashMap<crtc::Handle, RedrawState>,
     /// Keyboard focus saved when a layer-shell surface grabs
     /// exclusive focus (e.g. rofi), restored when that surface
     /// is destroyed.
@@ -523,6 +555,191 @@ impl State {
         })
     }
 
+    /// Request that `crtc`'s output render a fresh frame. This is the
+    /// on-demand core: instead of flipping every vblank, each output sits
+    /// idle until a trigger (client commit, input, layout change,
+    /// animation, …) calls this. Coalescing is automatic — many triggers
+    /// between two frames schedule at most one render.
+    fn queue_redraw(&mut self, crtc: crtc::Handle) {
+        let schedule = match self.redraw.entry(crtc).or_insert(RedrawState::Idle) {
+            slot @ RedrawState::Idle => {
+                *slot = RedrawState::Scheduled;
+                true
+            }
+            // Already going to render this turn.
+            RedrawState::Scheduled => false,
+            // A flip is in flight; remember to render again on its vblank.
+            RedrawState::WaitingForVblank { dirty } => {
+                *dirty = true;
+                false
+            }
+        };
+        if schedule {
+            self.loop_handle
+                .insert_idle(move |data| data.state.render_crtc(crtc));
+        }
+    }
+
+    /// Queue a redraw on every output. Used for changes we can't (or needn't)
+    /// pin to one output — layout reflows, focus changes, config reloads.
+    fn queue_redraw_all(&mut self) {
+        for crtc in self.renderer.crtcs() {
+            self.queue_redraw(crtc);
+        }
+    }
+
+    /// Queue a redraw on every output that *isn't* currently showing a
+    /// fullscreen window. Used for redraws we can't pin to one output
+    /// (popups, cursor/drag surfaces) and for the safety heartbeat, so we
+    /// never stutter a fullscreen client's VRR by flipping its output for
+    /// an unrelated reason.
+    fn queue_redraw_nonfullscreen(&mut self) {
+        for crtc in self.renderer.crtcs() {
+            let fullscreen = self
+                .renderer
+                .output_name_for_crtc(crtc)
+                .is_some_and(|name| self.layout.output_has_fullscreen(&name));
+            if !fullscreen {
+                self.queue_redraw(crtc);
+            }
+        }
+    }
+
+    /// Queue a redraw for the output a committing `surface` is visible on.
+    /// Resolving the surface to its output keeps a window on one output (or
+    /// in a background workspace) from waking an unrelated output — the
+    /// isolation VRR needs. A surface occluded behind a fullscreen window
+    /// is skipped; an unplaceable surface (popup, cursor, drag icon) falls
+    /// back to every non-fullscreen output.
+    fn queue_redraw_for_surface(&mut self, surface: &WlSurface) {
+        let root = root_surface(surface);
+        // A tracked toplevel (or a subsurface of one) → its output, unless
+        // it's hidden behind a fullscreen window there.
+        if let Some(name) = self.layout.output_of(&root) {
+            if self.layout.output_fullscreen_other_than(&name, &root) {
+                return;
+            }
+            if let Some(crtc) = self.renderer.crtc_for_output_name(&name) {
+                self.queue_redraw(crtc);
+            }
+            return;
+        }
+        // A layer-shell surface → its bound output, unless a fullscreen
+        // window covers it.
+        if let Some(name) = self.layer_outputs.get(&root).cloned() {
+            if !self.layout.output_has_fullscreen(&name)
+                && let Some(crtc) = self.renderer.crtc_for_output_name(&name)
+            {
+                self.queue_redraw(crtc);
+            }
+            return;
+        }
+        // Popup / cursor / drag icon / not-yet-mapped → every output not
+        // running a fullscreen window.
+        self.queue_redraw_nonfullscreen();
+    }
+
+    /// Render and queue one output's frame, then park it (a flip is now in
+    /// flight, acked on the next vblank). Re-arms itself via the dirty flag
+    /// while a window animation or workspace slide is still running. This is
+    /// the old free-run vblank body, now driven on demand by
+    /// [`Self::queue_redraw`] and re-driven by the vblank handler.
+    fn render_crtc(&mut self, crtc: crtc::Handle) {
+        let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        // Workspace slide spec (None when disabled). Clear finished slides,
+        // then emit (both workspaces during one, the active one otherwise).
+        let ws_anim = self.config.animations.workspace;
+        let slide = (self.config.animations.enabled && ws_anim.enabled).then_some(ws_anim);
+        self.layout.tick_transitions(slide);
+        let placements = self.layout.placements(focused.as_ref(), slide);
+        let layer_placements = self.snapshot_layer_placements();
+        let popup_placements = self.snapshot_popup_placements(&placements, &layer_placements);
+
+        // Drain pending captures for the output this CRTC drives so the
+        // renderer can read them off this frame's framebuffer.
+        let out_name = self.renderer.output_name_for_crtc(crtc);
+        let mut captures: Vec<screencopy::PendingCapture> = Vec::new();
+        let mut internal: Vec<InternalCapture> = Vec::new();
+        if let Some(name) = out_name.as_deref() {
+            let pending = std::mem::take(&mut self.screencopy_pending);
+            let (mine, rest): (Vec<_>, Vec<_>) =
+                pending.into_iter().partition(|p| p.output == name);
+            self.screencopy_pending = rest;
+            captures = mine;
+
+            let ipending = std::mem::take(&mut self.screenshot_pending);
+            let (imine, irest): (Vec<_>, Vec<_>) =
+                ipending.into_iter().partition(|c| c.output == name);
+            self.screenshot_pending = irest;
+            internal = imine;
+        }
+        let mut specs: Vec<render::CaptureSpec> = captures
+            .iter()
+            .map(|c| render::CaptureSpec {
+                region: c.region,
+                fourcc: screencopy::CAPTURE_FOURCC,
+                target: match smithay::wayland::dmabuf::get_dmabuf(&c.buffer) {
+                    Ok(dmabuf) => render::CaptureTarget::Dmabuf(dmabuf.clone()),
+                    Err(_) => render::CaptureTarget::Shm,
+                },
+            })
+            .collect();
+        for c in &internal {
+            specs.push(render::CaptureSpec {
+                region: c.region,
+                fourcc: screencopy::CAPTURE_FOURCC,
+                target: render::CaptureTarget::Shm,
+            });
+        }
+        let capture_hides_cursor =
+            !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
+        let internal_hides_cursor =
+            !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
+        let hide_cursor =
+            self.pointer_locked() || capture_hides_cursor || internal_hides_cursor;
+        let client_n = captures.len();
+        let followup = match self.renderer.render_for_crtc(
+            crtc,
+            &placements,
+            &layer_placements,
+            &popup_placements,
+            hide_cursor,
+            &specs,
+        ) {
+            Ok((mut results, followup)) => {
+                // Trailing results belong to the internal specs.
+                let internal_results = results.split_off(client_n.min(results.len()));
+                for (pending, captured) in captures.iter().zip(results) {
+                    screencopy::complete(pending, captured);
+                }
+                for (cap, outcome) in internal.into_iter().zip(internal_results) {
+                    self.complete_internal_capture(cap, outcome);
+                }
+                followup
+            }
+            Err(err) => {
+                // Don't kill the loop on a render hiccup; a later trigger
+                // retries this output. Fail any captures riding this frame.
+                warn!(error = %err, ?crtc, "render_for_crtc failed");
+                for pending in &captures {
+                    screencopy::complete(pending, render::CaptureOutcome::Failed);
+                }
+                if !internal.is_empty() {
+                    warn!("screenshot: capture dropped (render failed)");
+                }
+                // No flip was queued, so park (don't wait for a vblank that
+                // won't come); the next trigger retries.
+                self.redraw.insert(crtc, RedrawState::Idle);
+                return;
+            }
+        };
+        // A flip is in flight; park until its vblank. Keep rendering while a
+        // window animation (followup) or a workspace slide is still running.
+        let dirty = followup || self.layout.is_animating();
+        self.redraw
+            .insert(crtc, RedrawState::WaitingForVblank { dirty });
+    }
+
     /// Forward the current cursor location to the focused client as
     /// a `wl_pointer.motion` event (smithay generates enter/leave
     /// when the focus surface changes). Hit-tests the layout to
@@ -545,6 +762,14 @@ impl State {
         let delta_unaccel = evt.delta_unaccel();
         let time = evt.time_msec();
         let utime = evt.time();
+
+        // The cursor sprite (and any drag / screenshot selection) moves on
+        // every motion, so this output needs a fresh frame — unless the
+        // pointer is locked, where the cursor is hidden and the locked
+        // client redraws via its own commits (keeping its VRR untouched).
+        if !self.pointer_locked() {
+            self.queue_redraw_all();
+        }
 
         // A screenshot session owns the pointer: move the cursor and
         // update the live selection (region drag corner / hovered
@@ -788,6 +1013,11 @@ impl State {
         time: u32,
     ) {
         use smithay::backend::input::ButtonState;
+        // A button can change focus (border colour), start/end a drag, or
+        // drive the screenshot UI — all visual. Queue a redraw up front so
+        // every path is covered; it coalesces into an actively-rendering
+        // output, so it doesn't perturb a focused game's VRR.
+        self.queue_redraw_all();
         // A screenshot session owns the pointer. Left button: PRESS starts
         // the region drag (anchor) / RELEASE finalizes it; for window mode
         // a press captures the hovered window. Right button cancels. All
@@ -1070,6 +1300,9 @@ impl State {
     /// switch the workspace on the output under the cursor and
     /// re-derive focus (the previously-focused window is now hidden).
     fn workspace_gesture(&mut self, shift: bool, delta: i32) {
+        // Switching or moving across workspaces reflows + starts a slide;
+        // redraw so it shows (the slide then self-sustains via followup).
+        self.queue_redraw_all();
         if shift {
             if let Some(surface) = self.seat.get_keyboard().and_then(|k| k.current_focus()) {
                 let moved = self.layout.move_focused_window(&surface, delta);
@@ -1548,6 +1781,10 @@ impl State {
     /// Run a bound action. Grows as we add more actions (`reload`,
     /// `spawn`, `change_vt`, …).
     fn dispatch_action(&mut self, action: config::Action) {
+        // Most actions change what's on screen (fullscreen/maximize/float
+        // toggles, workspace switches, screenshots). A few (spawn, exit)
+        // don't, but a redundant redraw is harmless and coalesces away.
+        self.queue_redraw_all();
         match action {
             config::Action::Exit => {
                 info!("exit action fired — stopping event loop");
@@ -1637,7 +1874,9 @@ impl State {
 
         // Settings whose runtime consumers run once at startup.
         if new.monitors != self.config.monitors {
-            warn!("monitor config changed; restart Libreland to apply mode/position/scale/primary");
+            warn!(
+                "monitor config changed; restart Libreland to apply mode/position/scale/primary/vrr"
+            );
         }
         if new.env != self.config.env {
             warn!("env changed; restart to re-export environment variables");
@@ -1683,6 +1922,8 @@ impl State {
         self.renderer.set_decoration(new.decoration.clone());
         self.config = new;
         info!("config reloaded");
+        // Wallpaper / gaps / border / decoration all changed the picture.
+        self.queue_redraw_all();
     }
 }
 
@@ -2474,6 +2715,18 @@ fn main() -> Result<()> {
         },
         config.border.width,
     );
+    // On-demand render bookkeeping: each output already has its priming
+    // flip in flight (from `render_initial` above). Start every CRTC in
+    // WaitingForVblank with `dirty` set, so the first vblank runs a real
+    // `render_crtc` (not just a park) — that establishes the followup loop
+    // for an animated wallpaper and draws any client that connected before
+    // the loop started; outputs with nothing to animate park right after.
+    let redraw = renderer
+        .crtcs()
+        .into_iter()
+        .map(|crtc| (crtc, RedrawState::WaitingForVblank { dirty: true }))
+        .collect();
+
     let state = State {
         session,
         loop_signal,
@@ -2507,6 +2760,7 @@ fn main() -> Result<()> {
         screencopy_manager: wayland_init.screencopy_manager,
         screencopy_pending: Vec::new(),
         loop_handle: handle.clone(),
+        redraw,
         popup_manager: wayland_init.popup_manager,
         kbd_focus_before_layer: None,
         layout,
@@ -2784,9 +3038,19 @@ fn wire_event_sources(
     libinput_backend: LibinputInputBackend,
 ) -> Result<()> {
     handle
-        .insert_source(session_notifier, |event, (), _data| match event {
+        .insert_source(session_notifier, |event, (), data: &mut LoopData| match event {
             smithay::backend::session::Event::PauseSession => warn!("session paused"),
-            smithay::backend::session::Event::ActivateSession => info!("session activated"),
+            smithay::backend::session::Event::ActivateSession => {
+                info!("session activated");
+                // The kernel dropped any flip that was in flight when we
+                // switched VTs away, so its vblank will never arrive. Discard
+                // the stale WaitingForVblank bookkeeping (reset to Idle) and
+                // force a fresh render of every output to restore scanout.
+                for crtc in data.state.renderer.crtcs() {
+                    data.state.redraw.insert(crtc, RedrawState::Idle);
+                }
+                data.state.queue_redraw_all();
+            }
         })
         .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
 
@@ -2809,117 +3073,20 @@ fn wire_event_sources(
             drm_notifier,
             |event, _meta, data: &mut LoopData| match event {
                 smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                    // Snapshot every laid-out window's placement so
-                    // the borrow on `layout` ends before the mut
-                    // borrow on `renderer` starts. WlSurface clones
-                    // are Arc-backed — cheap. Layout returns
-                    // placements in draw order (tiled tree first,
-                    // floats next, in-transit on top) along with
-                    // each window's focused flag so the renderer
-                    // picks active vs inactive border colour.
-                    let focused = data
-                        .state
-                        .seat
-                        .get_keyboard()
-                        .and_then(|k| k.current_focus());
-                    // Workspace slide spec (None when disabled). Clear
-                    // finished slides, then emit (both workspaces during
-                    // one, the active one otherwise).
-                    let ws_anim = data.state.config.animations.workspace;
-                    let slide = (data.state.config.animations.enabled && ws_anim.enabled)
-                        .then_some(ws_anim);
-                    data.state.layout.tick_transitions(slide);
-                    let placements = data.state.layout.placements(focused.as_ref(), slide);
-                    let layer_placements = data.state.snapshot_layer_placements();
-                    let popup_placements = data
-                        .state
-                        .snapshot_popup_placements(&placements, &layer_placements);
-                    // Drain any pending screencopy captures for the
-                    // output this CRTC drives, so the renderer can read
-                    // them off this frame's framebuffer.
-                    let out_name = data.state.renderer.output_name_for_crtc(crtc);
-                    // Client zwlr_screencopy captures + compositor-internal
-                    // screenshot captures both ride this output's frame.
-                    let mut captures: Vec<screencopy::PendingCapture> = Vec::new();
-                    let mut internal: Vec<InternalCapture> = Vec::new();
-                    if let Some(name) = out_name.as_deref() {
-                        let pending = std::mem::take(&mut data.state.screencopy_pending);
-                        let (mine, rest): (Vec<_>, Vec<_>) =
-                            pending.into_iter().partition(|p| p.output == name);
-                        data.state.screencopy_pending = rest;
-                        captures = mine;
-
-                        let ipending = std::mem::take(&mut data.state.screenshot_pending);
-                        let (imine, irest): (Vec<_>, Vec<_>) =
-                            ipending.into_iter().partition(|c| c.output == name);
-                        data.state.screenshot_pending = irest;
-                        internal = imine;
-                    }
-                    // Client specs first (shm or zero-copy dmabuf blit),
-                    // then internal screenshot specs (always CPU shm).
-                    let mut specs: Vec<render::CaptureSpec> = captures
-                        .iter()
-                        .map(|c| render::CaptureSpec {
-                            region: c.region,
-                            fourcc: screencopy::CAPTURE_FOURCC,
-                            target: match smithay::wayland::dmabuf::get_dmabuf(&c.buffer) {
-                                Ok(dmabuf) => render::CaptureTarget::Dmabuf(dmabuf.clone()),
-                                Err(_) => render::CaptureTarget::Shm,
-                            },
-                        })
-                        .collect();
-                    for c in &internal {
-                        specs.push(render::CaptureSpec {
-                            region: c.region,
-                            fourcc: screencopy::CAPTURE_FOURCC,
-                            target: render::CaptureTarget::Shm,
-                        });
-                    }
-                    // Hide our cursor while a game holds a pointer lock (it
-                    // draws its own), for a client capture that asked for no
-                    // cursor, and for an internal screenshot capture unless
-                    // its bind set `show_cursor`.
-                    let capture_hides_cursor =
-                        !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
-                    let internal_hides_cursor =
-                        !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
-                    let hide_cursor = data.state.pointer_locked()
-                        || capture_hides_cursor
-                        || internal_hides_cursor;
-                    let client_n = captures.len();
-                    match data.state.renderer.render_for_crtc(
-                        crtc,
-                        &placements,
-                        &layer_placements,
-                        &popup_placements,
-                        hide_cursor,
-                        &specs,
-                    ) {
-                        Ok(mut results) => {
-                            // Trailing results belong to the internal specs.
-                            let internal_results = results.split_off(client_n.min(results.len()));
-                            for (pending, captured) in captures.iter().zip(results) {
-                                screencopy::complete(pending, captured);
-                            }
-                            for (cap, outcome) in internal.into_iter().zip(internal_results) {
-                                data.state.complete_internal_capture(cap, outcome);
-                            }
-                        }
-                        Err(err) => {
-                            // Don't kill the event loop on a render
-                            // hiccup — log and let the next vblank try
-                            // again. A persistent failure on one CRTC
-                            // freezes that output but leaves the others
-                            // (and the exit hotkey) responsive. Fail any
-                            // captures that were riding this frame.
-                            warn!(error = %err, ?crtc, "render_for_crtc failed on vblank");
-                            for pending in &captures {
-                                screencopy::complete(pending, render::CaptureOutcome::Failed);
-                            }
-                            if !internal.is_empty() {
-                                warn!("screenshot: capture dropped (render failed)");
-                            }
-                        }
+                    // The flip for this output just completed — ack it so the
+                    // swapchain frees the scanned-out buffer.
+                    data.state.renderer.frame_submitted(crtc);
+                    // Re-render only if a trigger arrived while the flip was in
+                    // flight, or an animation/slide is still running. Otherwise
+                    // the output parks until the next trigger queues a redraw.
+                    let again = matches!(
+                        data.state.redraw.get(&crtc),
+                        Some(RedrawState::WaitingForVblank { dirty: true })
+                    );
+                    if again {
+                        data.state.render_crtc(crtc);
+                    } else {
+                        data.state.redraw.insert(crtc, RedrawState::Idle);
                     }
                 }
                 smithay::backend::drm::DrmEvent::Error(err) => {
@@ -2928,6 +3095,24 @@ fn wire_event_sources(
             },
         )
         .map_err(|e| anyhow::anyhow!("failed to insert drm source: {e}"))?;
+
+    // Safety heartbeat for on-demand rendering. Correctness depends on every
+    // visual change queueing a redraw; should a trigger ever be missed, an
+    // output would otherwise freeze. This ticks each *non-fullscreen* output
+    // about once a second, so a missed trigger degrades to <=1s of staleness
+    // instead of a stuck frame. It skips fullscreen outputs, so it never
+    // disturbs a game's VRR (those redraw on the client's own commits). Once
+    // the triggers are proven on hardware this can be lengthened or removed.
+    {
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        let beat = std::time::Duration::from_secs(1);
+        handle
+            .insert_source(Timer::from_duration(beat), move |_, (), data: &mut LoopData| {
+                data.state.queue_redraw_nonfullscreen();
+                TimeoutAction::ToDuration(beat)
+            })
+            .map_err(|e| anyhow::anyhow!("failed to insert redraw heartbeat: {e}"))?;
+    }
 
     handle
         .insert_source(libinput_backend, |event, (), data: &mut LoopData| {

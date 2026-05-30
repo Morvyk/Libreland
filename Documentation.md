@@ -106,6 +106,7 @@ monitors = {
             mode = { width = 3840, height = 2160, refresh_mhz = 144000 },  -- optional; defaults to EDID-preferred
             position = { x = 0, y = 0 },
             scale = 1.0,
+            vrr = "auto",  -- "auto" (default) | "always" | "off"
         },
         ["HDMI-A-1"] = {
             position = { x = 3840, y = 0 },
@@ -279,6 +280,7 @@ the runtime today (✅) or just held in `Config` for a later consumer
 | `outputs[name].mode`     | `nil`    | ✅    | `{ width = …, height = …, refresh_mhz = … }` to force a mode. The override is matched against the EDID mode list by size and refresh (mHz); on a miss it logs and falls back to the EDID-preferred mode. `nil` uses EDID-preferred directly.                                                                   |
 | `outputs[name].position` | `nil`    | ✅    | Top-left of this output in the virtual layout, in *logical* pixels (`{ x = …, y = … }`). `nil` falls back to the auto left-to-right layout. Mixing configured and auto-positioned outputs is fine; positions can overlap if you let them.                                                                       |
 | `outputs[name].scale`    | `1.0`    | ✅    | Fractional scale. The renderer scales every layout coordinate from compositor (= logical) to physical by this factor. Clients see the exact fractional value via `wp_fractional_scale_manager_v1` and a rounded integer fallback via `wl_output.scale`; `wp_viewporter` is advertised so fractional-aware clients can map their oversized buffer down to the logical rect (without it their content composites at the wrong size). Must be positive. Per-surface scale tracking is single-output for now — every surface gets the primary's scale until per-output workspaces ship. |
+| `outputs[name].vrr`      | `"auto"` | ✅    | Variable Refresh Rate (adaptive-sync / FreeSync / G-Sync) policy. `"auto"` enables VRR only while a window fills this output (fullscreen or maximized) — where it actually helps (games, fullscreen video) — and disables it on the desktop, avoiding the flicker some panels show under idle VRR. `"always"` keeps it on; `"off"` never uses it. A no-op on outputs whose connector doesn't advertise adaptive-sync (logged at startup as `vrr_support=NotSupported`). On DisplayPort toggling is seamless; on HDMI the kernel currently needs a modeset (brief blink) to switch, which Libreland performs automatically. |
 | `primary`                | `nil`    | ✅    | Connector name of the primary output. The tile area's bounds + the initial cursor position come from this output. `nil` falls back to the first connected output in DRM enumeration order.                                                                                                                      |
 
 ### input

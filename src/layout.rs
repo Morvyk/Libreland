@@ -1046,6 +1046,67 @@ impl Layout {
     /// loops are the function tail — the borrow checker rejects
     /// reborrowing `self` after a loop that conditionally returns a
     /// `&mut` from inside it.
+    /// Connector name of the output whose *active* workspace currently
+    /// holds `surface` (tiled or floating). The on-demand renderer redraws
+    /// just this output when `surface` commits, so a window elsewhere — on
+    /// another output or in a hidden workspace — doesn't wake (and stutter
+    /// the VRR of) an unrelated output. `None` for a hidden / in-transit
+    /// window or a non-toplevel surface.
+    pub fn output_of(&self, surface: &WlSurface) -> Option<String> {
+        for op in &self.outputs {
+            let Some(ws) = op.workspaces.get(op.active) else {
+                continue;
+            };
+            let here = ws
+                .floating
+                .iter()
+                .any(|w| w.toplevel.wl_surface() == surface)
+                || ws.tree.as_ref().is_some_and(|t| tree_contains(t, surface));
+            if here {
+                return Some(op.name.clone());
+            }
+        }
+        None
+    }
+
+    /// Whether output `name`'s active workspace shows a fullscreen window
+    /// whose surface isn't `surface` — i.e. `surface` is occluded behind a
+    /// fullscreen window there. The on-demand renderer skips redrawing such
+    /// an output for `surface`'s commits so it doesn't stutter the
+    /// fullscreen window's VRR.
+    pub fn output_fullscreen_other_than(&self, name: &str, surface: &WlSurface) -> bool {
+        self.fullscreen_surface(name).is_some_and(|s| s != surface)
+    }
+
+    /// Whether output `name`'s active workspace shows a fullscreen window.
+    pub fn output_has_fullscreen(&self, name: &str) -> bool {
+        self.fullscreen_surface(name).is_some()
+    }
+
+    /// The surface of the fullscreen window in output `name`'s active
+    /// workspace, if any (tiled or floating).
+    fn fullscreen_surface(&self, name: &str) -> Option<&WlSurface> {
+        let op = self.outputs.iter().find(|o| o.name == name)?;
+        let ws = op.workspaces.get(op.active)?;
+        if let Some(w) = ws
+            .floating
+            .iter()
+            .find(|w| w.fill == FillMode::Fullscreen)
+        {
+            return Some(w.toplevel.wl_surface());
+        }
+        ws.tree
+            .as_ref()
+            .and_then(tree_fullscreen)
+            .map(|w| w.toplevel.wl_surface())
+    }
+
+    /// Whether any output has a workspace-switch slide in progress, so the
+    /// on-demand renderer keeps redrawing until it finishes.
+    pub fn is_animating(&self) -> bool {
+        self.outputs.iter().any(|op| op.transition.is_some())
+    }
+
     fn window_mut(&mut self, surface: &WlSurface) -> Option<&mut Window> {
         if self
             .in_transit
@@ -1652,6 +1713,16 @@ fn tree_contains(node: &Node, surface: &WlSurface) -> bool {
         Node::Leaf(w) => w.toplevel.wl_surface() == surface,
         Node::Split { first, second, .. } => {
             tree_contains(first, surface) || tree_contains(second, surface)
+        }
+    }
+}
+
+/// First fullscreen window in a tiling tree, if any.
+fn tree_fullscreen(node: &Node) -> Option<&Window> {
+    match node {
+        Node::Leaf(w) => (w.fill == FillMode::Fullscreen).then_some(w),
+        Node::Split { first, second, .. } => {
+            tree_fullscreen(first).or_else(|| tree_fullscreen(second))
         }
     }
 }

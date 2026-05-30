@@ -90,6 +90,15 @@ impl Animation {
         Self { slot, stop, handle }
     }
 
+    /// Whether the decode thread is still running, i.e. more frames are
+    /// coming. A still image's thread exits after publishing its one frame
+    /// (see [`decode_loop`]), so this returns `false` for stills — letting
+    /// the on-demand renderer park that output instead of re-compositing an
+    /// unchanging wallpaper every refresh, while a video/gif keeps it live.
+    pub fn is_live(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     /// Take the latest frame if the slot has advanced past `last_seq`.
     /// Returns the frame and its new sequence number.
     pub fn take_new(&self, last_seq: u64) -> Option<(Frame, u64)> {
