@@ -67,6 +67,7 @@ mod cursor;
 mod drm;
 mod ipc;
 mod keyboard;
+mod media;
 mod layout;
 mod render;
 mod screencopy;
@@ -1677,13 +1678,77 @@ impl State {
             },
             new.border.width,
         );
-        self.renderer
-            .set_appearance(new.misc.wallpaper.clone(), new.border.clone());
+        apply_wallpaper(&mut self.renderer, &new.misc.wallpaper, &new.border);
         self.renderer.set_animations(new.animations.clone());
         self.renderer.set_decoration(new.decoration.clone());
         self.config = new;
         info!("config reloaded");
     }
+}
+
+/// Apply `wallpaper` to the renderer: either a flat fill, or a
+/// libav-decoded media frame (image/gif/video, fitted per `mode`). On a
+/// decode/upload failure the media is dropped and a neutral fallback fill
+/// shows instead of a black screen. Also (re)applies `border`. Shared by
+/// startup and live reload.
+fn apply_wallpaper(
+    renderer: &mut render::Renderer,
+    wallpaper: &config::Wallpaper,
+    border: &config::BorderConfig,
+) {
+    match wallpaper {
+        config::Wallpaper::Fill(fill) => {
+            renderer.set_appearance(fill.clone(), border.clone());
+            renderer.set_wallpaper_media(None);
+        }
+        config::Wallpaper::Media { path, mode } => {
+            // Cap the decode to the largest output dimension so a huge
+            // source doesn't allocate an oversized texture; the GPU scales
+            // per output from there.
+            #[allow(clippy::cast_sign_loss, reason = "output dimensions are positive")]
+            let cap = renderer
+                .output_descriptors()
+                .iter()
+                .map(|d| d.mode_size.w.max(d.mode_size.h))
+                .max()
+                .unwrap_or(3840)
+                .max(1) as u32;
+            match media::decode_first_frame(path, cap) {
+                Ok(frame) => {
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "decoded dims are capped to output size, well within i32"
+                    )]
+                    let (w, h) = (frame.width as i32, frame.height as i32);
+                    if renderer.set_wallpaper_media(Some((&frame.rgba, w, h, *mode))) {
+                        // The rounded-corner shader can't sample media, so
+                        // the corner cutout falls back to black.
+                        renderer
+                            .set_appearance(config::Fill::Solid([0.0, 0.0, 0.0]), border.clone());
+                        info!(
+                            path = %path.display(),
+                            width = frame.width,
+                            height = frame.height,
+                            "media wallpaper loaded"
+                        );
+                    } else {
+                        renderer.set_appearance(wallpaper_fallback(), border.clone());
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, path = %path.display(), "media wallpaper failed; flat background");
+                    renderer.set_wallpaper_media(None);
+                    renderer.set_appearance(wallpaper_fallback(), border.clone());
+                }
+            }
+        }
+    }
+}
+
+/// A neutral flat fill shown when a media wallpaper can't be loaded, so
+/// the screen isn't left black.
+fn wallpaper_fallback() -> config::Fill {
+    config::Fill::Solid([0.08, 0.08, 0.10])
 }
 
 /// Axis-aligned rect (absolute compositor px) spanning two cursor
@@ -2164,13 +2229,16 @@ fn main() -> Result<()> {
     let mut renderer = render::Renderer::new(
         drm_fd,
         drm_outputs,
-        config.misc.wallpaper.clone(),
+        // Bootstrap fill; `apply_wallpaper` below sets the real wallpaper
+        // (flat or decoded media) once the renderer exists.
+        config::Fill::Solid([0.0, 0.0, 0.0]),
         config.border.clone(),
         &config.monitors,
     )
     .context("render pipeline init failed")?;
     renderer.set_animations(config.animations.clone());
     renderer.set_decoration(config.decoration.clone());
+    apply_wallpaper(&mut renderer, &config.misc.wallpaper, &config.border);
 
     info!("phase: priming swapchains (one initial frame per output)");
     renderer.render_initial().context("initial render failed")?;

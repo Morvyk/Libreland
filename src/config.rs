@@ -383,8 +383,10 @@ pub struct ScreenshotBind {
 
 #[derive(Debug, Clone)]
 pub struct MiscConfig {
-    /// Background painted before any cursor / surface composition.
-    pub wallpaper: Fill,
+    /// Background painted before any cursor / surface composition: a
+    /// solid/gradient fill, or a media file (image/gif/video) decoded by
+    /// libav and drawn per the chosen scaling mode.
+    pub wallpaper: Wallpaper,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +415,31 @@ pub enum Fill {
     /// Vertical linear gradient from `top` at `y=0` to `bottom` at
     /// `y=output_height`. RGB components in `[0.0, 1.0]`.
     VerticalGradient { top: [f32; 3], bottom: [f32; 3] },
+}
+
+/// The desktop background: a flat [`Fill`], or a media file decoded by
+/// libav (any image/gif/video `FFmpeg` can read).
+#[derive(Debug, Clone)]
+pub enum Wallpaper {
+    Fill(Fill),
+    Media {
+        path: PathBuf,
+        mode: ScaleMode,
+    },
+}
+
+/// How a media wallpaper is fitted to each output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScaleMode {
+    /// Cover the whole output, cropping the overflow (no bars). Default.
+    #[default]
+    Fill,
+    /// Fit entirely on the output, letterboxing the remainder.
+    Fit,
+    /// Stretch to exactly fill, ignoring aspect ratio.
+    Stretch,
+    /// Draw at native size, centred (cropped if larger than the output).
+    Center,
 }
 
 impl Default for Config {
@@ -458,10 +485,10 @@ impl Default for Config {
                 ],
             },
             misc: MiscConfig {
-                wallpaper: Fill::VerticalGradient {
+                wallpaper: Wallpaper::Fill(Fill::VerticalGradient {
                     top: [0.40, 0.60, 0.90],    // light sky blue
                     bottom: [0.10, 0.20, 0.50], // deep navy
-                },
+                }),
             },
             layout: LayoutConfig {
                 gaps_outer: 8,
@@ -842,9 +869,48 @@ fn parse_action(t: &Table) -> mlua::Result<Action> {
 fn parse_misc(t: &Table, defaults: MiscConfig) -> mlua::Result<MiscConfig> {
     let mut cfg = defaults;
     if let Some(w) = t.get::<Option<Table>>("wallpaper")? {
-        cfg.wallpaper = parse_fill(&w).context("wallpaper")?;
+        cfg.wallpaper = parse_wallpaper(&w).context("wallpaper")?;
     }
     Ok(cfg)
+}
+
+/// Parse `misc.wallpaper`: a `solid`/`vertical_gradient` fill, or a
+/// `media` (alias `image`/`video`) file with a `path` and optional `mode`.
+fn parse_wallpaper(t: &Table) -> mlua::Result<Wallpaper> {
+    let kind: String = t.get("type").context(
+        "missing or invalid `type` (expected \"solid\", \"vertical_gradient\", or \"media\")",
+    )?;
+    match kind.to_lowercase().as_str() {
+        "solid" | "vertical_gradient" => Ok(Wallpaper::Fill(parse_fill(t)?)),
+        "media" | "image" | "video" => {
+            let path: String = t
+                .get("path")
+                .context("media wallpaper needs a `path` string")?;
+            let mode = match t.get::<Option<String>>("mode")? {
+                Some(m) => parse_scale_mode(&m)?,
+                None => ScaleMode::default(),
+            };
+            Ok(Wallpaper::Media {
+                path: PathBuf::from(path),
+                mode,
+            })
+        }
+        other => lua_bail!(
+            "unknown wallpaper type {other:?}; expected \"solid\", \"vertical_gradient\", or \"media\""
+        ),
+    }
+}
+
+fn parse_scale_mode(s: &str) -> mlua::Result<ScaleMode> {
+    Ok(match s.to_lowercase().as_str() {
+        "fill" | "cover" => ScaleMode::Fill,
+        "fit" | "contain" => ScaleMode::Fit,
+        "stretch" => ScaleMode::Stretch,
+        "center" | "centre" => ScaleMode::Center,
+        other => lua_bail!(
+            "unknown wallpaper mode {other:?}; expected \"fill\", \"fit\", \"stretch\", or \"center\""
+        ),
+    })
 }
 
 fn parse_layout(t: &Table, defaults: LayoutConfig) -> mlua::Result<LayoutConfig> {

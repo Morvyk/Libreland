@@ -50,7 +50,9 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
-use crate::config::{AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig};
+use crate::config::{
+    AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode,
+};
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
 
@@ -340,8 +342,14 @@ pub struct Renderer {
     /// local logical, then scales to physical via `OutputRender::scale`.
     cursor_x: f64,
     cursor_y: f64,
-    /// Wallpaper drawn under the cursor on every output.
+    /// Flat wallpaper fill. Painted full-screen when no media wallpaper is
+    /// set, and always used by the frame shader for the rounded-corner
+    /// cutout (which can't sample a media texture).
     wallpaper: Fill,
+    /// Media wallpaper (decoded image/gif/video frame uploaded as a
+    /// texture), drawn full-screen per output in place of `wallpaper` when
+    /// set. `None` = use the flat fill.
+    wallpaper_media: Option<WallpaperMedia>,
     /// Window border width + active / inactive fills.
     border: BorderConfig,
     /// Custom GLES pixel shader used to mask rounded corners.
@@ -454,6 +462,18 @@ struct BlurScratch {
     levels: Vec<GlesTexture>,
     /// Per-tier full-resolution blurred backdrops (see [`BLUR_TIERS`]).
     tiers: Vec<GlesTexture>,
+}
+
+/// A decoded media wallpaper uploaded to a GLES texture. `Arc`-backed, so
+/// it's cheap to clone out before the frame borrow.
+#[derive(Clone)]
+struct WallpaperMedia {
+    texture: GlesTexture,
+    /// Texture dimensions in its own pixels.
+    width: i32,
+    height: i32,
+    /// How to fit it to each output.
+    mode: ScaleMode,
 }
 
 /// A window's last frame, captured at destroy time, animating out.
@@ -784,6 +804,7 @@ impl Renderer {
             cursor_x,
             cursor_y,
             wallpaper,
+            wallpaper_media: None,
             border,
             frame_shader,
             cursor,
@@ -1045,6 +1066,35 @@ impl Renderer {
     pub fn set_appearance(&mut self, wallpaper: Fill, border: BorderConfig) {
         self.wallpaper = wallpaper;
         self.border = border;
+    }
+
+    /// Set (or clear) the media wallpaper. `Some((rgba, w, h, mode))`
+    /// uploads a packed-RGBA frame as a texture drawn full-screen per
+    /// output in `mode`; `None` reverts to the flat [`Self::set_appearance`]
+    /// fill. Returns whether the upload succeeded — a failure clears the
+    /// media so the flat fill shows instead of nothing.
+    pub fn set_wallpaper_media(&mut self, frame: Option<(&[u8], i32, i32, ScaleMode)>) -> bool {
+        let Some((rgba, width, height, mode)) = frame else {
+            self.wallpaper_media = None;
+            return true;
+        };
+        let size = Size::<i32, smithay::utils::Buffer>::from((width, height));
+        match self.gles.import_memory(rgba, Fourcc::Abgr8888, size, false) {
+            Ok(texture) => {
+                self.wallpaper_media = Some(WallpaperMedia {
+                    texture,
+                    width,
+                    height,
+                    mode,
+                });
+                true
+            }
+            Err(err) => {
+                warn!(error = %err, "wallpaper: media texture upload failed");
+                self.wallpaper_media = None;
+                false
+            }
+        }
     }
 
     /// Set (or clear) the screenshot selection overlay drawn over every
@@ -1474,6 +1524,9 @@ impl Renderer {
         let cursor_abs_x = self.cursor_x;
         let cursor_abs_y = self.cursor_y;
         let wallpaper = self.wallpaper.clone();
+        // Cheap Arc-backed clone of the media wallpaper (if any), so the
+        // backdrop closures can draw it without borrowing `self`.
+        let wallpaper_media = self.wallpaper_media.clone();
         let border = self.border.clone();
         let frame_shader = self.frame_shader.clone();
         let cursor_size = self.cursor_size;
@@ -1782,7 +1835,11 @@ impl Renderer {
         // `cell_local`  : a window's animated rect → output-local physical.
         // `draw_window` : one window's surface + (Normal-only) border ring.
         let draw_base = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
-            draw_fill(frame, &wallpaper, mode_size, mode_size)?;
+            if let Some(wp) = &wallpaper_media {
+                draw_wallpaper_texture(frame, wp, mode_size)?;
+            } else {
+                draw_fill(frame, &wallpaper, mode_size, mode_size)?;
+            }
             for (bucket, elements) in &layer_groups {
                 if matches!(bucket, LayerBucket::Background | LayerBucket::Bottom) {
                     draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
@@ -2418,6 +2475,89 @@ fn blur_pass(
 /// are being painted); each stripe is clipped to `rect` and
 /// skipped if it lies entirely outside, so border edges that
 /// only intersect a few stripes don't pay for the rest.
+/// Draw the media wallpaper `wp` across one output, fitted per its mode.
+/// `Fit`/`Center` don't cover the whole output, so the background is
+/// filled black first.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "destination pixel sizes are bounded by the output dimensions (i32)"
+)]
+fn draw_wallpaper_texture(
+    frame: &mut GlesFrame<'_, '_>,
+    wp: &WallpaperMedia,
+    output: Size<i32, Physical>,
+) -> Result<()> {
+    let (ow, oh) = (f64::from(output.w), f64::from(output.h));
+    let (tw, th) = (f64::from(wp.width.max(1)), f64::from(wp.height.max(1)));
+    let full_dst = Rectangle::<i32, Physical>::from_size(output);
+    let buf = |x: f64, y: f64, w: f64, h: f64| {
+        Rectangle::<f64, smithay::utils::Buffer>::new(Point::from((x, y)), Size::from((w, h)))
+    };
+    let draw =
+        |frame: &mut GlesFrame<'_, '_>,
+         src: Rectangle<f64, smithay::utils::Buffer>,
+         dst: Rectangle<i32, Physical>|
+         -> Result<()> {
+            frame
+                .render_texture_from_to(
+                    &wp.texture,
+                    src,
+                    dst,
+                    &[dst],
+                    &[dst],
+                    Transform::Normal,
+                    1.0,
+                    None,
+                    &[],
+                )
+                .context("render_texture_from_to (wallpaper) failed")
+        };
+    let black = Fill::Solid([0.0, 0.0, 0.0]);
+    match wp.mode {
+        ScaleMode::Stretch => draw(frame, buf(0.0, 0.0, tw, th), full_dst)?,
+        ScaleMode::Fill => {
+            // Cover: sample the centred sub-rect of the texture that
+            // matches the output aspect, stretched across the full output.
+            let scale = (ow / tw).max(oh / th);
+            let (vis_w, vis_h) = (ow / scale, oh / scale);
+            draw(
+                frame,
+                buf((tw - vis_w) / 2.0, (th - vis_h) / 2.0, vis_w, vis_h),
+                full_dst,
+            )?;
+        }
+        ScaleMode::Fit => {
+            draw_fill(frame, &black, output, output)?;
+            let scale = (ow / tw).min(oh / th);
+            let (dw, dh) = ((tw * scale) as i32, (th * scale) as i32);
+            let dst = Rectangle::new(
+                Point::from(((output.w - dw) / 2, (output.h - dh) / 2)),
+                Size::from((dw, dh)),
+            );
+            draw(frame, buf(0.0, 0.0, tw, th), dst)?;
+        }
+        ScaleMode::Center => {
+            draw_fill(frame, &black, output, output)?;
+            // Native size, centred, cropped to the output.
+            let (off_x, off_y) = ((output.w - wp.width) / 2, (output.h - wp.height) / 2);
+            let (x0, x1) = (off_x.max(0), (off_x + wp.width).min(output.w));
+            let (y0, y1) = (off_y.max(0), (off_y + wp.height).min(output.h));
+            if x1 > x0 && y1 > y0 {
+                let dst =
+                    Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)));
+                let src = buf(
+                    f64::from(x0 - off_x),
+                    f64::from(y0 - off_y),
+                    f64::from(x1 - x0),
+                    f64::from(y1 - y0),
+                );
+                draw(frame, src, dst)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn draw_fill(
     frame: &mut GlesFrame<'_, '_>,
     fill: &Fill,
