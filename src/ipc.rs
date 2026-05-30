@@ -81,6 +81,55 @@ pub enum Request {
     Reload,
     /// Exit the compositor.
     Exit,
+
+    // --- events ---
+    /// Subscribe to the live event stream. The connection stays open and
+    /// the compositor pushes one [`Event`] per line as state changes.
+    /// `events` filters to specific kinds; empty = all. On subscribe the
+    /// current focus + workspaces are sent immediately as a snapshot.
+    Subscribe {
+        #[serde(default)]
+        events: Vec<EventKind>,
+    },
+}
+
+/// One kind of [`Event`], used to filter a subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+pub enum EventKind {
+    WindowOpened,
+    WindowClosed,
+    WindowFocused,
+    WorkspacesChanged,
+}
+
+/// A pushed event on a subscribed connection. Serialized internally
+/// tagged on an `event` field, e.g. `{"event":"window-focused",…}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum Event {
+    /// A window was mapped.
+    WindowOpened { window: WindowInfo },
+    /// A window was unmapped.
+    WindowClosed { id: u64 },
+    /// Keyboard focus moved (to a window, or to nothing). Re-emitted when
+    /// the focused window's title changes, so title modules stay live.
+    WindowFocused { window: Option<WindowInfo> },
+    /// The set of workspaces changed (switch, add/remove, window counts).
+    WorkspacesChanged { workspaces: Vec<WorkspaceInfo> },
+}
+
+impl Event {
+    /// The [`EventKind`] discriminant, for subscription filtering.
+    fn kind(&self) -> EventKind {
+        match self {
+            Event::WindowOpened { .. } => EventKind::WindowOpened,
+            Event::WindowClosed { .. } => EventKind::WindowClosed,
+            Event::WindowFocused { .. } => EventKind::WindowFocused,
+            Event::WorkspacesChanged { .. } => EventKind::WorkspacesChanged,
+        }
+    }
 }
 
 /// A workspace to switch/move to: an absolute index, or one step in
@@ -142,7 +191,7 @@ pub struct OutputInfo {
 }
 
 /// One workspace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub output: String,
     pub index: usize,
@@ -191,7 +240,7 @@ pub struct BindInfo {
 // ======================================================================
 
 mod server {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -208,13 +257,20 @@ mod server {
     use tracing::{info, warn};
 
     use super::{
-        BindInfo, OutputInfo, Reply, Request, Response, VersionInfo, WindowInfo, WorkspaceInfo,
-        WorkspaceTarget,
+        BindInfo, Event, EventKind, OutputInfo, Reply, Request, Response, VersionInfo, WindowInfo,
+        WorkspaceInfo, WorkspaceTarget,
     };
     use crate::layout::{FillMode, Layout, WindowEntry};
     use crate::{LoopData, State};
 
-    /// Stable window-id registry + (later) event subscribers. Lives in
+    /// One subscribed connection: a write handle to its socket plus the
+    /// event kinds it wants (`None` = all).
+    struct Subscriber {
+        stream: UnixStream,
+        kinds: Option<Vec<EventKind>>,
+    }
+
+    /// Stable window-id registry + event-stream bookkeeping. Lives in
     /// [`State`]; ids are assigned on map and reused for the window's
     /// lifetime so a client can name a specific window across reflows.
     #[derive(Default)]
@@ -222,6 +278,13 @@ mod server {
         next_id: u64,
         by_surface: HashMap<ObjectId, u64>,
         by_id: HashMap<u64, WlSurface>,
+        /// Live event subscribers, keyed by a per-connection id.
+        subscribers: HashMap<u64, Subscriber>,
+        next_conn: u64,
+        /// Diff baselines so the per-iteration poll only emits changes.
+        last_window_ids: HashSet<u64>,
+        last_focus: Option<(u64, Option<String>)>,
+        last_workspaces: Vec<WorkspaceInfo>,
     }
 
     impl IpcState {
@@ -246,6 +309,120 @@ mod server {
         pub fn forget(&mut self, surface: &WlSurface) {
             if let Some(id) = self.by_surface.remove(&surface.id()) {
                 self.by_id.remove(&id);
+            }
+        }
+
+        /// Register a subscriber. Returns its connection id and whether it
+        /// was the first (so the caller can seed the diff baselines).
+        fn add_subscriber(&mut self, stream: UnixStream, events: Vec<EventKind>) -> (u64, bool) {
+            let first = self.subscribers.is_empty();
+            self.next_conn += 1;
+            let id = self.next_conn;
+            let kinds = (!events.is_empty()).then_some(events);
+            self.subscribers.insert(id, Subscriber { stream, kinds });
+            (id, first)
+        }
+
+        /// Drop a subscriber (its connection closed).
+        fn remove_subscriber(&mut self, id: u64) {
+            self.subscribers.remove(&id);
+        }
+
+        /// Whether anyone is listening (the poll early-outs if not).
+        fn has_subscribers(&self) -> bool {
+            !self.subscribers.is_empty()
+        }
+
+        /// Write `event` to every subscriber that wants its kind, dropping
+        /// any whose socket has gone away.
+        fn broadcast(&mut self, event: &Event) {
+            let kind = event.kind();
+            let Ok(mut payload) = serde_json::to_vec(event) else {
+                return;
+            };
+            payload.push(b'\n');
+            let mut dead = Vec::new();
+            for (id, sub) in &self.subscribers {
+                if sub.kinds.as_ref().is_some_and(|k| !k.contains(&kind)) {
+                    continue;
+                }
+                if (&sub.stream).write_all(&payload).is_err() {
+                    dead.push(*id);
+                }
+            }
+            for id in dead {
+                self.subscribers.remove(&id);
+            }
+        }
+
+        /// Send one event to a single subscriber (the subscribe snapshot).
+        fn send_to(&mut self, id: u64, event: &Event) {
+            let Some(sub) = self.subscribers.get(&id) else {
+                return;
+            };
+            let Ok(mut payload) = serde_json::to_vec(event) else {
+                return;
+            };
+            payload.push(b'\n');
+            if (&sub.stream).write_all(&payload).is_err() {
+                self.subscribers.remove(&id);
+            }
+        }
+
+        /// Seed the diff baselines from the current state so the next poll
+        /// doesn't re-announce everything that already exists.
+        fn set_baseline(
+            &mut self,
+            windows: &[WindowInfo],
+            workspaces: &[WorkspaceInfo],
+            focus: Option<&WindowInfo>,
+        ) {
+            self.last_window_ids = windows.iter().map(|w| w.id).collect();
+            self.last_focus = focus.map(|w| (w.id, w.title.clone()));
+            self.last_workspaces = workspaces.to_vec();
+        }
+
+        /// Diff the gathered state against the baselines, broadcasting one
+        /// event per change, then update the baselines.
+        fn emit_changes(
+            &mut self,
+            windows: Vec<WindowInfo>,
+            workspaces: Vec<WorkspaceInfo>,
+            focus: Option<WindowInfo>,
+        ) {
+            // Compute the open/close deltas first (borrowing the old
+            // baseline), then update it, then broadcast — broadcast needs
+            // `&mut self`, so it can't run while the baseline is borrowed.
+            let cur_ids: HashSet<u64> = windows.iter().map(|w| w.id).collect();
+            let opened: Vec<WindowInfo> = windows
+                .into_iter()
+                .filter(|w| !self.last_window_ids.contains(&w.id))
+                .collect();
+            let closed: Vec<u64> = self
+                .last_window_ids
+                .iter()
+                .filter(|id| !cur_ids.contains(id))
+                .copied()
+                .collect();
+            self.last_window_ids = cur_ids;
+            for window in opened {
+                self.broadcast(&Event::WindowOpened { window });
+            }
+            for id in closed {
+                self.broadcast(&Event::WindowClosed { id });
+            }
+
+            let focus_key = focus.as_ref().map(|w| (w.id, w.title.clone()));
+            if focus_key != self.last_focus {
+                self.last_focus = focus_key;
+                self.broadcast(&Event::WindowFocused { window: focus });
+            }
+
+            if workspaces != self.last_workspaces {
+                self.broadcast(&Event::WorkspacesChanged {
+                    workspaces: workspaces.clone(),
+                });
+                self.last_workspaces = workspaces;
             }
         }
     }
@@ -304,6 +481,9 @@ mod server {
             return;
         }
         let mut pending: Vec<u8> = Vec::new();
+        // Set once this connection issues `subscribe`, so its subscriber
+        // entry is dropped when the socket closes.
+        let mut subscriber_id: Option<u64> = None;
         let res = handle.insert_source(
             Generic::new(stream, Interest::READ, Mode::Level),
             move |_, stream, data: &mut LoopData| {
@@ -312,34 +492,50 @@ mod server {
                 // *binding* to the shared reference is all we need.
                 let mut conn: &UnixStream = stream;
                 let mut buf = [0u8; 4096];
+                let mut closed = false;
                 loop {
                     match conn.read(&mut buf) {
-                        Ok(0) => return Ok(PostAction::Remove),
+                        Ok(0) => {
+                            closed = true;
+                            break;
+                        }
                         Ok(n) => pending.extend_from_slice(&buf[..n]),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(e) => {
                             warn!(error = %e, "IPC connection read failed");
-                            return Ok(PostAction::Remove);
+                            closed = true;
+                            break;
                         }
                     }
                 }
                 while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=nl).collect();
-                    let reply: Reply = match serde_json::from_slice::<Request>(&line[..nl]) {
-                        Ok(req) => dispatch(&mut data.state, req),
-                        Err(e) => Err(format!("invalid request: {e}")),
-                    };
-                    match serde_json::to_vec(&reply) {
-                        Ok(mut bytes) => {
-                            bytes.push(b'\n');
-                            // Best effort: a client that hung up mid-reply
-                            // just loses the response; the source is reaped
-                            // on the next read returning EOF.
-                            let _ = conn.write_all(&bytes);
+                    match serde_json::from_slice::<Request>(&line[..nl]) {
+                        // `subscribe` turns this connection into an event
+                        // stream: clone the write half for the broadcaster,
+                        // then push the current snapshot. No request/reply.
+                        Ok(Request::Subscribe { events }) => match conn.try_clone() {
+                            Ok(write_half) => {
+                                let (id, first) =
+                                    data.state.ipc.add_subscriber(write_half, events);
+                                subscriber_id = Some(id);
+                                on_subscribe(&mut data.state, id, first);
+                            }
+                            Err(e) => write_reply(conn, &Err(format!("subscribe failed: {e}"))),
+                        },
+                        Ok(req) => {
+                            let reply = dispatch(&mut data.state, req);
+                            write_reply(conn, &reply);
                         }
-                        Err(e) => warn!(error = %e, "IPC serialize reply failed"),
+                        Err(e) => write_reply(conn, &Err(format!("invalid request: {e}"))),
                     }
+                }
+                if closed {
+                    if let Some(id) = subscriber_id.take() {
+                        data.state.ipc.remove_subscriber(id);
+                    }
+                    return Ok(PostAction::Remove);
                 }
                 Ok(PostAction::Continue)
             },
@@ -347,6 +543,55 @@ mod server {
         if let Err(e) = res {
             warn!(error = %e, "insert IPC connection source failed");
         }
+    }
+
+    /// Serialize and write one reply line. Best effort: a client that hung
+    /// up just loses it; the source is reaped on the next read's EOF.
+    fn write_reply(mut conn: &UnixStream, reply: &Reply) {
+        match serde_json::to_vec(reply) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                let _ = conn.write_all(&bytes);
+            }
+            Err(e) => warn!(error = %e, "IPC serialize reply failed"),
+        }
+    }
+
+    /// Send a fresh subscriber its initial snapshot (focus + workspaces),
+    /// and seed the diff baselines when it's the first subscriber so the
+    /// next poll doesn't re-announce everything already on screen.
+    fn on_subscribe(state: &mut State, id: u64, first: bool) {
+        let focus = focused_window(state);
+        let workspaces = workspaces(state);
+        state.ipc.send_to(
+            id,
+            &Event::WindowFocused {
+                window: focus.clone(),
+            },
+        );
+        state.ipc.send_to(
+            id,
+            &Event::WorkspacesChanged {
+                workspaces: workspaces.clone(),
+            },
+        );
+        if first {
+            let windows = windows(state);
+            state.ipc.set_baseline(&windows, &workspaces, focus.as_ref());
+        }
+    }
+
+    /// Run once per event-loop iteration (after each batch): diff the
+    /// current state against the baselines and broadcast any changes.
+    /// Cheap no-op when nobody is subscribed.
+    pub fn poll_events(state: &mut State) {
+        if !state.ipc.has_subscribers() {
+            return;
+        }
+        let windows = windows(state);
+        let workspaces = workspaces(state);
+        let focus = focused_window(state);
+        state.ipc.emit_changes(windows, workspaces, focus);
     }
 
     /// Route a request to its query or action and wrap the result as a
@@ -376,6 +621,12 @@ mod server {
                 info!("exit requested via IPC");
                 state.loop_signal.stop();
                 Ok(Response::Handled)
+            }
+            // `subscribe` is intercepted before dispatch (it streams
+            // rather than replying once); reaching here means a client
+            // sent it on a plain request/response connection.
+            Request::Subscribe { .. } => {
+                Err("subscribe must be used as a streaming connection".to_owned())
             }
         }
     }
@@ -681,7 +932,7 @@ mod server {
     }
 }
 
-pub use server::{IpcState, setup, socket_path};
+pub use server::{IpcState, poll_events, setup, socket_path};
 
 // ======================================================================
 // Client — the `libreland msg …` subcommand.
@@ -695,7 +946,7 @@ mod client {
     use anyhow::{Context as _, Result, bail};
     use clap::{Parser, Subcommand};
 
-    use super::{Reply, Request, Response, WorkspaceTarget};
+    use super::{Event, EventKind, Reply, Request, Response, WorkspaceTarget};
 
     /// A workspace argument: a number, `next`, or `prev`.
     #[derive(Clone)]
@@ -791,6 +1042,12 @@ mod client {
         Reload,
         /// Exit the compositor.
         Exit,
+        /// Stream live events until interrupted. With no kinds given,
+        /// every event is streamed.
+        Subscribe {
+            #[arg(value_enum)]
+            events: Vec<EventKind>,
+        },
     }
 
     impl Command {
@@ -820,6 +1077,9 @@ mod client {
                 },
                 Command::Reload => Request::Reload,
                 Command::Exit => Request::Exit,
+                Command::Subscribe { events } => Request::Subscribe {
+                    events: events.clone(),
+                },
             }
         }
     }
@@ -833,10 +1093,90 @@ mod client {
         let argv = std::iter::once(std::ffi::OsString::from("libreland msg"))
             .chain(std::env::args_os().skip(2));
         let cli = Cli::parse_from(argv);
-        let reply = send(&cli.command.to_request()).context("talking to the compositor")?;
+        let request = cli.command.to_request();
+        // `subscribe` is a long-lived stream, not a single round-trip.
+        if let Request::Subscribe { .. } = request {
+            return stream_events(&request, cli.json);
+        }
+        let reply = send(&request).context("talking to the compositor")?;
         match reply {
             Ok(response) => print_response(&response, cli.json),
             Err(message) => bail!("{message}"),
+        }
+    }
+
+    /// Open a subscription and print each event as it arrives, until the
+    /// compositor closes the connection or the user interrupts.
+    fn stream_events(request: &Request, json: bool) -> Result<()> {
+        let path = socket_path().context(
+            "could not locate the control socket; is the compositor running? \
+             (set $LIBRELAND_SOCKET or $WAYLAND_DISPLAY)",
+        )?;
+        let stream = UnixStream::connect(&path)
+            .with_context(|| format!("connecting to {}", path.display()))?;
+        let mut writer = stream.try_clone().context("clone IPC stream")?;
+        let mut line = serde_json::to_vec(request).context("serialize request")?;
+        line.push(b'\n');
+        writer.write_all(&line).context("send subscribe")?;
+        writer.flush().ok();
+
+        let reader = std::io::BufReader::new(stream);
+        for line in reader.lines() {
+            let line = line.context("read event")?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Event>(trimmed) {
+                Ok(event) => print_event(&event, json),
+                // A non-event line can only be an early error reply
+                // (e.g. the socket refused the subscription).
+                Err(_) => {
+                    if let Ok(Err(message)) = serde_json::from_str::<Reply>(trimmed) {
+                        bail!("{message}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_event(event: &Event, json: bool) {
+        use std::io::Write as _;
+        if json {
+            if let Ok(s) = serde_json::to_string(event) {
+                println!("{s}");
+            }
+            return;
+        }
+        match event {
+            Event::WindowOpened { window } => {
+                println!("opened   #{} {}", window.id, window_label(window));
+            }
+            Event::WindowClosed { id } => println!("closed   #{id}"),
+            Event::WindowFocused { window } => match window {
+                Some(w) => println!("focused  #{} {}", w.id, window_label(w)),
+                None => println!("focused  (none)"),
+            },
+            Event::WorkspacesChanged { workspaces } => {
+                let active: Vec<String> = workspaces
+                    .iter()
+                    .filter(|w| w.active)
+                    .map(|w| format!("{}:{}", w.output, w.index))
+                    .collect();
+                println!("workspaces  active=[{}]", active.join(" "));
+            }
+        }
+        // Events stream live; keep them flushing for `| while read` loops.
+        let _ = std::io::stdout().flush();
+    }
+
+    /// A short `app_id — title` label for a window event line.
+    fn window_label(w: &super::WindowInfo) -> String {
+        match (w.app_id.as_deref(), w.title.as_deref()) {
+            (Some(app), Some(title)) => format!("{app} — {title}"),
+            (Some(s), None) | (None, Some(s)) => s.to_owned(),
+            (None, None) => "(untitled)".to_owned(),
         }
     }
 

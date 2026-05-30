@@ -2450,10 +2450,12 @@ fn main() -> Result<()> {
     info!("entering event loop — type to generate events, super+shift+e to exit");
     event_loop
         .run(None, &mut loop_data, |data| {
-            // Post-batch: flush Wayland clients so their pending
-            // outbound messages don't accumulate. A failure here
-            // typically means a client died mid-flight; log and
+            // Post-batch: broadcast any IPC state changes (focus, windows,
+            // workspaces) to subscribers, then flush Wayland clients so
+            // their pending outbound messages don't accumulate. A flush
+            // failure typically means a client died mid-flight; log and
             // move on rather than crash the compositor.
+            ipc::poll_events(&mut data.state);
             if let Err(err) = data.display.flush_clients() {
                 warn!(error = %err, "wayland flush_clients failed");
             }
