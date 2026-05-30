@@ -52,6 +52,8 @@ pub struct Config {
     /// Window/workspace motion. Applied live on reload; the renderer
     /// reads it fresh each frame.
     pub animations: AnimationsConfig,
+    /// Window opacity + background blur. Applied live on reload.
+    pub decoration: DecorationConfig,
     /// Environment variables to export into the compositor's own
     /// process before spawning any children, so every client we
     /// launch (startup commands, `spawn` binds, ad-hoc shells in
@@ -156,6 +158,52 @@ impl Default for AnimationsConfig {
                 enabled: true,
                 duration: Duration::from_millis(300),
                 curve: Curve::EaseInOut,
+            },
+        }
+    }
+}
+
+/// Window opacity + background blur.
+#[derive(Debug, Clone)]
+pub struct DecorationConfig {
+    /// Compositor-applied alpha for *windows* (multiplies the client's
+    /// own alpha). `1.0` = fully opaque (the default — windows aren't
+    /// see-through). Lower values reveal whatever is behind, blurred if
+    /// window blur is on. Layers keep their own buffer alpha.
+    pub window_opacity: f32,
+    /// Background blur behind translucent surfaces.
+    pub blur: BlurConfig,
+}
+
+/// Kawase dual-filter background blur. Only *visible* where a surface is
+/// translucent (client alpha or [`DecorationConfig::window_opacity`] <
+/// 1). Defaults: on for layer-shell surfaces (panels, launchers), off
+/// for windows.
+#[derive(Debug, Clone, Copy)]
+pub struct BlurConfig {
+    /// Master switch for all blur.
+    pub enabled: bool,
+    /// Blur behind layer-shell surfaces (panels, rofi, notifications).
+    pub layers: bool,
+    /// Blur behind windows.
+    pub windows: bool,
+    /// Dual-filter passes — each is a downsample + later upsample. More
+    /// passes = a wider, softer blur (and more cost). `0` = no blur.
+    pub passes: u32,
+    /// Per-tap sample offset in pixels; scales the blur's spread.
+    pub radius: f32,
+}
+
+impl Default for DecorationConfig {
+    fn default() -> Self {
+        Self {
+            window_opacity: 1.0,
+            blur: BlurConfig {
+                enabled: true,
+                layers: true,
+                windows: false,
+                passes: 3,
+                radius: 5.0,
             },
         }
     }
@@ -442,6 +490,7 @@ impl Default for Config {
                 rounded_corners: 4,
             },
             animations: AnimationsConfig::default(),
+            decoration: DecorationConfig::default(),
             env: Vec::new(),
             startup: Vec::new(),
             screenshot: None,
@@ -534,6 +583,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("animations")? {
             config.animations = parse_animations(&t, config.animations).context("animations")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("decoration")? {
+            config.decoration = parse_decoration(&t, config.decoration).context("decoration")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("env")? {
             config.env = parse_env(&t).context("env")?;
@@ -835,6 +887,46 @@ fn parse_border(t: &Table, defaults: BorderConfig) -> mlua::Result<BorderConfig>
     Ok(cfg)
 }
 
+fn parse_decoration(t: &Table, defaults: DecorationConfig) -> mlua::Result<DecorationConfig> {
+    let mut cfg = defaults;
+    if let Some(o) = t.get::<Option<f32>>("opacity")? {
+        if !(0.0..=1.0).contains(&o) {
+            lua_bail!("decoration.opacity {o} out of range; expected [0.0, 1.0]");
+        }
+        cfg.window_opacity = o;
+    }
+    if let Some(b) = t.get::<Option<Table>>("blur")? {
+        cfg.blur = parse_blur(&b, cfg.blur).context("blur")?;
+    }
+    Ok(cfg)
+}
+
+fn parse_blur(t: &Table, defaults: BlurConfig) -> mlua::Result<BlurConfig> {
+    let mut cfg = defaults;
+    if let Some(e) = t.get::<Option<bool>>("enabled")? {
+        cfg.enabled = e;
+    }
+    if let Some(l) = t.get::<Option<bool>>("layers")? {
+        cfg.layers = l;
+    }
+    if let Some(w) = t.get::<Option<bool>>("windows")? {
+        cfg.windows = w;
+    }
+    if let Some(p) = t.get::<Option<i64>>("passes")? {
+        if !(0..=10).contains(&p) {
+            lua_bail!("decoration.blur.passes {p} out of range; expected 0..=10");
+        }
+        cfg.passes = u32::try_from(p).unwrap_or(0);
+    }
+    if let Some(r) = t.get::<Option<f32>>("radius")? {
+        if r < 0.0 {
+            lua_bail!("decoration.blur.radius {r} out of range; expected >= 0");
+        }
+        cfg.radius = r;
+    }
+    Ok(cfg)
+}
+
 fn parse_animations(t: &Table, defaults: AnimationsConfig) -> mlua::Result<AnimationsConfig> {
     let mut cfg = defaults;
     if let Some(e) = t.get::<Option<bool>>("enabled")? {
@@ -1095,6 +1187,61 @@ mod animation_tests {
         for src in [
             r#"animations = { curve = "boing" }"#,
             r#"animations = { duration = -5 }"#,
+        ] {
+            let lua = Lua::new();
+            lua.load(src).exec().unwrap();
+            assert!(
+                Config::populate_from_globals(&lua.globals()).is_err(),
+                "expected error for: {src}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Config {
+        let lua = Lua::new();
+        lua.load(src).exec().expect("lua exec");
+        Config::populate_from_globals(&lua.globals()).expect("populate")
+    }
+
+    #[test]
+    fn defaults_when_absent() {
+        let d = parse("").decoration;
+        assert_eq!(d.window_opacity, 1.0);
+        assert!(d.blur.enabled);
+        assert!(d.blur.layers);
+        assert!(!d.blur.windows);
+        assert_eq!(d.blur.passes, 3);
+    }
+
+    #[test]
+    fn parses_opacity_and_blur() {
+        let d = parse(
+            r#"decoration = {
+                opacity = 0.85,
+                blur = { windows = true, layers = false, passes = 2, radius = 8.0 },
+            }"#,
+        )
+        .decoration;
+        assert!((d.window_opacity - 0.85).abs() < 1e-6);
+        assert!(d.blur.windows);
+        assert!(!d.blur.layers);
+        assert!(d.blur.enabled); // untouched -> default
+        assert_eq!(d.blur.passes, 2);
+        assert!((d.blur.radius - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_out_of_range() {
+        for src in [
+            r#"decoration = { opacity = 1.5 }"#,
+            r#"decoration = { opacity = -0.1 }"#,
+            r#"decoration = { blur = { passes = 99 } }"#,
+            r#"decoration = { blur = { radius = -1 } }"#,
         ] {
             let lua = Lua::new();
             lua.load(src).exec().unwrap();

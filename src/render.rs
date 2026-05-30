@@ -50,7 +50,7 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
-use crate::config::{AnimationsConfig, BorderConfig, Fill, MonitorsConfig};
+use crate::config::{AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig};
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
 
@@ -345,6 +345,9 @@ pub struct Renderer {
     /// Animation timing/curves, read fresh each frame; updated live on
     /// config reload via [`Self::set_animations`].
     animations: AnimationsConfig,
+    /// Window opacity + blur, read fresh each frame; updated live on
+    /// config reload via [`Self::set_decoration`].
+    decoration: DecorationConfig,
     /// Per-window animation state keyed by surface id: the rect we're
     /// drawing at vs. the layout's target, plus any in-flight open/move
     /// animations. Persists across workspace switches (entries are pruned
@@ -700,6 +703,7 @@ impl Renderer {
             screenshot_overlay: None,
             dnd_icon: None,
             animations: AnimationsConfig::default(),
+            decoration: DecorationConfig::default(),
             win_anims: HashMap::new(),
             pending_open: HashSet::new(),
             no_anim_move: None,
@@ -986,6 +990,12 @@ impl Renderer {
     /// effect next frame; animations already in flight keep their timing.
     pub fn set_animations(&mut self, cfg: AnimationsConfig) {
         self.animations = cfg;
+    }
+
+    /// Replace the decoration config (window opacity + blur). Live config
+    /// reload; read fresh next frame.
+    pub fn set_decoration(&mut self, cfg: DecorationConfig) {
+        self.decoration = cfg;
     }
 
     /// Mark a freshly-mapped toplevel so it plays an open animation the
@@ -1297,6 +1307,7 @@ impl Renderer {
         let border = self.border.clone();
         let frame_shader = self.frame_shader.clone();
         let cursor_size = self.cursor_size;
+        let window_opacity = self.decoration.window_opacity;
         // The effective cursor this frame: a compositor override (grab /
         // screenshot) wins over the client's request. For a Named cursor
         // we resolve (and lazily upload) its themed sprite now, while we
@@ -1428,13 +1439,21 @@ impl Renderer {
                         origin.x - scale_f(f64::from(geo_x), scale),
                         origin.y - scale_f(f64::from(geo_y), scale),
                     ));
+                    // Configurable window opacity, on top of the animation
+                    // alpha. Only Normal (tiled/floating) windows; a
+                    // maximized/fullscreen surface stays at full opacity.
+                    let alpha = if p.fill == FillMode::Normal {
+                        wd.alpha * window_opacity
+                    } else {
+                        wd.alpha
+                    };
                     let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                         render_elements_from_surface_tree(
                             &mut self.gles,
                             &p.surface,
                             location,
                             scale,
-                            wd.alpha,
+                            alpha,
                             Kind::Unspecified,
                         );
                     let content_scale = Scale::from((csx, csy));
@@ -1678,7 +1697,9 @@ impl Renderer {
                         fill,
                         &wallpaper,
                         mode_size,
-                        wd.alpha,
+                        // Border fades with the window opacity too (this
+                        // loop is Normal windows only).
+                        wd.alpha * window_opacity,
                     )?;
                 }
             }

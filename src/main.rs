@@ -1675,6 +1675,7 @@ impl State {
         self.renderer
             .set_appearance(new.misc.wallpaper.clone(), new.border.clone());
         self.renderer.set_animations(new.animations.clone());
+        self.renderer.set_decoration(new.decoration.clone());
         self.config = new;
         info!("config reloaded");
     }
@@ -2157,6 +2158,7 @@ fn main() -> Result<()> {
     )
     .context("render pipeline init failed")?;
     renderer.set_animations(config.animations.clone());
+    renderer.set_decoration(config.decoration.clone());
 
     info!("phase: priming swapchains (one initial frame per output)");
     renderer.render_initial().context("initial render failed")?;
