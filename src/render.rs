@@ -2057,9 +2057,15 @@ impl Renderer {
                 Point::from((f64::from(dst.loc.x), f64::from(dst.loc.y))),
                 Size::from((f64::from(dst.size.w), f64::from(dst.size.h))),
             );
+            // `render_texture_from_to` treats the damage / opaque rects as
+            // *relative to `dst`'s origin* (it constrains them to `dst.size`),
+            // so they must be `(0,0)`-anchored. Passing the absolute `dst`
+            // collapses to a zero-size instance for any offset surface — the
+            // whole reason blur only ever showed full-screen.
+            let local = [Rectangle::from_size(dst.size)];
             frame
                 .render_texture_from_to(
-                    tier, src, dst, &[dst], &[dst], Transform::Normal, 1.0, None, &[],
+                    tier, src, dst, &local, &local, Transform::Normal, 1.0, None, &[],
                 )
                 .context("blur: backdrop sub-rect")?;
             Ok(())
@@ -2513,7 +2519,12 @@ fn blur_pass(
             src_rect,
             dst_rect,
             &[dst_rect],
-            &[],
+            // A blur pass fully repaints its destination, so mark the whole
+            // rect opaque: smithay then disables blending and *overwrites*
+            // the (never-cleared, frame-reused) mip instead of blending the
+            // premultiplied result over stale content where the source has
+            // any sub-1 alpha.
+            &[dst_rect],
             Transform::Normal,
             1.0,
             Some(program),
