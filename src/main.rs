@@ -1625,7 +1625,7 @@ impl State {
     /// fix and save to recover. Settings that can't be hot-applied
     /// (monitor modes, env, input device/keymap setup) are flagged
     /// with a "restart to apply" log when they change.
-    fn reload_config(&mut self, path: &std::path::Path) {
+    pub(crate) fn reload_config(&mut self, path: &std::path::Path) {
         let new = match config::Config::load_from_file(path) {
             Ok(new) => new,
             Err(err) => {

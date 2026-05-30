@@ -452,8 +452,9 @@ impl Layout {
     /// re-inserted into the tree at the window's current centre,
     /// so it lands where it visually was.
     ///
-    /// Silent no-op for surfaces we don't track.
-    pub fn toggle_floating(&mut self, surface: &WlSurface) {
+    /// Returns whether `surface` was a tracked window that got toggled
+    /// (a silent no-op, `false`, for surfaces we don't track).
+    pub fn toggle_floating(&mut self, surface: &WlSurface) -> bool {
         // Toggling never crosses workspaces: the window stays on the
         // active workspace it's currently visible on.
         //
@@ -476,7 +477,7 @@ impl Layout {
                     push_configure_for_floating(&window, self.border_width, area);
                     self.active_ws_mut(oi).floating.push(window);
                     self.recompute_and_push();
-                    return;
+                    return true;
                 }
             }
         }
@@ -506,8 +507,9 @@ impl Layout {
                 Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(center), inner),
             });
             self.recompute_and_push();
-            return;
+            return true;
         }
+        false
     }
 
     /// Start an interactive *move* drag. Pulls the matched window
@@ -989,6 +991,23 @@ impl Layout {
         true
     }
 
+    /// Flip `surface` between maximized and normal (IPC
+    /// `toggle-maximized`). A fullscreen window drops to maximized;
+    /// anything else toggles against maximized. Returns whether `surface`
+    /// was found.
+    pub fn toggle_maximized(&mut self, surface: &WlSurface) -> bool {
+        let Some(w) = self.window_mut(surface) else {
+            return false;
+        };
+        w.fill = if w.fill == FillMode::Maximized {
+            FillMode::Normal
+        } else {
+            FillMode::Maximized
+        };
+        self.recompute_and_push();
+        true
+    }
+
     /// Whether `surface` is a tracked window that's maximized or
     /// fullscreen (used to refuse interactive move/resize on it).
     fn is_filled(&self, surface: &WlSurface) -> bool {
@@ -1082,7 +1101,14 @@ impl Layout {
             return false; // scroll-up at workspace 0: no wrap, no-op.
         }
         #[allow(clippy::cast_sign_loss, reason = "target >= 0 checked just above")]
-        let target = target as usize;
+        self.switch_to_index(oi, target as usize)
+    }
+
+    /// Switch output `oi` to the absolute workspace `target`, growing the
+    /// list with empties if `target` is past the end. Shared by the
+    /// scroll gesture ([`Self::switch`]) and the IPC
+    /// [`Self::switch_workspace_to`]. Returns whether `active` changed.
+    fn switch_to_index(&mut self, oi: usize, target: usize) -> bool {
         while target >= self.outputs[oi].workspaces.len() {
             self.outputs[oi].workspaces.push(Workspace::default());
         }
@@ -1102,15 +1128,25 @@ impl Layout {
         );
         self.outputs[oi].transition = Some(WsTransition {
             from,
-            // Next workspace slides up (incoming from the bottom),
-            // previous slides down — the natural scroll mapping.
-            dir: -delta.signum(),
+            // Moving to a later workspace slides up (incoming from the
+            // bottom), to an earlier one slides down — the natural
+            // scroll mapping, also correct for absolute IPC jumps.
+            dir: if target > self.outputs[oi].active { -1 } else { 1 },
             start: Instant::now(),
         });
         self.outputs[oi].active = target;
         self.normalize_output(oi);
         self.recompute_and_push();
         true
+    }
+
+    /// IPC: switch the named output to workspace `index` (absolute).
+    /// No-op (returns `false`) if there's no output by that name.
+    pub fn switch_workspace_to(&mut self, output: &str, index: usize) -> bool {
+        let Some(oi) = self.outputs.iter().position(|o| o.name == output) else {
+            return false;
+        };
+        self.switch_to_index(oi, index)
     }
 
     /// Move the keyboard-focused window to the adjacent workspace on
@@ -1121,27 +1157,9 @@ impl Layout {
     /// `surface` isn't on any visible workspace or the move was a
     /// no-op (at the top edge).
     pub fn move_focused_window(&mut self, surface: &WlSurface, delta: i32) -> bool {
-        // Locate the window on a visible (active) workspace.
-        let mut found: Option<(usize, bool)> = None;
-        for (oi, op) in self.outputs.iter().enumerate() {
-            let ws = &op.workspaces[op.active];
-            if ws
-                .floating
-                .iter()
-                .any(|w| w.toplevel.wl_surface() == surface)
-            {
-                found = Some((oi, true));
-                break;
-            }
-            if ws.tree.as_ref().is_some_and(|t| tree_contains(t, surface)) {
-                found = Some((oi, false));
-                break;
-            }
-        }
-        let Some((oi, is_floating)) = found else {
+        let Some((oi, is_floating)) = self.find_visible(surface) else {
             return false;
         };
-
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_possible_wrap,
@@ -1152,7 +1170,45 @@ impl Layout {
             return false; // Shift+scroll-up at workspace 0: no-op.
         }
         #[allow(clippy::cast_sign_loss, reason = "dst >= 0 checked just above")]
-        let dst = dst as usize;
+        self.relocate(surface, oi, is_floating, dst as usize)
+    }
+
+    /// IPC: move `surface` to workspace `index` (absolute) on its own
+    /// output and follow it. Only finds windows on a *visible* (active)
+    /// workspace; returns `false` if `surface` isn't currently visible or
+    /// the move is a no-op.
+    pub fn move_window_to_workspace(&mut self, surface: &WlSurface, index: usize) -> bool {
+        let Some((oi, is_floating)) = self.find_visible(surface) else {
+            return false;
+        };
+        self.relocate(surface, oi, is_floating, index)
+    }
+
+    /// Locate `surface` on some output's active workspace, returning that
+    /// output index and whether it's floating. `None` if it isn't on any
+    /// visible workspace.
+    fn find_visible(&self, surface: &WlSurface) -> Option<(usize, bool)> {
+        for (oi, op) in self.outputs.iter().enumerate() {
+            let ws = &op.workspaces[op.active];
+            if ws
+                .floating
+                .iter()
+                .any(|w| w.toplevel.wl_surface() == surface)
+            {
+                return Some((oi, true));
+            }
+            if ws.tree.as_ref().is_some_and(|t| tree_contains(t, surface)) {
+                return Some((oi, false));
+            }
+        }
+        None
+    }
+
+    /// Move `surface` (known to be `is_floating` on output `oi`'s active
+    /// workspace) to absolute workspace `dst`, growing the list if needed,
+    /// then follow it (the destination becomes active). Returns whether a
+    /// move happened (`false` if `dst` is already the active workspace).
+    fn relocate(&mut self, surface: &WlSurface, oi: usize, is_floating: bool, dst: usize) -> bool {
         while dst >= self.outputs[oi].workspaces.len() {
             self.outputs[oi].workspaces.push(Workspace::default());
         }

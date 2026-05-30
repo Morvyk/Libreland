@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
+    // --- queries ---
     /// Compositor name + version.
     Version,
     /// Every connected output.
@@ -36,6 +37,60 @@ pub enum Request {
     FocusedWindow,
     /// The configured keybindings.
     Binds,
+
+    // --- actions ---
+    /// Focus a window by id (revealing its workspace first).
+    FocusWindow { id: u64 },
+    /// Close a window (the focused one if `id` is omitted).
+    Close {
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Toggle a window between tiled and floating.
+    ToggleFloating {
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Toggle a window's fullscreen state.
+    ToggleFullscreen {
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Toggle a window's maximized state.
+    ToggleMaximized {
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Switch the active workspace of an output (the primary if
+    /// `output` is omitted).
+    FocusWorkspace {
+        #[serde(default)]
+        output: Option<String>,
+        target: WorkspaceTarget,
+    },
+    /// Move a window (the focused one if `id` is omitted) to a workspace
+    /// on its own output and follow it.
+    MoveToWorkspace {
+        #[serde(default)]
+        id: Option<u64>,
+        target: WorkspaceTarget,
+    },
+    /// Spawn a child process. `command` is an argv (program + args).
+    Spawn { command: Vec<String> },
+    /// Re-read the config file now.
+    Reload,
+    /// Exit the compositor.
+    Exit,
+}
+
+/// A workspace to switch/move to: an absolute index, or one step in
+/// either direction. Serializes as `{"index":N}`, `"next"`, or `"prev"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceTarget {
+    Index(usize),
+    Next,
+    Prev,
 }
 
 /// The compositor's reply to a [`Request`]: the payload on success, or a
@@ -51,6 +106,8 @@ pub enum Response {
     Windows(Vec<WindowInfo>),
     FocusedWindow(Option<WindowInfo>),
     Binds(Vec<BindInfo>),
+    /// An action completed successfully (no payload).
+    Handled,
 }
 
 /// Compositor identity.
@@ -145,14 +202,16 @@ mod server {
     use smithay::reexports::wayland_server::Resource as _;
     use smithay::reexports::wayland_server::backend::ObjectId;
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+    use smithay::utils::{IsAlive, SERIAL_COUNTER};
     use smithay::wayland::compositor::with_states;
     use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
     use tracing::{info, warn};
 
     use super::{
         BindInfo, OutputInfo, Reply, Request, Response, VersionInfo, WindowInfo, WorkspaceInfo,
+        WorkspaceTarget,
     };
-    use crate::layout::{FillMode, WindowEntry};
+    use crate::layout::{FillMode, Layout, WindowEntry};
     use crate::{LoopData, State};
 
     /// Stable window-id registry + (later) event subscribers. Lives in
@@ -176,6 +235,11 @@ mod server {
             self.by_surface.insert(surface.id(), id);
             self.by_id.insert(id, surface.clone());
             id
+        }
+
+        /// The surface for a previously-assigned id, if it's still known.
+        pub fn surface_of(&self, id: u64) -> Option<WlSurface> {
+            self.by_id.get(&id).cloned()
         }
 
         /// Drop a window's id once its surface is gone.
@@ -285,26 +349,182 @@ mod server {
         }
     }
 
-    /// Route a request to the right query and wrap the result as a
-    /// [`Reply`]. Read-only queries can't fail today, so this is always
-    /// `Ok`; action commands (a later increment) will return `Err`.
-    #[allow(
-        clippy::needless_pass_by_value,
-        clippy::unnecessary_wraps,
-        reason = "action variants (a later increment) carry owned payloads and return Err"
-    )]
+    /// Route a request to its query or action and wrap the result as a
+    /// [`Reply`]. Queries can't fail; actions return `Err(message)` when
+    /// the target can't be resolved.
     fn dispatch(state: &mut State, req: Request) -> Reply {
-        Ok(match req {
-            Request::Version => Response::Version(VersionInfo {
+        match req {
+            Request::Version => Ok(Response::Version(VersionInfo {
                 name: "libreland".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
-            }),
-            Request::Outputs => Response::Outputs(outputs(state)),
-            Request::Workspaces => Response::Workspaces(workspaces(state)),
-            Request::Windows => Response::Windows(windows(state)),
-            Request::FocusedWindow => Response::FocusedWindow(focused_window(state)),
-            Request::Binds => Response::Binds(binds(state)),
-        })
+            })),
+            Request::Outputs => Ok(Response::Outputs(outputs(state))),
+            Request::Workspaces => Ok(Response::Workspaces(workspaces(state))),
+            Request::Windows => Ok(Response::Windows(windows(state))),
+            Request::FocusedWindow => Ok(Response::FocusedWindow(focused_window(state))),
+            Request::Binds => Ok(Response::Binds(binds(state))),
+            Request::FocusWindow { id } => focus_window(state, id),
+            Request::Close { id } => close_window(state, id),
+            Request::ToggleFloating { id } => toggle(state, id, Layout::toggle_floating),
+            Request::ToggleFullscreen { id } => toggle(state, id, Layout::toggle_fullscreen),
+            Request::ToggleMaximized { id } => toggle(state, id, Layout::toggle_maximized),
+            Request::FocusWorkspace { output, target } => focus_workspace(state, output, target),
+            Request::MoveToWorkspace { id, target } => move_to_workspace(state, id, target),
+            Request::Spawn { command } => spawn(&command),
+            Request::Reload => reload(state),
+            Request::Exit => {
+                info!("exit requested via IPC");
+                state.loop_signal.stop();
+                Ok(Response::Handled)
+            }
+        }
+    }
+
+    /// Resolve a window target: the surface for `id`, or the focused
+    /// window when `id` is `None`. Errors if the id is unknown / dead or
+    /// nothing is focused.
+    fn resolve(state: &State, id: Option<u64>) -> Result<WlSurface, String> {
+        match id {
+            Some(id) => state
+                .ipc
+                .surface_of(id)
+                .filter(IsAlive::alive)
+                .ok_or_else(|| format!("no window with id {id}")),
+            None => state
+                .seat
+                .get_keyboard()
+                .and_then(|k| k.current_focus())
+                .ok_or_else(|| "no focused window".to_owned()),
+        }
+    }
+
+    fn focus_window(state: &mut State, id: u64) -> Reply {
+        let surface = resolve(state, Some(id))?;
+        // Reveal the window's workspace first so a focus request for a
+        // window on a hidden workspace actually shows it.
+        if let Some(entry) = state
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| e.surface == surface)
+        {
+            state
+                .layout
+                .switch_workspace_to(&entry.output, entry.workspace);
+        }
+        if let Some(kbd) = state.seat.get_keyboard() {
+            kbd.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+        }
+        Ok(Response::Handled)
+    }
+
+    fn close_window(state: &mut State, id: Option<u64>) -> Reply {
+        let surface = resolve(state, id)?;
+        let toplevel = state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|t| t.wl_surface() == &surface)
+            .cloned()
+            .ok_or_else(|| "target is not a toplevel window".to_owned())?;
+        toplevel.send_close();
+        Ok(Response::Handled)
+    }
+
+    /// Shared body for the three toggle actions. `apply` runs the layout
+    /// mutation and reports whether the window was found.
+    fn toggle(
+        state: &mut State,
+        id: Option<u64>,
+        apply: impl FnOnce(&mut crate::layout::Layout, &WlSurface) -> bool,
+    ) -> Reply {
+        let surface = resolve(state, id)?;
+        if apply(&mut state.layout, &surface) {
+            Ok(Response::Handled)
+        } else {
+            Err("window is not managed by the tiler".to_owned())
+        }
+    }
+
+    fn focus_workspace(
+        state: &mut State,
+        output: Option<String>,
+        target: WorkspaceTarget,
+    ) -> Reply {
+        let output = output.unwrap_or_else(|| state.renderer.primary_output_name().to_owned());
+        let active = state
+            .layout
+            .active_workspace(&output)
+            .ok_or_else(|| format!("no output named {output}"))?;
+        let index = resolve_target(target, active);
+        if state.layout.switch_workspace_to(&output, index) {
+            refocus_active(state, &output);
+        }
+        Ok(Response::Handled)
+    }
+
+    fn move_to_workspace(state: &mut State, id: Option<u64>, target: WorkspaceTarget) -> Reply {
+        let surface = resolve(state, id)?;
+        let entry = state
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| e.surface == surface)
+            .ok_or_else(|| "window is not on a workspace".to_owned())?;
+        let index = resolve_target(target, entry.workspace);
+        if state.layout.move_window_to_workspace(&surface, index) {
+            Ok(Response::Handled)
+        } else {
+            Err("could not move the window (is it on the active workspace?)".to_owned())
+        }
+    }
+
+    /// Resolve a [`WorkspaceTarget`] to an absolute index relative to the
+    /// `current` active workspace.
+    fn resolve_target(target: WorkspaceTarget, current: usize) -> usize {
+        match target {
+            WorkspaceTarget::Index(i) => i,
+            WorkspaceTarget::Next => current + 1,
+            WorkspaceTarget::Prev => current.saturating_sub(1),
+        }
+    }
+
+    /// After a workspace switch, move keyboard focus to a window on the
+    /// now-active workspace (or clear it when that workspace is empty), so
+    /// input and the active border follow the switch.
+    fn refocus_active(state: &mut State, output: &str) {
+        let Some(active) = state.layout.active_workspace(output) else {
+            return;
+        };
+        let next = state
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| e.output == output && e.workspace == active)
+            .map(|e| e.surface);
+        if let Some(kbd) = state.seat.get_keyboard() {
+            kbd.set_focus(state, next, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn spawn(command: &[String]) -> Reply {
+        let Some((program, args)) = command.split_first() else {
+            return Err("empty command".to_owned());
+        };
+        match std::process::Command::new(program).args(args).spawn() {
+            Ok(child) => {
+                info!(pid = child.id(), ?command, "spawned via IPC");
+                Ok(Response::Handled)
+            }
+            Err(e) => Err(format!("spawn failed: {e}")),
+        }
+    }
+
+    fn reload(state: &mut State) -> Reply {
+        let path = crate::config::Config::path()
+            .ok_or_else(|| "no config path (XDG dirs unset)".to_owned())?;
+        state.reload_config(&path);
+        Ok(Response::Handled)
     }
 
     fn outputs(state: &mut State) -> Vec<OutputInfo> {
@@ -475,7 +695,39 @@ mod client {
     use anyhow::{Context as _, Result, bail};
     use clap::{Parser, Subcommand};
 
-    use super::{Reply, Request, Response};
+    use super::{Reply, Request, Response, WorkspaceTarget};
+
+    /// A workspace argument: a number, `next`, or `prev`.
+    #[derive(Clone)]
+    enum WsTargetArg {
+        Index(usize),
+        Next,
+        Prev,
+    }
+
+    impl std::str::FromStr for WsTargetArg {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, String> {
+            match s.to_ascii_lowercase().as_str() {
+                "next" => Ok(Self::Next),
+                "prev" | "previous" => Ok(Self::Prev),
+                _ => s
+                    .parse::<usize>()
+                    .map(Self::Index)
+                    .map_err(|_| format!(r#"expected a workspace index, "next", or "prev", got {s:?}"#)),
+            }
+        }
+    }
+
+    impl WsTargetArg {
+        fn to_target(&self) -> WorkspaceTarget {
+            match self {
+                Self::Index(i) => WorkspaceTarget::Index(*i),
+                Self::Next => WorkspaceTarget::Next,
+                Self::Prev => WorkspaceTarget::Prev,
+            }
+        }
+    }
 
     #[derive(Parser)]
     #[command(
@@ -506,6 +758,39 @@ mod client {
         FocusedWindow,
         /// List the configured keybindings.
         Binds,
+        /// Focus a window by id (revealing its workspace).
+        FocusWindow { id: u64 },
+        /// Close a window (the focused one if no id is given).
+        Close { id: Option<u64> },
+        /// Toggle a window between tiled and floating.
+        ToggleFloating { id: Option<u64> },
+        /// Toggle a window's fullscreen state.
+        ToggleFullscreen { id: Option<u64> },
+        /// Toggle a window's maximized state.
+        ToggleMaximized { id: Option<u64> },
+        /// Switch a workspace. TARGET is a number, "next", or "prev".
+        FocusWorkspace {
+            target: WsTargetArg,
+            /// Output to switch (defaults to the primary).
+            #[arg(long)]
+            output: Option<String>,
+        },
+        /// Move a window to a workspace and follow it. TARGET is a
+        /// number, "next", or "prev".
+        MoveToWorkspace {
+            target: WsTargetArg,
+            /// Window id (defaults to the focused window).
+            id: Option<u64>,
+        },
+        /// Spawn a command (everything after the verb is the argv).
+        Spawn {
+            #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+            command: Vec<String>,
+        },
+        /// Re-read the config file now.
+        Reload,
+        /// Exit the compositor.
+        Exit,
     }
 
     impl Command {
@@ -517,6 +802,24 @@ mod client {
                 Command::Windows => Request::Windows,
                 Command::FocusedWindow => Request::FocusedWindow,
                 Command::Binds => Request::Binds,
+                Command::FocusWindow { id } => Request::FocusWindow { id: *id },
+                Command::Close { id } => Request::Close { id: *id },
+                Command::ToggleFloating { id } => Request::ToggleFloating { id: *id },
+                Command::ToggleFullscreen { id } => Request::ToggleFullscreen { id: *id },
+                Command::ToggleMaximized { id } => Request::ToggleMaximized { id: *id },
+                Command::FocusWorkspace { target, output } => Request::FocusWorkspace {
+                    output: output.clone(),
+                    target: target.to_target(),
+                },
+                Command::MoveToWorkspace { target, id } => Request::MoveToWorkspace {
+                    id: *id,
+                    target: target.to_target(),
+                },
+                Command::Spawn { command } => Request::Spawn {
+                    command: command.clone(),
+                },
+                Command::Reload => Request::Reload,
+                Command::Exit => Request::Exit,
             }
         }
     }
@@ -590,6 +893,9 @@ mod client {
                 None => println!("no focused window"),
             },
             Response::Binds(binds) => print_binds(binds),
+            // Actions succeed silently (Unix convention); `--json` above
+            // still prints the `"Handled"` marker for scripts that check.
+            Response::Handled => {}
         }
         Ok(())
     }
