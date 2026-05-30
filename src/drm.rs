@@ -15,6 +15,7 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmSurfac
 use smithay::backend::session::Session as _;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::reexports::drm;
+use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{
     Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc,
 };
@@ -146,12 +147,41 @@ pub fn open_display(
     }
     info!(count = outputs.len(), "all connected outputs bound");
 
+    // Wipe each CRTC's cursor plane inherited from the display manager so
+    // its pointer doesn't linger as a ghost over our scene (see fn docs).
+    clear_leftover_cursors(&device, &outputs);
+
     Ok(DrmInit {
         device,
         fd,
         notifier,
         outputs,
     })
+}
+
+/// Clear any hardware cursor the display manager left on each CRTC's
+/// cursor plane before we took DRM master. Libreland composites its own
+/// (GPU-rendered) cursor into the primary framebuffer and never programs
+/// the KMS cursor plane, so without this the DM's last cursor image keeps
+/// scanning out as a frozen "ghost" over our scene.
+///
+/// The legacy `set_cursor` ioctl is the simplest portable way to *disable*
+/// it: on atomic drivers (including NVIDIA) the kernel routes the legacy
+/// call through its universal-cursor path, which disables the cursor
+/// plane — so this works without us implementing atomic plane programming
+/// we'd otherwise never need. Per-CRTC failures are non-fatal (at worst
+/// the ghost remains), so they're logged and ignored.
+fn clear_leftover_cursors(device: &DrmDevice, outputs: &[DrmOutput]) {
+    for output in outputs {
+        #[allow(
+            deprecated,
+            reason = "drm-rs deprecates set_cursor in favour of programming a cursor plane; we deliberately don't use the plane, and this is the portable way to *disable* the one the DM left behind"
+        )]
+        let cleared = ControlDevice::set_cursor(device, output.crtc, None::<&DumbBuffer>);
+        if let Err(err) = cleared {
+            warn!(error = %err, crtc = ?output.crtc, "could not clear the DM's leftover cursor");
+        }
+    }
 }
 
 /// Pick a mode for `conn`. If `requested` is `Some`, look for an
