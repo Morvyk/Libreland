@@ -65,6 +65,7 @@ mod clipboard;
 mod config;
 mod cursor;
 mod drm;
+mod ipc;
 mod keyboard;
 mod layout;
 mod render;
@@ -298,6 +299,10 @@ pub(crate) struct State {
     /// the process goes multithreaded) so screenshot filenames can use
     /// local time reliably.
     pub(crate) local_offset: time::UtcOffset,
+    /// Control-IPC state: the stable window-id registry (and, later,
+    /// event subscribers). The socket lives on the event loop; this is
+    /// the bookkeeping its dispatch reads + writes.
+    pub(crate) ipc: ipc::IpcState,
 }
 
 /// An in-progress screenshot. `bind` carries the configured behaviour
@@ -2037,6 +2042,13 @@ impl State {
     reason = "init flow is naturally linear (session → udev → DRM → renderer → keyboard → libinput → Wayland → state → run); extracting sub-helpers would obscure ownership/order more than the function being long does"
 )]
 fn main() -> Result<()> {
+    // `libreland msg …` is the IPC control client, not the compositor.
+    // Detect it before any compositor init (logging, config, DRM) so it
+    // stays a fast, side-effect-free CLI that just talks to the socket.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("msg")) {
+        return ipc::run_client();
+    }
+
     // The WorkerGuard MUST stay alive for the whole of main; dropping it
     // releases the tracing-appender worker thread and flushes the file
     // log. Bind it with a leading underscore so clippy doesn't nag, but
@@ -2234,6 +2246,26 @@ fn main() -> Result<()> {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     }
 
+    // Control IPC socket, derived from the same display name. Export
+    // `$LIBRELAND_SOCKET` so children + the `libreland msg` client connect
+    // without re-deriving the path. The listener itself is registered on
+    // the loop further down (it needs the loop handle).
+    let ipc_socket = ipc::socket_path(&socket_name);
+    if let Some(path) = &ipc_socket {
+        // SAFETY: same single-threaded-init reasoning as the
+        // WAYLAND_DISPLAY set_var above — still pre-event-loop.
+        #[allow(
+            unsafe_code,
+            reason = "set_var is unsafe due to multi-threaded env races; called in single-threaded init before the event loop, same as WAYLAND_DISPLAY"
+        )]
+        // SAFETY: see #[allow] above.
+        unsafe {
+            std::env::set_var("LIBRELAND_SOCKET", path);
+        }
+    } else {
+        warn!("XDG_RUNTIME_DIR unset; control IPC socket disabled");
+    }
+
     // XWayland via xwayland-satellite: a rootless Xwayland that
     // connects to *our* socket as a normal Wayland client (so X
     // windows arrive as ordinary xdg_toplevels) and serves X11 on a
@@ -2307,6 +2339,15 @@ fn main() -> Result<()> {
             },
         )
         .map_err(|e| anyhow::anyhow!("failed to insert wayland dispatch source: {e}"))?;
+
+    // Control IPC: bind the socket derived above and register it on the
+    // loop. A bind failure is non-fatal — the compositor runs fine
+    // without IPC, you just can't `libreland msg` it.
+    if let Some(path) = &ipc_socket
+        && let Err(err) = ipc::setup(&handle, path)
+    {
+        warn!(error = %err, "control IPC unavailable");
+    }
 
     // Now that the socket is listening and `$WAYLAND_DISPLAY` is
     // set, spawn any configured startup commands. Their stdout /
@@ -2402,6 +2443,7 @@ fn main() -> Result<()> {
         screenshot: None,
         screenshot_pending: Vec::new(),
         local_offset,
+        ipc: ipc::IpcState::default(),
     };
     let mut loop_data = LoopData { state, display };
 

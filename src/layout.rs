@@ -272,6 +272,27 @@ pub struct Gaps {
     pub inner: i32,
 }
 
+/// One window's structural info for the IPC `windows` query. The caller
+/// (the IPC dispatcher, which holds `State`) reads title/app-id off the
+/// surface and pairs it with a stable id.
+pub struct WindowEntry {
+    pub surface: WlSurface,
+    /// Cell rect in absolute compositor (logical) pixels.
+    pub rect: Rectangle<i32, Physical>,
+    pub fill: FillMode,
+    pub floating: bool,
+    pub output: String,
+    pub workspace: usize,
+}
+
+/// One workspace's info for the IPC `workspaces` query.
+pub struct WorkspaceEntry {
+    pub output: String,
+    pub index: usize,
+    pub active: bool,
+    pub windows: usize,
+}
+
 enum Node {
     Leaf(Window),
     Split {
@@ -881,6 +902,61 @@ impl Layout {
         self.border_width
     }
 
+    /// Snapshot every workspace across every output for the IPC
+    /// `workspaces` query. One entry per workspace (including the
+    /// trailing empty slot), in output-then-index order.
+    pub fn workspace_entries(&self) -> Vec<WorkspaceEntry> {
+        let mut out = Vec::new();
+        for op in &self.outputs {
+            for (index, ws) in op.workspaces.iter().enumerate() {
+                out.push(WorkspaceEntry {
+                    output: op.name.clone(),
+                    index,
+                    active: index == op.active,
+                    windows: workspace_window_count(ws),
+                });
+            }
+        }
+        out
+    }
+
+    /// Snapshot every managed window across every output and workspace
+    /// for the IPC `windows` query: its surface (so the caller can read
+    /// title/app-id + assign a stable id), cell rect, fill mode, and
+    /// whether it floats, plus which output/workspace holds it. The
+    /// transient in-transit drag window is omitted (it has no settled
+    /// home until release).
+    pub fn window_entries(&self) -> Vec<WindowEntry> {
+        let mut out = Vec::new();
+        for op in &self.outputs {
+            for (index, ws) in op.workspaces.iter().enumerate() {
+                if let Some(tree) = &ws.tree {
+                    collect_window_entries(tree, &op.name, index, &mut out);
+                }
+                for w in &ws.floating {
+                    out.push(WindowEntry {
+                        surface: w.toplevel.wl_surface().clone(),
+                        rect: w.rect,
+                        fill: w.fill,
+                        floating: true,
+                        output: op.name.clone(),
+                        workspace: index,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Active workspace index of the named output, or `None` if no such
+    /// output. Used to annotate the IPC `outputs` query.
+    pub fn active_workspace(&self, output: &str) -> Option<usize> {
+        self.outputs
+            .iter()
+            .find(|op| op.name == output)
+            .map(|op| op.active)
+    }
+
     /// Set a window's fill mode (normal / maximized / fullscreen) and
     /// reflow so it picks up its new size, border state, and z-order.
     /// The state lives on the `Window`, so it survives moves between
@@ -1410,6 +1486,40 @@ fn collect_workspace(
             floating: true,
             slide_dy: 0,
         });
+    }
+}
+
+/// Total windows in a workspace: tiled leaves plus floats.
+fn workspace_window_count(ws: &Workspace) -> usize {
+    fn leaves(node: &Node) -> usize {
+        match node {
+            Node::Leaf(_) => 1,
+            Node::Split { first, second, .. } => leaves(first) + leaves(second),
+        }
+    }
+    ws.tree.as_ref().map_or(0, leaves) + ws.floating.len()
+}
+
+/// Push a [`WindowEntry`] for every tiled leaf in `node` (recursively).
+fn collect_window_entries(
+    node: &Node,
+    output: &str,
+    workspace: usize,
+    out: &mut Vec<WindowEntry>,
+) {
+    match node {
+        Node::Leaf(w) => out.push(WindowEntry {
+            surface: w.toplevel.wl_surface().clone(),
+            rect: w.rect,
+            fill: w.fill,
+            floating: false,
+            output: output.to_owned(),
+            workspace,
+        }),
+        Node::Split { first, second, .. } => {
+            collect_window_entries(first, output, workspace, out);
+            collect_window_entries(second, output, workspace, out);
+        }
     }
 }
 

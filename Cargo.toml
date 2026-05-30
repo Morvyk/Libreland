@@ -19,9 +19,15 @@ members = ["output-picker"]
 
 [dependencies]
 anyhow = "1.0.102"
+# CLI parser for the `libreland msg` IPC client subcommand (derive API).
+clap = { version = "4.6.1", features = ["derive"] }
 mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
 # Pure-Rust PNG encoder for the built-in screenshot tool (no C deps).
 png = "0.18.1"
+# JSON IPC: request/response + event-stream (de)serialization for the
+# control socket and the `libreland msg` client.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 smithay = { version = "0.7.0", default-features = false, features = ["backend_drm", "backend_egl", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev", "renderer_gl", "wayland_frontend", "desktop"] }
 # `local-offset` lets screenshot filenames use local time; the UTC offset
 # is captured once at startup (on the main thread) because the per-call

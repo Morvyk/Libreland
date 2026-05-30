@@ -720,6 +720,8 @@ impl XdgShellHandler for State {
         // Pull from the tiler — its sibling takes the freed cell
         // and every remaining window receives a fresh configure.
         self.layout.remove(surface.wl_surface());
+        // Release the window's stable IPC id so it isn't reused.
+        self.ipc.forget(surface.wl_surface());
         // Clear keyboard focus only if the destroyed surface was
         // actually focused — otherwise leave whatever is focused
         // alone (it might be a different live toplevel). 4d.2 will
