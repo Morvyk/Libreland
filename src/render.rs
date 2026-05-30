@@ -29,8 +29,8 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::gles::{
-    GlesFrame, GlesPixelProgram, GlesRenderer, GlesTarget, GlesTexProgram, GlesTexture, Uniform,
-    UniformName, UniformType,
+    GlesFrame, GlesRenderer, GlesTarget, GlesTexProgram, GlesTexture, Uniform, UniformName,
+    UniformType,
 };
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
@@ -174,102 +174,6 @@ pub struct OutputDescriptor {
 /// the bounding-box width and height.
 const CURSOR_SIZE: i32 = 24;
 
-/// GLES2 fragment shader that paints the *frame* of a window —
-/// the rounded-corner cutout (wallpaper) and the border ring
-/// (border colour) — in one pass over the window's cell rect.
-/// Runs after the surface is drawn, so the surface fills the
-/// interior and this shader overpaints everything from the
-/// border ring outward.
-///
-/// Region selection uses the signed-distance field of a rounded
-/// rectangle. With `dist` = SDF distance from the rounded
-/// boundary (positive outside, negative inside):
-///
-/// - `dist >  0`: outside the cell shape → paint wallpaper.
-/// - `dist in (-border_width, 0]`: in the border ring → paint
-///   border colour, which itself can be a vertical gradient.
-/// - `dist <= -border_width`: interior → discard, keeping the
-///   surface pixel that was drawn before.
-///
-/// Both transitions get a `smoothstep` ramp so the curve and
-/// the border's inner edge are anti-aliased. Colours are sampled
-/// from vertical gradients keyed off the fragment's *global* y
-/// (output-space), so the active-border gradient stays
-/// continuous between adjacent tiles instead of resetting per
-/// cell, and similarly for the wallpaper cutout.
-///
-/// Uniforms: `size` and `alpha` come from smithay; the rest are
-/// registered at compile time and re-set each frame.
-const FRAME_SHADER: &str = r"
-#extension GL_OES_standard_derivatives : enable
-
-#ifdef GL_FRAGMENT_PRECISION_HIGH
-precision highp float;
-#else
-precision mediump float;
-#endif
-
-uniform vec2 size;
-uniform float alpha;
-uniform float radius;
-uniform float border_width;
-uniform vec3 grad_top;
-uniform vec3 grad_bottom;
-uniform vec3 border_top;
-uniform vec3 border_bottom;
-uniform float output_height;
-uniform float cell_origin_y;
-
-varying vec2 v_coords;
-
-void main() {
-    vec2 p = v_coords * size;
-    vec2 half_size = size * 0.5;
-    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
-    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
-
-    // Screen-space AA half-width via the derivative of the SDF.
-    // Falls back to 0.5 px when `fwidth` isn't supported or
-    // returns 0 (e.g. on perfectly axis-aligned edges of an
-    // un-rotated frame). This makes the AA ramp exactly one
-    // *output* pixel wide regardless of fractional scale, so a
-    // 4K display at scale 1.5 gets the same crisp 1-pixel ramp
-    // as a 1080p panel at scale 1.
-    float aa = max(fwidth(dist) * 0.5, 0.5);
-
-    // Inner cutoff (cell interior, surface kept). The AA ramp
-    // for the inner edge fits below this threshold.
-    if (dist <= -border_width - aa) {
-        discard;
-    }
-
-    float global_y = cell_origin_y + p.y;
-    float t = clamp(global_y / max(output_height, 1.0), 0.0, 1.0);
-    vec3 wallpaper_rgb = mix(grad_top, grad_bottom, t);
-    vec3 border_rgb = mix(border_top, border_bottom, t);
-
-    // Pick wallpaper outside the rounded boundary, border colour
-    // inside, with a derivative-sized smoothstep across `dist = 0`.
-    float outer_blend = smoothstep(-aa, aa, dist);
-    vec3 color = mix(border_rgb, wallpaper_rgb, outer_blend);
-
-    // Alpha: 1 from the outside through the border ring, fading
-    // to 0 across the inner edge (`dist = -border_width`) so the
-    // surface peeks through smoothly. With border_width = 0 the
-    // two transitions coincide and the shader collapses to the
-    // wallpaper-only mask case.
-    float a = smoothstep(-border_width - aa, -border_width + aa, dist) * alpha;
-
-    // The frame's blend mode is GL_ONE / GL_ONE_MINUS_SRC_ALPHA
-    // (premultiplied source-over), so RGB has to be multiplied
-    // by alpha here. Without this, partially-transparent edge
-    // fragments come out over-bright and the smoothstep AA on
-    // the curve and the border's inner edge looks like a hard
-    // halo instead of a smooth ramp.
-    gl_FragColor = vec4(color * a, a);
-}
-";
-
 /// Kawase *dual-filter* blur — downsample half. One bilinear tap at the
 /// centre (weighted ×4) plus four diagonal taps, averaged. Run once per
 /// shrink step of the backdrop pyramid. `halfpixel` is half a texel of
@@ -323,6 +227,78 @@ void main() {
 }
 ";
 
+/// Composite a window's surface (pre-rendered into a cell-sized offscreen
+/// texture) through a rounded-rectangle mask: sample the surface in the
+/// interior, paint an opaque border-gradient ring just inside the edge, and
+/// `discard` outside the rounded boundary so the corners are *genuinely
+/// transparent* — the already-drawn backdrop (media wallpaper, a tile under
+/// a float, a blurred tier) shows through instead of a faked fill colour.
+///
+/// Same rounded-rect SDF as the retired pixel-shader frame mask, but as a
+/// *texture* shader so it can sample the surface. The surface fills the
+/// whole cell (the border overlays its outer edge), so it stays opaque
+/// across the border boundary and there's no transparent seam at the
+/// border's inner edge. Premultiplied output (blend is
+/// `GL_ONE / GL_ONE_MINUS_SRC_ALPHA`); `size` is the cell pixel size, passed
+/// in because texture shaders get no built-in `size` uniform.
+const ROUND_TEX_SHADER: &str = r"#version 100
+//_DEFINES_
+#extension GL_OES_standard_derivatives : enable
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform sampler2D tex;
+uniform float alpha;
+uniform vec2 size;
+uniform float radius;
+uniform float border_width;
+uniform vec3 border_top;
+uniform vec3 border_bottom;
+uniform float output_height;
+uniform float cell_origin_y;
+
+varying vec2 v_coords;
+
+void main() {
+    vec2 p = v_coords * size;
+    vec2 half_size = size * 0.5;
+    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
+    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
+    float aa = max(fwidth(dist) * 0.5, 0.5);
+
+    // Outside the rounded shape: discard so the backdrop shows through.
+    if (dist > aa) {
+        discard;
+    }
+
+    // Interior: the window's surface, already premultiplied in the offscreen.
+    vec4 surf = texture2D(tex, v_coords);
+
+    // Border ring colour, a vertical gradient keyed off the fragment's
+    // *global* y so the ramp stays continuous between adjacent tiles.
+    float global_y = cell_origin_y + p.y;
+    float t = clamp(global_y / max(output_height, 1.0), 0.0, 1.0);
+    vec3 border_rgb = mix(border_top, border_bottom, t);
+
+    // ring: 0 in the interior, 1 in the border ring (AA across dist=-border).
+    float ring = smoothstep(-border_width - aa, -border_width + aa, dist);
+    // outer: 1 inside the rounded edge, 0 outside (AA across dist=0).
+    float outer = 1.0 - smoothstep(-aa, aa, dist);
+
+    // Both premultiplied, faded by the outer-edge coverage; mix interior
+    // surface with the opaque border ring.
+    vec4 inner_px = surf * outer;
+    vec4 border_px = vec4(border_rgb * outer, outer);
+    vec4 color = mix(inner_px, border_px, ring);
+
+    gl_FragColor = color * alpha;
+}
+";
+
 /// Renderer for every connected output on a single GPU.
 pub struct Renderer {
     /// Shared GLES2 renderer; owns the EGL context.
@@ -352,10 +328,6 @@ pub struct Renderer {
     wallpaper_media: Option<WallpaperMedia>,
     /// Window border width + active / inactive fills.
     border: BorderConfig,
-    /// Custom GLES pixel shader used to mask rounded corners.
-    /// `Arc`-backed so it's cheap to clone out before borrowing
-    /// the renderer for the frame.
-    frame_shader: GlesPixelProgram,
     /// Loaded `XCursor` `default` arrow sprite. `None` (no theme found)
     /// falls back to the built-in triangle. `Arc`-backed texture, so
     /// it's cheap to clone out before borrowing the renderer for the
@@ -434,6 +406,10 @@ pub struct Renderer {
     /// `Arc`-backed, cheap to clone out before borrowing the renderer.
     blur_down: GlesTexProgram,
     blur_up: GlesTexProgram,
+    /// Texture shader that composites a window's offscreen surface through a
+    /// rounded-rectangle mask (transparent corners + opaque border ring).
+    /// See [`ROUND_TEX_SHADER`]. `Arc`-backed, cheap to clone out per frame.
+    round_tex_shader: GlesTexProgram,
     /// Per-output offscreen scratch for backdrop blur (keyed by output
     /// index): the rendered backdrop snapshot + the downsample/upsample
     /// mip chain. Built lazily, sized to the output, reused every frame
@@ -661,23 +637,6 @@ impl Renderer {
             unsafe { GlesRenderer::new(egl_context) }.context("GlesRenderer::new failed")?;
         info!("GLES renderer created");
 
-        info!("phase: compiling window-frame pixel shader");
-        let frame_shader = gles
-            .compile_custom_pixel_shader(
-                FRAME_SHADER,
-                &[
-                    UniformName::new("radius", UniformType::_1f),
-                    UniformName::new("border_width", UniformType::_1f),
-                    UniformName::new("grad_top", UniformType::_3f),
-                    UniformName::new("grad_bottom", UniformType::_3f),
-                    UniformName::new("border_top", UniformType::_3f),
-                    UniformName::new("border_bottom", UniformType::_3f),
-                    UniformName::new("output_height", UniformType::_1f),
-                    UniformName::new("cell_origin_y", UniformType::_1f),
-                ],
-            )
-            .context("window-frame shader compile failed")?;
-
         info!("phase: compiling Kawase blur shaders");
         let blur_uniforms = [
             UniformName::new("halfpixel", UniformType::_2f),
@@ -689,6 +648,22 @@ impl Renderer {
         let blur_up = gles
             .compile_custom_texture_shader(BLUR_UP, &blur_uniforms)
             .context("blur upsample shader compile failed")?;
+
+        info!("phase: compiling rounded-corner composite shader");
+        let round_tex_shader = gles
+            .compile_custom_texture_shader(
+                ROUND_TEX_SHADER,
+                &[
+                    UniformName::new("size", UniformType::_2f),
+                    UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("border_width", UniformType::_1f),
+                    UniformName::new("border_top", UniformType::_3f),
+                    UniformName::new("border_bottom", UniformType::_3f),
+                    UniformName::new("output_height", UniformType::_1f),
+                    UniformName::new("cell_origin_y", UniformType::_1f),
+                ],
+            )
+            .context("rounded-corner composite shader compile failed")?;
 
         info!("phase: creating GBM allocator");
         let allocator = GbmAllocator::new(
@@ -838,7 +813,6 @@ impl Renderer {
             wallpaper,
             wallpaper_media: None,
             border,
-            frame_shader,
             cursor,
             #[allow(
                 clippy::cast_possible_wrap,
@@ -861,6 +835,7 @@ impl Renderer {
             closing: Vec::new(),
             blur_down,
             blur_up,
+            round_tex_shader,
             blur_scratch: HashMap::new(),
         })
     }
@@ -1673,7 +1648,7 @@ impl Renderer {
         // `self` (the decode-thread handle stays on the renderer).
         let wallpaper_media = self.wallpaper_media.as_ref().map(|m| m.draw.clone());
         let border = self.border.clone();
-        let frame_shader = self.frame_shader.clone();
+        let round_tex_shader = self.round_tex_shader.clone();
         let cursor_size = self.cursor_size;
         let window_opacity = self.decoration.window_opacity;
         // The effective cursor this frame: a compositor override (grab /
@@ -1743,6 +1718,12 @@ impl Renderer {
         // composes the client buffer at the right size for
         // fractional displays.
         let bw_comp = border.width.max(0);
+        let radius_comp = border.rounded_corners.max(0);
+        // A Normal window with a border and/or rounded corners is composited
+        // through an offscreen texture + the rounded mask shader (so its
+        // corners are genuinely transparent). Without either it's a plain
+        // rectangle drawn straight to the frame, like fullscreen/maximized.
+        let decorated = radius_comp > 0 || bw_comp > 0;
         #[allow(
             clippy::type_complexity,
             reason = "one frame's worth of per-window, rescale-wrapped surface elements"
@@ -1767,6 +1748,15 @@ impl Renderer {
                         (0, 0)
                     };
                     let bw_p = if p.fill == FillMode::Normal { bw_comp } else { 0 };
+                    // A decorated Normal window is rendered into a *cell-sized
+                    // offscreen* (origin (0,0)) and masked in the composite, so
+                    // here its surface fills the WHOLE cell — the opaque border
+                    // ring overlays the outer edge, which keeps the surface
+                    // opaque across the border boundary (no transparent seam).
+                    // Everything else (fullscreen/maximized/undecorated) draws
+                    // straight to the frame at its output-local cell position,
+                    // inset by the border.
+                    let offscreen = p.fill == FillMode::Normal && decorated;
                     // Draw the window into its *animated* rect
                     // (`wd.effective`), scaling the surface's actual
                     // content to fill it. `render_elements_from_surface_tree`'s
@@ -1785,17 +1775,29 @@ impl Renderer {
                             p.cell_rect.size.w - 2 * bw_p,
                             p.cell_rect.size.h - 2 * bw_p,
                         ));
-                    let eff_inner_w = f64::from((eff.size.w - 2 * bw_p).max(1));
-                    let eff_inner_h = f64::from((eff.size.h - 2 * bw_p).max(1));
-                    let csx = eff_inner_w / f64::from(content_w.max(1));
-                    let csy = eff_inner_h / f64::from(content_h.max(1));
-                    // Content origin on screen (effective inner origin),
-                    // output-local physical — the fixed point of the rescale.
-                    let inner_x = f64::from(eff.loc.x + bw_p - compositor_position.x);
-                    let inner_y = f64::from(eff.loc.y + bw_p - compositor_position.y);
+                    // Offscreen: fill the cell, anchored at the cell origin
+                    // (0,0). Direct: inset by the border, anchored at the
+                    // output-local cell position.
+                    let (target_w, target_h, anchor_x, anchor_y) = if offscreen {
+                        (
+                            f64::from(eff.size.w.max(1)),
+                            f64::from(eff.size.h.max(1)),
+                            0.0,
+                            0.0,
+                        )
+                    } else {
+                        (
+                            f64::from((eff.size.w - 2 * bw_p).max(1)),
+                            f64::from((eff.size.h - 2 * bw_p).max(1)),
+                            f64::from(eff.loc.x + bw_p - compositor_position.x),
+                            f64::from(eff.loc.y + bw_p - compositor_position.y),
+                        )
+                    };
+                    let csx = target_w / f64::from(content_w.max(1));
+                    let csy = target_h / f64::from(content_h.max(1));
                     let origin = Point::<i32, Physical>::from((
-                        scale_f(inner_x, scale),
-                        scale_f(inner_y, scale),
+                        scale_f(anchor_x, scale),
+                        scale_f(anchor_y, scale),
                     ));
                     // Build at output scale so the content's geometry origin
                     // lands on `origin`; the rescale below shrinks/grows it.
@@ -1803,10 +1805,15 @@ impl Renderer {
                         origin.x - scale_f(f64::from(geo_x), scale),
                         origin.y - scale_f(f64::from(geo_y), scale),
                     ));
-                    // Configurable window opacity, on top of the animation
-                    // alpha. Only Normal (tiled/floating) windows; a
-                    // maximized/fullscreen surface stays at full opacity.
-                    let alpha = if p.fill == FillMode::Normal {
+                    // The window's configurable opacity (Normal only) plus its
+                    // animation alpha. For the offscreen path this is applied
+                    // in the *composite* (the shader's `alpha`), so the surface
+                    // itself is rendered fully opaque (1.0) — keeping the
+                    // client's own per-pixel translucency intact — and we don't
+                    // double-apply.
+                    let alpha = if offscreen {
+                        1.0
+                    } else if p.fill == FillMode::Normal {
                         wd.alpha * window_opacity
                     } else {
                         wd.alpha
@@ -1968,13 +1975,13 @@ impl Renderer {
             .collect();
 
         let full_damage = [Rectangle::<i32, Physical>::from_size(mode_size)];
-        let radius_comp = border.rounded_corners.max(0);
         // --- Backdrop bands, factored so the same draw logic feeds both
         // the on-screen frame and the offscreen blur snapshots. ---
         //
         // `draw_base`   : wallpaper + Background/Bottom layers.
         // `cell_local`  : a window's animated rect → output-local physical.
-        // `draw_window` : one window's surface + (Normal-only) border ring.
+        // `draw_window` : one window's surface, composited through the
+        //                 rounded mask (decorated Normal) or drawn straight.
         let draw_base = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
             if let Some(wp) = &wallpaper_media {
                 draw_wallpaper_texture(frame, wp, mode_size)?;
@@ -1998,69 +2005,166 @@ impl Renderer {
                 Size::new(scale_i(eff.size.w, scale), scale_i(eff.size.h, scale)),
             )
         };
+
+        // --- Phase A: render each decorated Normal window's surface into its
+        // own cell-sized offscreen texture (cleared transparent). `draw_window`
+        // then composites that texture through the rounded-mask shader, so the
+        // corners are genuinely transparent and the backdrop shows through.
+        // Undecorated / fullscreen / maximized windows get `None` and draw
+        // straight to the frame. No cross-frame pooling: with on-demand
+        // rendering an idle output allocates nothing, and these free at frame
+        // end. Mirrors the close-snapshot offscreen above.
+        let mut win_tex: Vec<Option<GlesTexture>> = Vec::with_capacity(placements.len());
+        for ((p, elements), wd) in placements
+            .iter()
+            .zip(grouped.iter())
+            .zip(win_draws.iter())
+        {
+            if p.fill != FillMode::Normal || !decorated {
+                win_tex.push(None);
+                continue;
+            }
+            let cell = cell_local(wd.effective);
+            let size = Size::<i32, smithay::utils::Buffer>::from((
+                cell.size.w.max(1),
+                cell.size.h.max(1),
+            ));
+            let phys = Size::<i32, Physical>::from((size.w, size.h));
+            let full = [Rectangle::<i32, Physical>::from_size(phys)];
+            let tex = (|| -> Option<GlesTexture> {
+                let mut tex = self
+                    .gles
+                    .create_buffer(Fourcc::Abgr8888, size)
+                    .inspect_err(|err| warn!(error = %err, "rounded window: offscreen alloc failed"))
+                    .ok()?;
+                let mut target = self
+                    .gles
+                    .bind(&mut tex)
+                    .inspect_err(|err| warn!(error = %err, "rounded window: bind failed"))
+                    .ok()?;
+                let mut frame = self
+                    .gles
+                    .render(&mut target, phys, Transform::Normal)
+                    .inspect_err(|err| warn!(error = %err, "rounded window: render failed"))
+                    .ok()?;
+                let _ = frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full);
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full)
+                    .inspect_err(|err| warn!(error = %err, "rounded window: draw failed"))
+                    .ok()?;
+                // Same-context sequential GL: the composite that samples this
+                // texture is ordered after these writes, so the fence is dropped.
+                let _ = frame
+                    .finish()
+                    .inspect_err(|err| warn!(error = %err, "rounded window: finish failed"))
+                    .ok()?;
+                drop(target);
+                Some(tex)
+            })();
+            win_tex.push(tex);
+        }
+
         let draw_window = |frame: &mut GlesFrame<'_, '_>,
                            p: &Placement,
                            elements: &[RescaleRenderElement<
             WaylandSurfaceRenderElement<GlesRenderer>,
         >],
-                           wd: &WinDraw|
+                           wd: &WinDraw,
+                           tex: Option<&GlesTexture>|
          -> Result<()> {
-            // Surface first; the frame shader overpaints the border ring
-            // and rounded-corner cutout on top. Border tracks the window's
-            // *animated* rect so it slides/scales/fades with the surface.
-            // Maximized/fullscreen are borderless.
-            draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
-                .context("draw_render_elements failed")?;
-            if p.fill == FillMode::Normal && (bw_comp > 0 || radius_comp > 0) {
+            if p.fill == FillMode::Normal && decorated {
+                // Composite the window's pre-rendered surface through the
+                // rounded mask: surface inside, opaque border ring, and the
+                // corners discarded → genuinely transparent so the backdrop
+                // shows through. `None` means the offscreen alloc failed this
+                // frame (logged in Phase A) — skip rather than draw garbage.
+                let Some(tex) = tex else {
+                    return Ok(());
+                };
+                let dst = cell_local(wd.effective);
                 let fill = if p.focused {
                     &border.active
                 } else {
                     &border.inactive
                 };
-                draw_window_frame(
-                    frame,
-                    &frame_shader,
-                    cell_local(wd.effective),
-                    scale_i(bw_comp, scale),
-                    scale_i(radius_comp, scale),
-                    fill,
-                    &wallpaper,
-                    mode_size,
-                    // Border fades with the window opacity too.
-                    wd.alpha * window_opacity,
-                )?;
+                let (border_top, border_bottom) = match fill {
+                    Fill::Solid(rgb) => (*rgb, *rgb),
+                    Fill::VerticalGradient { top, bottom } => (*top, *bottom),
+                };
+                // Clamp like the old frame mask: radius/border never exceed
+                // half the cell, and leave >=1px of surface for the border.
+                let max_half = (dst.size.w / 2).min(dst.size.h / 2);
+                let radius = scale_i(radius_comp, scale).min(max_half).max(0);
+                let bw = scale_i(bw_comp, scale).min((max_half - 1).max(0)).max(0);
+                let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(tex.size().to_f64());
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "cell pixel sizes / radius / border are bounded by the output, exact in f32"
+                )]
+                let uniforms = [
+                    Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
+                    Uniform::new("radius", radius as f32),
+                    Uniform::new("border_width", bw as f32),
+                    Uniform::new("border_top", border_top),
+                    Uniform::new("border_bottom", border_bottom),
+                    Uniform::new("output_height", mode_size.h as f32),
+                    Uniform::new("cell_origin_y", dst.loc.y as f32),
+                ];
+                frame
+                    .render_texture_from_to(
+                        tex,
+                        src,
+                        dst,
+                        &[Rectangle::from_size(dst.size)],
+                        &[],
+                        Transform::Normal,
+                        // Window opacity + animation alpha, applied here (the
+                        // offscreen surface itself was rendered fully opaque).
+                        wd.alpha * window_opacity,
+                        Some(&round_tex_shader),
+                        &uniforms,
+                    )
+                    .context("rounded window composite failed")?;
+            } else {
+                // Plain rectangle (fullscreen / maximized / undecorated):
+                // draw the surface straight to the frame at its output-local
+                // position. Border tracks the window's *animated* rect.
+                draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
+                    .context("draw_render_elements failed")?;
             }
             Ok(())
         };
         // Scene stages replayed into the blur accumulator (each on top of
         // the previous): the tiled band, then the floating + maximized band.
         let draw_tiled = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
-            for ((p, elements), wd) in placements
+            for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Normal && !p.floating)
+                .zip(win_tex.iter())
+                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
             {
-                draw_window(frame, p, elements, wd)?;
+                draw_window(frame, p, elements, wd, tex.as_ref())?;
             }
             Ok(())
         };
         let draw_floating_max = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
-            for ((p, elements), wd) in placements
+            for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Normal && p.floating)
+                .zip(win_tex.iter())
+                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
             {
-                draw_window(frame, p, elements, wd)?;
+                draw_window(frame, p, elements, wd, tex.as_ref())?;
             }
-            for ((p, elements), wd) in placements
+            for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Maximized)
+                .zip(win_tex.iter())
+                .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
             {
-                draw_window(frame, p, elements, wd)?;
+                draw_window(frame, p, elements, wd, tex.as_ref())?;
             }
             Ok(())
         };
@@ -2175,39 +2279,42 @@ impl Renderer {
             // can't skip floats behind earlier tiles.
             draw_base(&mut frame)?;
             // Tiled windows blur against the base (tier 0).
-            for ((p, elements), wd) in placements
+            for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Normal && !p.floating)
+                .zip(win_tex.iter())
+                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
             {
                 if let Some(t) = &tier_tiled {
                     blur_rect(&mut frame, t, cell_local(wd.effective))?;
                 }
-                draw_window(&mut frame, p, elements, wd)?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
             }
             // Floating windows draw above tiled and blur against base +
             // tiled (tier 1), so a float reveals the windows beneath it.
-            for ((p, elements), wd) in placements
+            for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Normal && p.floating)
+                .zip(win_tex.iter())
+                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
             {
                 if let Some(t) = &tier_float {
                     blur_rect(&mut frame, t, cell_local(wd.effective))?;
                 }
-                draw_window(&mut frame, p, elements, wd)?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
             }
             // Maximized windows: borderless, above normal windows but below
             // Top/Overlay panels. Opaque — no backdrop blur.
-            for ((p, elements), wd) in placements
+            for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
-                .filter(|((p, _), _)| p.fill == FillMode::Maximized)
+                .zip(win_tex.iter())
+                .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
             {
-                draw_window(&mut frame, p, elements, wd)?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
             }
 
             // Top + Overlay layer surfaces go above windows but below the
@@ -2831,89 +2938,6 @@ fn draw_fill_rect(
     Ok(())
 }
 
-/// Mask a window's corners into a rounded shape by running the
-/// custom GLES pixel shader over the cell rect. The shader writes
-/// alpha = 1 with the wallpaper colour outside the rounded
-/// boundary and discards / writes alpha = 0 inside, so the
-/// already-drawn border + surface remain visible inside and the
-/// wallpaper colour appears in the corner cutouts. The
-/// `smoothstep` in the shader gives ~1 px of anti-aliasing along
-/// the curve.
-///
-/// Per-cell effective radius is clamped to half the cell's
-/// smaller dimension so two corners can never overlap on a tiny
-/// tile.
-///
-/// Trade-off: a floating window over a tile shows wallpaper (not
-/// the tile) at the rounded corners — the shader paints the mask
-/// colour rather than sampling whatever was underneath the
-/// surface. True transparency at corners needs per-window
-/// offscreen rendering, which is later polish.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "all 8 args are first-class inputs to one pixel-shader call; bundling them into a struct would just spread the call site across more lines for no real readability win"
-)]
-fn draw_window_frame(
-    frame: &mut GlesFrame<'_, '_>,
-    shader: &GlesPixelProgram,
-    cell_rect_phys: Rectangle<i32, Physical>,
-    border_width_phys: i32,
-    radius_phys: i32,
-    border_fill: &Fill,
-    wallpaper: &Fill,
-    output_size: Size<i32, Physical>,
-    alpha: f32,
-) -> Result<()> {
-    let max_half = (cell_rect_phys.size.w / 2).min(cell_rect_phys.size.h / 2);
-    let radius = radius_phys.min(max_half).max(0);
-    // Don't let the border eat the entire cell — leave at least
-    // 1 px of surface visible. For tiny tiles this clamps the
-    // configured border down so the shader still has an interior.
-    let border = border_width_phys.min(max_half - 1).max(0);
-    if radius <= 0 && border <= 0 {
-        return Ok(());
-    }
-    let (grad_top, grad_bottom) = match wallpaper {
-        Fill::Solid(rgb) => (*rgb, *rgb),
-        Fill::VerticalGradient { top, bottom } => (*top, *bottom),
-    };
-    let (border_top, border_bottom) = match border_fill {
-        Fill::Solid(rgb) => (*rgb, *rgb),
-        Fill::VerticalGradient { top, bottom } => (*top, *bottom),
-    };
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "radius, border, and cell origin are bounded by i32 cell / output sizes; fit f32 exactly for any realistic value"
-    )]
-    let uniforms = [
-        Uniform::new("radius", radius as f32),
-        Uniform::new("border_width", border as f32),
-        Uniform::new("grad_top", grad_top),
-        Uniform::new("grad_bottom", grad_bottom),
-        Uniform::new("border_top", border_top),
-        Uniform::new("border_bottom", border_bottom),
-        Uniform::new("output_height", output_size.h as f32),
-        Uniform::new("cell_origin_y", cell_rect_phys.loc.y as f32),
-    ];
-    // The shader doesn't sample any texture but the API still
-    // wants a `src` + `size`; passing the cell rect makes the
-    // built-in `size` uniform come out as the cell's pixel size.
-    let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(smithay::utils::Size::<
-        f64,
-        smithay::utils::Buffer,
-    >::from((
-        f64::from(cell_rect_phys.size.w),
-        f64::from(cell_rect_phys.size.h),
-    )));
-    let size = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((
-        cell_rect_phys.size.w,
-        cell_rect_phys.size.h,
-    ));
-    frame
-        .render_pixel_shader_to(shader, src, cell_rect_phys, size, None, alpha, &uniforms)
-        .context("render_pixel_shader_to (window frame) failed")?;
-    Ok(())
-}
 
 /// Multiply an i32 by a positive f64 scale and round to the nearest
 /// integer. The cast can't truncate in any practical case: input is
