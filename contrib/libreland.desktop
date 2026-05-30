@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Libreland
+Comment=A Wayland compositor in pure Rust, configured in Lua
+Exec=libreland
+TryExec=libreland
+Type=Application
+DesktopNames=libreland

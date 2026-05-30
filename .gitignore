@@ -1,1 +1,8 @@
 /target
+
+# makepkg build artifacts (the PKGBUILD lives in contrib/, so its scratch
+# dirs are created there — never at the repo root, where /src is the source)
+/contrib/src/
+/contrib/pkg/
+/contrib/*.pkg.tar.*
+/contrib/*.log

@@ -1,0 +1,108 @@
+# Maintainer: Morvyk <Morvyk@proton.me>
+#
+# Builds the Libreland compositor + its screencast output picker from the
+# checkout this file lives in. Run `makepkg -si` from inside contrib/.
+#
+# The PKGBUILD lives in contrib/ (not the repo root) on purpose: makepkg's
+# scratch dirs are $startdir/src and $startdir/pkg, and at the repo root
+# $startdir/src would collide with the project's own src/ directory. From
+# contrib/, the repo root is one level up ($startdir/..).
+
+pkgname=libreland
+# Placeholder; pkgver() rewrites this to a git snapshot at build time.
+pkgver=0.1.0.r61.gae2fe0e
+pkgrel=1
+pkgdesc='A Wayland compositor in pure Rust, configured in Lua'
+arch=('x86_64')
+license=('MIT')
+# Runtime libraries the binaries actually link (from DT_NEEDED): libgbm
+# (mesa), libseat (seatd), libudev (systemd-libs), libinput, libxkbcommon.
+# Lua is statically vendored and Wayland is pure-Rust, so neither is a dep.
+# xwayland-satellite is launched by default (config `xwayland = true`).
+depends=(
+    'glibc'
+    'gcc-libs'
+    'mesa'
+    'libinput'
+    'libxkbcommon'
+    'seatd'
+    'systemd-libs'
+    'xwayland-satellite'
+)
+# `rust` provides cargo; the project's .cargo/config.toml links through mold.
+makedepends=('rust' 'mold' 'git')
+optdepends=(
+    'xdg-desktop-portal: desktop integration frontend (file dialogs, screen sharing)'
+    'xdg-desktop-portal-wlr: screen sharing + screenshots via PipeWire'
+    'xdg-desktop-portal-gtk: file chooser / settings / notification backend'
+    'rofi: app launcher bound to Super+Space in the default config'
+    'kitty: terminal bound to Super+Return in the default config'
+)
+provides=('libreland')
+install="$pkgname.install"
+# Take full control of the build away from the user's /etc/makepkg.conf:
+#  !lto   — the `release` profile already does fat LTO; makepkg's `lto`
+#           would only inject -flto into the vendored-lua C build (mismatch).
+#  !debug — the binary is built with debug=false + stripped, so there's no
+#           debuginfo to split into a -debug package.
+# RUSTFLAGS from makepkg.conf is unset in build() (see there) so the
+# project's .cargo/config.toml (mold linker) and Cargo.toml profile win.
+options=('!lto' '!debug')
+# Built from the local tree; nothing to fetch or verify.
+source=()
+sha256sums=()
+
+pkgver() {
+    cd "$startdir/.."
+    # Monotonic snapshot version: 0.1.0.r<commit-count>.g<short-hash>, so
+    # each commit yields a higher version makepkg/pacman will upgrade to.
+    printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$startdir/.."
+    # makepkg.conf exports RUSTFLAGS (and the encoded variants), which would
+    # *replace* — not merge with — the project's `.cargo/config.toml`
+    # rustflags (the `-fuse-ld=mold` link arg). Unset them so config.toml +
+    # the Cargo.toml `[profile.release]` (fat LTO, opt 3, strip) are the
+    # single source of truth, regardless of the host's makepkg.conf.
+    unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+    # The `release` profile already does fat LTO + symbol stripping; build
+    # the whole workspace (compositor + output picker). --locked uses the
+    # committed Cargo.lock so the package is reproducible.
+    cargo build --release --locked
+}
+
+package() {
+    local root="$startdir/.."
+
+    # Binaries.
+    install -Dm755 "$root/target/release/libreland" \
+        "$pkgdir/usr/bin/libreland"
+    install -Dm755 "$root/target/release/libreland-output-picker" \
+        "$pkgdir/usr/bin/libreland-output-picker"
+
+    # Wayland session entry so display managers (SDDM/GDM/greetd/…) list
+    # "Libreland". Exec is the bare compositor; it sets up its own session
+    # identity (XDG_CURRENT_DESKTOP=libreland, etc.) on startup.
+    install -Dm644 "$startdir/libreland.desktop" \
+        "$pkgdir/usr/share/wayland-sessions/libreland.desktop"
+
+    # Portal routing: xdg-desktop-portal selects this when
+    # XDG_CURRENT_DESKTOP=libreland (which the compositor sets). Screen
+    # capture/share goes to the wlr backend (Libreland's own screencopy),
+    # everything else to the generic backend.
+    install -Dm644 "$startdir/libreland-portals.conf" \
+        "$pkgdir/usr/share/xdg-desktop-portal/libreland-portals.conf"
+
+    # xdg-desktop-portal-wlr screencast chooser, scoped to Libreland
+    # sessions (xdpw reads /etc/xdg/xdg-desktop-portal-wlr/$XDG_CURRENT_DESKTOP),
+    # so it doesn't clobber another compositor's xdpw `config`. It points
+    # the chooser at the libreland-output-picker installed above.
+    install -Dm644 "$startdir/xdg-desktop-portal-wlr.config" \
+        "$pkgdir/etc/xdg/xdg-desktop-portal-wlr/libreland"
+
+    # License + docs.
+    install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$root/Documentation.md" "$pkgdir/usr/share/doc/$pkgname/Documentation.md"
+}
