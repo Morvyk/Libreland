@@ -165,6 +165,14 @@ animations = {
     workspace    = { duration = 300, curve = "ease-in-out" }, -- vertical slide
 }
 
+-- Window opacity + Kawase backdrop blur. Default: opaque windows, blur
+-- behind layer surfaces (rofi/panels) only. Set opacity < 1 and/or
+-- blur.windows = true to frost behind windows as well.
+decoration = {
+    opacity = 1.0,
+    blur = { enabled = true, layers = true, windows = false, passes = 3, radius = 5.0 },
+}
+
 -- Environment variables exported into the compositor's own process
 -- before any client is launched, so every child (startup commands,
 -- `spawn` binds, shells) inherits them. Handy for theming hints.
@@ -367,6 +375,44 @@ animations = {
     -- e.g. a snappier, custom-bezier move; disable the workspace slide:
     -- window_move = { duration = 200, curve = { 0.05, 0.9, 0.1, 1.0 } },
     -- workspace   = { enabled = false },
+}
+```
+
+### decoration
+
+Window opacity and Kawase backdrop blur. Applied live on reload.
+
+| Field          | Default | State | Notes                                                                                                                                  |
+| -------------- | ------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `opacity`      | `1.0`   | ✅    | Compositor-applied alpha for **windows** (multiplies the client's own alpha). `1.0` = fully opaque. Tiled/floating windows only; maximized/fullscreen stay opaque. `[0.0, 1.0]`. |
+| `blur`         | see below | ✅  | Background blur sub-table (below). Only **visible** where a surface is translucent (client alpha or `opacity` < 1).                     |
+
+The `blur` sub-table:
+
+| Field      | Default | State | Notes                                                                                                                                          |
+| ---------- | ------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`  | `true`  | ✅    | Master switch for all blur.                                                                                                                    |
+| `layers`   | `true`  | ✅    | Blur behind **Top/Overlay** layer-shell surfaces (panels, launchers like rofi, notifications). Sampled against the whole desktop beneath them. |
+| `windows`  | `false` | ✅    | Blur behind **windows**. Tiled windows blur against the base (wallpaper + lower layers); floating windows blur against the base **plus the tiled windows underneath**, so a float reveals a blurred copy of the windows it covers. |
+| `passes`   | `3`     | ✅    | Dual-filter passes — each is a downsample + later upsample. More passes = a wider, softer (and costlier) blur. `0` disables. `0..=10`.          |
+| `radius`   | `5.0`   | ✅    | Per-tap sample offset in pixels; scales the blur's spread. `>= 0`.                                                                             |
+
+Blur only runs when something translucent is on screen that needs it: the
+backdrop is snapshotted per z-band (base → +tiled → +floating/maximized)
+and each band is blurred at most once, so nothing is ever double-blurred.
+Surface alpha isn't probed, so a mapped opaque panel/window still pays for
+its tier while it's up — the cost is bounded.
+
+```lua
+decoration = {
+    opacity = 0.9,                    -- windows slightly see-through (1.0 = opaque)
+    blur = {
+        -- enabled = false,           -- uncomment to turn all blur off
+        layers  = true,               -- frost behind rofi/panels/notifications
+        windows = true,               -- frost behind translucent windows too
+        passes  = 3,
+        radius  = 5.0,
+    },
 }
 ```
 
