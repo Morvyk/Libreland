@@ -464,16 +464,27 @@ struct BlurScratch {
     tiers: Vec<GlesTexture>,
 }
 
-/// A decoded media wallpaper uploaded to a GLES texture. `Arc`-backed, so
-/// it's cheap to clone out before the frame borrow.
+/// The drawable part of a media wallpaper: the current frame uploaded as a
+/// GLES texture plus how to fit it. `Arc`-backed texture, so it's cheap to
+/// clone into the frame's backdrop closures.
 #[derive(Clone)]
-struct WallpaperMedia {
+struct WpDraw {
     texture: GlesTexture,
     /// Texture dimensions in its own pixels.
     width: i32,
     height: i32,
     /// How to fit it to each output.
     mode: ScaleMode,
+}
+
+/// A media wallpaper: the current drawable frame plus its decode source —
+/// a background thread feeding new frames (video/gif). A still image's
+/// thread self-terminates after one frame, leaving `draw` static.
+struct WallpaperMedia {
+    draw: WpDraw,
+    anim: crate::media::Animation,
+    /// Sequence number of the last frame uploaded from `anim`.
+    last_seq: u64,
 }
 
 /// A window's last frame, captured at destroy time, animating out.
@@ -1068,13 +1079,17 @@ impl Renderer {
         self.border = border;
     }
 
-    /// Set (or clear) the media wallpaper. `Some((rgba, w, h, mode))`
-    /// uploads a packed-RGBA frame as a texture drawn full-screen per
-    /// output in `mode`; `None` reverts to the flat [`Self::set_appearance`]
-    /// fill. Returns whether the upload succeeded — a failure clears the
-    /// media so the flat fill shows instead of nothing.
-    pub fn set_wallpaper_media(&mut self, frame: Option<(&[u8], i32, i32, ScaleMode)>) -> bool {
-        let Some((rgba, width, height, mode)) = frame else {
+    /// Set (or clear) the media wallpaper. `Some((rgba, w, h, mode, anim))`
+    /// uploads the first packed-RGBA frame as a texture drawn full-screen
+    /// per output in `mode`, and keeps `anim` (the decode thread) feeding
+    /// later frames via [`Self::refresh_wallpaper`]; `None` reverts to the
+    /// flat [`Self::set_appearance`] fill. Returns whether the upload
+    /// succeeded — a failure clears the media so the flat fill shows.
+    pub fn set_wallpaper_media(
+        &mut self,
+        init: Option<(&[u8], i32, i32, ScaleMode, crate::media::Animation)>,
+    ) -> bool {
+        let Some((rgba, width, height, mode, anim)) = init else {
             self.wallpaper_media = None;
             return true;
         };
@@ -1082,10 +1097,14 @@ impl Renderer {
         match self.gles.import_memory(rgba, Fourcc::Abgr8888, size, false) {
             Ok(texture) => {
                 self.wallpaper_media = Some(WallpaperMedia {
-                    texture,
-                    width,
-                    height,
-                    mode,
+                    draw: WpDraw {
+                        texture,
+                        width,
+                        height,
+                        mode,
+                    },
+                    anim,
+                    last_seq: 0,
                 });
                 true
             }
@@ -1094,6 +1113,37 @@ impl Renderer {
                 self.wallpaper_media = None;
                 false
             }
+        }
+    }
+
+    /// Poll the media wallpaper's decode thread and, if it has produced a
+    /// newer frame, upload it as the current wallpaper texture. Called once
+    /// per output render; the sequence check makes the extra calls when
+    /// several outputs render per vblank cheap no-ops, and re-uploads
+    /// happen only at the media's frame rate.
+    fn refresh_wallpaper(&mut self) {
+        let Some(media) = self.wallpaper_media.as_ref() else {
+            return;
+        };
+        let Some((frame, seq)) = media.anim.take_new(media.last_seq) else {
+            return;
+        };
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "decoded dims are capped to output size, well within i32"
+        )]
+        let (width, height) = (frame.width as i32, frame.height as i32);
+        let size = Size::<i32, smithay::utils::Buffer>::from((width, height));
+        match self.gles.import_memory(&frame.rgba, Fourcc::Abgr8888, size, false) {
+            Ok(texture) => {
+                if let Some(media) = self.wallpaper_media.as_mut() {
+                    media.draw.texture = texture;
+                    media.draw.width = width;
+                    media.draw.height = height;
+                    media.last_seq = seq;
+                }
+            }
+            Err(err) => warn!(error = %err, "wallpaper: animated frame upload failed"),
         }
     }
 
@@ -1516,6 +1566,11 @@ impl Renderer {
         hide_cursor: bool,
         captures: &[CaptureSpec],
     ) -> Result<Vec<CaptureOutcome>> {
+        // Upload the latest media-wallpaper frame (if the decode thread has
+        // produced one) before snapshotting the drawable below, so animated
+        // wallpapers advance each vblank.
+        self.refresh_wallpaper();
+
         // Pull everything we need before the mutable borrows on
         // `self.outputs[idx].surface` / `self.gles` kick in. All
         // *_phys helpers below take pre-scaled physical pixel
@@ -1524,9 +1579,10 @@ impl Renderer {
         let cursor_abs_x = self.cursor_x;
         let cursor_abs_y = self.cursor_y;
         let wallpaper = self.wallpaper.clone();
-        // Cheap Arc-backed clone of the media wallpaper (if any), so the
-        // backdrop closures can draw it without borrowing `self`.
-        let wallpaper_media = self.wallpaper_media.clone();
+        // Cheap Arc-backed clone of just the drawable wallpaper frame (if
+        // any), so the backdrop closures can paint it without borrowing
+        // `self` (the decode-thread handle stays on the renderer).
+        let wallpaper_media = self.wallpaper_media.as_ref().map(|m| m.draw.clone());
         let border = self.border.clone();
         let frame_shader = self.frame_shader.clone();
         let cursor_size = self.cursor_size;
@@ -2484,7 +2540,7 @@ fn blur_pass(
 )]
 fn draw_wallpaper_texture(
     frame: &mut GlesFrame<'_, '_>,
-    wp: &WallpaperMedia,
+    wp: &WpDraw,
     output: Size<i32, Physical>,
 ) -> Result<()> {
     let (ow, oh) = (f64::from(output.w), f64::from(output.h));

@@ -1720,7 +1720,11 @@ fn apply_wallpaper(
                         reason = "decoded dims are capped to output size, well within i32"
                     )]
                     let (w, h) = (frame.width as i32, frame.height as i32);
-                    if renderer.set_wallpaper_media(Some((&frame.rgba, w, h, *mode))) {
+                    // The decode thread loops video/gif and self-terminates
+                    // for a still image; it shares the slot the renderer
+                    // polls for new frames.
+                    let anim = media::Animation::start(path, cap);
+                    if renderer.set_wallpaper_media(Some((&frame.rgba, w, h, *mode, anim))) {
                         // The rounded-corner shader can't sample media, so
                         // the corner cutout falls back to black.
                         renderer
