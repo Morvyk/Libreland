@@ -973,6 +973,8 @@ impl WlrLayerShellHandler for State {
         if let Some(name) = output_name.clone() {
             self.layer_outputs.insert(surface.wl_surface().clone(), name);
         }
+        self.layer_namespaces
+            .insert(surface.wl_surface().clone(), namespace.clone());
         info!(
             namespace,
             ?layer,
@@ -991,6 +993,7 @@ impl WlrLayerShellHandler for State {
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: layer surface destroyed");
         self.layer_outputs.remove(surface.wl_surface());
+        self.layer_namespaces.remove(surface.wl_surface());
         let cur_focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
         if cur_focus.as_ref() == Some(surface.wl_surface())
             && let Some(kbd) = self.seat.get_keyboard()

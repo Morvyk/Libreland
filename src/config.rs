@@ -179,12 +179,15 @@ pub struct DecorationConfig {
 /// translucent (client alpha or [`DecorationConfig::window_opacity`] <
 /// 1). Defaults: on for layer-shell surfaces (panels, launchers), off
 /// for windows.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlurConfig {
     /// Master switch for all blur.
     pub enabled: bool,
-    /// Blur behind layer-shell surfaces (panels, rofi, notifications).
-    pub layers: bool,
+    /// Layer-shell namespaces to blur behind. A layer surface is blurred when
+    /// its namespace contains any of these (substring match), so blur is
+    /// opt-in per layer rather than applied to every panel. Empty = none.
+    /// Use `libreland msg layers` to discover the namespaces in use.
+    pub layers: Vec<String>,
     /// Blur behind windows.
     pub windows: bool,
     /// Dual-filter passes — each is a downsample + later upsample. More
@@ -200,7 +203,7 @@ impl Default for DecorationConfig {
             window_opacity: 1.0,
             blur: BlurConfig {
                 enabled: true,
-                layers: true,
+                layers: Vec::new(),
                 windows: false,
                 passes: 3,
                 radius: 5.0,
@@ -1006,7 +1009,7 @@ fn parse_blur(t: &Table, defaults: BlurConfig) -> mlua::Result<BlurConfig> {
     if let Some(e) = t.get::<Option<bool>>("enabled")? {
         cfg.enabled = e;
     }
-    if let Some(l) = t.get::<Option<bool>>("layers")? {
+    if let Some(l) = t.get::<Option<Vec<String>>>("layers")? {
         cfg.layers = l;
     }
     if let Some(w) = t.get::<Option<bool>>("windows")? {
@@ -1313,7 +1316,7 @@ mod decoration_tests {
         let d = parse("").decoration;
         assert_eq!(d.window_opacity, 1.0);
         assert!(d.blur.enabled);
-        assert!(d.blur.layers);
+        assert!(d.blur.layers.is_empty()); // opt-in per namespace
         assert!(!d.blur.windows);
         assert_eq!(d.blur.passes, 3);
     }
@@ -1323,13 +1326,13 @@ mod decoration_tests {
         let d = parse(
             r#"decoration = {
                 opacity = 0.85,
-                blur = { windows = true, layers = false, passes = 2, radius = 8.0 },
+                blur = { windows = true, layers = { "rofi", "quickshell" }, passes = 2, radius = 8.0 },
             }"#,
         )
         .decoration;
         assert!((d.window_opacity - 0.85).abs() < 1e-6);
         assert!(d.blur.windows);
-        assert!(!d.blur.layers);
+        assert_eq!(d.blur.layers, vec!["rofi".to_owned(), "quickshell".to_owned()]);
         assert!(d.blur.enabled); // untouched -> default
         assert_eq!(d.blur.passes, 2);
         assert!((d.blur.radius - 8.0).abs() < 1e-6);

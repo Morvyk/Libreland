@@ -257,6 +257,9 @@ pub(crate) struct State {
     /// layer surface's `wl_surface`; absent ⇒ the client let the
     /// compositor choose ⇒ fall back to primary.
     pub(crate) layer_outputs: std::collections::HashMap<WlSurface, String>,
+    /// wlr-layer-shell namespace each layer surface set at creation, kept for
+    /// per-layer blur rules and the `layers` IPC query.
+    pub(crate) layer_namespaces: std::collections::HashMap<WlSurface, String>,
     /// `zwp_relative_pointer_manager_v1` global — held alive so clients
     /// keep receiving relative motion (mouse-look). Dispatched via the
     /// delegate; not otherwise read.
@@ -1399,6 +1402,7 @@ impl State {
                     smithay::utils::Size::new(width, height),
                 ),
                 layer: bucket,
+                namespace: self.layer_namespaces.get(surface).cloned().unwrap_or_default(),
             });
         }
         out
@@ -2731,6 +2735,7 @@ fn main() -> Result<()> {
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         layer_outputs: std::collections::HashMap::new(),
+        layer_namespaces: std::collections::HashMap::new(),
         relative_pointer_state: wayland_init.relative_pointer_state,
         pointer_constraints_state: wayland_init.pointer_constraints_state,
         primary_selection_state: wayland_init.primary_selection_state,

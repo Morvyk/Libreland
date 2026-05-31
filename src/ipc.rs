@@ -31,6 +31,9 @@ pub enum Request {
     Outputs,
     /// Every workspace across every output.
     Workspaces,
+    /// Every live layer-shell surface (bars, launchers, rofi, …) with its
+    /// namespace — for discovering names to use in `blur.layers` rules.
+    Layers,
     /// Every managed window.
     Windows,
     /// The keyboard-focused window, if any.
@@ -160,6 +163,7 @@ pub enum Response {
     Version(VersionInfo),
     Outputs(Vec<OutputInfo>),
     Workspaces(Vec<WorkspaceInfo>),
+    Layers(Vec<LayerInfo>),
     Windows(Vec<WindowInfo>),
     FocusedWindow(Option<WindowInfo>),
     Binds(Vec<BindInfo>),
@@ -202,6 +206,22 @@ pub struct OutputInfo {
     pub logical_height: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_workspace: Option<usize>,
+}
+
+/// One live layer-shell surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerInfo {
+    /// Namespace the client set at creation (e.g. "rofi", "quickshell").
+    pub namespace: String,
+    /// `background` | `bottom` | `top` | `overlay`.
+    pub layer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    pub width: i32,
+    pub height: i32,
+    /// Whether the surface takes keyboard focus (exclusive/on-demand).
+    pub keyboard: bool,
+    pub exclusive_zone: i32,
 }
 
 /// One workspace.
@@ -277,8 +297,8 @@ mod server {
     use tracing::{info, warn};
 
     use super::{
-        BindInfo, Event, EventKind, OutputInfo, Reply, Request, Response, VersionInfo, WindowInfo,
-        WorkspaceInfo, WorkspaceTarget,
+        BindInfo, Event, EventKind, LayerInfo, OutputInfo, Reply, Request, Response, VersionInfo,
+        WindowInfo, WorkspaceInfo, WorkspaceTarget,
     };
     use crate::layout::{FillMode, Layout, WindowEntry};
     use crate::{LoopData, State};
@@ -638,6 +658,7 @@ mod server {
             })),
             Request::Outputs => Ok(Response::Outputs(outputs(state))),
             Request::Workspaces => Ok(Response::Workspaces(workspaces(state))),
+            Request::Layers => Ok(Response::Layers(layers(state))),
             Request::Windows => Ok(Response::Windows(windows(state))),
             Request::FocusedWindow => Ok(Response::FocusedWindow(focused_window(state))),
             Request::Binds => Ok(Response::Binds(binds(state))),
@@ -911,6 +932,38 @@ mod server {
             .collect()
     }
 
+    fn layers(state: &State) -> Vec<LayerInfo> {
+        use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
+        state
+            .layer_shell_state
+            .layer_surfaces()
+            .map(|ls| {
+                let surface = ls.wl_surface();
+                let cached = crate::wayland::layer_cached_state(surface);
+                let (width, height) =
+                    crate::wayland::layer_size(state.layer_output_rect(surface), &cached);
+                LayerInfo {
+                    namespace: state.layer_namespaces.get(surface).cloned().unwrap_or_default(),
+                    layer: match cached.layer {
+                        Layer::Background => "background",
+                        Layer::Bottom => "bottom",
+                        Layer::Top => "top",
+                        Layer::Overlay => "overlay",
+                    }
+                    .to_owned(),
+                    output: state.layer_outputs.get(surface).cloned(),
+                    width,
+                    height,
+                    keyboard: !matches!(
+                        cached.keyboard_interactivity,
+                        KeyboardInteractivity::None
+                    ),
+                    exclusive_zone: cached.exclusive_zone.into(),
+                }
+            })
+            .collect()
+    }
+
     fn windows(state: &mut State) -> Vec<WindowInfo> {
         let focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
         let dh = state.display_handle.clone();
@@ -1039,7 +1092,7 @@ mod client {
     use anyhow::{Context as _, Result, bail};
     use clap::{Parser, Subcommand};
 
-    use super::{Event, EventKind, Reply, Request, Response, WorkspaceTarget};
+    use super::{Event, EventKind, LayerInfo, Reply, Request, Response, WorkspaceTarget};
 
     /// A workspace argument: a number, `next`, or `prev`.
     #[derive(Clone)]
@@ -1095,6 +1148,8 @@ mod client {
         Outputs,
         /// List workspaces across all outputs.
         Workspaces,
+        /// List live layer-shell surfaces (with their namespaces).
+        Layers,
         /// List all managed windows.
         Windows,
         /// Show the keyboard-focused window.
@@ -1157,6 +1212,7 @@ mod client {
                 Command::Version => Request::Version,
                 Command::Outputs => Request::Outputs,
                 Command::Workspaces => Request::Workspaces,
+                Command::Layers => Request::Layers,
                 Command::Windows => Request::Windows,
                 Command::FocusedWindow => Request::FocusedWindow,
                 Command::Binds => Request::Binds,
@@ -1329,6 +1385,7 @@ mod client {
             Response::Version(v) => println!("{} {}", v.name, v.version),
             Response::Outputs(outputs) => print_outputs(outputs),
             Response::Workspaces(workspaces) => print_workspaces(workspaces),
+            Response::Layers(layers) => print_layers(layers),
             Response::Windows(windows) => print_windows(windows),
             Response::FocusedWindow(window) => match window {
                 Some(w) => print_windows(std::slice::from_ref(w)),
@@ -1387,6 +1444,29 @@ mod client {
                 w.index,
                 if w.active { "*" } else { "" },
                 w.window_count
+            );
+        }
+    }
+
+    fn print_layers(layers: &[LayerInfo]) {
+        if layers.is_empty() {
+            println!("no layer surfaces");
+            return;
+        }
+        println!(
+            "{:<22} {:<9} {:<8} {:>9}  {:<3} {:>8}",
+            "NAMESPACE", "LAYER", "OUTPUT", "SIZE", "KBD", "EXCL"
+        );
+        for l in layers {
+            println!(
+                "{:<22} {:<9} {:<8} {:>4}x{:<4} {:<3} {:>8}",
+                l.namespace,
+                l.layer,
+                l.output.as_deref().unwrap_or("-"),
+                l.width,
+                l.height,
+                if l.keyboard { "yes" } else { "" },
+                l.exclusive_zone
             );
         }
     }

@@ -169,12 +169,13 @@ animations = {
     workspace    = { duration = 300, curve = "ease-in-out" }, -- vertical slide
 }
 
--- Window opacity + Kawase backdrop blur. Default: opaque windows, blur
--- behind layer surfaces (rofi/panels) only. Set opacity < 1 and/or
--- blur.windows = true to frost behind windows as well.
+-- Window opacity + Kawase backdrop blur. Default: opaque windows and no layer
+-- blur. `blur.layers` is a list of layer-shell namespaces to frost behind
+-- (substring match) — run `libreland msg layers` to see the names in use.
+-- Set opacity < 1 and/or blur.windows = true to frost behind windows too.
 decoration = {
     opacity = 1.0,
-    blur = { enabled = true, layers = true, windows = false, passes = 3, radius = 5.0 },
+    blur = { enabled = true, layers = { "rofi" }, windows = false, passes = 3, radius = 5.0 },
 }
 
 -- Environment variables exported into the compositor's own process
@@ -428,7 +429,7 @@ The `blur` sub-table:
 | Field      | Default | State | Notes                                                                                                                                          |
 | ---------- | ------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`  | `true`  | ✅    | Master switch for all blur.                                                                                                                    |
-| `layers`   | `true`  | ✅    | Blur behind **Top/Overlay** layer-shell surfaces (panels, launchers like rofi, notifications). Sampled against the whole desktop beneath them. |
+| `layers`   | `{}`    | ✅    | List of layer-shell **namespaces** to blur behind (a surface matches if its namespace *contains* any entry, so `"quickshell"` matches `"quickshell-bar"`). Empty = no layer blur. Run **`libreland msg layers`** to discover the namespaces in use (rofi → `"rofi"`, etc.). Sampled against the whole desktop beneath them. |
 | `windows`  | `false` | ✅    | Blur behind **windows**. Tiled windows blur against the base (wallpaper + lower layers); floating windows blur against the base **plus the tiled windows underneath**, so a float reveals a blurred copy of the windows it covers. |
 | `passes`   | `3`     | ✅    | Dual-filter passes — each is a downsample + later upsample. More passes = a wider, softer (and costlier) blur. `0` disables. `0..=10`.          |
 | `radius`   | `5.0`   | ✅    | Per-tap sample offset in pixels; scales the blur's spread. `>= 0`.                                                                             |
@@ -444,7 +445,7 @@ decoration = {
     opacity = 0.9,                    -- windows slightly see-through (1.0 = opaque)
     blur = {
         -- enabled = false,           -- uncomment to turn all blur off
-        layers  = true,               -- frost behind rofi/panels/notifications
+        layers  = { "rofi" },         -- namespaces to frost behind (see `libreland msg layers`)
         windows = true,               -- frost behind translucent windows too
         passes  = 3,
         radius  = 5.0,
@@ -600,8 +601,10 @@ the full usage.
 | `version`          | Compositor name + version.                                                                  |
 | `outputs`          | Connected outputs: make/model, mode, refresh, scale, logical position/size, active workspace. |
 | `workspaces`       | Every workspace across all outputs: output, index, active, window count.                    |
-| `windows`          | Every managed window: stable id, app-id, title, output, workspace, geometry, state flags.   |
+| `layers`           | Every live layer-shell surface: namespace, layer, output, size, keyboard, exclusive zone. Use it to find names for `blur.layers`. |
+| `windows`          | Every managed window: stable id, app-id, title, output, workspace, geometry, state flags, **pid**. |
 | `focused-window`   | The keyboard-focused window (alias `focused`).                                               |
+| `capture-window <id> [--max N]` | Render a window (any workspace/output) to a PNG thumbnail and print its path. `--max` caps the longest side (default 512). |
 | `binds`            | The configured keybindings.                                                                  |
 
 **Actions** — windows are addressed by the stable **id** from `windows`

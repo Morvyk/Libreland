@@ -51,7 +51,8 @@ use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
 use crate::config::{
-    AnimationsConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode, VrrMode,
+    AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode,
+    VrrMode,
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
@@ -71,6 +72,17 @@ pub struct LayerPlacement {
     /// `render_output`. Renderer treats `Background`/`Bottom` as
     /// below windows and `Top`/`Overlay` as above.
     pub layer: LayerBucket,
+    /// wlr-layer-shell namespace the client set at creation (e.g. "rofi",
+    /// "quickshell"). Drives per-layer blur rules.
+    pub namespace: String,
+}
+
+/// Whether a layer surface with `namespace` should get backdrop blur, per the
+/// configured `blur.layers` rules (substring match; empty rules ignored).
+fn layer_should_blur(blur: &BlurConfig, namespace: &str) -> bool {
+    blur.layers
+        .iter()
+        .any(|rule| !rule.is_empty() && namespace.contains(rule.as_str()))
 }
 
 /// An `xdg_popup` (menu / submenu) to render this frame. Built by main
@@ -2322,14 +2334,18 @@ impl Renderer {
         // Window blur (decoration.blur.windows) drives tiers 0/1; layer
         // blur drives tier 2. We don't probe per-surface alpha, so a mapped
         // opaque panel/window still pays while it's up; the cost is bounded.
-        let blur = self.decoration.blur;
+        let blur = self.decoration.blur.clone();
         let passes_ok = blur.enabled && blur.passes > 0;
         let any_normal = placements.iter().any(|p| p.fill == FillMode::Normal);
-        let has_top_layer = layer_groups
-            .iter()
-            .any(|(b, _)| matches!(b, LayerBucket::Top | LayerBucket::Overlay));
         let need_window = passes_ok && blur.windows && any_normal;
-        let need_layer = passes_ok && blur.layers && has_top_layer;
+        // Layer blur is opt-in per namespace (config `blur.layers`), so a
+        // fullscreen always-mapped overlay (e.g. a launcher) doesn't frost the
+        // whole screen — only the layers the user named are blurred.
+        let need_layer = passes_ok
+            && layers.iter().any(|l| {
+                matches!(l.layer, LayerBucket::Top | LayerBucket::Overlay)
+                    && layer_should_blur(&blur, &l.namespace)
+            });
         // Saved per-tier blurred backdrops. Pull the scratch out of the map
         // so the blur helpers borrow only `self.gles`; on any GPU failure
         // we clear the tiers and fall back to sharp rendering. Programs are
@@ -2495,7 +2511,9 @@ impl Renderer {
                 if !matches!(bucket, LayerBucket::Top | LayerBucket::Overlay) {
                     continue;
                 }
-                if let Some(t) = &tier_layer {
+                if let Some(t) = &tier_layer
+                    && layer_should_blur(&blur, &l.namespace)
+                {
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
