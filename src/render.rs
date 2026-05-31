@@ -299,6 +299,48 @@ void main() {
 }
 ";
 
+/// Clips a blurred backdrop tier to the same rounded-rect shape its window or
+/// layer-shell panel uses, so the corners reveal the *sharp* backdrop instead
+/// of a square block of blur poking out past the rounded edge. Same SDF as
+/// [`ROUND_TEX_SHADER`] but with no border ring — it only masks the blur.
+/// Sampled texture (the tier) is already premultiplied; output stays premult
+/// for the `GL_ONE / GL_ONE_MINUS_SRC_ALPHA` blend. With `radius = 0` the SDF
+/// is a plain rectangle, so nothing is clipped (the pre-rounding behaviour).
+const ROUND_BLUR_SHADER: &str = r"#version 100
+//_DEFINES_
+#extension GL_OES_standard_derivatives : enable
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform sampler2D tex;
+uniform float alpha;
+uniform vec2 size;
+uniform float radius;
+
+varying vec2 v_coords;
+
+void main() {
+    vec2 p = v_coords * size;
+    vec2 half_size = size * 0.5;
+    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
+    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
+    float aa = max(fwidth(dist) * 0.5, 0.5);
+
+    // Outside the rounded shape: discard so the sharp backdrop shows through.
+    if (dist > aa) {
+        discard;
+    }
+
+    vec4 c = texture2D(tex, v_coords);
+    float outer = 1.0 - smoothstep(-aa, aa, dist);
+    gl_FragColor = c * (outer * alpha);
+}
+";
+
 /// Renderer for every connected output on a single GPU.
 pub struct Renderer {
     /// Shared GLES2 renderer; owns the EGL context.
@@ -410,6 +452,10 @@ pub struct Renderer {
     /// rounded-rectangle mask (transparent corners + opaque border ring).
     /// See [`ROUND_TEX_SHADER`]. `Arc`-backed, cheap to clone out per frame.
     round_tex_shader: GlesTexProgram,
+    /// Texture shader that clips a blurred backdrop tier to a rounded-rect
+    /// shape, so a rounded window / panel's corners reveal the sharp backdrop
+    /// rather than a square block of blur. See [`ROUND_BLUR_SHADER`].
+    round_blur_shader: GlesTexProgram,
     /// Per-output offscreen scratch for backdrop blur (keyed by output
     /// index): the rendered backdrop snapshot + the downsample/upsample
     /// mip chain. Built lazily, sized to the output, reused every frame
@@ -664,6 +710,15 @@ impl Renderer {
                 ],
             )
             .context("rounded-corner composite shader compile failed")?;
+        let round_blur_shader = gles
+            .compile_custom_texture_shader(
+                ROUND_BLUR_SHADER,
+                &[
+                    UniformName::new("size", UniformType::_2f),
+                    UniformName::new("radius", UniformType::_1f),
+                ],
+            )
+            .context("rounded-blur mask shader compile failed")?;
 
         info!("phase: creating GBM allocator");
         let allocator = GbmAllocator::new(
@@ -836,6 +891,7 @@ impl Renderer {
             blur_down,
             blur_up,
             round_tex_shader,
+            round_blur_shader,
             blur_scratch: HashMap::new(),
         })
     }
@@ -1649,6 +1705,7 @@ impl Renderer {
         let wallpaper_media = self.wallpaper_media.as_ref().map(|m| m.draw.clone());
         let border = self.border.clone();
         let round_tex_shader = self.round_tex_shader.clone();
+        let round_blur_shader = self.round_blur_shader.clone();
         let cursor_size = self.cursor_size;
         let window_opacity = self.decoration.window_opacity;
         // The effective cursor this frame: a compositor override (grab /
@@ -2252,9 +2309,34 @@ impl Renderer {
             // collapses to a zero-size instance for any offset surface — the
             // whole reason blur only ever showed full-screen.
             let local = [Rectangle::from_size(dst.size)];
+            // Clip the tier to the rounded-rect shape its window / panel uses,
+            // so the corners reveal the sharp backdrop rather than a square
+            // block of blur. Radius matches `draw_window`'s clamp; for a
+            // layer-shell panel it assumes the client rounds to the compositor's
+            // `rounded_corners` (keep the panel's QML `radius` in sync). The
+            // AA edge needs blending, so the opaque-region hint is now empty;
+            // with `radius_comp == 0` the SDF is a plain rect (old behaviour).
+            let max_half = (dst.size.w / 2).min(dst.size.h / 2);
+            let radius = scale_i(radius_comp, scale).min(max_half).max(0);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "cell pixel sizes / radius are bounded by the output, exact in f32"
+            )]
+            let uniforms = [
+                Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
+                Uniform::new("radius", radius as f32),
+            ];
             frame
                 .render_texture_from_to(
-                    tier, src, dst, &local, &local, Transform::Normal, 1.0, None, &[],
+                    tier,
+                    src,
+                    dst,
+                    &local,
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                    Some(&round_blur_shader),
+                    &uniforms,
                 )
                 .context("blur: backdrop sub-rect")?;
             Ok(())
