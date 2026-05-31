@@ -1637,6 +1637,29 @@ impl State {
             if !inside {
                 continue;
             }
+            // Respect the surface's input region: a layer that committed an
+            // empty/partial input region — a click-through fullscreen overlay
+            // (an idle launcher), or a toast strip masked to just its cards —
+            // must NOT capture the pointer for the parts it doesn't claim,
+            // even though the cursor is within its rect. Compositor coords are
+            // logical-scale, so the Physical-tagged values map straight to
+            // Logical here.
+            let point = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                f64::from(pos.x),
+                f64::from(pos.y),
+            ));
+            let location =
+                smithay::utils::Point::<i32, smithay::utils::Logical>::from((r.loc.x, r.loc.y));
+            if smithay::desktop::utils::under_from_surface_tree(
+                &placement.surface,
+                point,
+                location,
+                smithay::desktop::WindowSurfaceType::ALL,
+            )
+            .is_none()
+            {
+                continue;
+            }
             let p = priority(placement.layer);
             if best.as_ref().is_none_or(|(_, bp)| *bp < p) {
                 best = Some((placement, p));
