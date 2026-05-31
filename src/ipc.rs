@@ -37,6 +37,14 @@ pub enum Request {
     FocusedWindow,
     /// The configured keybindings.
     Binds,
+    /// Render a thumbnail of a window (by id) to a PNG and return its path.
+    /// Works for any window regardless of workspace or output. `max` caps
+    /// the longest side in pixels (downscaled only; default 512).
+    CaptureWindow {
+        id: u64,
+        #[serde(default)]
+        max: Option<i32>,
+    },
 
     // --- actions ---
     /// Focus a window by id (revealing its workspace first).
@@ -155,6 +163,12 @@ pub enum Response {
     Windows(Vec<WindowInfo>),
     FocusedWindow(Option<WindowInfo>),
     Binds(Vec<BindInfo>),
+    /// A window thumbnail was written to `path` (a PNG of `width`x`height`).
+    WindowCapture {
+        path: String,
+        width: i32,
+        height: i32,
+    },
     /// An action completed successfully (no payload).
     Handled,
 }
@@ -225,6 +239,11 @@ pub struct WindowInfo {
     pub fullscreen: bool,
     pub maximized: bool,
     pub focused: bool,
+    /// PID of the window's Wayland client, from its socket credentials.
+    /// `None` if the client has no resolvable peer pid. Lets a panel kill
+    /// or match audio streams to the owning process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
 }
 
 /// One configured keybinding.
@@ -249,6 +268,7 @@ mod server {
     use smithay::reexports::calloop::generic::Generic;
     use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
     use smithay::reexports::wayland_server::Resource as _;
+    use smithay::reexports::wayland_server::DisplayHandle;
     use smithay::reexports::wayland_server::backend::ObjectId;
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
     use smithay::utils::{IsAlive, SERIAL_COUNTER};
@@ -621,6 +641,7 @@ mod server {
             Request::Windows => Ok(Response::Windows(windows(state))),
             Request::FocusedWindow => Ok(Response::FocusedWindow(focused_window(state))),
             Request::Binds => Ok(Response::Binds(binds(state))),
+            Request::CaptureWindow { id, max } => capture_window(state, id, max),
             Request::FocusWindow { id } => focus_window(state, id),
             Request::Close { id } => close_window(state, id),
             Request::ToggleFloating { id } => toggle(state, id, Layout::toggle_floating),
@@ -646,6 +667,48 @@ mod server {
             state.queue_redraw_all();
         }
         reply
+    }
+
+    /// Render a window thumbnail to a PNG and return its path. Works for any
+    /// window, on any workspace or output (its surface tree is rendered in
+    /// isolation — no other windows, no cursor).
+    fn capture_window(state: &mut State, id: u64, max: Option<i32>) -> Reply {
+        let surface = state
+            .ipc
+            .surface_of(id)
+            .filter(IsAlive::alive)
+            .ok_or_else(|| format!("no window with id {id}"))?;
+        let (w, h, rgba) = state
+            .renderer
+            .capture_window(&surface, max.unwrap_or(512))
+            .map_err(|e| format!("capture failed: {e}"))?;
+        let png = crate::screenshot::encode_rgba(&rgba, w, h)
+            .map_err(|e| format!("png encode failed: {e}"))?;
+        let path = capture_path(id);
+        write_atomic(&path, &png)
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+        Ok(Response::WindowCapture {
+            path: path.to_string_lossy().into_owned(),
+            width: w,
+            height: h,
+        })
+    }
+
+    /// `$XDG_RUNTIME_DIR/libreland-window-<id>.png` (falls back to `/tmp`).
+    fn capture_path(id: u64) -> std::path::PathBuf {
+        let mut dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
+            || std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from,
+        );
+        dir.push(format!("libreland-window-{id}.png"));
+        dir
+    }
+
+    /// Write atomically (temp + rename) so a reader never sees a half-file.
+    fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// Resolve a window target: the surface for `id`, or the focused
@@ -850,30 +913,42 @@ mod server {
 
     fn windows(state: &mut State) -> Vec<WindowInfo> {
         let focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
-        state
-            .layout
-            .window_entries()
+        let dh = state.display_handle.clone();
+        let entries = state.layout.window_entries();
+        entries
             .into_iter()
-            .map(|e| window_info(&mut state.ipc, e, focus.as_ref()))
+            .map(|e| window_info(&mut state.ipc, &dh, e, focus.as_ref()))
             .collect()
     }
 
     fn focused_window(state: &mut State) -> Option<WindowInfo> {
         let focus = state.seat.get_keyboard().and_then(|k| k.current_focus())?;
+        let dh = state.display_handle.clone();
         let entry = state
             .layout
             .window_entries()
             .into_iter()
             .find(|e| e.surface == focus)?;
-        Some(window_info(&mut state.ipc, entry, Some(&focus)))
+        Some(window_info(&mut state.ipc, &dh, entry, Some(&focus)))
     }
 
     /// Build a [`WindowInfo`] from a layout entry, assigning its stable
     /// id and reading title/app-id off the surface.
-    fn window_info(ipc: &mut IpcState, e: WindowEntry, focus: Option<&WlSurface>) -> WindowInfo {
+    fn window_info(
+        ipc: &mut IpcState,
+        dh: &DisplayHandle,
+        e: WindowEntry,
+        focus: Option<&WlSurface>,
+    ) -> WindowInfo {
         let id = ipc.assign(&e.surface);
         let (app_id, title) = toplevel_strings(&e.surface);
         let focused = focus == Some(&e.surface);
+        // Peer pid from the client's socket credentials.
+        let pid = e
+            .surface
+            .client()
+            .and_then(|c| c.get_credentials(dh).ok())
+            .map(|cred| cred.pid);
         WindowInfo {
             id,
             app_id,
@@ -888,6 +963,7 @@ mod server {
             fullscreen: e.fill == FillMode::Fullscreen,
             maximized: e.fill == FillMode::Maximized,
             focused,
+            pid,
         }
     }
 
@@ -1026,6 +1102,14 @@ mod client {
         FocusedWindow,
         /// List the configured keybindings.
         Binds,
+        /// Render a window (by id) to a PNG thumbnail and print its path.
+        /// Works regardless of the window's workspace or output.
+        CaptureWindow {
+            id: u64,
+            /// Cap the longest side in pixels (downscaled only; default 512).
+            #[arg(long)]
+            max: Option<i32>,
+        },
         /// Focus a window by id (revealing its workspace).
         FocusWindow { id: u64 },
         /// Close a window (the focused one if no id is given).
@@ -1076,6 +1160,7 @@ mod client {
                 Command::Windows => Request::Windows,
                 Command::FocusedWindow => Request::FocusedWindow,
                 Command::Binds => Request::Binds,
+                Command::CaptureWindow { id, max } => Request::CaptureWindow { id: *id, max: *max },
                 Command::FocusWindow { id } => Request::FocusWindow { id: *id },
                 Command::Close { id } => Request::Close { id: *id },
                 Command::ToggleFloating { id } => Request::ToggleFloating { id: *id },
@@ -1250,6 +1335,9 @@ mod client {
                 None => println!("no focused window"),
             },
             Response::Binds(binds) => print_binds(binds),
+            Response::WindowCapture { path, width, height } => {
+                println!("{path} ({width}x{height})");
+            }
             // Actions succeed silently (Unix convention); `--json` above
             // still prints the `"Handled"` marker for scripts that check.
             Response::Handled => {}
@@ -1432,10 +1520,12 @@ mod tests {
             fullscreen: false,
             maximized: false,
             focused: true,
+            pid: None,
         };
         let json = serde_json::to_string(&w).unwrap();
         // Skipped Nones don't appear; present fields do.
         assert!(!json.contains("app_id"), "got {json}");
+        assert!(!json.contains("pid"), "got {json}");
         assert!(json.contains(r#""id":7"#));
         assert!(json.contains(r#""focused":true"#));
     }

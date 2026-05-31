@@ -64,6 +64,66 @@ pub(crate) fn encode_region(
     Ok(out)
 }
 
+/// Encode a per-window capture read-back as an RGBA PNG.
+///
+/// `src` is `width * height * 4` bytes in **R, G, B, A** order with
+/// **premultiplied** alpha (the renderer composites into a transparent
+/// `Abgr8888` offscreen). `copy_framebuffer` hands rows back **top-down**
+/// (row 0 = top — same as the screenshot read-back, which also doesn't
+/// reverse), so we copy straight; colours are un-premultiplied so translucent
+/// windows / rounded corners don't darken. Used by the IPC `capture-window`
+/// command.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "width/height are non-negative pixel counts bounded by output size, well within usize/u32"
+)]
+pub(crate) fn encode_rgba(
+    src: &[u8],
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, png::EncodingError> {
+    let cols = width.max(0) as usize;
+    let rows = height.max(0) as usize;
+    let stride = cols * 4;
+    let mut data = vec![0u8; cols * rows * 4];
+    for out_y in 0..rows {
+        let s_off = out_y * stride;
+        if s_off + stride > src.len() {
+            continue;
+        }
+        let src_row = &src[s_off..s_off + stride];
+        let dst_row = &mut data[out_y * stride..out_y * stride + stride];
+        for col in 0..cols {
+            let px = &src_row[col * 4..col * 4 + 4];
+            let alpha = px[3];
+            let out_px = &mut dst_row[col * 4..col * 4 + 4];
+            if alpha == 0 || alpha == 255 {
+                out_px.copy_from_slice(px);
+            } else {
+                // un-premultiply: straight = premul * 255 / alpha (rounded)
+                let unp = |c: u8| {
+                    ((u32::from(c) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+                };
+                out_px[0] = unp(px[0]);
+                out_px[1] = unp(px[1]);
+                out_px[2] = unp(px[2]);
+                out_px[3] = alpha;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(Cursor::new(&mut out), cols as u32, rows as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header()?;
+        writer.write_image_data(&data)?;
+    }
+    Ok(out)
+}
+
 /// Convert a captured BGRX read-back into a fully-opaque RGBA buffer for
 /// uploading as the freeze backdrop texture. The read-back is already
 /// top-down (natural row order); alpha is forced to 255 (the captured X

@@ -1471,6 +1471,94 @@ impl Renderer {
         });
     }
 
+    /// Render `surface`'s current surface tree into an offscreen and read it
+    /// back as premultiplied-RGBA8 bytes — an on-demand per-window thumbnail
+    /// for the IPC. Independent of any output: a window on another workspace
+    /// or screen still captures its last-committed content, in isolation (no
+    /// other windows, no cursor). The longest side is capped at `max`
+    /// (downscaled, never upscaled). Returns `(width, height, rgba)` —
+    /// premultiplied RGBA8, bottom-up (the encoder flips it upright).
+    pub fn capture_window(
+        &mut self,
+        surface: &WlSurface,
+        max: i32,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        // Visible window rect (excludes the CSD shadow); fall back to the full
+        // surface-tree bbox when the client set no window geometry (e.g. some
+        // XWayland surfaces).
+        let (gx, gy, gw, gh) = window_geometry_size(surface).map_or_else(
+            || {
+                let bb = smithay::desktop::utils::bbox_from_surface_tree(surface, (0, 0));
+                (bb.loc.x, bb.loc.y, bb.size.w, bb.size.h)
+            },
+            |(w, h)| {
+                let (ox, oy) = window_geometry_offset(surface);
+                (ox, oy, w, h)
+            },
+        );
+        let (gw, gh) = (gw.max(1), gh.max(1));
+        let cap = if max > 0 { max } else { 512 };
+        // Downscale only — never enlarge a small window.
+        let scale = (f64::from(cap) / f64::from(gw.max(gh))).min(1.0);
+
+        // Anchor the window geometry's top-left at the texture origin.
+        let origin = Point::<i32, Physical>::from((
+            -scale_f(f64::from(gx), scale),
+            -scale_f(f64::from(gy), scale),
+        ));
+        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            render_elements_from_surface_tree(
+                &mut self.gles,
+                surface,
+                origin,
+                scale,
+                1.0_f32,
+                Kind::Unspecified,
+            );
+        if elements.is_empty() {
+            anyhow::bail!("window has no current buffer to capture");
+        }
+
+        let tw = scale_f(f64::from(gw), scale).max(1);
+        let th = scale_f(f64::from(gh), scale).max(1);
+        let tex_size = Size::<i32, smithay::utils::Buffer>::from((tw, th));
+        let phys = Size::<i32, Physical>::from((tw, th));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+
+        let mut texture: GlesTexture = self
+            .gles
+            .create_buffer(Fourcc::Abgr8888, tex_size)
+            .context("capture_window: create_buffer")?;
+        let mut target = self.gles.bind(&mut texture).context("capture_window: bind")?;
+        {
+            let mut frame = self
+                .gles
+                .render(&mut target, phys, Transform::Normal)
+                .context("capture_window: render")?;
+            frame
+                .clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full)
+                .context("capture_window: clear")?;
+            draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
+                .context("capture_window: draw")?;
+            // Same-context sequential GL: the copy_framebuffer below is ordered
+            // after these writes, so the fence can be dropped.
+            let _ = frame.finish().context("capture_window: finish")?;
+        }
+
+        let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(tex_size);
+        let mapping = self
+            .gles
+            .copy_framebuffer(&target, region, Fourcc::Abgr8888)
+            .context("capture_window: copy_framebuffer")?;
+        let bytes = self
+            .gles
+            .map_texture(&mapping)
+            .context("capture_window: map_texture")?
+            .to_vec();
+        drop(target);
+        Ok((tw, th, bytes))
+    }
+
     /// Advance per-window animations against `now` (seconds on the shared
     /// clock) and return the on-screen rect + opacity to draw each
     /// placement at, in placement order. Position/size interpolate toward
