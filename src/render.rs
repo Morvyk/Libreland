@@ -2503,12 +2503,12 @@ impl Renderer {
                 draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
             }
 
-            // Top + Overlay layer surfaces go above windows but below the
-            // cursor (rofi above kitty, status bar above everything but the
-            // cursor). Blur against the full backdrop (tier 2) so a
-            // translucent panel/launcher reveals a frosted desktop.
+            // Top layer surfaces go above windows but below a fullscreen
+            // window (status bar above kitty, but a fullscreen game covers the
+            // bar). Blur against the full backdrop (tier 2) so a translucent
+            // panel reveals a frosted desktop.
             for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
-                if !matches!(bucket, LayerBucket::Top | LayerBucket::Overlay) {
+                if !matches!(bucket, LayerBucket::Top) {
                     continue;
                 }
                 if let Some(t) = &tier_layer
@@ -2524,12 +2524,13 @@ impl Renderer {
                     blur_rect(&mut frame, t, dst)?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
-                    .context("draw_render_elements (layer top/overlay) failed")?;
+                    .context("draw_render_elements (layer top) failed")?;
             }
 
-            // Fullscreen windows: borderless and above everything,
-            // including Top/Overlay panels (a fullscreen game/video
-            // covers the bar), but still below popups and the cursor.
+            // Fullscreen windows: borderless, above tiled/maximized windows and
+            // Top panels (a fullscreen game/video covers the bar), but BELOW
+            // Overlay layers (launcher / toasts / OSDs stay visible) and below
+            // popups and the cursor.
             for (_p, elements) in placements
                 .iter()
                 .zip(grouped.iter())
@@ -2542,6 +2543,29 @@ impl Renderer {
                     &full_damage,
                 )
                 .context("draw_render_elements (fullscreen) failed")?;
+            }
+
+            // Overlay layer surfaces go above everything else below the cursor —
+            // above windows AND fullscreen, so a launcher / toast / OSD stays on
+            // top of a fullscreen game. Same tier-2 blur as the Top layer.
+            for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
+                if !matches!(bucket, LayerBucket::Overlay) {
+                    continue;
+                }
+                if let Some(t) = &tier_layer
+                    && layer_should_blur(&blur, &l.namespace)
+                {
+                    let dst = Rectangle::<i32, Physical>::new(
+                        Point::new(
+                            scale_i(l.rect.loc.x - compositor_position.x, scale),
+                            scale_i(l.rect.loc.y - compositor_position.y, scale),
+                        ),
+                        Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
+                    );
+                    blur_rect(&mut frame, t, dst)?;
+                }
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
+                    .context("draw_render_elements (layer overlay) failed")?;
             }
 
             // Closing windows: the fade/shrink-out snapshot, above the

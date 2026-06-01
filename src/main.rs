@@ -1637,6 +1637,20 @@ impl State {
             if !inside {
                 continue;
             }
+            // A fullscreen window sits above the Top/Bottom/Background layers
+            // on its output (the render path draws `Fullscreen` over them — a
+            // fullscreen game/video hides the bar), so the pointer must fall
+            // through those now-invisible panels to the window. Otherwise a
+            // click over the hidden bar would land on the bar, not the game.
+            // `Overlay` stays above fullscreen (launcher / toasts / OSDs remain
+            // interactive), and maximized windows draw below Top, so neither is
+            // occluded here.
+            if !matches!(placement.layer, render::LayerBucket::Overlay)
+                && let Some(name) = self.layer_outputs.get(&placement.surface)
+                && self.layout.output_has_fullscreen(name)
+            {
+                continue;
+            }
             // Respect the surface's input region: a layer that committed an
             // empty/partial input region — a click-through fullscreen overlay
             // (an idle launcher), or a toast strip masked to just its cards —

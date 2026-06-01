@@ -355,11 +355,14 @@ impl Layout {
     }
 
     /// Index of the first output whose **full** bounds contain `p`.
-    /// Full bounds (not the gap-shrunk tile area) so a point in an
-    /// output's outer-gap margin still resolves to that output
-    /// instead of falling through to the fallback.
+    /// The output's *full* rect, not the work area (`bounds`, which is
+    /// `full` minus layer-shell exclusive zones). A point in an output's
+    /// outer-gap margin OR a panel's exclusive-zone strip (e.g. under the
+    /// bar) must still resolve to that output — otherwise a fullscreen
+    /// window, which fills `full`, isn't hit-testable under the bar and the
+    /// click falls through to nothing.
     fn outpane_at(&self, p: Point<i32, Physical>) -> Option<usize> {
-        self.outputs.iter().position(|o| rect_contains(o.bounds, p))
+        self.outputs.iter().position(|o| rect_contains(o.full, p))
     }
 
     /// Pick the output a new / dropped window belongs to: the one
