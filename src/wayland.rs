@@ -438,6 +438,24 @@ impl CompositorHandler for State {
         // invisible (no texture) even though the client did
         // everything right.
         on_commit_buffer_handler::<State>(surface);
+        // Some clients ignore the size in the *initial* configure (sent before
+        // they map) and render at their own default size, only resizing when a
+        // later configure arrives — MPV's idle "Drop files" window is the
+        // notorious one: it maps small inside its cell and snaps to size only
+        // on the next configure (e.g. when the user moves it). The first time a
+        // tracked toplevel commits a buffer, re-send its layout configure so it
+        // resizes itself with no user interaction.
+        if smithay::wayland::compositor::get_role(surface)
+            == Some(smithay::wayland::shell::xdg::XDG_TOPLEVEL_ROLE)
+            && !self.mapped_toplevels.contains(surface)
+            && smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                s.buffer().is_some()
+            })
+            .unwrap_or(false)
+        {
+            self.mapped_toplevels.insert(surface.clone());
+            self.layout.reconfigure(surface);
+        }
         maybe_handle_layer_commit(self, surface);
         // Promote a freshly-mapped popup into its parent's tree (and
         // let smithay send its initial configure if needed), then reap
@@ -454,6 +472,9 @@ impl CompositorHandler for State {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         info!(surface = ?surface.id(), "wayland: surface destroyed");
+        // Drop the first-map nudge record so the set doesn't accumulate dead
+        // surfaces (a toplevel's wl_surface is never reused once destroyed).
+        self.mapped_toplevels.remove(surface);
     }
 }
 

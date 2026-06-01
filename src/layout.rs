@@ -1045,6 +1045,35 @@ impl Layout {
         None
     }
 
+    /// Re-send `surface`'s configure (size + tiled/maximized/fullscreen
+    /// states) for its current rect, on whatever workspace it lives. A client
+    /// that ignored the size in its *initial* configure — MPV's idle window
+    /// maps at a default size and only repaints when a *later* configure
+    /// arrives — snaps to its cell when nudged this way (the same thing a
+    /// window move does). Returns whether `surface` is a window we track.
+    pub fn reconfigure(&self, surface: &WlSurface) -> bool {
+        for op in &self.outputs {
+            let area = op.area();
+            for ws in &op.workspaces {
+                if let Some(t) = &ws.tree
+                    && let Some(w) = leaf_ref(t, surface)
+                {
+                    push_configure_for_tile(w, self.border_width, area);
+                    return true;
+                }
+                if let Some(w) = ws
+                    .floating
+                    .iter()
+                    .find(|w| w.toplevel.wl_surface() == surface)
+                {
+                    push_configure_for_floating(w, self.border_width, area);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Mutable [`Self::window_ref`]. In-transit is checked first so the
     /// loops are the function tail — the borrow checker rejects
     /// reborrowing `self` after a loop that conditionally returns a

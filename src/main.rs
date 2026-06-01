@@ -260,6 +260,11 @@ pub(crate) struct State {
     /// wlr-layer-shell namespace each layer surface set at creation, kept for
     /// per-layer blur rules and the `layers` IPC query.
     pub(crate) layer_namespaces: std::collections::HashMap<WlSurface, String>,
+    /// Toplevels that have already been re-configured once after mapping their
+    /// first buffer. Some clients (MPV's idle window) ignore the size in the
+    /// initial configure and only resize on a later one, so we nudge each
+    /// exactly once on first map — this set stops it firing every frame.
+    pub(crate) mapped_toplevels: std::collections::HashSet<WlSurface>,
     /// `zwp_relative_pointer_manager_v1` global — held alive so clients
     /// keep receiving relative motion (mouse-look). Dispatched via the
     /// delegate; not otherwise read.
@@ -2790,6 +2795,7 @@ fn main() -> Result<()> {
         layer_shell_state: wayland_init.layer_shell_state,
         layer_outputs: std::collections::HashMap::new(),
         layer_namespaces: std::collections::HashMap::new(),
+        mapped_toplevels: std::collections::HashSet::new(),
         relative_pointer_state: wayland_init.relative_pointer_state,
         pointer_constraints_state: wayland_init.pointer_constraints_state,
         primary_selection_state: wayland_init.primary_selection_state,
