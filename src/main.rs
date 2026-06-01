@@ -2455,6 +2455,18 @@ fn main() -> Result<()> {
             info!(name, value, "applying configured env var");
             std::env::set_var(name, value);
         }
+        // Pin $XCURSOR_SIZE (unless the user set one) so Xwayland's cursor
+        // matches native Wayland ones. Xwayland renders X11 cursors at
+        // $XCURSOR_SIZE *physical* pixels and xwayland-satellite forwards them
+        // as a buffer_scale-1 surface with no viewport, so we draw them at
+        // size × output_scale — the same as our own themed cursor (loaded at
+        // the same logical size). With $XCURSOR_SIZE unset, libXcursor inside
+        // Xwayland instead picks a HiDPI-derived default (~2× on a 1.5× output),
+        // making the X cursor twice the size of native ones. Mirrors niri's
+        // CursorManager::ensure_env.
+        if std::env::var_os("XCURSOR_SIZE").is_none() {
+            std::env::set_var("XCURSOR_SIZE", crate::cursor::DEFAULT_SIZE.to_string());
+        }
     }
 
     // Wayland frontend bootstrap. Display must exist before the
@@ -2624,9 +2636,11 @@ fn main() -> Result<()> {
     // connects to *our* socket as a normal Wayland client (so X
     // windows arrive as ordinary xdg_toplevels) and serves X11 on a
     // display we pick. It must start after WAYLAND_DISPLAY is set (it
-    // inherits it) and before X clients. It scales X apps itself via
-    // wp_fractional_scale + wp_viewporter; cursors stay consistent
-    // because we draw our own over everything and export XCURSOR_*.
+    // inherits it) and before X clients. It scales X *windows* itself via
+    // wp_fractional_scale + wp_viewporter (per-window buffer_scale +
+    // viewport). X *cursors*, though, it forwards verbatim as a surface, which
+    // we display — so they only match native ones because we pinned
+    // $XCURSOR_SIZE to the logical size above (and it inherits $XCURSOR_THEME).
     if config.xwayland
         && let Some(disp) = start_xwayland_satellite()
     {
