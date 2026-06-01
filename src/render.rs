@@ -3258,7 +3258,7 @@ fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
 /// apps with no shadow). Returned as a raw `(i32, i32)` so the caller
 /// can fold it straight into the compositor-pixel position math
 /// without juggling the `Logical`/`Physical` unit tags.
-fn window_geometry_offset(surface: &WlSurface) -> (i32, i32) {
+pub(crate) fn window_geometry_offset(surface: &WlSurface) -> (i32, i32) {
     with_states(surface, |states| {
         states
             .cached_state

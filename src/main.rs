@@ -915,11 +915,28 @@ impl State {
             })
             .or_else(|| {
                 self.layout.window_at(cursor_i).map(|(w, rect)| {
+                    // A CSD client pads its buffer with an invisible shadow
+                    // margin and reports the real content rect via
+                    // set_window_geometry; the render path shifts the buffer
+                    // up-left by that offset so the visible content lands at
+                    // the cell origin. The pointer focus origin must use that
+                    // SAME shifted buffer origin — otherwise surface-local
+                    // coordinates are off by the shadow margin and clicks land
+                    // below where the content visually is (the Lutris "+"
+                    // button). The shadow only exists on Normal windows;
+                    // maximized/fullscreen drop it, matching `grouped` in
+                    // render_output.
+                    let (gx, gy) = if w.fill == crate::layout::FillMode::Normal {
+                        crate::render::window_geometry_offset(w.toplevel.wl_surface())
+                    } else {
+                        (0, 0)
+                    };
                     (
                         w.toplevel.wl_surface().clone(),
-                        // Effective rect origin: the output origin for a
-                        // fullscreen/maximized window, else its cell.
-                        Point::<f64, Logical>::from((f64::from(rect.loc.x), f64::from(rect.loc.y))),
+                        Point::<f64, Logical>::from((
+                            f64::from(rect.loc.x - gx),
+                            f64::from(rect.loc.y - gy),
+                        )),
                     )
                 })
             });
