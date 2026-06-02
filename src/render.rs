@@ -38,7 +38,7 @@ use smithay::backend::renderer::{
     Offscreen as _, Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
 };
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
-use smithay::reexports::drm::control::crtc;
+use smithay::reexports::drm::control::{connector, crtc};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
@@ -583,6 +583,9 @@ pub struct ScreenshotOverlay {
 struct OutputRender {
     name: String,
     crtc: crtc::Handle,
+    /// Connector scanning out this output. Kept so idle DPMS power-off can
+    /// target it (the DPMS state is a connector property).
+    connector: connector::Handle,
     surface: GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
     /// DRM framebuffer dimensions in physical pixels.
     mode_size: Size<i32, Physical>,
@@ -814,6 +817,7 @@ impl Renderer {
             outputs.push(OutputRender {
                 name: drm_output.name,
                 crtc: drm_output.crtc,
+                connector,
                 surface,
                 mode_size,
                 refresh_mhz,
@@ -1072,6 +1076,11 @@ impl Renderer {
     /// redraws across all outputs.
     pub fn crtcs(&self) -> Vec<crtc::Handle> {
         self.outputs.iter().map(|o| o.crtc).collect()
+    }
+
+    /// Connectors of every output, for idle DPMS power control.
+    pub fn output_connectors(&self) -> Vec<connector::Handle> {
+        self.outputs.iter().map(|o| o.connector).collect()
     }
 
     /// CRTC of the output named `name` (connector name), if present.

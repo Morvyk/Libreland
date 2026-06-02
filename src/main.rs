@@ -265,6 +265,24 @@ pub(crate) struct State {
     /// initial configure and only resize on a later one, so we nudge each
     /// exactly once on first map — this set stops it firing every frame.
     pub(crate) mapped_toplevels: std::collections::HashSet<WlSurface>,
+    /// Built-in idle handling (`config.idle`). `idle_last_input` is bumped on
+    /// every input event; the idle timer compares its age to the configured
+    /// thresholds. `idle_screen_off` tracks whether the panels are DPMS-off so
+    /// input can wake them; `idle_lock_spawned` stops the lock command being
+    /// re-spawned every tick while idle (reset when the session unlocks).
+    pub(crate) idle_last_input: std::time::Instant,
+    pub(crate) idle_screen_off: bool,
+    pub(crate) idle_lock_spawned: bool,
+    /// `ext-session-lock-v1` manager global. Held so the global stays
+    /// registered; dispatch routes through `State`.
+    pub(crate) session_lock_state: smithay::wayland::session_lock::SessionLockManagerState,
+    /// While the session is locked, the lock surface for each output (by
+    /// connector name). The renderer draws only these (full-screen, above
+    /// everything) and the pointer/keyboard are routed solely to them.
+    pub(crate) lock_surfaces:
+        std::collections::HashMap<String, smithay::wayland::session_lock::LockSurface>,
+    /// Whether a client has locked the session (the `SessionLocker` confirmed).
+    pub(crate) session_locked: bool,
     /// `zwp_relative_pointer_manager_v1` global — held alive so clients
     /// keep receiving relative motion (mouse-look). Dispatched via the
     /// delegate; not otherwise read.
@@ -596,6 +614,150 @@ impl State {
         }
     }
 
+    /// Power every output's panel on (`true`) or off (`false`) via the
+    /// connector's DPMS property. Off blanks the panel while keeping the
+    /// session and clients intact; on re-enables it and forces a redraw so
+    /// fresh pixels scan out at once. Best-effort: a driver that rejects the
+    /// legacy DPMS property just logs and stays as-is.
+    pub(crate) fn set_screen_power(&mut self, on: bool) {
+        use smithay::reexports::drm::control::Device as _;
+        // DPMS enum: 0 = On, 1 = Standby, 2 = Suspend, 3 = Off.
+        let value: u64 = if on { 0 } else { 3 };
+        for conn in self.renderer.output_connectors() {
+            let Ok(props) = self.drm_device.get_properties(conn) else {
+                continue;
+            };
+            let (handles, _values) = props.as_props_and_values();
+            for &handle in handles {
+                let Ok(info) = self.drm_device.get_property(handle) else {
+                    continue;
+                };
+                if info.name().to_bytes() == b"DPMS" {
+                    if let Err(err) = self.drm_device.set_property(conn, handle, value) {
+                        warn!(error = %err, ?conn, on, "failed to set DPMS property");
+                    }
+                    break;
+                }
+            }
+        }
+        self.idle_screen_off = !on;
+        if on {
+            self.queue_redraw_all();
+        }
+    }
+
+    /// Record input activity for the idle timer: reset the clock and, if the
+    /// panels were powered off, wake them. Called on every input event.
+    pub(crate) fn note_input_activity(&mut self) {
+        self.idle_last_input = std::time::Instant::now();
+        if self.idle_screen_off {
+            self.set_screen_power(true);
+        }
+    }
+
+    /// Idle-timer tick: spawn the lock command and/or DPMS the screens off once
+    /// their configured idle thresholds elapse. No-op unless `config.idle` is
+    /// set. The lock command spawns once per idle period (re-armed when the
+    /// session unlocks); the screen-off fires once and is undone by input.
+    pub(crate) fn idle_tick(&mut self) {
+        let Some(idle) = self.config.idle.clone() else {
+            return;
+        };
+        let idle_for = self.idle_last_input.elapsed();
+        if let Some(after) = idle.lock_after
+            && idle_for >= after
+            && !self.idle_lock_spawned
+            && !self.session_lock_active()
+            && let Some(cmd) = &idle.lock_command
+        {
+            info!(command = %cmd, "idle: spawning lock command");
+            crate::wayland::spawn_startup(&[cmd.to_string()]);
+            self.idle_lock_spawned = true;
+        }
+        if let Some(after) = idle.screen_off_after
+            && idle_for >= after
+            && !self.idle_screen_off
+        {
+            info!("idle: powering screens off (DPMS)");
+            self.set_screen_power(false);
+        }
+    }
+
+    /// Whether the session is currently locked (`ext-session-lock-v1`).
+    pub(crate) fn session_lock_active(&self) -> bool {
+        self.session_locked
+    }
+
+    /// Engage the lock: from now the renderer draws only lock surfaces and
+    /// input goes only to them. Keyboard focus is dropped from the desktop; it
+    /// moves to a lock surface as soon as one is created. Called when a client
+    /// confirms the lock.
+    pub(crate) fn on_session_locked(&mut self) {
+        self.session_locked = true;
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+        self.queue_redraw_all();
+    }
+
+    /// Release the lock: drop the lock surfaces, re-arm idle locking, and
+    /// redraw the desktop.
+    pub(crate) fn on_session_unlocked(&mut self) {
+        self.session_locked = false;
+        self.lock_surfaces.clear();
+        self.idle_lock_spawned = false;
+        self.idle_last_input = std::time::Instant::now();
+        self.queue_redraw_all();
+    }
+
+    /// Register a lock surface for an output: size it to that output, give it
+    /// keyboard focus, and redraw so it appears.
+    pub(crate) fn add_lock_surface(
+        &mut self,
+        surface: smithay::wayland::session_lock::LockSurface,
+        output: &smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    ) {
+        let Some(name) = smithay::output::Output::from_resource(output).map(|o| o.name()) else {
+            return;
+        };
+        if let Some(rect) = self.renderer.output_rect(&name) {
+            surface.with_pending_state(|state| {
+                state.size = Some(smithay::utils::Size::from((
+                    u32::try_from(rect.size.w).unwrap_or(0),
+                    u32::try_from(rect.size.h).unwrap_or(0),
+                )));
+            });
+            surface.send_configure();
+        }
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(
+                self,
+                Some(surface.wl_surface().clone()),
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+        self.lock_surfaces.insert(name, surface);
+        self.queue_redraw_all();
+    }
+
+    /// While locked, the lock surface (and its output's origin) under `cursor`,
+    /// so the pointer/keyboard route only to it. `None` if that output has no
+    /// lock surface yet.
+    fn locked_surface_at(
+        &self,
+        cursor: Point<i32, Physical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let geom = self.renderer.output_at(cursor)?;
+        let surface = self.lock_surfaces.get(&geom.name)?;
+        Some((
+            surface.wl_surface().clone(),
+            Point::<f64, Logical>::from((
+                f64::from(geom.compositor.loc.x),
+                f64::from(geom.compositor.loc.y),
+            )),
+        ))
+    }
+
     /// Queue a redraw on every output that *isn't* currently showing a
     /// fullscreen window. Used for redraws we can't pin to one output
     /// (popups, cursor/drag surfaces) and for the safety heartbeat, so we
@@ -666,6 +828,26 @@ impl State {
         // Drain pending captures for the output this CRTC drives so the
         // renderer can read them off this frame's framebuffer.
         let out_name = self.renderer.output_name_for_crtc(crtc);
+
+        // Session locked: blank everything and draw only this output's lock
+        // surface, full-size, as an Overlay (above all windows/layers). Reusing
+        // the Overlay layer path means no special render branch. Nothing else
+        // (windows, real layers, popups) reaches the screen.
+        let (placements, layer_placements, popup_placements) = if self.session_locked {
+            let lock = out_name.as_deref().and_then(|name| {
+                let surface = self.lock_surfaces.get(name)?;
+                let rect = self.renderer.output_rect(name)?;
+                Some(render::LayerPlacement {
+                    surface: surface.wl_surface().clone(),
+                    rect,
+                    layer: render::LayerBucket::Overlay,
+                    namespace: String::new(),
+                })
+            });
+            (Vec::new(), lock.into_iter().collect::<Vec<_>>(), Vec::new())
+        } else {
+            (placements, layer_placements, popup_placements)
+        };
         let mut captures: Vec<screencopy::PendingCapture> = Vec::new();
         let mut internal: Vec<InternalCapture> = Vec::new();
         if let Some(name) = out_name.as_deref() {
@@ -909,9 +1091,17 @@ impl State {
         // cursor wins the *pointer* (menus draw on top of everything),
         // then layer surfaces (rofi, panels, OSDs), then the tile /
         // floating layout.
-        let popup_hit = self.popup_at(cursor_i);
-        let surface_hit = self
-            .layer_at(cursor_i)
+        // While locked, only the lock surface is reachable — no popups, layers,
+        // or windows take the pointer.
+        let popup_hit = if self.session_locked {
+            None
+        } else {
+            self.popup_at(cursor_i)
+        };
+        let surface_hit = if self.session_locked {
+            self.locked_surface_at(cursor_i)
+        } else {
+            self.layer_at(cursor_i)
             .map(|(surface, rect)| {
                 (
                     surface,
@@ -944,7 +1134,8 @@ impl State {
                         )),
                     )
                 })
-            });
+            })
+        };
         // Keyboard focus follows windows / layers only — never popups.
         // We don't run a popup grab yet, and a menu shouldn't pull
         // keyboard focus off its parent toplevel.
@@ -1196,8 +1387,9 @@ impl State {
             let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
             // Clicking inside a popup must not re-home keyboard focus
             // to the window/layer beneath it — leave focus on the
-            // popup's parent.
-            if self.popup_at(cursor_i).is_none() {
+            // popup's parent. While locked, keyboard focus stays on the lock
+            // surface — never re-homed to a (hidden) window/layer on click.
+            if !self.session_locked && self.popup_at(cursor_i).is_none() {
                 // Prefer a layer surface under the cursor (rofi / OSDs)
                 // over a tile so click-to-focus on a panel works without
                 // a separate path.
@@ -2782,6 +2974,14 @@ fn main() -> Result<()> {
         .map(|crtc| (crtc, RedrawState::WaitingForVblank { dirty: true }))
         .collect();
 
+    // ext-session-lock-v1 manager. Built here (before `display_handle` moves
+    // into State) so it can borrow the handle; allow any client to lock.
+    let session_lock_state =
+        smithay::wayland::session_lock::SessionLockManagerState::new::<State, _>(
+            &wayland_init.display_handle,
+            |_client| true,
+        );
+
     let state = State {
         session,
         loop_signal,
@@ -2810,6 +3010,12 @@ fn main() -> Result<()> {
         layer_outputs: std::collections::HashMap::new(),
         layer_namespaces: std::collections::HashMap::new(),
         mapped_toplevels: std::collections::HashSet::new(),
+        idle_last_input: std::time::Instant::now(),
+        idle_screen_off: false,
+        idle_lock_spawned: false,
+        session_lock_state,
+        lock_surfaces: std::collections::HashMap::new(),
+        session_locked: false,
         relative_pointer_state: wayland_init.relative_pointer_state,
         pointer_constraints_state: wayland_init.pointer_constraints_state,
         primary_selection_state: wayland_init.primary_selection_state,
@@ -3171,9 +3377,36 @@ fn wire_event_sources(
             .map_err(|e| anyhow::anyhow!("failed to insert redraw heartbeat: {e}"))?;
     }
 
+    // Built-in idle handling: a low-frequency tick that locks / powers off the
+    // screens once the configured idle thresholds elapse (input wakes them).
+    // `idle_tick` early-returns unless `config.idle` is set, so an unconfigured
+    // session just no-ops here. 5 s granularity is plenty for minute timeouts.
+    {
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        let tick = std::time::Duration::from_secs(5);
+        handle
+            .insert_source(Timer::from_duration(tick), move |_, (), data: &mut LoopData| {
+                data.state.idle_tick();
+                TimeoutAction::ToDuration(tick)
+            })
+            .map_err(|e| anyhow::anyhow!("failed to insert idle timer: {e}"))?;
+    }
+
     handle
         .insert_source(libinput_backend, |event, (), data: &mut LoopData| {
             log_input_event(&event);
+            // Any real user input resets the idle clock and wakes powered-off
+            // screens (so a mouse move turns the panels back on). Device
+            // add/remove isn't user activity, so it's excluded.
+            if matches!(
+                event,
+                InputEvent::Keyboard { .. }
+                    | InputEvent::PointerMotion { .. }
+                    | InputEvent::PointerButton { .. }
+                    | InputEvent::PointerAxis { .. }
+            ) {
+                data.state.note_input_activity();
+            }
             match event {
                 InputEvent::Keyboard { event: ke } => data.state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {

@@ -73,6 +73,9 @@ use smithay::wayland::selection::primary_selection::{
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::session_lock::{
+    LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
+};
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
@@ -1115,3 +1118,26 @@ delegate_relative_pointer!(State);
 delegate_pointer_constraints!(State);
 delegate_cursor_shape!(State);
 delegate_primary_selection!(State);
+smithay::delegate_session_lock!(State);
+
+impl SessionLockHandler for State {
+    fn lock_state(&mut self) -> &mut SessionLockManagerState {
+        &mut self.session_lock_state
+    }
+
+    fn lock(&mut self, confirmation: SessionLocker) {
+        // We can always lock: confirm to the client, then switch rendering and
+        // input over to the lock surfaces (dropping `confirmation` instead
+        // would tell the client the lock failed).
+        confirmation.lock();
+        self.on_session_locked();
+    }
+
+    fn unlock(&mut self) {
+        self.on_session_unlocked();
+    }
+
+    fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
+        self.add_lock_surface(surface, &output);
+    }
+}

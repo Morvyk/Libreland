@@ -80,6 +80,25 @@ pub struct Config {
     /// `wp_fractional_scale` + `wp_viewporter`. Toggling needs a
     /// restart (the satellite is spawned once at launch).
     pub xwayland: bool,
+    /// Built-in idle handling: lock the session and/or power the screens off
+    /// after a period of no input, waking on any input. `None` (the default)
+    /// disables idle handling entirely.
+    pub idle: Option<IdleConfig>,
+}
+
+/// Idle timeouts + the lock command, all optional so any piece can be left
+/// out. A `0` timeout (or absent) disables that action.
+#[derive(Debug, Clone)]
+pub struct IdleConfig {
+    /// Idle time before `lock_command` is spawned. `None` = never lock.
+    pub lock_after: Option<Duration>,
+    /// Idle time before the outputs are powered off via DPMS (any input wakes
+    /// them). `None` = never power off.
+    pub screen_off_after: Option<Duration>,
+    /// Command spawned at the lock threshold — whitespace-split into program +
+    /// args, no shell (same rules as binds/startup). Typically a lock-screen
+    /// client speaking `ext-session-lock-v1`.
+    pub lock_command: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +564,7 @@ impl Default for Config {
             startup: Vec::new(),
             screenshot: None,
             xwayland: true,
+            idle: None,
         }
     }
 }
@@ -648,6 +668,9 @@ impl Config {
         }
         if let Some(x) = globals.get::<Option<bool>>("xwayland")? {
             config.xwayland = x;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("idle")? {
+            config.idle = Some(parse_idle(&t).context("idle")?);
         }
 
         Ok(config)
@@ -1187,6 +1210,28 @@ fn parse_startup(t: &Table) -> mlua::Result<Vec<String>> {
         commands.push(cmd);
     }
     Ok(commands)
+}
+
+fn parse_idle(t: &Table) -> mlua::Result<IdleConfig> {
+    // A `0` (or absent) timeout disables that action; negatives are an error.
+    fn secs(t: &Table, key: &str) -> mlua::Result<Option<Duration>> {
+        match t.get::<Option<i64>>(key)? {
+            None | Some(0) => Ok(None),
+            Some(s) if s > 0 => Ok(Some(Duration::from_secs(u64::try_from(s).unwrap_or(0)))),
+            Some(s) => lua_bail!("idle.{key} {s} out of range; expected >= 0"),
+        }
+    }
+    let lock_after = secs(t, "lock_after_secs")?;
+    let screen_off_after = secs(t, "screen_off_after_secs")?;
+    let lock_command = t
+        .get::<Option<String>>("lock_command")?
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| Arc::from(s.as_str()));
+    Ok(IdleConfig {
+        lock_after,
+        screen_off_after,
+        lock_command,
+    })
 }
 
 fn parse_rgb_triple(t: &Table) -> mlua::Result<[f32; 3]> {
