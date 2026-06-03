@@ -60,7 +60,8 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
-use smithay::wayland::shell::xdg::ToplevelSurface;
+use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::xdg::{SurfaceCachedState, ToplevelSurface};
 use tracing::debug;
 
 use crate::config::AnimSpec;
@@ -509,6 +510,61 @@ impl Layout {
                 None => leaf,
                 Some(root) => insert_at_cursor(root, leaf, tile_bounds, Some(center), inner),
             });
+            self.recompute_and_push();
+            return true;
+        }
+        false
+    }
+
+    /// If `surface` is a child/dialog toplevel, pull it out of the tile
+    /// tree and place it floating, centred on its output's work area —
+    /// Hyprland-style auto-float so transient windows (a file-properties
+    /// dialog, an app's preferences or login window) don't wedge into the
+    /// tiling. Called once when the toplevel first maps, where its parent
+    /// and size hints are finally set. Returns whether it was floated; the
+    /// caller falls back to a normal tile reconfigure on `false`.
+    ///
+    /// "Dialog" is the same heuristic mature compositors use without a
+    /// window rule: it has an xdg `parent`, or it pins itself to a fixed
+    /// size (`min_size == max_size`), which only non-tileable windows do.
+    pub fn float_if_dialog(&mut self, surface: &WlSurface) -> bool {
+        for oi in 0..self.outputs.len() {
+            let area = self.outputs[oi].area();
+            let work = area.work;
+            let ws = self.active_ws_mut(oi);
+            let Some(root) = ws.tree.take() else {
+                continue;
+            };
+            // Decide before disturbing the tree: only float genuine dialogs,
+            // and put the untouched tree back if this isn't one (or the
+            // surface lives on another output's active workspace).
+            let Some(pref) = leaf_ref(&root, surface).and_then(|w| dialog_size(&w.toplevel)) else {
+                ws.tree = Some(root);
+                continue;
+            };
+            let (root_after, removed) = remove_from_tree(root, surface);
+            ws.tree = root_after;
+            let Some(mut window) = removed else { continue };
+            // Honour the dialog's requested size, clamped to the work area;
+            // fall back to a third of it on any axis it left unconstrained.
+            let w = if pref.w > 0 {
+                pref.w.min(work.size.w)
+            } else {
+                work.size.w / 3
+            };
+            let h = if pref.h > 0 {
+                pref.h.min(work.size.h)
+            } else {
+                work.size.h / 3
+            };
+            let loc = Point::<i32, Physical>::new(
+                work.loc.x + (work.size.w - w) / 2,
+                work.loc.y + (work.size.h - h) / 2,
+            );
+            window.rect = Rectangle::new(loc, Size::<i32, Physical>::from((w, h)));
+            window.fill = FillMode::Normal;
+            push_configure_for_floating(&window, self.border_width, area);
+            self.active_ws_mut(oi).floating.push(window);
             self.recompute_and_push();
             return true;
         }
@@ -1711,6 +1767,35 @@ fn collect_filled<'a>(node: &'a Node, out: &mut Vec<&'a Window>) {
             collect_filled(second, out);
         }
     }
+}
+
+/// Classify a toplevel as a dialog that should auto-float, returning its
+/// preferred size (logical px, re-tagged to the layout's `Physical`-as-logical
+/// space) — or `None` to leave it tiled. A zero axis means "no preference"; the
+/// caller substitutes a fraction of the work area.
+///
+/// A toplevel is a dialog if it declares an xdg `parent` (a transient child —
+/// a properties or preferences window over its app) or pins a fixed size
+/// (`min_size == max_size`, which only non-tileable windows do). The preferred
+/// size is the client's window geometry, else its fixed size.
+fn dialog_size(toplevel: &ToplevelSurface) -> Option<Size<i32, Physical>> {
+    let has_parent = toplevel.parent().is_some();
+    let (min, max, geo) = with_states(toplevel.wl_surface(), |states| {
+        let mut cached = states.cached_state.get::<SurfaceCachedState>();
+        let cur = cached.current();
+        (cur.min_size, cur.max_size, cur.geometry.map(|g| g.size))
+    });
+    let fixed = min.w > 0 && min.h > 0 && min == max;
+    if !has_parent && !fixed {
+        return None;
+    }
+    // Window geometry is the visible size sans shadows; prefer it, else the
+    // pinned size, else leave both axes 0 for the caller to fill in.
+    let size = geo
+        .filter(|s| s.w > 0 && s.h > 0)
+        .or(fixed.then_some(min))
+        .unwrap_or_default();
+    Some(Size::<i32, Physical>::from((size.w, size.h)))
 }
 
 /// Find the leaf whose window is `surface` (shared borrow).

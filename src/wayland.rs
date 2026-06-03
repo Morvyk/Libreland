@@ -457,7 +457,14 @@ impl CompositorHandler for State {
             .unwrap_or(false)
         {
             self.mapped_toplevels.insert(surface.clone());
-            self.layout.reconfigure(surface);
+            // Child/dialog toplevels (a properties window, a login/preferences
+            // dialog) auto-float centred instead of wedging into the tiling —
+            // their parent + size hints are only set now, at first map. If it's
+            // not a dialog, fall back to the size nudge for clients that
+            // ignored the initial configure.
+            if !self.layout.float_if_dialog(surface) {
+                self.layout.reconfigure(surface);
+            }
         }
         maybe_handle_layer_commit(self, surface);
         // Promote a freshly-mapped popup into its parent's tree (and
