@@ -107,44 +107,15 @@ pub fn open_display(
         if conn_info.state() != connector::State::Connected {
             continue;
         }
-        let name = conn_info.to_string();
-
-        let requested_mode = monitors.outputs.get(&name).and_then(|cfg| cfg.mode);
-        let Some(mode) = pick_mode(&conn_info, requested_mode, &name) else {
-            warn!(connector = %name, "connector reports no modes — skipping");
-            continue;
-        };
-        let (mode_w, mode_h) = mode.size();
-
-        let Some(crtc) = pick_unused_crtc(&device, &conn_info, &resources, &used_crtcs) else {
-            warn!(
-                connector = %name,
-                "no unused CRTC compatible with this connector — skipping"
-            );
-            continue;
-        };
-        used_crtcs.insert(crtc);
-
-        let surface = device
-            .create_surface(crtc, mode, &[conn_handle])
-            .with_context(|| format!("DrmDevice::create_surface failed for {name}"))?;
-        info!(
-            connector = %name,
-            crtc = ?crtc,
-            width = mode_w,
-            height = mode_h,
-            refresh = mode.vrefresh(),
-            legacy = surface.is_legacy(),
-            "output bound"
-        );
-
-        outputs.push(DrmOutput {
-            name,
-            crtc,
-            connector: conn_handle,
-            surface,
-            mode,
-        });
+        // A connector that finds no mode or no free CRTC is skipped
+        // (Ok(None)); a surface-creation failure aborts the launch (the
+        // `?`), matching the original strictness for startup.
+        if let Some(output) =
+            build_output(&mut device, &conn_info, conn_handle, &resources, monitors, &used_crtcs)?
+        {
+            used_crtcs.insert(output.crtc);
+            outputs.push(output);
+        }
     }
 
     if outputs.is_empty() {
@@ -162,6 +133,122 @@ pub fn open_display(
         notifier,
         outputs,
     })
+}
+
+/// Outcome of a live connector re-scan ([`rescan_connectors`]).
+pub struct RescanResult {
+    /// Connector names currently in the `Connected` state — the caller
+    /// diffs this against the outputs it already drives to find which
+    /// ones were unplugged.
+    pub connected: Vec<String>,
+    /// Newly-connected outputs (not among `existing`) brought up with a
+    /// fresh CRTC + surface, ready to hand to the renderer.
+    pub added: Vec<DrmOutput>,
+}
+
+/// Re-enumerate `device`'s connectors after a udev "changed" event
+/// (monitor plugged or unplugged) and bind a surface for every
+/// connected output whose connector name is not already in `existing`.
+/// `used_crtcs` are the CRTCs the compositor's current outputs hold, so
+/// a freshly-plugged monitor is assigned a genuinely free one. Already-
+/// known connectors are reported in `connected` (so the caller can spot
+/// removals) without being rebuilt. Unlike [`open_display`] this never
+/// aborts: a connector that fails to bind is logged and skipped, because
+/// a hotplug must not bring the whole session down.
+pub fn rescan_connectors(
+    device: &mut DrmDevice,
+    monitors: &MonitorsConfig,
+    existing: &HashSet<String>,
+    used_crtcs: &HashSet<crtc::Handle>,
+) -> Result<RescanResult> {
+    let resources = device
+        .resource_handles()
+        .context("failed to read DRM resource handles on rescan")?;
+    let mut connected = Vec::new();
+    let mut added = Vec::new();
+    let mut used = used_crtcs.clone();
+
+    for &conn_handle in resources.connectors() {
+        let conn_info = match device.get_connector(conn_handle, false) {
+            Ok(info) => info,
+            Err(err) => {
+                warn!(?err, ?conn_handle, "failed to query connector on rescan — skipping");
+                continue;
+            }
+        };
+        if conn_info.state() != connector::State::Connected {
+            continue;
+        }
+        let name = conn_info.to_string();
+        connected.push(name.clone());
+        if existing.contains(&name) {
+            continue;
+        }
+        match build_output(device, &conn_info, conn_handle, &resources, monitors, &used) {
+            Ok(Some(output)) => {
+                used.insert(output.crtc);
+                added.push(output);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(connector = %name, error = %err, "failed to bind hot-plugged output — skipping");
+            }
+        }
+    }
+
+    Ok(RescanResult { connected, added })
+}
+
+/// Build one [`DrmOutput`] for an already-known-connected connector:
+/// pick its mode (honouring any config override), allocate a CRTC not in
+/// `used_crtcs`, and create the surface. `Ok(None)` means the connector
+/// has no usable mode or no free CRTC (skip it); `Err` means surface
+/// creation failed.
+fn build_output(
+    device: &mut DrmDevice,
+    conn_info: &connector::Info,
+    conn_handle: connector::Handle,
+    resources: &drm::control::ResourceHandles,
+    monitors: &MonitorsConfig,
+    used_crtcs: &HashSet<crtc::Handle>,
+) -> Result<Option<DrmOutput>> {
+    let name = conn_info.to_string();
+
+    let requested_mode = monitors.outputs.get(&name).and_then(|cfg| cfg.mode);
+    let Some(mode) = pick_mode(conn_info, requested_mode, &name) else {
+        warn!(connector = %name, "connector reports no modes — skipping");
+        return Ok(None);
+    };
+    let (mode_w, mode_h) = mode.size();
+
+    let Some(crtc) = pick_unused_crtc(device, conn_info, resources, used_crtcs) else {
+        warn!(
+            connector = %name,
+            "no unused CRTC compatible with this connector — skipping"
+        );
+        return Ok(None);
+    };
+
+    let surface = device
+        .create_surface(crtc, mode, &[conn_handle])
+        .with_context(|| format!("DrmDevice::create_surface failed for {name}"))?;
+    info!(
+        connector = %name,
+        crtc = ?crtc,
+        width = mode_w,
+        height = mode_h,
+        refresh = mode.vrefresh(),
+        legacy = surface.is_legacy(),
+        "output bound"
+    );
+
+    Ok(Some(DrmOutput {
+        name,
+        crtc,
+        connector: conn_handle,
+        surface,
+        mode,
+    }))
 }
 
 /// Clear any hardware cursor the display manager left on each CRTC's

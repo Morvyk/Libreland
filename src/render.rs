@@ -357,6 +357,11 @@ void main() {
 pub struct Renderer {
     /// Shared GLES2 renderer; owns the EGL context.
     gles: GlesRenderer,
+    /// GBM scanout allocator, retained so a hot-plugged output can have
+    /// its swapchain built at runtime (cloned into each new
+    /// `GbmBufferedSurface`). The dmabuf render formats are re-queried
+    /// from `gles` on demand.
+    allocator: GbmAllocator<DrmDeviceFd>,
     /// One swapchain + framebuffer chain per output.
     outputs: Vec<OutputRender>,
     /// Index into `outputs` of the layout's primary output. Picked
@@ -876,6 +881,7 @@ impl Renderer {
 
         Ok(Self {
             gles,
+            allocator,
             outputs,
             primary_idx,
             layout_bounds,
@@ -1078,6 +1084,149 @@ impl Renderer {
         self.outputs.iter().map(|o| o.crtc).collect()
     }
 
+    /// Connector names of every output currently driven, for the
+    /// hotplug path to diff against a fresh connector scan.
+    pub fn output_names(&self) -> Vec<String> {
+        self.outputs.iter().map(|o| o.name.clone()).collect()
+    }
+
+    /// Bind a freshly hot-plugged DRM output into the render pipeline:
+    /// build its GBM swapchain over the retained allocator, query
+    /// adaptive-sync support, and append an [`OutputRender`]. The
+    /// compositor position is provisional (`0,0`) — call
+    /// [`Self::reflow_outputs`] afterwards to pack every output and
+    /// recompute the layout bounds. Per-output scratch caches keyed by
+    /// index are cleared (cheap; rebuilt next frame) since the indices
+    /// shift. No-op if an output with this connector name already exists.
+    pub fn add_output(
+        &mut self,
+        drm_output: crate::drm::DrmOutput,
+        monitors: &MonitorsConfig,
+    ) -> Result<()> {
+        if self.outputs.iter().any(|o| o.name == drm_output.name) {
+            return Ok(());
+        }
+        let (mode_w, mode_h) = drm_output.mode.size();
+        let mode_size = Size::<i32, Physical>::new(i32::from(mode_w), i32::from(mode_h));
+        let refresh_mhz =
+            i32::try_from(drm_output.mode.vrefresh().saturating_mul(1000)).unwrap_or(i32::MAX);
+        let output_cfg = monitors.outputs.get(&drm_output.name);
+        let scale = output_cfg.map_or(1.0, |c| c.scale);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "mode pixels are u16-bounded; divided by scale > 0 fits in i32 trivially"
+        )]
+        let compositor_size = Size::<i32, Physical>::new(
+            (f64::from(mode_size.w) / scale).round() as i32,
+            (f64::from(mode_size.h) / scale).round() as i32,
+        );
+
+        let connector = drm_output.connector;
+        let renderer_formats = self.gles.egl_context().dmabuf_render_formats().clone();
+        let surface = GbmBufferedSurface::new(
+            drm_output.surface,
+            self.allocator.clone(),
+            &[Fourcc::Xrgb8888],
+            renderer_formats,
+        )
+        .with_context(|| {
+            format!(
+                "GbmBufferedSurface::new failed for hot-plugged {} (no compatible scanout format?)",
+                drm_output.name
+            )
+        })?;
+
+        let vrr_mode = output_cfg.map_or_else(VrrMode::default, |c| c.vrr);
+        let vrr_support = surface
+            .vrr_supported(connector)
+            .unwrap_or(VrrSupport::NotSupported);
+
+        info!(output = %drm_output.name, "hot-plugged output swapchain ready");
+        self.outputs.push(OutputRender {
+            name: drm_output.name,
+            crtc: drm_output.crtc,
+            connector,
+            surface,
+            mode_size,
+            refresh_mhz,
+            // Provisional; `reflow_outputs` rewrites this.
+            compositor_position: Point::<i32, Physical>::from((0, 0)),
+            compositor_size,
+            scale,
+            vrr_mode,
+            vrr_support,
+        });
+        self.blur_scratch.clear();
+        Ok(())
+    }
+
+    /// Tear a hot-unplugged output out of the pipeline. Returns its
+    /// connector name (for the caller to clean up its protocol globals).
+    /// Drops the output's frozen-snapshot texture and clears the
+    /// index-keyed scratch caches. Caller should follow with
+    /// [`Self::reflow_outputs`].
+    pub fn remove_output(&mut self, crtc: crtc::Handle) -> Option<String> {
+        let idx = self.outputs.iter().position(|o| o.crtc == crtc)?;
+        let removed = self.outputs.remove(idx);
+        self.freeze_textures.remove(&removed.name);
+        self.blur_scratch.clear();
+        Some(removed.name)
+    }
+
+    /// Recompute every output's compositor position after the output set
+    /// changed: outputs the user pinned in config keep their position,
+    /// the rest pack left-to-right (new screens land to the right).
+    /// Refreshes each output's scale + compositor size from config,
+    /// recomputes the layout bounding box, re-resolves the primary
+    /// output, clamps the cursor back inside the new bounds, and returns
+    /// fresh [`OutputDescriptor`]s for the Wayland layer to re-advertise.
+    pub fn reflow_outputs(&mut self, monitors: &MonitorsConfig) -> Vec<OutputDescriptor> {
+        let mut auto_x: i32 = 0;
+        for o in &mut self.outputs {
+            let cfg = monitors.outputs.get(&o.name);
+            let scale = cfg.map_or(1.0, |c| c.scale);
+            o.scale = scale;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "mode pixels are u16-bounded; divided by scale > 0 fits in i32 trivially"
+            )]
+            let compositor_size = Size::<i32, Physical>::new(
+                (f64::from(o.mode_size.w) / scale).round() as i32,
+                (f64::from(o.mode_size.h) / scale).round() as i32,
+            );
+            o.compositor_size = compositor_size;
+            o.compositor_position = match cfg.and_then(|c| c.position) {
+                Some((x, y)) => Point::<i32, Physical>::from((x, y)),
+                None => Point::<i32, Physical>::from((auto_x, 0)),
+            };
+            if cfg.and_then(|c| c.position).is_none() {
+                auto_x = auto_x.saturating_add(compositor_size.w);
+            }
+        }
+
+        let mut layout_w: i32 = 0;
+        let mut layout_h: i32 = 0;
+        for o in &self.outputs {
+            layout_w = layout_w.max(o.compositor_position.x + o.compositor_size.w);
+            layout_h = layout_h.max(o.compositor_position.y + o.compositor_size.h);
+        }
+        self.layout_bounds = Size::<i32, Physical>::new(layout_w, layout_h);
+
+        self.primary_idx = monitors
+            .primary
+            .as_deref()
+            .and_then(|name| self.outputs.iter().position(|o| o.name == name))
+            .unwrap_or(0)
+            .min(self.outputs.len().saturating_sub(1));
+
+        // The cursor may now sit beyond the shrunken union (an output to
+        // its right vanished); pull it back onto a real pixel.
+        self.cursor_x = self.cursor_x.clamp(0.0, f64::from(layout_w));
+        self.cursor_y = self.cursor_y.clamp(0.0, f64::from(layout_h));
+
+        self.output_descriptors()
+    }
+
     /// Connectors of every output, for idle DPMS power control.
     pub fn output_connectors(&self) -> Vec<connector::Handle> {
         self.outputs.iter().map(|o| o.connector).collect()
@@ -1165,10 +1314,12 @@ impl Renderer {
         self.outputs.iter().map(OutputGeom::from).collect()
     }
 
-    /// Connector name of the primary output. Used by the layer-shell
-    /// reflow to attribute exclusive zones to the primary by name.
-    pub fn primary_output_name(&self) -> &str {
-        &self.outputs[self.primary_idx].name
+    /// Connector name of the primary output, or `None` when no output is
+    /// connected (every monitor unplugged — the compositor runs headless
+    /// until one returns). Used by the layer-shell reflow to attribute
+    /// exclusive zones to the primary by name.
+    pub fn primary_output_name(&self) -> Option<&str> {
+        self.outputs.get(self.primary_idx).map(|o| o.name.as_str())
     }
 
     /// Swap the wallpaper + border styling used from the next frame
@@ -1735,7 +1886,7 @@ impl Renderer {
     /// (since the layout is single-output for now — multi-output
     /// per-surface scale tracking is a later milestone).
     pub fn primary_scale(&self) -> f64 {
-        self.outputs[self.primary_idx].scale
+        self.outputs.get(self.primary_idx).map_or(1.0, |o| o.scale)
     }
 
     /// Settle one output's Variable Refresh Rate state for the frame about

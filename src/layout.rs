@@ -945,6 +945,67 @@ impl Layout {
         self.recompute_and_push();
     }
 
+    /// Register a freshly hot-plugged output, appending it with one
+    /// empty workspace at `bounds`. The caller positions/sizes it for
+    /// real via [`Self::set_output_bounds`] right after. Idempotent: an
+    /// output whose connector name we already track is a no-op, so a
+    /// monitor reconnecting on the same port reuses its retained pane
+    /// (and the windows still on it) rather than spawning a duplicate.
+    pub fn add_output(&mut self, name: String, bounds: Rectangle<i32, Physical>) {
+        if self.outputs.iter().any(|o| o.name == name) {
+            return;
+        }
+        self.outputs.push(Outpane::new(name, bounds));
+    }
+
+    /// Drop a hot-unplugged output. Any windows it held (every
+    /// workspace, tiled and floating) are re-homed onto `fallback`'s
+    /// active workspace as tiles so their clients survive the unplug.
+    ///
+    /// When `fallback` is `None` — the last output just went away — the
+    /// pane is *kept* intact instead of dropped: its windows stay parked
+    /// in the layout (clients live on, headless) and reappear when an
+    /// output returns under the same connector name. A `name` we don't
+    /// track is a silent no-op.
+    pub fn remove_output(&mut self, name: &str, fallback: Option<&str>) {
+        let Some(idx) = self.outputs.iter().position(|o| o.name == name) else {
+            return;
+        };
+        let Some(dst_name) = fallback else {
+            // Nowhere to move the windows; keep the pane so they aren't lost.
+            return;
+        };
+        let Some(mut di) = self.outputs.iter().position(|o| o.name == dst_name) else {
+            return;
+        };
+        let pane = self.outputs.remove(idx);
+        // `remove` shifted every later index down by one.
+        if di > idx {
+            di -= 1;
+        }
+        let mut rescued: Vec<Window> = Vec::new();
+        for ws in pane.workspaces {
+            if let Some(tree) = ws.tree {
+                collect_windows_owned(tree, &mut rescued);
+            }
+            rescued.extend(ws.floating);
+        }
+        let tile_bounds = self.tile_bounds(di);
+        let inner = self.gaps.inner;
+        for mut window in rescued {
+            // The fill mode targeted the vanished output; re-tile cleanly.
+            window.fill = FillMode::Normal;
+            let leaf = Node::Leaf(window);
+            let ws = self.active_ws_mut(di);
+            ws.tree = Some(match ws.tree.take() {
+                None => leaf,
+                Some(root) => insert_at_cursor(root, leaf, tile_bounds, None, inner),
+            });
+        }
+        self.normalize_output(di);
+        self.recompute_and_push();
+    }
+
     /// Swap the gap + border-width settings and reflow every
     /// workspace (for live config reload). Tiles get re-laid-out with
     /// the new gaps and re-configured to the new inside-border size;
@@ -1755,6 +1816,19 @@ fn leaf_at(node: &Node, pos: Point<i32, Physical>) -> Option<&Window> {
 
 /// Push every maximized/fullscreen leaf onto `out` in tree (draw)
 /// order — used by `window_at` to find the topmost filled window.
+/// Consume a dwindle tree, draining every window it holds into `out`
+/// (depth-first). Used when an output is unplugged and its windows must
+/// be moved wholesale onto another output.
+fn collect_windows_owned(node: Node, out: &mut Vec<Window>) {
+    match node {
+        Node::Leaf(w) => out.push(w),
+        Node::Split { first, second, .. } => {
+            collect_windows_owned(*first, out);
+            collect_windows_owned(*second, out);
+        }
+    }
+}
+
 fn collect_filled<'a>(node: &'a Node, out: &mut Vec<&'a Window>) {
     match node {
         Node::Leaf(w) => {

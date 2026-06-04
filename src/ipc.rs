@@ -803,7 +803,9 @@ mod server {
         output: Option<String>,
         target: WorkspaceTarget,
     ) -> Reply {
-        let output = output.unwrap_or_else(|| state.renderer.primary_output_name().to_owned());
+        let output = output
+            .or_else(|| state.renderer.primary_output_name().map(str::to_owned))
+            .ok_or_else(|| "no output connected".to_string())?;
         let active = state
             .layout
             .active_workspace(&output)

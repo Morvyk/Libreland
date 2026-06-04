@@ -38,7 +38,9 @@ use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, GlobalId,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
@@ -184,11 +186,48 @@ pub struct WaylandInit {
     /// clients as a `wl_output` global so they can pick a target
     /// output for fullscreen / fractional scale.
     pub outputs: Vec<Output>,
+    /// The `wl_output` global id for each output, keyed by connector
+    /// name. Kept so a hot-unplugged output's global can be removed
+    /// (and a hot-plugged one's added) at runtime.
+    pub output_globals: std::collections::HashMap<String, GlobalId>,
     /// Preferred fractional scale shipped to every new
     /// `wp_fractional_scale` object. For now this is the primary
     /// output's scale; multi-output per-surface scale tracking
     /// lands with workspaces.
     pub preferred_scale: f64,
+}
+
+/// Build a smithay [`Output`] from a descriptor and apply its current
+/// mode, transform, fractional scale, and position. Does **not** create
+/// the `wl_output` global — the caller does that and keeps the returned
+/// [`GlobalId`]. Shared by [`init`] (startup) and the hotplug path (a
+/// monitor connecting at runtime) so both configure outputs identically.
+pub(crate) fn make_output(desc: &OutputDescriptor) -> Output {
+    let output = Output::new(
+        desc.name.clone(),
+        PhysicalProperties {
+            size: smithay::utils::Size::from((0, 0)),
+            subpixel: Subpixel::Unknown,
+            make: "libreland".into(),
+            model: desc.name.clone(),
+        },
+    );
+    let mode = OutputMode {
+        size: desc.mode_size,
+        // Refresh in milli-Hz, threaded through from the active DRM mode
+        // (so a 4K@144 monitor advertises 144 000 here, not a placeholder).
+        refresh: desc.refresh_mhz,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(Scale::Fractional(desc.scale)),
+        Some(smithay::utils::Point::<i32, smithay::utils::Logical>::from(
+            (desc.compositor_position.x, desc.compositor_position.y),
+        )),
+    );
+    output.set_preferred(mode);
+    output
 }
 
 /// Build every Wayland substate, register the corresponding globals
@@ -297,33 +336,11 @@ pub fn init(
     // text. Fractional-aware clients see the exact scale via
     // `wp_fractional_scale_manager_v1`.
     let mut outputs = Vec::with_capacity(output_descs.len());
+    let mut output_globals = std::collections::HashMap::with_capacity(output_descs.len());
     for desc in output_descs {
-        let output = Output::new(
-            desc.name.clone(),
-            PhysicalProperties {
-                size: smithay::utils::Size::from((0, 0)),
-                subpixel: Subpixel::Unknown,
-                make: "libreland".into(),
-                model: desc.name.clone(),
-            },
-        );
-        let mode = OutputMode {
-            size: desc.mode_size,
-            // Refresh in milli-Hz, threaded through from the
-            // active DRM mode (so a 4K@144 monitor advertises
-            // 144 000 here, not a placeholder).
-            refresh: desc.refresh_mhz,
-        };
-        output.change_current_state(
-            Some(mode),
-            Some(Transform::Normal),
-            Some(Scale::Fractional(desc.scale)),
-            Some(smithay::utils::Point::<i32, smithay::utils::Logical>::from(
-                (desc.compositor_position.x, desc.compositor_position.y),
-            )),
-        );
-        output.set_preferred(mode);
-        output.create_global::<State>(&dh);
+        let output = make_output(desc);
+        let global = output.create_global::<State>(&dh);
+        output_globals.insert(desc.name.clone(), global);
         outputs.push(output);
     }
 
@@ -378,6 +395,7 @@ pub fn init(
         screencopy_manager,
         popup_manager,
         outputs,
+        output_globals,
         preferred_scale,
     })
 }

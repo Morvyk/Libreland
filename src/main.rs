@@ -199,6 +199,11 @@ pub(crate) struct State {
         reason = "held so each wl_output global stays alive; reads happen via the Output objects themselves on focus/resize"
     )]
     pub(crate) outputs: Vec<smithay::output::Output>,
+    /// `wl_output` global id per output (by connector name), so the
+    /// hotplug path can remove a vanished output's global and register a
+    /// newly-connected one. Kept in lock-step with `outputs`.
+    pub(crate) output_globals:
+        std::collections::HashMap<String, smithay::reexports::wayland_server::backend::GlobalId>,
     /// `wp_fractional_scale_manager_v1` substate.
     #[allow(
         dead_code,
@@ -1960,7 +1965,10 @@ impl State {
         // output the reserving surface is bound to — so a bar on the
         // secondary monitor shrinks *that* monitor's tile area, not the
         // primary's.
-        let primary_name = self.renderer.primary_output_name().to_owned();
+        // No outputs (every monitor unplugged) — nothing to lay out.
+        let Some(primary_name) = self.renderer.primary_output_name().map(str::to_owned) else {
+            return;
+        };
         let mut zones: std::collections::HashMap<String, (i32, i32, i32, i32)> =
             std::collections::HashMap::new();
         for layer in self.layer_shell_state.layer_surfaces() {
@@ -2008,6 +2016,126 @@ impl State {
             // (full minus exclusive zones). Fullscreen fills the
             // former, tiling/maximized the latter.
             self.layout.set_output_bounds(&name, rect, new_bounds);
+        }
+    }
+
+    /// Reconcile the output set after a udev "device changed" event —
+    /// the hotplug entry point. Re-scans the DRM device's connectors,
+    /// then brings up any newly-connected monitor (a fresh CRTC +
+    /// swapchain + `wl_output` global, packed to the right of the
+    /// existing ones) and tears down any that vanished (its windows are
+    /// moved onto a surviving output so their clients live on). A change
+    /// that doesn't alter our output set is a cheap no-op.
+    pub(crate) fn handle_drm_changed(&mut self) {
+        let existing: std::collections::HashSet<String> =
+            self.renderer.output_names().into_iter().collect();
+        let used_crtcs: std::collections::HashSet<crtc::Handle> =
+            self.renderer.crtcs().into_iter().collect();
+        let rescan = match crate::drm::rescan_connectors(
+            &mut self.drm_device,
+            &self.config.monitors,
+            &existing,
+            &used_crtcs,
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(error = %err, "connector rescan failed — leaving outputs unchanged");
+                return;
+            }
+        };
+        let connected: std::collections::HashSet<String> =
+            rescan.connected.into_iter().collect();
+        let removed: Vec<String> = existing
+            .iter()
+            .filter(|n| !connected.contains(*n))
+            .cloned()
+            .collect();
+        if removed.is_empty() && rescan.added.is_empty() {
+            // EDID refresh or a change on a card we don't drive: nothing to do.
+            return;
+        }
+
+        // --- Disconnects: evacuate windows, then drop the output. ---
+        for name in &removed {
+            // Move this output's windows onto any surviving output (one
+            // that isn't itself being removed). `None` ⇒ it was the last
+            // output; the layout keeps the windows parked for its return.
+            let fallback = self
+                .renderer
+                .output_names()
+                .into_iter()
+                .find(|n| n != name && !removed.contains(n));
+            self.layout.remove_output(name, fallback.as_deref());
+            if let Some(crtc) = self.renderer.crtc_for_output_name(name) {
+                self.renderer.remove_output(crtc);
+                self.redraw.remove(&crtc);
+            }
+            if let Some(global) = self.output_globals.remove(name) {
+                self.display_handle.remove_global::<State>(global);
+            }
+            self.outputs.retain(|o| o.name() != *name);
+            self.lock_surfaces.remove(name);
+            self.layer_outputs.retain(|_, v| v != name);
+            info!(output = %name, "output disconnected");
+        }
+
+        // --- Connects: build the swapchain, register the layout pane. ---
+        for drm_output in rescan.added {
+            let name = drm_output.name.clone();
+            let crtc = drm_output.crtc;
+            match self.renderer.add_output(drm_output, &self.config.monitors) {
+                Ok(()) => {
+                    // Provisional rect; `reflow_outputs` + `recompute_layer_layout`
+                    // below set the real position and work area.
+                    let rect = self.renderer.output_rect(&name).unwrap_or_default();
+                    self.layout.add_output(name.clone(), rect);
+                    self.redraw.insert(crtc, RedrawState::Idle);
+                    info!(output = %name, "output connected");
+                }
+                Err(err) => {
+                    warn!(output = %name, error = %err, "failed to bring up hot-plugged output");
+                }
+            }
+        }
+
+        // --- Re-pack positions, re-advertise to clients, re-tile, repaint. ---
+        let descs = self.renderer.reflow_outputs(&self.config.monitors);
+        self.sync_output_globals(&descs);
+        self.recompute_layer_layout();
+        self.preferred_scale = self.renderer.primary_scale();
+        self.queue_redraw_all();
+    }
+
+    /// Reconcile the `wl_output` globals with the renderer's reflowed
+    /// output set: update each surviving output's advertised
+    /// position/mode/scale (a neighbour vanishing shifts everyone left),
+    /// and create + advertise a global for any output that's new since
+    /// the last sync. Removal of vanished globals happens in
+    /// [`Self::handle_drm_changed`] before this runs.
+    fn sync_output_globals(&mut self, descs: &[render::OutputDescriptor]) {
+        use smithay::output::{Mode as OutputMode, Scale};
+        use smithay::utils::{Logical, Point, Transform};
+        for desc in descs {
+            if let Some(output) = self.outputs.iter().find(|o| o.name() == desc.name) {
+                let mode = OutputMode {
+                    size: desc.mode_size,
+                    refresh: desc.refresh_mhz,
+                };
+                output.change_current_state(
+                    Some(mode),
+                    Some(Transform::Normal),
+                    Some(Scale::Fractional(desc.scale)),
+                    Some(Point::<i32, Logical>::from((
+                        desc.compositor_position.x,
+                        desc.compositor_position.y,
+                    ))),
+                );
+            } else {
+                let output = crate::wayland::make_output(desc);
+                let global = output.create_global::<State>(&self.display_handle);
+                self.output_globals.insert(desc.name.clone(), global);
+                self.outputs.push(output);
+            }
         }
     }
 
@@ -3023,6 +3151,7 @@ fn main() -> Result<()> {
         kde_decoration_state: wayland_init.kde_decoration_state,
         output_manager_state: wayland_init.output_manager_state,
         outputs: wayland_init.outputs,
+        output_globals: wayland_init.output_globals,
         fractional_scale_state: wayland_init.fractional_scale_state,
         viewporter_state: wayland_init.viewporter_state,
         data_device_state: wayland_init.data_device_state,
@@ -3352,7 +3481,7 @@ fn wire_event_sources(
         .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
 
     handle
-        .insert_source(udev, |event, (), _data| match event {
+        .insert_source(udev, |event, (), data: &mut LoopData| match event {
             UdevEvent::Added { device_id, path } => {
                 info!(device_id, path = %path.display(), "udev: device added");
             }
@@ -3360,7 +3489,13 @@ fn wire_event_sources(
                 info!(device_id, "udev: device removed");
             }
             UdevEvent::Changed { device_id } => {
+                // A connector changed state on a DRM device — most often a
+                // monitor was plugged in or unplugged. Re-scan and reconcile
+                // our output set. We drive a single GPU, so a change on any
+                // card triggers a rescan of ours; the diff makes it a no-op
+                // when nothing we own actually changed.
                 debug!(device_id, "udev: device changed");
+                data.state.handle_drm_changed();
             }
         })
         .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
