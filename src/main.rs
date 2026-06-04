@@ -2704,11 +2704,34 @@ fn main() -> Result<()> {
         debug!(device_id, path = %path.display(), "udev pre-existing device");
     }
 
-    let drm_path = pick_drm_card_path(&initial_devices)?;
-    info!(drm_path = %drm_path.display(), "selected DRM device");
-
-    let drm_init = drm::open_display(&mut session, &drm_path, &config.monitors)
-        .context("DRM device init failed")?;
+    // A multi-GPU box exposes several `cardN` nodes (e.g. an iGPU with no
+    // monitors plus a discrete card the displays hang off). udev lists them
+    // in an unstable order, so try each in turn and keep the first that
+    // actually brings up a connected output. A card that has no displays —
+    // or that we momentarily can't drive — yields an error and we fall
+    // through to the next one instead of failing the whole launch.
+    let drm_paths = drm_card_paths(&initial_devices)?;
+    let mut drm_init = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for drm_path in &drm_paths {
+        info!(drm_path = %drm_path.display(), "trying DRM device");
+        match drm::open_display(&mut session, drm_path, &config.monitors) {
+            Ok(init) => {
+                info!(drm_path = %drm_path.display(), "selected DRM device");
+                drm_init = Some(init);
+                break;
+            }
+            Err(err) => {
+                warn!(drm_path = %drm_path.display(), error = %err, "DRM device unusable — trying next");
+                last_err = Some(err);
+            }
+        }
+    }
+    let drm_init = drm_init.ok_or_else(|| {
+        last_err
+            .unwrap_or_else(|| anyhow::anyhow!("no usable DRM device"))
+            .context("DRM device init failed (no enumerated card could drive a display)")
+    })?;
     let drm::DrmInit {
         device: drm_device,
         fd: drm_fd,
@@ -3271,16 +3294,27 @@ fn first_free_x_display() -> Option<u32> {
 /// (`renderD128`) come through the same DRM subsystem and we
 /// explicitly don't want them for modesetting. First card wins for
 /// now; multi-GPU is a later milestone.
-fn pick_drm_card_path<T>(devices: &[(T, std::path::PathBuf)]) -> Result<std::path::PathBuf> {
-    devices
+/// Collect every `/dev/dri/cardN` path udev enumerated, sorted by name
+/// for deterministic ordering (udev's own iteration order is not stable
+/// across runs). On a multi-GPU machine this returns e.g. `card0`,
+/// `card1`; the caller tries each in turn until one yields a connected
+/// output, so we don't hard-fail when udev happens to list a display-less
+/// render GPU (iGPU, headless card) first.
+fn drm_card_paths<T>(devices: &[(T, std::path::PathBuf)]) -> Result<Vec<std::path::PathBuf>> {
+    let mut paths: Vec<std::path::PathBuf> = devices
         .iter()
-        .find(|(_, p)| {
+        .filter(|(_, p)| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("card"))
         })
         .map(|(_, p)| p.clone())
-        .context("no /dev/dri/cardN device enumerated by udev — no display to drive")
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        anyhow::bail!("no /dev/dri/cardN device enumerated by udev — no display to drive");
+    }
+    Ok(paths)
 }
 
 /// Insert the libseat/udev/DRM/libinput event sources into the calloop
