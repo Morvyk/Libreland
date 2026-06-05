@@ -635,6 +635,54 @@ impl From<&OutputRender> for OutputGeom {
     }
 }
 
+/// Logical (compositor) size of an output: physical mode pixels divided
+/// by the output's scale. Centralised so output construction and
+/// `reflow_outputs` round identically.
+fn output_compositor_size(mode: Size<i32, Physical>, scale: f64) -> Size<i32, Physical> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "mode pixels are u16-bounded; divided by scale > 0 fits in i32 trivially"
+    )]
+    Size::<i32, Physical>::new(
+        (f64::from(mode.w) / scale).round() as i32,
+        (f64::from(mode.h) / scale).round() as i32,
+    )
+}
+
+/// Assign every output an absolute compositor-space position so screens
+/// never overlap. Two passes over `sizes` (each `(connector name,
+/// logical size)`): first place each output the user pinned to an
+/// explicit position, tracking the rightmost occupied edge, then pack
+/// the rest left-to-right starting past that edge.
+///
+/// Placing the configured outputs first is what prevents the overlap
+/// bug: an auto-placed monitor lands beyond every configured one
+/// regardless of connector iteration order, so a second, unconfigured
+/// screen can't stack on top of a configured one sitting at x=0.
+fn place_outputs(
+    monitors: &MonitorsConfig,
+    sizes: &[(String, Size<i32, Physical>)],
+) -> HashMap<String, Point<i32, Physical>> {
+    let mut positions = HashMap::with_capacity(sizes.len());
+    let mut auto_x: i32 = 0;
+    // Pass 1: user-pinned outputs keep their configured position; the
+    // running cursor is pushed past each so auto outputs avoid them.
+    for (name, size) in sizes {
+        if let Some((x, y)) = monitors.outputs.get(name).and_then(|c| c.position) {
+            positions.insert(name.clone(), Point::<i32, Physical>::from((x, y)));
+            auto_x = auto_x.max(x.saturating_add(size.w));
+        }
+    }
+    // Pass 2: everything else packs left-to-right beyond the pinned set.
+    for (name, size) in sizes {
+        if monitors.outputs.get(name).and_then(|c| c.position).is_none() {
+            positions.insert(name.clone(), Point::<i32, Physical>::from((auto_x, 0)));
+            auto_x = auto_x.saturating_add(size.w);
+        }
+    }
+    positions
+}
+
 /// A cursor theme image uploaded to a GLES texture, plus the geometry
 /// needed to place it. Cheap to clone (texture is `Arc`-backed).
 #[derive(Clone)]
@@ -749,10 +797,21 @@ impl Renderer {
         info!("phase: building per-output GBM buffered surfaces");
         let renderer_formats = gles.egl_context().dmabuf_render_formats().clone();
         let mut outputs = Vec::with_capacity(drm_outputs.len());
-        // Running compositor-x cursor for outputs the user didn't
-        // pin to a specific position. Configured positions can
-        // overlap with the auto cursor; that's the user's call.
-        let mut auto_x: i32 = 0;
+        // Resolve every output's compositor position up front, before
+        // the per-output surface loop, so user-pinned monitors are laid
+        // out before the auto-placed ones — otherwise an unconfigured
+        // second screen would stack on top of a configured one at x=0
+        // instead of landing to its right (see `place_outputs`).
+        let output_sizes: Vec<(String, Size<i32, Physical>)> = drm_outputs
+            .iter()
+            .map(|o| {
+                let (w, h) = o.mode.size();
+                let mode = Size::<i32, Physical>::new(i32::from(w), i32::from(h));
+                let scale = monitors.outputs.get(&o.name).map_or(1.0, |c| c.scale);
+                (o.name.clone(), output_compositor_size(mode, scale))
+            })
+            .collect();
+        let output_positions = place_outputs(monitors, &output_sizes);
 
         for drm_output in drm_outputs {
             let (mode_w, mode_h) = drm_output.mode.size();
@@ -764,21 +823,13 @@ impl Renderer {
                 i32::try_from(drm_output.mode.vrefresh().saturating_mul(1000)).unwrap_or(i32::MAX);
             let output_cfg = monitors.outputs.get(&drm_output.name);
             let scale = output_cfg.map_or(1.0, |c| c.scale);
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "mode pixels are u16-bounded; divided by scale > 0 fits in i32 trivially"
-            )]
-            let compositor_size = Size::<i32, Physical>::new(
-                (f64::from(mode_size.w) / scale).round() as i32,
-                (f64::from(mode_size.h) / scale).round() as i32,
-            );
-            let compositor_position = match output_cfg.and_then(|c| c.position) {
-                Some((x, y)) => Point::<i32, Physical>::from((x, y)),
-                None => Point::<i32, Physical>::from((auto_x, 0)),
-            };
-            if output_cfg.and_then(|c| c.position).is_none() {
-                auto_x = auto_x.saturating_add(compositor_size.w);
-            }
+            let compositor_size = output_compositor_size(mode_size, scale);
+            // Placed in the pre-pass above; every output name is present,
+            // so the fallback is unreachable (kept for panic-freedom).
+            let compositor_position = output_positions
+                .get(&drm_output.name)
+                .copied()
+                .unwrap_or_default();
 
             // Grab the connector before the surface is moved into the
             // GBM swapchain — adaptive-sync support is a connector property.
@@ -1181,26 +1232,23 @@ impl Renderer {
     /// output, clamps the cursor back inside the new bounds, and returns
     /// fresh [`OutputDescriptor`]s for the Wayland layer to re-advertise.
     pub fn reflow_outputs(&mut self, monitors: &MonitorsConfig) -> Vec<OutputDescriptor> {
-        let mut auto_x: i32 = 0;
+        // Refresh scale + compositor size from config first, then assign
+        // non-overlapping positions in a second pass (configured monitors
+        // pinned, the rest packed past them — see `place_outputs`).
         for o in &mut self.outputs {
-            let cfg = monitors.outputs.get(&o.name);
-            let scale = cfg.map_or(1.0, |c| c.scale);
+            let scale = monitors.outputs.get(&o.name).map_or(1.0, |c| c.scale);
             o.scale = scale;
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "mode pixels are u16-bounded; divided by scale > 0 fits in i32 trivially"
-            )]
-            let compositor_size = Size::<i32, Physical>::new(
-                (f64::from(o.mode_size.w) / scale).round() as i32,
-                (f64::from(o.mode_size.h) / scale).round() as i32,
-            );
-            o.compositor_size = compositor_size;
-            o.compositor_position = match cfg.and_then(|c| c.position) {
-                Some((x, y)) => Point::<i32, Physical>::from((x, y)),
-                None => Point::<i32, Physical>::from((auto_x, 0)),
-            };
-            if cfg.and_then(|c| c.position).is_none() {
-                auto_x = auto_x.saturating_add(compositor_size.w);
+            o.compositor_size = output_compositor_size(o.mode_size, scale);
+        }
+        let sizes: Vec<(String, Size<i32, Physical>)> = self
+            .outputs
+            .iter()
+            .map(|o| (o.name.clone(), o.compositor_size))
+            .collect();
+        let positions = place_outputs(monitors, &sizes);
+        for o in &mut self.outputs {
+            if let Some(&pos) = positions.get(&o.name) {
+                o.compositor_position = pos;
             }
         }
 
