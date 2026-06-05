@@ -4,60 +4,49 @@ A Wayland compositor written in pure Rust, configured in Lua.
 
 ## Status
 
-Pre-alpha. Each `cargo run` currently:
+Alpha. A usable single-seat compositor you can run as your daily
+session, though APIs and config may still shift. What works today:
 
-1. Opens a libseat session and enumerates input devices via udev +
-   libinput. Every pointer-capable device gets the configured accel
-   profile + speed applied on `DeviceAdded` (defaults: `Flat` / `0.0`
-   — 1:1 motion, no acceleration ramp).
-2. Opens the first DRM card, picks the first connected output and its
-   preferred mode, then sets up a **GBM + EGL + GLES2 render pipeline**
-   over it (via smithay's `GbmBufferedSurface`).
-3. Each vblank renders the configured wallpaper (default: vertical
-   sky-blue → navy gradient via 256 horizontal stripes) with a pointer
-   cursor that follows mouse motion. The cursor is loaded from the
-   `XCursor` theme named by `$XCURSOR_THEME` (size from `$XCURSOR_SIZE`,
-   default 24), falling back to a built-in white right-triangle when no
-   theme is found. Frame GPU work is fenced before scanout
-   (tearing-free).
-4. Routes every key event through **xkbcommon** for layout-aware
-   keysym + modifier handling, then matches against the keybind list
-   in [`config.binds`](#binds). The default binding fires the `Exit`
-   action on `Super+Shift+E`.
-5. Brings up a minimal **Wayland frontend** — `wl_compositor`,
-   `wl_subcompositor`, `wl_shm`, `wl_seat` (with keyboard + pointer
-   capabilities advertised), `wl_output`, `xdg_wm_base`/
-   `xdg_toplevel`/`xdg_surface`, `wl_data_device_manager` (clipboard +
-   drag-and-drop), `wp_viewporter` + `wp_fractional_scale_manager_v1`
-   (fractional scaling), and `wlr_layer_shell`. Sets `$WAYLAND_DISPLAY`
-   and spawns every `config.startup` command as a child.
-   Decorations are forced **server-side** (and Libreland draws none, so
-   windows are bare): both `zxdg_decoration_manager_v1` and the legacy
-   KDE `org_kde_kwin_server_decoration` are advertised with a Server
-   default, since some toolkits (GTK/Firefox) only honour the KDE one.
-6. Composites every live `xdg_toplevel`'s surface onto the
-   framebuffer between wallpaper and cursor, by uploading each
-   client buffer as a GLES texture and drawing it through smithay's
-   surface render-element pipeline. After each output is queued for
-   scanout, drains the surface tree's `wl_callback` queue so clients
-   know to draw the next frame.
-7. Forwards pointer motion + button events to the focused client
-   through `wl_pointer.motion` / `wl_pointer.button` (plus
-   smithay-driven `enter`/`leave`), and forwards keyboard keys —
-   including modifier tracking — through `wl_keyboard.key` /
-   `wl_keyboard.modifiers`. Compositor-level hotkeys (see
-   `config.binds`) are filtered out of forwarding so e.g. typing in
-   a focused client can't accidentally trigger them. Pointer focus
-   is set by hit-testing the layout each motion; keyboard focus
-   follows the [`input.focus_model`](#input) (`"hover"` by default,
-   `"click"` available). Newly mapped windows take focus on map in
-   either model.
-8. Sits in the calloop event loop until an `Exit` action runs.
+- **Multi-output DRM/KMS** on a **GBM + EGL + GLES2** pipeline (one
+  `GbmBufferedSurface` per connector), with **live hotplug** (connect /
+  disconnect) and per-output `mode` / `position` / `scale` / `vrr`
+  config — all applicable on a live reload (see
+  [Live reload](#live-reload)). The compositor picks a DRM card that can
+  actually drive a display, and handles multi-GPU setups. Frame GPU work
+  is fenced before scanout (tearing-free); **VRR** (adaptive-sync) is
+  supported per-output.
+- **Tiling window management**: a dwindle-style tiling tree plus a
+  floating stack, with **per-output dynamic workspaces** (niri-style —
+  scroll to materialize a fresh workspace, empties compact away).
+  Interactive **move/resize** gestures, fullscreen, maximize, and
+  dialog/child toplevels auto-floated centred. Fractional scaling via
+  `wp_fractional_scale` + `wp_viewporter`.
+- **Rendering niceties**: animated wallpaper (solid / gradient / image /
+  gif / video), window-open/close/move and workspace-slide **animations**,
+  Kawase **backdrop blur**, **rounded corners** and gradient **borders**.
+- **Input**: libinput devices via udev with configurable pointer accel;
+  every key routed through **xkbcommon** for layout-aware hotkeys
+  ([`binds`](#binds)); hover- or click-to-focus.
+- **Wayland protocols**: a broad frontend (xdg-shell, layer-shell,
+  fractional-scale, viewporter, dmabuf, relative-pointer, pointer-
+  constraints, cursor-shape, session-lock, screencopy, the selection +
+  data-control stack, …) — see [Wayland protocols](#wayland-protocols).
+  Decorations are forced **server-side** and Libreland draws none, so
+  windows are bare.
+- **Clipboard** that survives the source app closing, plus clipboard
+  managers via data-control (see [Clipboard & selections](#clipboard--selections)).
+- **Built-in screenshots** ([Screenshots](#screenshots-built-in)),
+  **screen sharing** via `zwlr_screencopy_v1` + xdg-desktop-portal, an
+  **idle** locker / DPMS, and **XWayland** via `xwayland-satellite`.
+- A **control IPC** socket (`libreland msg`) for bars and scripts
+  ([Control IPC](#control-ipc)).
 
 All user-tunable behaviour lives in a single `Config` struct (see
-[Configuration](#configuration)).
+[Configuration](#configuration)) and **hot-reloads** on save.
 
-Still to come: window management (4d).
+Still to come: more bind actions (`reload`, `change_vt`), a
+`GlobalShortcuts` portal backend, per-surface (vs per-output) scale
+tracking, and cross-monitor region screenshots.
 
 ## Configuration
 
@@ -79,20 +68,35 @@ the corresponding default; anything you don't set keeps its default.
 ### Live reload
 
 The config file is watched (its mtime is polled once a second) and
-re-applied on save — no restart needed for most settings. A save that
-fails to parse is logged and **ignored**, leaving the running config
-untouched, so a typo never breaks your session.
+re-applied on save. A save that fails to parse is logged and
+**ignored**, leaving the running config untouched, so a typo never
+breaks your session. You can also force a reload at any time with
+`libreland msg reload`.
 
-Applied live: `binds`, `screenshot`, `input.focus_model`,
-`misc.wallpaper`, the whole `border` section, `layout` gaps, and the
-whole `animations` section. Changing these takes effect on the next
-frame / window reconfigure.
+**Applied live — effectively the whole config:**
 
-Needs a restart (a "restart to apply" line is logged when they change):
-`monitors` (mode/position/scale/primary), the keyboard/pointer
-`input` settings other than `focus_model` (`repeat_rate`,
-`repeat_delay`, `keyboard_layout`, `mouse_accel_*`), `env`, and
-`startup` (`env`/`startup` only act at launch).
+- `binds`, `screenshot`, `input.focus_model` — read live each event.
+- `misc.wallpaper`, the whole `border` section, `layout` gaps, the
+  whole `animations` and `decoration` sections — take effect on the
+  next frame / window reconfigure.
+- `monitors` — `position`, `scale`, `primary` and `vrr` reflow the
+  outputs immediately; a changed `mode` triggers a live DRM modeset
+  (the affected output blinks once, windows are preserved).
+- `input` — `repeat_rate`/`repeat_delay`, `keyboard_layout` (both the
+  keymap clients receive and the one hotkeys match against), and the
+  `mouse_accel_*` settings (re-applied to the connected pointers).
+- `idle` — the new timeouts/command are picked up on the next idle tick.
+- `xwayland` — toggling it starts or stops `xwayland-satellite`
+  (stopping it disconnects any running X11 clients).
+- `env` — applies to **children spawned from now on** (`spawn` binds,
+  the idle lock command, `libreland msg spawn`). Already-running
+  clients are unaffected, and vars the compositor itself consumes
+  (`XCURSOR_*`) still need a restart. The process environment is not
+  mutated at runtime — that's unsafe once worker threads are running —
+  so the values are layered onto each child instead.
+
+**Only a restart re-runs:** `startup` (those commands are one-shot at
+launch; editing the list just logs that it changed).
 
 ### Complete example
 
@@ -178,9 +182,11 @@ decoration = {
     blur = { enabled = true, layers = { "rofi" }, windows = false, passes = 3, radius = 5.0 },
 }
 
--- Environment variables exported into the compositor's own process
--- before any client is launched, so every child (startup commands,
--- `spawn` binds, shells) inherits them. Handy for theming hints.
+-- Environment variables layered onto every child we spawn (startup
+-- commands, `spawn` binds, the idle lock command, `libreland msg
+-- spawn`). Handy for theming hints. Edits apply to children spawned
+-- after the reload; `XCURSOR_*` is also read by the compositor itself
+-- (for its own pointer), which only re-reads it on restart.
 env = {
     XCURSOR_THEME = "Breeze_Light",
     QT_QPA_PLATFORMTHEME = "kde",
@@ -196,19 +202,31 @@ startup = {
 }
 
 -- Run xwayland-satellite at startup for X11 app support (default true).
+-- Toggling on a live reload starts/stops the satellite.
 xwayland = true
+
+-- Built-in idle handling (off by default). Lock the session and/or
+-- power the screens off after a period of no input; any input wakes
+-- the screens. A `0` or omitted timeout disables that action.
+idle = {
+    lock_after_secs       = 300,           -- spawn lock_command after 5 min idle
+    screen_off_after_secs = 600,           -- DPMS the outputs off after 10 min
+    lock_command          = "swaylock -f",  -- a lock client (ext-session-lock-v1)
+}
 ```
 
 ### env
 
 | Field | Default      | State | Notes                                                                          |
 | ----- | ------------ | ----- | ------------------------------------------------------------------------------ |
-| `env` | `{}` (empty) | ✅    | Map of `NAME = "value"` pairs exported via `setenv` at startup, before any child is spawned, so all clients inherit them. Applied before `WAYLAND_DISPLAY` (which can't be overridden). Names can't be empty or contain `=`/NUL. Changing them needs a restart. |
+| `env` | `{}` (empty) | ✅    | Map of `NAME = "value"` pairs. At startup they're exported into the compositor's process (so all clients inherit them); on a live reload they're layered onto each child we spawn from then on (already-running clients are untouched). Names can't be empty or contain `=`/NUL. The process environment is never mutated at runtime — `std::env::set_var` is unsafe once worker threads run — so a reload only changes what new children receive. |
 
 `XCURSOR_THEME` and `XCURSOR_SIZE` set here do double duty: clients
 inherit them *and* the compositor reads them for its own pointer
 cursor, so `env = { XCURSOR_THEME = "Breeze_Light" }` themes both. The
-compositor reads the env once at startup, so a change needs a restart.
+compositor reads those two once at startup, so changing the cursor
+theme/size needs a restart even though other `env` edits apply live to
+new children.
 
 **Session defaults.** Libreland sets these session-identity vars at
 startup so apps and the desktop portal know what they're in — you don't
@@ -236,7 +254,7 @@ They're also pushed (with `WAYLAND_DISPLAY` / `DISPLAY`) into the D-Bus
 
 | Field      | Default | State | Notes |
 | ---------- | ------- | ----- | ----- |
-| `xwayland` | `true`  | ✅    | Run [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite) at startup so X11 apps work. The compositor picks a free X display (`:0`..`:32`), launches the satellite on it, and exports `$DISPLAY`. If the binary isn't installed it's logged and skipped (never fatal). Toggling needs a restart. |
+| `xwayland` | `true`  | ✅    | Run [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite) at startup so X11 apps work. The compositor picks a free X display (`:0`..`:32`), launches the satellite on it, and exports `$DISPLAY` to children. If the binary isn't installed it's logged and skipped (never fatal). Toggling on a live reload starts or stops the satellite — turning it **off** disconnects any running X11 clients from their server. |
 
 XWayland runs **rootless** via `xwayland-satellite`: it connects to
 Libreland as an ordinary Wayland client, so X windows arrive as normal
@@ -246,6 +264,31 @@ scales X apps itself through `wp_fractional_scale` + `wp_viewporter`
 scale). Cursors stay consistent because Libreland draws its own pointer
 over every surface and exports `XCURSOR_THEME`/`XCURSOR_SIZE` to the
 satellite. Requires `xwayland-satellite` (and `Xwayland`) installed.
+
+### idle
+
+Built-in idle handling — lock the session and/or power the screens off
+after a stretch of no input. **Off by default** (omit the `idle` table
+to disable it entirely). Any input (key, pointer motion, button) resets
+the idle timer and wakes powered-off screens.
+
+| Field                   | Default | State | Notes                                                                                                              |
+| ----------------------- | ------- | ----- | ---------------------------------------------------------------------------------------------------------------- |
+| `lock_after_secs`       | `nil`   | ✅    | Seconds of inactivity before `lock_command` is spawned. `0` or omitted = never lock. Negative is an error.        |
+| `screen_off_after_secs` | `nil`   | ✅    | Seconds of inactivity before the outputs are powered off via DPMS. `0` or omitted = never power off. Any input wakes them. |
+| `lock_command`          | `nil`   | ✅    | Command spawned at the lock threshold — whitespace-split into program + args (no shell), same rules as `startup`. Typically a lock client speaking `ext-session-lock-v1` (e.g. `swaylock`, `quickshell`). Without it, `lock_after_secs` does nothing. |
+
+Read live each idle tick, so edits apply without a restart. The lock is
+spawned at most once per idle period; it re-arms after the session
+unlocks.
+
+```lua
+idle = {
+    lock_after_secs       = 300,            -- lock after 5 min idle
+    screen_off_after_secs = 600,            -- screens off after 10 min
+    lock_command          = "swaylock -f",
+}
+```
 
 ### Modifier names (case-insensitive)
 
@@ -262,9 +305,10 @@ Anything xkbcommon's `xkb_keysym_from_name` accepts — `"E"`,
 | Action              | Effect                                                                                                       |
 | ------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `"exit"`            | Cleanly exit the compositor.                                                                                 |
-| `"togglefloating"`  | Flip the focused window between tiled and floating. A newly floating window centres at ~70% of its previous cell. |
-| `"close"`           | Politely ask the focused toplevel to close (`xdg_toplevel.close`). The client runs its own close path, so it may prompt or ignore the request. Aliases: `"closewindow"`, `"kill"`. |
-| `"spawn"`           | Run an arbitrary command. Requires an additional `command = "…"` field on the bind table; the string is whitespace-split into program + args, children inherit our env (so `$WAYLAND_DISPLAY` reaches them). Wrap with `"sh -c '…'"` for shell features (pipes, env, `&`). |
+| `"togglefloating"`  | Flip the focused window between tiled and floating. A newly floating window centres at ~70% of its previous cell. Alias: `"toggle_floating"`. |
+| `"togglefullscreen"`| Flip the focused window in/out of fullscreen. Aliases: `"toggle_fullscreen"`, `"fullscreen"`.                |
+| `"close"`           | Politely ask the focused toplevel to close (`xdg_toplevel.close`). The client runs its own close path, so it may prompt or ignore the request. Aliases: `"closewindow"`, `"close_window"`, `"kill"`. |
+| `"spawn"`           | Run an arbitrary command. Requires an additional `command = "…"` field on the bind table; the string is whitespace-split into program + args, children inherit our env (so `$WAYLAND_DISPLAY`, the configured `env`, and X `$DISPLAY` reach them). Wrap with `"sh -c '…'"` for shell features (pipes, env, `&`). |
 
 (More actions land as features grow: `"reload"`, `"change_vt"`, …)
 
@@ -279,7 +323,7 @@ the runtime today (✅) or just held in `Config` for a later consumer
 | Field                    | Default  | State | Notes                                                                                                                                                                                                                                                                                                          |
 | ------------------------ | -------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `outputs[name].mode`     | `nil`    | ✅    | `{ width = …, height = …, refresh_mhz = … }` to force a mode. The override is matched against the EDID mode list by size and refresh (mHz); on a miss it logs and falls back to the EDID-preferred mode. `nil` uses EDID-preferred directly.                                                                   |
-| `outputs[name].position` | `nil`    | ✅    | Top-left of this output in the virtual layout, in *logical* pixels (`{ x = …, y = … }`). `nil` falls back to the auto left-to-right layout. Mixing configured and auto-positioned outputs is fine; positions can overlap if you let them.                                                                       |
+| `outputs[name].position` | `nil`    | ✅    | Top-left of this output in the virtual layout, in *logical* pixels (`{ x = …, y = … }`). `nil` falls back to the auto left-to-right layout. Mixing configured and auto-positioned outputs is fine. Outputs are never allowed to overlap: a configured position is honoured exactly unless it would collide with an already-placed output (e.g. a live `scale` change widens a monitor past its neighbour's `x`), in which case it's nudged right just enough to clear the collision — only on the X axis, so vertical/stacked layouts (same `x`, different `y`) keep their exact position. The shift is logged. |
 | `outputs[name].scale`    | `1.0`    | ✅    | Fractional scale. The renderer scales every layout coordinate from compositor (= logical) to physical by this factor. Clients see the exact fractional value via `wp_fractional_scale_manager_v1` and a rounded integer fallback via `wl_output.scale`; `wp_viewporter` is advertised so fractional-aware clients can map their oversized buffer down to the logical rect (without it their content composites at the wrong size). Must be positive. Per-surface scale tracking is single-output for now — every surface gets the primary's scale until per-output workspaces ship. |
 | `outputs[name].vrr`      | `"auto"` | ✅    | Variable Refresh Rate (adaptive-sync / FreeSync / G-Sync) policy. `"auto"` enables VRR only while a window fills this output (fullscreen or maximized) — where it actually helps (games, fullscreen video) — and disables it on the desktop, avoiding the flicker some panels show under idle VRR. `"always"` keeps it on; `"off"` never uses it. A no-op on outputs whose connector doesn't advertise adaptive-sync (logged at startup as `vrr_support=NotSupported`). On DisplayPort toggling is seamless; on HDMI the kernel currently needs a modeset (brief blink) to switch, which Libreland performs automatically. |
 | `primary`                | `nil`    | ✅    | Connector name of the primary output. The tile area's bounds + the initial cursor position come from this output. `nil` falls back to the first connected output in DRM enumeration order.                                                                                                                      |
@@ -288,11 +332,11 @@ the runtime today (✅) or just held in `Config` for a later consumer
 
 | Field                  | Default  | State                            | Notes                                                                                      |
 | ---------------------- | -------- | -------------------------------- | ------------------------------------------------------------------------------------------ |
-| `repeat_rate`          | `25`     | ✅                               | Repeats per second after the delay elapses. 25 matches X11's classic default. Passed to `wl_keyboard` via the seat at startup. |
-| `repeat_delay`         | `600`    | ✅                               | Milliseconds before repeat fires. Passed to `wl_keyboard` at startup.                      |
-| `keyboard_layout`      | `""`     | ✅                               | xkb RMLVO layout. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default.                  |
-| `mouse_accel_profile`  | `"flat"` | ✅ (applied per pointer device)  | `"flat"` (1:1, no ramp) or `"adaptive"` (libinput's curve, system default).                |
-| `mouse_accel_speed`    | `0.0`    | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `"flat"` this is "no extra sensitivity". |
+| `repeat_rate`          | `25`     | ✅                               | Repeats per second after the delay elapses. 25 matches X11's classic default. Sent to the seat keyboard; re-applied live on reload. |
+| `repeat_delay`         | `600`    | ✅                               | Milliseconds before repeat fires. Re-applied live on reload.                               |
+| `keyboard_layout`      | `""`     | ✅                               | xkb RMLVO layout. Empty defers to `$XKB_DEFAULT_LAYOUT` / system default. On a live reload the seat keymap (what clients receive) and the compositor's own hotkey-matching keymap are both rebuilt. |
+| `mouse_accel_profile`  | `"flat"` | ✅ (applied per pointer device)  | `"flat"` (1:1, no ramp) or `"adaptive"` (libinput's curve, system default). Re-applied to every connected pointer on reload. |
+| `mouse_accel_speed`    | `0.0`    | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `"flat"` this is "no extra sensitivity". Re-applied live on reload. |
 | `focus_model`          | `"hover"`| ✅                               | `"hover"`: keyboard focus follows the surface under the cursor on every motion event. `"click"`: focus only changes on a pointer-button press. New windows take focus on map either way. |
 
 ### binds
@@ -305,6 +349,7 @@ Built-in defaults:
 
 - `Super+Shift+E → exit`
 - `Super+F → togglefloating`
+- `Super+F11 → togglefullscreen`
 - `Super+C → close`
 
 Your `binds` table is **merged on top of** these defaults, not
@@ -313,8 +358,8 @@ default overrides that default's action, and any default you don't
 touch stays active. So adding a single `Super+Space` bind keeps
 `Super+Shift+E` and `Super+F` working.
 
-Available actions today: `exit`, `togglefloating`, `close`, `spawn`.
-The list grows as we add `reload`, `change_vt`, …
+Available actions today: `exit`, `togglefloating`, `togglefullscreen`,
+`close`, `spawn`. The list grows as we add `reload`, `change_vt`, …
 
 ### misc
 
@@ -563,6 +608,36 @@ above is in place. Global shortcuts (the `GlobalShortcuts` portal) are
 not yet provided — no off-the-shelf backend covers them for us, so they
 need a dedicated Libreland backend (planned).
 
+## Clipboard & selections
+
+Both the regular clipboard (`Ctrl+C`/`Ctrl+V`) and the primary
+selection (highlight-to-copy, middle-click-to-paste) work out of the
+box — `wl_data_device_manager` and `zwp_primary_selection_v1` are
+advertised, and drag-and-drop rides the same machinery (the drag icon
+is composited at the cursor).
+
+**Copies survive the source app closing.** In stock Wayland a selection
+is owned by the client that set it, so it dies when that client exits.
+Libreland avoids that "copy something, close the app, paste is empty"
+trap by eagerly **caching every selection** (clipboard *and* primary)
+and taking server-side ownership of it — the built-in equivalent of
+[`wl-clip-persist`](https://github.com/Linus789/wl-clip-persist), no
+external daemon needed. A single copy larger than **128 MiB** isn't
+cached (the source keeps ownership — normal Wayland behaviour, just no
+cross-close persistence) so a huge copy can't balloon compositor memory.
+
+**Clipboard managers work** via the data-control protocols. Both
+[`zwlr_data_control_v1`](https://wayland.app/protocols/wlr-data-control-unstable-v1)
+(v2, what most current tools target) and the standardized successor
+[`ext_data_control_v1`](https://wayland.app/protocols/ext-data-control-v1)
+(v1) are advertised, with the primary selection exposed through them as
+well. So `cliphist`, `clipman`, `copyq`, and `wl-paste --watch` can
+observe every new selection and set their own. Any client may bind them
+(these protocols grant unrestricted clipboard read by design).
+
+The [built-in screenshot tool](#screenshots-built-in) can put a PNG
+straight on the clipboard (`clipboard = true`), served as `image/png`.
+
 ## Control IPC
 
 Libreland exposes a control socket for querying and driving the
@@ -662,6 +737,30 @@ A minimal "focused window title" bar module:
         echo $line | jq -r '.window.title // "—"'
     end
 
+## Wayland protocols
+
+The globals Libreland advertises to clients. (Core globals like
+`wl_compositor`, `wl_subcompositor`, `wl_shm` and `wl_seat` are always
+present and elided here.)
+
+| Global                                                         | Purpose                                                                 |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `wl_output` + `xdg_output_manager_v1`                          | Output geometry, mode, scale, logical position.                         |
+| `xdg_wm_base` (xdg-shell)                                      | Application windows (`xdg_toplevel` / `xdg_popup`).                      |
+| `zwlr_layer_shell_v1`                                          | Bars, panels, launchers, lock screens, OSDs.                            |
+| `zxdg_decoration_manager_v1` + `org_kde_kwin_server_decoration` | Decoration negotiation — both advertise a **Server** default, so toolkits drop their CSD titlebars (Libreland draws none). |
+| `wp_fractional_scale_manager_v1`                               | Exact fractional output scale to clients.                               |
+| `wp_viewporter`                                                | Buffer crop/scale — required for fractional scaling.                    |
+| `zwp_linux_dmabuf_v1` (v4 feedback, v3 fallback)               | GPU buffer sharing (GPU-composited + XWayland/glamor clients).          |
+| `wp_cursor_shape_v1`                                           | Named cursor shapes the compositor themes.                              |
+| `zwp_relative_pointer_manager_v1`                              | Raw relative motion deltas (mouse-look in games).                       |
+| `zwp_pointer_constraints_v1`                                   | Pointer lock / confinement (FPS games).                                 |
+| `wl_data_device_manager`                                       | Clipboard + drag-and-drop.                                              |
+| `zwp_primary_selection_v1`                                     | Primary (middle-click) selection.                                       |
+| `zwlr_data_control_v1` (v2) + `ext_data_control_v1` (v1)       | Clipboard managers — see [Clipboard & selections](#clipboard--selections). |
+| `ext_session_lock_v1`                                          | Screen lockers (used by the [idle](#idle) locker).                      |
+| `zwlr_screencopy_v1`                                           | Output capture — screenshots + screen sharing via the portal.           |
+
 ## Running
 
 Switch to a free TTY (e.g. `Ctrl+Alt+F2`), log in, then:
@@ -717,9 +816,10 @@ dev profile gets fast linking.
 
 ## Code quality
 
-- Edition 2024, Rust `1.95.0` (pinned in `rust-toolchain.toml`).
-- `#[deny(unsafe_code)]` at the crate root; any unsafe must override with
-  `#[allow(unsafe_code, reason = "…")]` and ship with a `// SAFETY:` comment.
+- Edition 2024, Rust `1.95.0` (pinned in `rust-toolchain.toml`; distro-
+  packaged toolchains use whatever rustc they ship).
+- `unsafe_code = "deny"` in `Cargo.toml` `[lints]`; any unsafe must override
+  with `#[allow(unsafe_code, reason = "…")]` and ship with a `// SAFETY:` comment.
 - `clippy::all` denied, `clippy::pedantic` warned. Warnings are fixed at the
   source — `#[allow]` is only acceptable with a `reason = "…"`.
 - Always `cargo clippy` and `cargo fmt --check` clean before committing.
