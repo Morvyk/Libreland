@@ -282,6 +282,12 @@ Read live each idle tick, so edits apply without a restart. The lock is
 spawned at most once per idle period; it re-arms after the session
 unlocks.
 
+**Idle inhibitors are honoured.** While any client holds a
+`zwp_idle_inhibitor_v1` (video players, presentation tools, etc. create
+one during playback), both the lock and the screen-off are suppressed,
+and the idle countdown restarts cleanly once the inhibitor goes away —
+so watching a video doesn't blank or lock the screen.
+
 ```lua
 idle = {
     lock_after_secs       = 300,            -- lock after 5 min idle
@@ -751,10 +757,11 @@ present and elided here.)
 | `zxdg_decoration_manager_v1` + `org_kde_kwin_server_decoration` | Decoration negotiation — both advertise a **Server** default, so toolkits drop their CSD titlebars (Libreland draws none). |
 | `wp_fractional_scale_manager_v1`                               | Exact fractional output scale to clients.                               |
 | `wp_viewporter`                                                | Buffer crop/scale — required for fractional scaling.                    |
-| `zwp_linux_dmabuf_v1` (v4 feedback, v3 fallback)               | GPU buffer sharing (GPU-composited + XWayland/glamor clients).          |
+| `zwp_linux_dmabuf_v1` (v5 default feedback, v3 fallback)       | GPU buffer sharing (GPU-composited + XWayland/glamor clients).          |
 | `wp_cursor_shape_v1`                                           | Named cursor shapes the compositor themes.                              |
 | `zwp_relative_pointer_manager_v1`                              | Raw relative motion deltas (mouse-look in games).                       |
 | `zwp_pointer_constraints_v1`                                   | Pointer lock / confinement (FPS games).                                 |
+| `zwp_idle_inhibit_manager_v1`                                  | Clients (e.g. video players) inhibit idle while a surface is up — see [idle](#idle). |
 | `wl_data_device_manager`                                       | Clipboard + drag-and-drop.                                              |
 | `zwp_primary_selection_v1`                                     | Primary (middle-click) selection.                                       |
 | `zwlr_data_control_v1` (v2) + `ext_data_control_v1` (v1)       | Clipboard managers — see [Clipboard & selections](#clipboard--selections). |

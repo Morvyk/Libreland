@@ -46,7 +46,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
-use smithay::utils::{Logical, Physical, Point, SERIAL_COUNTER};
+use smithay::utils::{IsAlive, Logical, Physical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
@@ -291,6 +291,15 @@ pub(crate) struct State {
     pub(crate) idle_last_input: std::time::Instant,
     pub(crate) idle_screen_off: bool,
     pub(crate) idle_lock_spawned: bool,
+    /// `zwp_idle_inhibit_manager_v1` global. Held so it stays registered;
+    /// dispatch routes through `State`.
+    #[allow(dead_code, reason = "held to keep the idle-inhibit global alive")]
+    pub(crate) idle_inhibit_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState,
+    /// Surfaces holding an active idle inhibitor (e.g. a playing video).
+    /// While any is alive, `idle_tick` suppresses the built-in lock/DPMS.
+    /// Populated by the `IdleInhibitHandler`; pruned of dead surfaces each
+    /// tick (a crashed client never sends the clean destroy).
+    pub(crate) idle_inhibitors: std::collections::HashSet<WlSurface>,
     /// `ext-session-lock-v1` manager global. Held so the global stays
     /// registered; dispatch routes through `State`.
     pub(crate) session_lock_state: smithay::wayland::session_lock::SessionLockManagerState,
@@ -689,9 +698,20 @@ impl State {
     /// set. The lock command spawns once per idle period (re-armed when the
     /// session unlocks); the screen-off fires once and is undone by input.
     pub(crate) fn idle_tick(&mut self) {
+        // Drop inhibitors whose surface died without a clean destroy (a
+        // crashed client never sends one), so a stale one can't pin the
+        // screen on forever.
+        self.idle_inhibitors.retain(IsAlive::alive);
         let Some(idle) = self.config.idle.clone() else {
             return;
         };
+        if !self.idle_inhibitors.is_empty() {
+            // An idle inhibitor (e.g. a playing video) is active: count it
+            // as activity so lock/DPMS never fire and the idle countdown
+            // restarts cleanly once the inhibitor goes away.
+            self.note_input_activity();
+            return;
+        }
         let idle_for = self.idle_last_input.elapsed();
         if let Some(after) = idle.lock_after
             && idle_for >= after
@@ -3376,6 +3396,8 @@ fn main() -> Result<()> {
         idle_last_input: std::time::Instant::now(),
         idle_screen_off: false,
         idle_lock_spawned: false,
+        idle_inhibit_state: wayland_init.idle_inhibit_state,
+        idle_inhibitors: std::collections::HashSet::new(),
         session_lock_state,
         lock_surfaces: std::collections::HashMap::new(),
         session_locked: false,

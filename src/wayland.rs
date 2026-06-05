@@ -22,6 +22,7 @@ use smithay::delegate_cursor_shape;
 use smithay::delegate_data_control;
 use smithay::delegate_data_device;
 use smithay::delegate_ext_data_control;
+use smithay::delegate_idle_inhibit;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_kde_decoration;
@@ -75,6 +76,7 @@ use smithay::wayland::selection::data_device::{
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
 };
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use smithay::wayland::selection::wlr_data_control::{
     DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
 };
@@ -191,6 +193,9 @@ pub struct WaylandInit {
     /// `ext_data_control_manager_v1` — the standardized successor to
     /// `wlr_data_control`, same role. Held so the global stays alive.
     pub ext_data_control_state: ExtDataControlState,
+    /// `zwp_idle_inhibit_manager_v1` — clients inhibit idle (lock/DPMS)
+    /// while a surface is up. Held so the global stays alive.
+    pub idle_inhibit_state: IdleInhibitManagerState,
     /// `zwlr_screencopy_manager_v1` — output capture for screenshots
     /// and screen sharing. Held so the global stays alive.
     pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
@@ -350,6 +355,10 @@ pub fn init(
         WlrDataControlState::new::<State, _>(&dh, Some(&primary_selection_state), |_| true);
     let ext_data_control_state =
         ExtDataControlState::new::<State, _>(&dh, Some(&primary_selection_state), |_| true);
+    // zwp_idle_inhibit_manager_v1: lets a client (e.g. a video player)
+    // ask us not to idle while its surface is up. We honour it by
+    // suppressing the built-in lock/DPMS (see `State::idle_tick`).
+    let idle_inhibit_state = IdleInhibitManagerState::new::<State>(&dh);
     // zwlr_screencopy_manager_v1: lets grim / xdg-desktop-portal-wlr
     // capture outputs for screenshots and screen sharing.
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
@@ -423,6 +432,7 @@ pub fn init(
         primary_selection_state,
         wlr_data_control_state,
         ext_data_control_state,
+        idle_inhibit_state,
         screencopy_manager,
         popup_manager,
         outputs,
@@ -988,6 +998,21 @@ impl ExtDataControlHandler for State {
     }
 }
 
+// idle-inhibit: a client (typically a video player) holds an inhibitor
+// while its surface is up so the session doesn't idle. We just track the
+// inhibiting surfaces; `State::idle_tick` suppresses the built-in
+// lock/DPMS while any is alive. smithay calls `uninhibit` on a clean
+// destroy; a crashed client's stale surface is pruned in `idle_tick`.
+impl IdleInhibitHandler for State {
+    fn inhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibitors.insert(surface);
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibitors.remove(&surface);
+    }
+}
+
 // GPU buffer sharing. When a client (or Xwayland via the satellite)
 // offers a dmabuf, try to import it into the GLES renderer and accept
 // or reject accordingly — a rejected buffer makes the client fall
@@ -1192,6 +1217,7 @@ delegate_cursor_shape!(State);
 delegate_primary_selection!(State);
 delegate_data_control!(State);
 delegate_ext_data_control!(State);
+delegate_idle_inhibit!(State);
 smithay::delegate_session_lock!(State);
 
 impl SessionLockHandler for State {
