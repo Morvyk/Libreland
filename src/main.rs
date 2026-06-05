@@ -75,21 +75,6 @@ mod screencopy;
 mod screenshot;
 mod wayland;
 
-/// Mutable state threaded through every event-loop callback.
-///
-/// Holds the existing libseat / DRM / renderer / xkb / config state
-/// plus the Wayland frontend substate added in milestone 4a
-/// (compositor, shm, seat, `xdg_shell`, `output_manager`). The owned
-/// `Display<State>` itself can't live here (the type would be
-/// circular), so it sits beside `State` in [`LoopData`].
-///
-/// All fields are `pub(crate)` so handler impls in sibling modules
-/// (especially [`crate::wayland`]) can reach them directly without
-/// every field needing its own accessor method.
-#[allow(
-    clippy::struct_field_names,
-    reason = "the *_state suffix is smithay's convention and matches each field's type name; renaming would just diverge from upstream docs"
-)]
 /// Walk subsurface parents up to the root surface, so a subsurface commit
 /// resolves to the toplevel (or layer surface) it belongs to.
 fn root_surface(surface: &WlSurface) -> WlSurface {
@@ -118,6 +103,21 @@ enum RedrawState {
     WaitingForVblank { dirty: bool },
 }
 
+/// Mutable state threaded through every event-loop callback.
+///
+/// Holds the existing libseat / DRM / renderer / xkb / config state
+/// plus the Wayland frontend substate added in milestone 4a
+/// (compositor, shm, seat, `xdg_shell`, `output_manager`). The owned
+/// `Display<State>` itself can't live here (the type would be
+/// circular), so it sits beside `State` in [`LoopData`].
+///
+/// All fields are `pub(crate)` so handler impls in sibling modules
+/// (especially [`crate::wayland`]) can reach them directly without
+/// every field needing its own accessor method.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the *_state suffix is smithay's convention and matches each field's type name; renaming would just diverge from upstream docs"
+)]
 pub(crate) struct State {
     /// The libseat session is retained so future code can query its
     /// active flag and switch VTs. libinput already holds an internal
@@ -304,6 +304,17 @@ pub(crate) struct State {
     /// `PrimarySelectionHandler` impl; held so the global stays alive.
     pub(crate) primary_selection_state:
         smithay::wayland::selection::primary_selection::PrimarySelectionState,
+    /// `zwlr_data_control_manager_v1` global — privileged selection
+    /// access for clipboard managers (cliphist, clipman, `wl-paste
+    /// --watch`). Read by the wlr `DataControlHandler` impl; held so
+    /// the global stays alive.
+    pub(crate) wlr_data_control_state:
+        smithay::wayland::selection::wlr_data_control::DataControlState,
+    /// `ext_data_control_manager_v1` global — the standardized
+    /// successor to `wlr_data_control`, same role. Read by the ext
+    /// `DataControlHandler` impl; held so the global stays alive.
+    pub(crate) ext_data_control_state:
+        smithay::wayland::selection::ext_data_control::DataControlState,
     /// Compositor-side clipboard + primary-selection caches, so a
     /// copied buffer survives the source client closing. See
     /// [`crate::clipboard`].
@@ -3171,6 +3182,8 @@ fn main() -> Result<()> {
         relative_pointer_state: wayland_init.relative_pointer_state,
         pointer_constraints_state: wayland_init.pointer_constraints_state,
         primary_selection_state: wayland_init.primary_selection_state,
+        wlr_data_control_state: wayland_init.wlr_data_control_state,
+        ext_data_control_state: wayland_init.ext_data_control_state,
         clipboard: clipboard::Selections::default(),
         screencopy_manager: wayland_init.screencopy_manager,
         screencopy_pending: Vec::new(),

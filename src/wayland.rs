@@ -19,7 +19,9 @@ use anyhow::{Context as _, Result};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_cursor_shape;
+use smithay::delegate_data_control;
 use smithay::delegate_data_device;
+use smithay::delegate_ext_data_control;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_kde_decoration;
@@ -72,6 +74,12 @@ use smithay::wayland::selection::data_device::{
 };
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
+use smithay::wayland::selection::wlr_data_control::{
+    DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
+};
+use smithay::wayland::selection::ext_data_control::{
+    DataControlHandler as ExtDataControlHandler, DataControlState as ExtDataControlState,
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -176,6 +184,13 @@ pub struct WaylandInit {
     /// `zwp_primary_selection_v1` — the primary (middle-click) selection.
     /// Held so the global stays alive.
     pub primary_selection_state: PrimarySelectionState,
+    /// `zwlr_data_control_manager_v1` — privileged selection access for
+    /// clipboard managers (wlroots flavour). Read by the
+    /// `DataControlHandler` impl; held so the global stays alive.
+    pub wlr_data_control_state: WlrDataControlState,
+    /// `ext_data_control_manager_v1` — the standardized successor to
+    /// `wlr_data_control`, same role. Held so the global stays alive.
+    pub ext_data_control_state: ExtDataControlState,
     /// `zwlr_screencopy_manager_v1` — output capture for screenshots
     /// and screen sharing. Held so the global stays alive.
     pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
@@ -321,6 +336,20 @@ pub fn init(
     // (see crate::clipboard) so a copied buffer survives the source app
     // exiting.
     let primary_selection_state = PrimarySelectionState::new::<State>(&dh);
+    // zwlr_data_control_manager_v1 + ext_data_control_manager_v1:
+    // privileged selection access for clipboard managers (cliphist,
+    // clipman, `wl-paste --watch`) — they read every new selection and
+    // can set their own. We advertise both the wlroots protocol (what
+    // current tooling targets) and its standardized successor `ext`.
+    // Both reuse our `SelectionHandler`, so the compositor's clipboard
+    // cache backs them with no extra plumbing. Passing
+    // `primary_selection_state` also exposes the middle-click primary
+    // selection; the `|_| true` filter lets any client bind (these
+    // protocols grant unrestricted clipboard read, by design).
+    let wlr_data_control_state =
+        WlrDataControlState::new::<State, _>(&dh, Some(&primary_selection_state), |_| true);
+    let ext_data_control_state =
+        ExtDataControlState::new::<State, _>(&dh, Some(&primary_selection_state), |_| true);
     // zwlr_screencopy_manager_v1: lets grim / xdg-desktop-portal-wlr
     // capture outputs for screenshots and screen sharing.
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
@@ -392,6 +421,8 @@ pub fn init(
         relative_pointer_state,
         pointer_constraints_state,
         primary_selection_state,
+        wlr_data_control_state,
+        ext_data_control_state,
         screencopy_manager,
         popup_manager,
         outputs,
@@ -941,6 +972,22 @@ impl PrimarySelectionHandler for State {
     }
 }
 
+// data-control (wlr + ext): both protocols drive selections through the
+// shared `SelectionHandler` above, so a clipboard manager setting the
+// selection routes through `crate::clipboard` exactly like a normal
+// client would — no extra handling needed beyond exposing the state.
+impl WlrDataControlHandler for State {
+    fn data_control_state(&self) -> &WlrDataControlState {
+        &self.wlr_data_control_state
+    }
+}
+
+impl ExtDataControlHandler for State {
+    fn data_control_state(&self) -> &ExtDataControlState {
+        &self.ext_data_control_state
+    }
+}
+
 // GPU buffer sharing. When a client (or Xwayland via the satellite)
 // offers a dmabuf, try to import it into the GLES renderer and accept
 // or reject accordingly — a rejected buffer makes the client fall
@@ -1143,6 +1190,8 @@ delegate_relative_pointer!(State);
 delegate_pointer_constraints!(State);
 delegate_cursor_shape!(State);
 delegate_primary_selection!(State);
+delegate_data_control!(State);
+delegate_ext_data_control!(State);
 smithay::delegate_session_lock!(State);
 
 impl SessionLockHandler for State {
