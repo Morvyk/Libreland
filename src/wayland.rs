@@ -24,6 +24,7 @@ use smithay::delegate_data_device;
 use smithay::delegate_ext_data_control;
 use smithay::delegate_idle_inhibit;
 use smithay::delegate_idle_notify;
+use smithay::delegate_xdg_activation;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_kde_decoration;
@@ -79,6 +80,9 @@ use smithay::wayland::selection::primary_selection::{
 };
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::wayland::selection::wlr_data_control::{
     DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
 };
@@ -198,6 +202,9 @@ pub struct WaylandInit {
     /// `zwp_idle_inhibit_manager_v1` — clients inhibit idle (lock/DPMS)
     /// while a surface is up. Held so the global stays alive.
     pub idle_inhibit_state: IdleInhibitManagerState,
+    /// `xdg_activation_v1` — clients request focus/raise for a surface.
+    /// Read by the `XdgActivationHandler` impl.
+    pub xdg_activation_state: XdgActivationState,
     /// `zwlr_screencopy_manager_v1` — output capture for screenshots
     /// and screen sharing. Held so the global stays alive.
     pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
@@ -361,6 +368,10 @@ pub fn init(
     // ask us not to idle while its surface is up. We honour it by
     // suppressing the built-in lock/DPMS (see `State::idle_tick`).
     let idle_inhibit_state = IdleInhibitManagerState::new::<State>(&dh);
+    // xdg_activation_v1: lets a client request focus for a surface (open
+    // a link → the browser raises, notification click → app raises). We
+    // reveal + focus the target if the token is fresh.
+    let xdg_activation_state = XdgActivationState::new::<State>(&dh);
     // zwlr_screencopy_manager_v1: lets grim / xdg-desktop-portal-wlr
     // capture outputs for screenshots and screen sharing.
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
@@ -435,6 +446,7 @@ pub fn init(
         wlr_data_control_state,
         ext_data_control_state,
         idle_inhibit_state,
+        xdg_activation_state,
         screencopy_manager,
         popup_manager,
         outputs,
@@ -1027,6 +1039,29 @@ impl IdleNotifierHandler for State {
     }
 }
 
+// xdg-activation: a client asks us to focus a surface (it has a token it
+// got from another client — e.g. a terminal handing a token to the
+// program it launches). We honour it as a reveal + keyboard focus,
+// ignoring stale tokens as basic focus-stealing prevention.
+impl XdgActivationHandler for State {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn request_activation(
+        &mut self,
+        _token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        // Drop activations older than 10 s: a token that's been sitting
+        // around shouldn't be able to yank focus out from under you.
+        if token_data.timestamp.elapsed().as_secs() < 10 {
+            self.focus_surface(&surface);
+        }
+    }
+}
+
 // GPU buffer sharing. When a client (or Xwayland via the satellite)
 // offers a dmabuf, try to import it into the GLES renderer and accept
 // or reject accordingly — a rejected buffer makes the client fall
@@ -1233,6 +1268,7 @@ delegate_data_control!(State);
 delegate_ext_data_control!(State);
 delegate_idle_inhibit!(State);
 delegate_idle_notify!(State);
+delegate_xdg_activation!(State);
 smithay::delegate_session_lock!(State);
 
 impl SessionLockHandler for State {

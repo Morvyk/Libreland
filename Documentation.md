@@ -753,6 +753,7 @@ present and elided here.)
 | -------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `wl_output` + `xdg_output_manager_v1`                          | Output geometry, mode, scale, logical position.                         |
 | `xdg_wm_base` (xdg-shell)                                      | Application windows (`xdg_toplevel` / `xdg_popup`).                      |
+| `xdg_activation_v1`                                            | A client requests focus/raise for a surface (link opens → browser raises). Honoured as reveal + focus; stale tokens (>10 s) ignored. |
 | `zwlr_layer_shell_v1`                                          | Bars, panels, launchers, lock screens, OSDs.                            |
 | `zxdg_decoration_manager_v1` + `org_kde_kwin_server_decoration` | Decoration negotiation — both advertise a **Server** default, so toolkits drop their CSD titlebars (Libreland draws none). |
 | `wp_fractional_scale_manager_v1`                               | Exact fractional output scale to clients.                               |

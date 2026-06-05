@@ -752,21 +752,7 @@ mod server {
 
     fn focus_window(state: &mut State, id: u64) -> Reply {
         let surface = resolve(state, Some(id))?;
-        // Reveal the window's workspace first so a focus request for a
-        // window on a hidden workspace actually shows it.
-        if let Some(entry) = state
-            .layout
-            .window_entries()
-            .into_iter()
-            .find(|e| e.surface == surface)
-        {
-            state
-                .layout
-                .switch_workspace_to(&entry.output, entry.workspace);
-        }
-        if let Some(kbd) = state.seat.get_keyboard() {
-            kbd.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
-        }
+        state.focus_surface(&surface);
         Ok(Response::Handled)
     }
 

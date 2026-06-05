@@ -301,6 +301,9 @@ pub(crate) struct State {
     /// dispatch routes through `State`.
     #[allow(dead_code, reason = "held to keep the idle-inhibit global alive")]
     pub(crate) idle_inhibit_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState,
+    /// `xdg_activation_v1` global — read by the `XdgActivationHandler`
+    /// impl to focus a surface a client asks to raise.
+    pub(crate) xdg_activation_state: smithay::wayland::xdg_activation::XdgActivationState,
     /// Surfaces holding an active idle inhibitor (e.g. a playing video).
     /// While any is alive, `idle_tick` suppresses the built-in lock/DPMS.
     /// Populated by the `IdleInhibitHandler`; pruned of dead surfaces each
@@ -700,6 +703,28 @@ impl State {
         self.idle_inhibitors.retain(IsAlive::alive);
         self.idle_notifier
             .set_is_inhibited(!self.idle_inhibitors.is_empty());
+    }
+
+    /// Reveal and keyboard-focus a managed surface: switch to its
+    /// workspace first (so focusing a window on a hidden workspace shows
+    /// it), then move keyboard focus and repaint. No-op if the surface
+    /// isn't a managed window. Shared by `xdg_activation` and the IPC
+    /// `focus-window`.
+    pub(crate) fn focus_surface(&mut self, surface: &WlSurface) {
+        let Some(entry) = self
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| &e.surface == surface)
+        else {
+            return;
+        };
+        self.layout
+            .switch_workspace_to(&entry.output, entry.workspace);
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+        }
+        self.queue_redraw_all();
     }
 
     /// Idle-timer tick: spawn the lock command and/or DPMS the screens off once
@@ -3415,6 +3440,7 @@ fn main() -> Result<()> {
         idle_notifier,
         idle_inhibit_state: wayland_init.idle_inhibit_state,
         idle_inhibitors: std::collections::HashSet::new(),
+        xdg_activation_state: wayland_init.xdg_activation_state,
         session_lock_state,
         lock_surfaces: std::collections::HashMap::new(),
         session_locked: false,
