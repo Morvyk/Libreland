@@ -251,6 +251,47 @@ fn build_output(
     }))
 }
 
+/// Rebuild a [`DrmOutput`] for an *already-connected* connector on a
+/// specific, now-free CRTC, honouring the current mode override in
+/// `monitors`. Used for live mode changes on config reload: the caller
+/// drops the output's old surface (which frees its CRTC) and hands that
+/// same CRTC back here, so the modeset stays on the connector's existing
+/// pipe and no other output is disturbed. Unlike [`build_output`] this
+/// does not search for a free CRTC — it reuses the one given.
+pub fn rebuild_output_mode(
+    device: &mut DrmDevice,
+    connector: connector::Handle,
+    crtc: crtc::Handle,
+    monitors: &MonitorsConfig,
+) -> Result<DrmOutput> {
+    let conn_info = device
+        .get_connector(connector, false)
+        .context("failed to query connector for live mode rebuild")?;
+    let name = conn_info.to_string();
+    let requested = monitors.outputs.get(&name).and_then(|cfg| cfg.mode);
+    let mode = pick_mode(&conn_info, requested, &name)
+        .with_context(|| format!("{name} reports no usable mode for rebuild"))?;
+    let (mode_w, mode_h) = mode.size();
+    let surface = device
+        .create_surface(crtc, mode, &[connector])
+        .with_context(|| format!("DrmDevice::create_surface failed rebuilding {name}"))?;
+    info!(
+        connector = %name,
+        crtc = ?crtc,
+        width = mode_w,
+        height = mode_h,
+        refresh = mode.vrefresh(),
+        "output mode rebuilt"
+    );
+    Ok(DrmOutput {
+        name,
+        crtc,
+        connector,
+        surface,
+        mode,
+    })
+}
+
 /// Clear any hardware cursor the display manager left on each CRTC's
 /// cursor plane before we took DRM master. Libreland composites its own
 /// (GPU-rendered) cursor into the primary framebuffer and never programs

@@ -649,34 +649,100 @@ fn output_compositor_size(mode: Size<i32, Physical>, scale: f64) -> Size<i32, Ph
     )
 }
 
-/// Assign every output an absolute compositor-space position so screens
-/// never overlap. Two passes over `sizes` (each `(connector name,
-/// logical size)`): first place each output the user pinned to an
-/// explicit position, tracking the rightmost occupied edge, then pack
-/// the rest left-to-right starting past that edge.
+/// Strict rectangle overlap: their X *and* Y ranges must genuinely
+/// intersect. Edge-touching (a shared border, where one's right edge
+/// equals the other's left) is *not* overlap, so adjacent screens pass.
+fn rects_overlap(a: Rectangle<i32, Physical>, b: Rectangle<i32, Physical>) -> bool {
+    a.loc.x < b.loc.x + b.size.w
+        && b.loc.x < a.loc.x + a.size.w
+        && a.loc.y < b.loc.y + b.size.h
+        && b.loc.y < a.loc.y + a.size.h
+}
+
+/// One pinned output during placement: `(connector name, logical size,
+/// requested top-left)`. A named alias keeps [`place_outputs`]'s working
+/// vector readable.
+type PinnedOutput<'a> = (&'a String, Size<i32, Physical>, (i32, i32));
+
+/// Assign every output an absolute compositor-space position so that no
+/// two outputs ever overlap (overlapping outputs scan out the same
+/// compositor region onto both screens — a visible "merge").
 ///
-/// Placing the configured outputs first is what prevents the overlap
-/// bug: an auto-placed monitor lands beyond every configured one
-/// regardless of connector iteration order, so a second, unconfigured
-/// screen can't stack on top of a configured one sitting at x=0.
+/// `sizes` is each `(connector name, logical size)`. The invariant is
+/// upheld in two stages:
+///
+/// 1. **Configured outputs** (those the user pinned to a `position`) are
+///    placed left-to-right by their requested position. Each is honoured
+///    at its exact spot *unless* it would overlap an already-placed
+///    output, in which case it's pushed right (X only — the configured Y
+///    is preserved, so vertical/stacked layouts are untouched) just far
+///    enough to clear the collision. This keeps screens adjacent through
+///    a live scale change, where a widened output would otherwise grow
+///    over its neighbour's pinned position.
+/// 2. **Auto-placed outputs** (no `position`) pack left-to-right beyond
+///    every pinned one, so a freshly-connected screen never lands on top
+///    of a configured one regardless of connector enumeration order.
 fn place_outputs(
     monitors: &MonitorsConfig,
     sizes: &[(String, Size<i32, Physical>)],
 ) -> HashMap<String, Point<i32, Physical>> {
     let mut positions = HashMap::with_capacity(sizes.len());
+    let mut placed: Vec<Rectangle<i32, Physical>> = Vec::new();
     let mut auto_x: i32 = 0;
-    // Pass 1: user-pinned outputs keep their configured position; the
-    // running cursor is pushed past each so auto outputs avoid them.
-    for (name, size) in sizes {
-        if let Some((x, y)) = monitors.outputs.get(name).and_then(|c| c.position) {
-            positions.insert(name.clone(), Point::<i32, Physical>::from((x, y)));
-            auto_x = auto_x.max(x.saturating_add(size.w));
+
+    // Stage 1: configured outputs, leftmost-requested first so the
+    // leftmost anchors and only later ones move on collision.
+    let mut configured: Vec<PinnedOutput> = sizes
+        .iter()
+        .filter_map(|(name, size)| {
+            monitors
+                .outputs
+                .get(name)
+                .and_then(|c| c.position)
+                .map(|pos| (name, *size, pos))
+        })
+        .collect();
+    configured.sort_by(|(na, _, pa), (nb, _, pb)| {
+        pa.0.cmp(&pb.0).then(pa.1.cmp(&pb.1)).then_with(|| na.cmp(nb))
+    });
+
+    for (name, size, (req_x, req_y)) in configured {
+        let mut x = req_x;
+        // Push right past any placed rect we'd overlap. Only +x, so the
+        // configured Y stays — a vertical stack (same X, different Y)
+        // never collides and never moves.
+        loop {
+            let rect = Rectangle::new(Point::from((x, req_y)), size);
+            let Some(blocker) = placed.iter().find(|r| rects_overlap(**r, rect)) else {
+                break;
+            };
+            let cleared = blocker.loc.x.saturating_add(blocker.size.w);
+            // Guard against a non-advancing (or backward) step so the
+            // loop always terminates.
+            if cleared <= x {
+                break;
+            }
+            x = cleared;
         }
+        if x != req_x {
+            warn!(
+                output = %name,
+                requested_x = req_x,
+                placed_x = x,
+                "output position overlapped another output; shifted right to avoid a merge"
+            );
+        }
+        placed.push(Rectangle::new(Point::from((x, req_y)), size));
+        positions.insert(name.clone(), Point::from((x, req_y)));
+        auto_x = auto_x.max(x.saturating_add(size.w));
     }
-    // Pass 2: everything else packs left-to-right beyond the pinned set.
+
+    // Stage 2: auto-placed outputs pack left-to-right beyond the pinned
+    // set (auto_x is the rightmost configured edge, so they can't overlap
+    // any configured output).
     for (name, size) in sizes {
         if monitors.outputs.get(name).and_then(|c| c.position).is_none() {
-            positions.insert(name.clone(), Point::<i32, Physical>::from((auto_x, 0)));
+            positions.insert(name.clone(), Point::from((auto_x, 0)));
             auto_x = auto_x.saturating_add(size.w);
         }
     }
@@ -1224,6 +1290,19 @@ impl Renderer {
         Some(removed.name)
     }
 
+    /// The connector + CRTC currently driving the named output, if any.
+    /// Used by a live mode change to rebuild the DRM surface on the same
+    /// pipe (drop the old surface, modeset a new one on this CRTC).
+    pub fn output_connector_crtc(
+        &self,
+        name: &str,
+    ) -> Option<(connector::Handle, crtc::Handle)> {
+        self.outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| (o.connector, o.crtc))
+    }
+
     /// Recompute every output's compositor position after the output set
     /// changed: outputs the user pinned in config keep their position,
     /// the rest pack left-to-right (new screens land to the right).
@@ -1236,9 +1315,14 @@ impl Renderer {
         // non-overlapping positions in a second pass (configured monitors
         // pinned, the rest packed past them — see `place_outputs`).
         for o in &mut self.outputs {
-            let scale = monitors.outputs.get(&o.name).map_or(1.0, |c| c.scale);
+            let cfg = monitors.outputs.get(&o.name);
+            let scale = cfg.map_or(1.0, |c| c.scale);
             o.scale = scale;
             o.compositor_size = output_compositor_size(o.mode_size, scale);
+            // VRR policy is read fresh each flip in `apply_vrr`, so
+            // refreshing it here makes a config-reload change take effect
+            // on the next frame.
+            o.vrr_mode = cfg.map_or_else(VrrMode::default, |c| c.vrr);
         }
         let sizes: Vec<(String, Size<i32, Physical>)> = self
             .outputs

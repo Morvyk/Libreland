@@ -148,6 +148,19 @@ pub(crate) struct State {
     /// in one place. Defaults today; the Lua loader in milestone
     /// 3c will replace this from `$XDG_CONFIG_HOME/libreland/config.lua`.
     pub(crate) config: config::Config,
+    /// Pointer/keyboard libinput devices seen so far (added, not yet
+    /// removed). libinput exposes no device enumeration, so we keep the
+    /// handles ourselves — that lets a config reload re-apply mouse
+    /// acceleration to the *live* devices. Updated on
+    /// `DeviceAdded`/`DeviceRemoved`.
+    pub(crate) input_devices: Vec<smithay::reexports::input::Device>,
+    /// Running `xwayland-satellite` child, if X support is on. Held so a
+    /// live `xwayland = false` reload can stop it; `None` when off.
+    pub(crate) xwayland_child: Option<std::process::Child>,
+    /// X display the satellite serves (e.g. `":1"`). Exported as
+    /// `$DISPLAY` to children we spawn (see [`State::build_command`]) so
+    /// X clients connect; `None` when X support is off.
+    pub(crate) xwayland_display: Option<String>,
     /// Cheap-to-clone handle to the Wayland display. Used by handler
     /// impls that need to create new globals or look up clients.
     #[allow(
@@ -687,7 +700,12 @@ impl State {
             && let Some(cmd) = &idle.lock_command
         {
             info!(command = %cmd, "idle: spawning lock command");
-            crate::wayland::spawn_startup(&[cmd.to_string()]);
+            if let Some(mut command) = self.build_command(cmd) {
+                match command.spawn() {
+                    Ok(child) => info!(pid = child.id(), command = %cmd, "idle: lock command spawned"),
+                    Err(err) => warn!(error = %err, command = %cmd, "idle: lock command failed"),
+                }
+            }
             self.idle_lock_spawned = true;
         }
         if let Some(after) = idle.screen_off_after
@@ -2201,18 +2219,16 @@ impl State {
                 }
             }
             config::Action::Spawn(cmd) => {
-                // Identical semantics to `wayland::spawn_startup`
-                // but runs at bind-press time: whitespace-split
-                // into program + args, inherit our env so
-                // `$WAYLAND_DISPLAY` reaches the child. Empty
-                // commands and failures are logged and the loop
-                // keeps running.
-                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                let Some((program, args)) = parts.split_first() else {
+                // Runs at bind-press time. `build_command` whitespace-splits
+                // into program + args and layers the live `env` + X
+                // `$DISPLAY` over the inherited process env (which carries
+                // `$WAYLAND_DISPLAY`). Empty commands and failures are logged
+                // and the loop keeps running.
+                let Some(mut command) = self.build_command(&cmd) else {
                     warn!(command = %cmd, "spawn action: empty command");
                     return;
                 };
-                match std::process::Command::new(program).args(args).spawn() {
+                match command.spawn() {
                     Ok(child) => info!(
                         pid = child.id(),
                         command = %cmd,
@@ -2229,12 +2245,160 @@ impl State {
         }
     }
 
-    /// Re-read the config file and apply the settings that can change
-    /// at runtime. A parse/validation error keeps the currently
-    /// running config untouched (logged, never fatal) so the user can
-    /// fix and save to recover. Settings that can't be hot-applied
-    /// (monitor modes, env, input device/keymap setup) are flagged
-    /// with a "restart to apply" log when they change.
+    /// Build a child [`std::process::Command`] from a whitespace-split
+    /// command line, applying the configured `env` overrides and the
+    /// live X `$DISPLAY` so spawned clients inherit the *current*
+    /// environment. Returns `None` for an empty command line.
+    ///
+    /// We apply the environment per-child here rather than mutating the
+    /// process environment: `std::env::set_var` is `unsafe` and unsound
+    /// once worker threads are running (the media decoder), so a live
+    /// `env`/`xwayland` reload must not touch the process env — it only
+    /// changes what we pass to children spawned from now on. Already-
+    /// running clients and compositor-consumed vars (e.g. `XCURSOR_*`)
+    /// still need a restart.
+    fn build_command(&self, raw: impl AsRef<str>) -> Option<std::process::Command> {
+        let raw = raw.as_ref();
+        let parts: Vec<&str> = raw.split_whitespace().collect();
+        let (program, args) = parts.split_first()?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        self.apply_child_env(&mut cmd);
+        Some(cmd)
+    }
+
+    /// Apply the configured `env` overrides and the live X `$DISPLAY` to a
+    /// child `cmd`. Centralised so every runtime spawn path (bind spawn,
+    /// idle lock, IPC spawn) picks up an `env`/`xwayland` reload — we
+    /// can't mutate the process env at runtime (`set_var` is unsound with
+    /// the media worker threads running), so the current environment is
+    /// applied per-child instead.
+    pub(crate) fn apply_child_env(&self, cmd: &mut std::process::Command) {
+        cmd.envs(self.config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        // Export (or hide) `$DISPLAY` to match the live xwayland state.
+        match &self.xwayland_display {
+            Some(disp) => {
+                cmd.env("DISPLAY", disp);
+            }
+            None => {
+                cmd.env_remove("DISPLAY");
+            }
+        }
+    }
+
+    /// Apply changed input settings on reload: key repeat rate/delay,
+    /// keyboard layout (both the seat keymap clients receive and our own
+    /// hotkey-matching xkb state), and mouse acceleration (re-applied to
+    /// every live libinput device). The `*_changed` flags are computed by
+    /// the caller against the old config before it's swapped.
+    fn apply_input_reload(
+        &mut self,
+        new_input: &config::InputConfig,
+        repeat_changed: bool,
+        layout_changed: bool,
+        accel_changed: bool,
+    ) {
+        if repeat_changed && let Some(kbd) = self.seat.get_keyboard() {
+            let rate = i32::try_from(new_input.repeat_rate).unwrap_or(i32::MAX);
+            let delay = i32::try_from(new_input.repeat_delay).unwrap_or(i32::MAX);
+            kbd.change_repeat_info(rate, delay);
+            info!(rate, delay, "input: applied new key repeat");
+        }
+        if layout_changed {
+            // Seat keymap (what clients receive) …
+            if let Some(kbd) = self.seat.get_keyboard() {
+                let xkb = smithay::input::keyboard::XkbConfig {
+                    layout: &new_input.keyboard_layout,
+                    ..smithay::input::keyboard::XkbConfig::default()
+                };
+                if let Err(err) = kbd.set_xkb_config(self, xkb) {
+                    warn!(?err, "input: applying new keyboard layout to the seat failed");
+                }
+            }
+            // … and our own xkb wrapper used for hotkey matching.
+            match keyboard::Keyboard::new(&new_input.keyboard_layout) {
+                Ok(k) => {
+                    self.keyboard = k;
+                    info!(layout = %new_input.keyboard_layout, "input: applied new keyboard layout");
+                }
+                Err(err) => warn!(
+                    error = %err,
+                    "input: new keyboard layout failed to compile; keeping the old one for hotkeys"
+                ),
+            }
+        }
+        if accel_changed {
+            for device in &mut self.input_devices {
+                apply_input_config(device, new_input);
+            }
+            info!("input: re-applied mouse acceleration to live devices");
+        }
+    }
+
+    /// Start or stop `xwayland-satellite` to match a live `xwayland`
+    /// toggle. Enabling spawns it and records the child + display (which
+    /// [`State::build_command`] exports as `$DISPLAY` to children we
+    /// spawn). Disabling kills the running satellite — any X11 clients
+    /// connected to it lose their server.
+    fn apply_xwayland_toggle(&mut self, enable: bool) {
+        if enable {
+            if let Some((child, disp)) = start_xwayland_satellite() {
+                self.xwayland_child = Some(child);
+                self.xwayland_display = Some(disp.clone());
+                info!(
+                    x_display = %disp,
+                    "xwayland enabled; children spawned from now get $DISPLAY"
+                );
+            } else {
+                warn!("xwayland enabled but the satellite failed to start");
+            }
+        } else {
+            if let Some(mut child) = self.xwayland_child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.xwayland_display = None;
+            warn!("xwayland disabled; satellite stopped (running X11 clients lost their server)");
+        }
+    }
+
+    /// Apply a live mode change to one output: drop its DRM surface (which
+    /// frees its CRTC), then modeset a fresh surface on the *same*
+    /// connector/CRTC with the new mode and re-add it. The layout pane —
+    /// and therefore the windows on it — is left untouched, so a mode
+    /// change doesn't disturb window placement. On failure the output is
+    /// left down (logged); a replug or restart recovers it.
+    fn change_output_mode(&mut self, name: &str, monitors: &config::MonitorsConfig) {
+        let Some((connector, crtc)) = self.renderer.output_connector_crtc(name) else {
+            return;
+        };
+        self.renderer.remove_output(crtc);
+        self.redraw.remove(&crtc);
+        match crate::drm::rebuild_output_mode(&mut self.drm_device, connector, crtc, monitors) {
+            Ok(drm_output) => match self.renderer.add_output(drm_output, monitors) {
+                Ok(()) => {
+                    // Prime the CRTC so the next `queue_redraw_all` flips it.
+                    self.redraw.insert(crtc, RedrawState::Idle);
+                    info!(output = %name, "applied live mode change (modeset)");
+                }
+                Err(err) => warn!(
+                    output = %name, error = %err,
+                    "mode change: re-adding output failed; output down until replug/restart"
+                ),
+            },
+            Err(err) => warn!(
+                output = %name, error = %err,
+                "mode change: rebuilding DRM surface failed; output down until replug/restart"
+            ),
+        }
+    }
+
+    /// Re-read the config file and apply every setting that can change at
+    /// runtime. A parse/validation error keeps the running config
+    /// untouched (logged, never fatal) so the user can fix and save to
+    /// recover. The few settings that genuinely can't hot-apply (startup
+    /// commands are one-shot; `env`/`XCURSOR_*` consumed by the
+    /// compositor itself) are logged rather than applied.
     pub(crate) fn reload_config(&mut self, path: &std::path::Path) {
         let new = match config::Config::load_from_file(path) {
             Ok(new) => new,
@@ -2244,44 +2408,67 @@ impl State {
             }
         };
 
-        // Settings whose runtime consumers run once at startup.
-        if new.monitors != self.config.monitors {
-            warn!(
-                "monitor config changed; restart Libreland to apply mode/position/scale/primary/vrr"
-            );
-        }
+        // ---- Detect what changed (before any mutation). ----
+        let monitors_changed = new.monitors != self.config.monitors;
+        // Outputs whose forced-mode override changed need a real DRM
+        // modeset; reflow alone only re-positions/-scales/-VRRs.
+        let mode_changed: Vec<String> = if monitors_changed {
+            self.renderer
+                .output_names()
+                .into_iter()
+                .filter(|name| {
+                    let old = self.config.monitors.outputs.get(name).and_then(|c| c.mode);
+                    let new_m = new.monitors.outputs.get(name).and_then(|c| c.mode);
+                    old != new_m
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let repeat_changed = new.input.repeat_rate != self.config.input.repeat_rate
+            || new.input.repeat_delay != self.config.input.repeat_delay;
+        let layout_changed = new.input.keyboard_layout != self.config.input.keyboard_layout;
+        #[allow(
+            clippy::float_cmp,
+            reason = "exact change detection — did the configured accel speed differ at all, not 'approximately equal'"
+        )]
+        let accel_changed = new.input.mouse_accel_profile != self.config.input.mouse_accel_profile
+            || new.input.mouse_accel_speed != self.config.input.mouse_accel_speed;
+        let xwayland_changed = new.xwayland != self.config.xwayland;
         if new.env != self.config.env {
-            warn!("env changed; restart to re-export environment variables");
+            info!("env changed; applies to children spawned from now on (restart for XCURSOR_* etc.)");
         }
         if new.startup != self.config.startup {
             info!("startup commands changed; they only run at launch");
         }
-        if new.xwayland != self.config.xwayland {
-            warn!("xwayland setting changed; restart to start/stop xwayland-satellite");
-        }
-        let (old_in, new_in) = (&self.config.input, &new.input);
-        #[allow(
-            clippy::float_cmp,
-            reason = "exact change detection — did the configured accel speed differ at all, not 'is it approximately equal'"
-        )]
-        let input_changed = old_in.repeat_rate != new_in.repeat_rate
-            || old_in.repeat_delay != new_in.repeat_delay
-            || old_in.keyboard_layout != new_in.keyboard_layout
-            || old_in.mouse_accel_profile != new_in.mouse_accel_profile
-            || old_in.mouse_accel_speed != new_in.mouse_accel_speed;
-        if input_changed {
-            warn!(
-                "keyboard/pointer input settings changed; restart to apply (focus model applies live)"
-            );
+
+        // ---- Input: key repeat, keymap, mouse acceleration. ----
+        self.apply_input_reload(&new.input, repeat_changed, layout_changed, accel_changed);
+
+        // ---- Monitors: modeset changed modes, then reflow the rest. ----
+        if monitors_changed {
+            for name in &mode_changed {
+                self.change_output_mode(name, &new.monitors);
+            }
+            let descs = self.renderer.reflow_outputs(&new.monitors);
+            self.sync_output_globals(&descs);
+            self.recompute_layer_layout();
+            self.preferred_scale = self.renderer.primary_scale();
+            info!("monitor config reloaded (position/scale/primary/vrr/mode)");
         }
 
-        // Hot-apply. Update the layout FIRST (it reflows and sends new
+        // ---- XWayland: start or stop the satellite to match the toggle. ----
+        if xwayland_changed {
+            self.apply_xwayland_toggle(new.xwayland);
+        }
+
+        // ---- Appearance. Layout FIRST (it reflows and sends new
         // configures to clients), the renderer LAST: the renderer's
-        // border width drives where it draws the surface and the
-        // border ring, so changing it only after the clients have been
-        // asked to resize avoids a one-frame window where a new border
-        // is drawn around an old-sized buffer. Binds and focus model
-        // are read live from `self.config`, so swapping it suffices.
+        // border width drives where it draws the surface and the border
+        // ring, so changing it only after clients have been asked to
+        // resize avoids a one-frame window where a new border is drawn
+        // around an old-sized buffer. Binds and focus model are read live
+        // from `self.config`, so swapping it suffices. ----
         self.layout.set_appearance(
             layout::Gaps {
                 outer: new.layout.gaps_outer,
@@ -2294,7 +2481,6 @@ impl State {
         self.renderer.set_decoration(new.decoration.clone());
         self.config = new;
         info!("config reloaded");
-        // Wallpaper / gaps / border / decoration all changed the picture.
         self.queue_redraw_all();
     }
 }
@@ -2995,21 +3181,32 @@ fn main() -> Result<()> {
     // viewport). X *cursors*, though, it forwards verbatim as a surface, which
     // we display — so they only match native ones because we pinned
     // $XCURSOR_SIZE to the logical size above (and it inherits $XCURSOR_THEME).
-    if config.xwayland
-        && let Some(disp) = start_xwayland_satellite()
-    {
-        // SAFETY: same single-threaded-init reasoning as the
-        // WAYLAND_DISPLAY set_var above — still pre-event-loop.
-        #[allow(
-            unsafe_code,
-            reason = "set_var is unsafe due to multi-threaded env races; called in single-threaded init before the event loop, same as WAYLAND_DISPLAY"
-        )]
-        // SAFETY: see #[allow] above.
-        unsafe {
-            std::env::set_var("DISPLAY", &disp);
+    // Started here so the satellite inherits the process env (incl.
+    // WAYLAND_DISPLAY). The child + display are stored on `State` so a
+    // live `xwayland` reload can stop/start it; `xwayland_display` is
+    // also what `build_command` exports as `$DISPLAY` to children we
+    // spawn (the process env is only safe to mutate here, pre-threads).
+    let (xwayland_child, xwayland_display) = if config.xwayland {
+        match start_xwayland_satellite() {
+            Some((child, disp)) => {
+                // SAFETY: same single-threaded-init reasoning as the
+                // WAYLAND_DISPLAY set_var above — still pre-event-loop.
+                #[allow(
+                    unsafe_code,
+                    reason = "set_var is unsafe due to multi-threaded env races; called in single-threaded init before the event loop, same as WAYLAND_DISPLAY"
+                )]
+                // SAFETY: see #[allow] above.
+                unsafe {
+                    std::env::set_var("DISPLAY", &disp);
+                }
+                info!(x_display = %disp, "XWayland ready; $DISPLAY exported for X11 clients");
+                (Some(child), Some(disp))
+            }
+            None => (None, None),
         }
-        info!(x_display = %disp, "XWayland ready; $DISPLAY exported for X11 clients");
-    }
+    } else {
+        (None, None)
+    };
 
     // D-Bus-activated services (notably xdg-desktop-portal) are spawned
     // by the session bus, not by us, so they don't inherit our process
@@ -3151,6 +3348,9 @@ fn main() -> Result<()> {
         renderer,
         keyboard,
         config,
+        input_devices: Vec::new(),
+        xwayland_child,
+        xwayland_display,
         display_handle: wayland_init.display_handle,
         compositor_state: wayland_init.compositor_state,
         shm_state: wayland_init.shm_state,
@@ -3396,7 +3596,7 @@ fn export_activation_environment() {
 /// — in both cases X11 support is simply absent (logged), never fatal.
 /// The satellite inherits our environment, so it connects to
 /// `$WAYLAND_DISPLAY` and inherits `$XCURSOR_*` for its cursor theme.
-fn start_xwayland_satellite() -> Option<String> {
+fn start_xwayland_satellite() -> Option<(std::process::Child, String)> {
     let Some(n) = first_free_x_display() else {
         warn!("no free X display in :0..:32; not starting xwayland-satellite");
         return None;
@@ -3408,7 +3608,8 @@ fn start_xwayland_satellite() -> Option<String> {
     {
         Ok(child) => {
             info!(pid = child.id(), x_display = %disp, "spawned xwayland-satellite");
-            Some(disp)
+            // Keep the child so a live `xwayland = false` reload can stop it.
+            Some((child, disp))
         }
         Err(err) => {
             warn!(
@@ -3604,6 +3805,12 @@ fn wire_event_sources(
                 }
                 InputEvent::DeviceAdded { mut device } => {
                     apply_input_config(&mut device, &data.state.config.input);
+                    // Keep the handle so a config reload can re-apply
+                    // mouse-accel settings to this live device.
+                    data.state.input_devices.push(device);
+                }
+                InputEvent::DeviceRemoved { device } => {
+                    data.state.input_devices.retain(|d| *d != device);
                 }
                 _ => {}
             }

@@ -670,7 +670,7 @@ mod server {
             Request::ToggleMaximized { id } => toggle(state, id, Layout::toggle_maximized),
             Request::FocusWorkspace { output, target } => focus_workspace(state, output, target),
             Request::MoveToWorkspace { id, target } => move_to_workspace(state, id, target),
-            Request::Spawn { command } => spawn(&command),
+            Request::Spawn { command } => spawn(state, &command),
             Request::Reload => reload(state),
             Request::Exit => {
                 info!("exit requested via IPC");
@@ -861,11 +861,15 @@ mod server {
         }
     }
 
-    fn spawn(command: &[String]) -> Reply {
+    fn spawn(state: &State, command: &[String]) -> Reply {
         let Some((program, args)) = command.split_first() else {
             return Err("empty command".to_owned());
         };
-        match std::process::Command::new(program).args(args).spawn() {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        // Inherit the live env + X `$DISPLAY` like every other spawn path.
+        state.apply_child_env(&mut cmd);
+        match cmd.spawn() {
             Ok(child) => {
                 info!(pid = child.id(), ?command, "spawned via IPC");
                 Ok(Response::Handled)
