@@ -10,7 +10,7 @@
 
 pkgname=libreland
 # Placeholder; pkgver() rewrites this to a git snapshot at build time.
-pkgver=0.1.0.r78.g17d66c7
+pkgver=0.1.0.r85.ge447b0d
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua'
 arch=('x86_64')
