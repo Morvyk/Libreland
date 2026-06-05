@@ -304,6 +304,10 @@ pub(crate) struct State {
     /// `xdg_activation_v1` global — read by the `XdgActivationHandler`
     /// impl to focus a surface a client asks to raise.
     pub(crate) xdg_activation_state: smithay::wayland::xdg_activation::XdgActivationState,
+    /// `zwp_pointer_gestures_v1` global. Held so it stays registered;
+    /// dispatch routes through `State`.
+    #[allow(dead_code, reason = "held to keep the pointer-gestures global alive")]
+    pub(crate) pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
     /// Surfaces holding an active idle inhibitor (e.g. a playing video).
     /// While any is alive, `idle_tick` suppresses the built-in lock/DPMS.
     /// Populated by the `IdleInhibitHandler`; pruned of dead surfaces each
@@ -3441,6 +3445,7 @@ fn main() -> Result<()> {
         idle_inhibit_state: wayland_init.idle_inhibit_state,
         idle_inhibitors: std::collections::HashSet::new(),
         xdg_activation_state: wayland_init.xdg_activation_state,
+        pointer_gestures_state: wayland_init.pointer_gestures_state,
         session_lock_state,
         lock_surfaces: std::collections::HashMap::new(),
         session_locked: false,
@@ -3866,6 +3871,33 @@ fn wire_event_sources(
                 InputEvent::PointerAxis { event: pa } => {
                     state.forward_pointer_axis::<LibinputInputBackend>(&pa);
                 }
+                // Touchpad gestures (pinch / swipe / hold) — forwarded to
+                // the client under the pointer (browser pinch-zoom, GTK
+                // swipe). Purely client-facing, so no compositor handling.
+                InputEvent::GestureSwipeBegin { event } => {
+                    state.gesture_swipe_begin::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GestureSwipeUpdate { event } => {
+                    state.gesture_swipe_update::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GestureSwipeEnd { event } => {
+                    state.gesture_swipe_end::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GesturePinchBegin { event } => {
+                    state.gesture_pinch_begin::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GesturePinchUpdate { event } => {
+                    state.gesture_pinch_update::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GesturePinchEnd { event } => {
+                    state.gesture_pinch_end::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GestureHoldBegin { event } => {
+                    state.gesture_hold_begin::<LibinputInputBackend>(&event);
+                }
+                InputEvent::GestureHoldEnd { event } => {
+                    state.gesture_hold_end::<LibinputInputBackend>(&event);
+                }
                 InputEvent::DeviceAdded { mut device } => {
                     apply_input_config(&mut device, &state.config.input);
                     // Keep the handle so a config reload can re-apply
@@ -3883,10 +3915,128 @@ fn wire_event_sources(
     Ok(())
 }
 
+/// Touchpad gesture forwarding (`zwp_pointer_gestures_v1`). Each method
+/// translates a libinput gesture event into the matching smithay pointer
+/// event and sends it to the client under the pointer, then `frame()`s.
+/// Gestures don't change compositor state, so there's no redraw or focus
+/// handling — they ride the pointer's existing focus.
+impl State {
+    fn gesture_swipe_begin<I: InputBackend>(&mut self, e: &I::GestureSwipeBeginEvent) {
+        use smithay::backend::input::{Event as _, GestureBeginEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GestureSwipeBeginEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            time: e.time_msec(),
+            fingers: e.fingers(),
+        };
+        ptr.gesture_swipe_begin(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_swipe_update<I: InputBackend>(&mut self, e: &I::GestureSwipeUpdateEvent) {
+        use smithay::backend::input::{Event as _, GestureSwipeUpdateEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GestureSwipeUpdateEvent {
+            time: e.time_msec(),
+            delta: e.delta(),
+        };
+        ptr.gesture_swipe_update(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_swipe_end<I: InputBackend>(&mut self, e: &I::GestureSwipeEndEvent) {
+        use smithay::backend::input::{Event as _, GestureEndEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GestureSwipeEndEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            time: e.time_msec(),
+            cancelled: e.cancelled(),
+        };
+        ptr.gesture_swipe_end(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_pinch_begin<I: InputBackend>(&mut self, e: &I::GesturePinchBeginEvent) {
+        use smithay::backend::input::{Event as _, GestureBeginEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GesturePinchBeginEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            time: e.time_msec(),
+            fingers: e.fingers(),
+        };
+        ptr.gesture_pinch_begin(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_pinch_update<I: InputBackend>(&mut self, e: &I::GesturePinchUpdateEvent) {
+        use smithay::backend::input::{Event as _, GesturePinchUpdateEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GesturePinchUpdateEvent {
+            time: e.time_msec(),
+            delta: e.delta(),
+            scale: e.scale(),
+            rotation: e.rotation(),
+        };
+        ptr.gesture_pinch_update(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_pinch_end<I: InputBackend>(&mut self, e: &I::GesturePinchEndEvent) {
+        use smithay::backend::input::{Event as _, GestureEndEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GesturePinchEndEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            time: e.time_msec(),
+            cancelled: e.cancelled(),
+        };
+        ptr.gesture_pinch_end(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_hold_begin<I: InputBackend>(&mut self, e: &I::GestureHoldBeginEvent) {
+        use smithay::backend::input::{Event as _, GestureBeginEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GestureHoldBeginEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            time: e.time_msec(),
+            fingers: e.fingers(),
+        };
+        ptr.gesture_hold_begin(self, &evt);
+        ptr.frame(self);
+    }
+
+    fn gesture_hold_end<I: InputBackend>(&mut self, e: &I::GestureHoldEndEvent) {
+        use smithay::backend::input::{Event as _, GestureEndEvent as _};
+        let Some(ptr) = self.seat.get_pointer() else {
+            return;
+        };
+        let evt = smithay::input::pointer::GestureHoldEndEvent {
+            serial: SERIAL_COUNTER.next_serial(),
+            time: e.time_msec(),
+            cancelled: e.cancelled(),
+        };
+        ptr.gesture_hold_end(self, &evt);
+        ptr.frame(self);
+    }
+}
+
 /// Log a single libinput event. Keyboard / pointer events are what we
-/// care about for the TTY sanity check; touch, gestures and tablet
-/// variants are intentionally elided here and will be wired up later
-/// when there's something to do with them.
+/// care about for the TTY sanity check; touch and tablet variants are
+/// intentionally elided here.
 fn log_input_event(event: &InputEvent<LibinputInputBackend>) {
     match event {
         InputEvent::DeviceAdded { device } => {

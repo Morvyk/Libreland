@@ -24,6 +24,7 @@ use smithay::delegate_data_device;
 use smithay::delegate_ext_data_control;
 use smithay::delegate_idle_inhibit;
 use smithay::delegate_idle_notify;
+use smithay::delegate_pointer_gestures;
 use smithay::delegate_xdg_activation;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
@@ -205,6 +206,9 @@ pub struct WaylandInit {
     /// `xdg_activation_v1` — clients request focus/raise for a surface.
     /// Read by the `XdgActivationHandler` impl.
     pub xdg_activation_state: XdgActivationState,
+    /// `zwp_pointer_gestures_v1` — touchpad gestures to clients. Held so
+    /// the global stays alive; dispatch routes through it.
+    pub pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
     /// `zwlr_screencopy_manager_v1` — output capture for screenshots
     /// and screen sharing. Held so the global stays alive.
     pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
@@ -345,6 +349,10 @@ pub fn init(
     // which is what makes the view spin).
     let relative_pointer_state = RelativePointerManagerState::new::<State>(&dh);
     let pointer_constraints_state = PointerConstraintsState::new::<State>(&dh);
+    // zwp_pointer_gestures_v1: forward touchpad pinch/swipe/hold gestures
+    // to clients (handled in the libinput event loop).
+    let pointer_gestures_state =
+        smithay::wayland::pointer_gestures::PointerGesturesState::new::<State>(&dh);
     // zwp_primary_selection_v1: the middle-click "primary" selection.
     // Both it and the regular clipboard are persisted compositor-side
     // (see crate::clipboard) so a copied buffer survives the source app
@@ -447,6 +455,7 @@ pub fn init(
         ext_data_control_state,
         idle_inhibit_state,
         xdg_activation_state,
+        pointer_gestures_state,
         screencopy_manager,
         popup_manager,
         outputs,
@@ -1269,6 +1278,7 @@ delegate_ext_data_control!(State);
 delegate_idle_inhibit!(State);
 delegate_idle_notify!(State);
 delegate_xdg_activation!(State);
+delegate_pointer_gestures!(State);
 smithay::delegate_session_lock!(State);
 
 impl SessionLockHandler for State {

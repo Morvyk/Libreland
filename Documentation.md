@@ -761,6 +761,7 @@ present and elided here.)
 | `zwp_linux_dmabuf_v1` (v5 default feedback, v3 fallback)       | GPU buffer sharing (GPU-composited + XWayland/glamor clients).          |
 | `wp_cursor_shape_v1`                                           | Named cursor shapes the compositor themes.                              |
 | `zwp_relative_pointer_manager_v1`                              | Raw relative motion deltas (mouse-look in games).                       |
+| `zwp_pointer_gestures_v1`                                      | Touchpad pinch / swipe / hold gestures to clients (browser pinch-zoom, GTK swipe). |
 | `zwp_pointer_constraints_v1`                                   | Pointer lock / confinement (FPS games).                                 |
 | `zwp_idle_inhibit_manager_v1`                                  | Clients (e.g. video players) inhibit idle while a surface is up — see [idle](#idle). |
 | `ext_idle_notifier_v1`                                         | Idle daemons (e.g. swayidle) learn when the user goes idle; paused while an inhibitor is active. |
