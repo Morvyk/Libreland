@@ -762,6 +762,7 @@ present and elided here.)
 | `zwp_relative_pointer_manager_v1`                              | Raw relative motion deltas (mouse-look in games).                       |
 | `zwp_pointer_constraints_v1`                                   | Pointer lock / confinement (FPS games).                                 |
 | `zwp_idle_inhibit_manager_v1`                                  | Clients (e.g. video players) inhibit idle while a surface is up — see [idle](#idle). |
+| `ext_idle_notifier_v1`                                         | Idle daemons (e.g. swayidle) learn when the user goes idle; paused while an inhibitor is active. |
 | `wl_data_device_manager`                                       | Clipboard + drag-and-drop.                                              |
 | `zwp_primary_selection_v1`                                     | Primary (middle-click) selection.                                       |
 | `zwlr_data_control_v1` (v2) + `ext_data_control_v1` (v1)       | Clipboard managers — see [Clipboard & selections](#clipboard--selections). |

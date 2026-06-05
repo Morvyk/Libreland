@@ -41,7 +41,7 @@ use smithay::wayland::selection::primary_selection::{
 };
 use tracing::{debug, warn};
 
-use crate::{LoopData, State};
+use crate::State;
 
 /// Read granularity for draining a source pipe. Kept at 16 KiB so the
 /// per-read stack buffer stays small; the level-triggered source just
@@ -152,7 +152,7 @@ pub(crate) fn on_new_selection(state: &mut State, ty: SelectionTarget, mimes: Op
     // to an idle, which runs once the new source is current.
     state
         .loop_handle
-        .insert_idle(move |data| start_reads(&mut data.state, ty, epoch, mimes));
+        .insert_idle(move |state| start_reads(state, ty, epoch, mimes));
 }
 
 /// Begin draining the (now-current) selection source into a cache.
@@ -212,14 +212,14 @@ fn start_reads(state: &mut State, ty: SelectionTarget, epoch: u64, mimes: Vec<St
         let mut buf: Vec<u8> = Vec::new();
         let insert = state.loop_handle.insert_source(
             Generic::new(read_fd, Interest::READ, Mode::Level),
-            move |_, fd: &mut NoIoDrop<OwnedFd>, data: &mut LoopData| {
+            move |_, fd: &mut NoIoDrop<OwnedFd>, state: &mut State| {
                 Ok::<_, std::io::Error>(read_ready(
                     fd.as_fd(),
                     &mut buf,
                     &mime,
                     &progress,
                     &seat,
-                    &mut data.state,
+                    state,
                 ))
             },
         );
@@ -369,7 +369,7 @@ pub(crate) fn on_send_selection(state: &mut State, ty: SelectionTarget, mime: &s
     let mut offset = 0usize;
     let insert = state.loop_handle.insert_source(
         Generic::new(fd, Interest::WRITE, Mode::Level),
-        move |_, fd: &mut NoIoDrop<OwnedFd>, _data: &mut LoopData| {
+        move |_, fd: &mut NoIoDrop<OwnedFd>, _state: &mut State| {
             loop {
                 if offset >= bytes.len() {
                     return Ok::<_, std::io::Error>(PostAction::Remove);

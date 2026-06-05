@@ -301,7 +301,7 @@ mod server {
         WindowInfo, WorkspaceInfo, WorkspaceTarget,
     };
     use crate::layout::{FillMode, Layout, WindowEntry};
-    use crate::{LoopData, State};
+    use crate::State;
 
     /// One subscribed connection: a write handle to its socket plus the
     /// event kinds it wants (`None` = all).
@@ -479,7 +479,7 @@ mod server {
     /// Bind the control socket and register it on the event loop. Any
     /// stale socket file at `path` is removed first. Accepted connections
     /// are handled by [`accept_connection`].
-    pub fn setup(handle: &LoopHandle<'static, LoopData>, path: &Path) -> Result<()> {
+    pub fn setup(handle: &LoopHandle<'static, State>, path: &Path) -> Result<()> {
         // A leftover socket from a crashed run would make bind fail with
         // EADDRINUSE; clearing it is safe because two compositors can't
         // share one Wayland display name anyway.
@@ -492,10 +492,10 @@ mod server {
         handle
             .insert_source(
                 Generic::new(listener, Interest::READ, Mode::Level),
-                |_, listener, data: &mut LoopData| {
+                |_, listener, state: &mut State| {
                     loop {
                         match listener.accept() {
-                            Ok((stream, _)) => accept_connection(&data.state.loop_handle, stream),
+                            Ok((stream, _)) => accept_connection(&state.loop_handle, stream),
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) => {
                                 warn!(error = %e, "IPC accept failed");
@@ -515,7 +515,7 @@ mod server {
     /// per-connection read buffer is owned by the closure. Newline-framed
     /// requests are dispatched as they complete; the source removes
     /// itself on EOF or a hard read error.
-    fn accept_connection(handle: &LoopHandle<'static, LoopData>, stream: UnixStream) {
+    fn accept_connection(handle: &LoopHandle<'static, State>, stream: UnixStream) {
         if let Err(e) = stream.set_nonblocking(true) {
             warn!(error = %e, "IPC connection non-blocking failed");
             return;
@@ -526,7 +526,7 @@ mod server {
         let mut subscriber_id: Option<u64> = None;
         let res = handle.insert_source(
             Generic::new(stream, Interest::READ, Mode::Level),
-            move |_, stream, data: &mut LoopData| {
+            move |_, stream, state: &mut State| {
                 // calloop hands us a `&mut NoIoDrop<UnixStream>`; `UnixStream`
                 // implements `Read`/`Write` for `&UnixStream`, so a mutable
                 // *binding* to the shared reference is all we need.
@@ -558,14 +558,14 @@ mod server {
                         Ok(Request::Subscribe { events }) => match conn.try_clone() {
                             Ok(write_half) => {
                                 let (id, first) =
-                                    data.state.ipc.add_subscriber(write_half, events);
+                                    state.ipc.add_subscriber(write_half, events);
                                 subscriber_id = Some(id);
-                                on_subscribe(&mut data.state, id, first);
+                                on_subscribe(state, id, first);
                             }
                             Err(e) => write_reply(conn, &Err(format!("subscribe failed: {e}"))),
                         },
                         Ok(req) => {
-                            let reply = dispatch(&mut data.state, req);
+                            let reply = dispatch(state, req);
                             write_reply(conn, &reply);
                         }
                         Err(e) => write_reply(conn, &Err(format!("invalid request: {e}"))),
@@ -573,7 +573,7 @@ mod server {
                 }
                 if closed {
                     if let Some(id) = subscriber_id.take() {
-                        data.state.ipc.remove_subscriber(id);
+                        state.ipc.remove_subscriber(id);
                     }
                     return Ok(PostAction::Remove);
                 }

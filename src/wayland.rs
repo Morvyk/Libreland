@@ -7,11 +7,11 @@
 //! client buffers is the 4b milestone; input forwarding is 4c.
 //!
 //! Wayland state lives on [`crate::State`] as flat fields so the
-//! `delegate_*` macros work without intermediate wrappers. The owned
-//! `Display<State>` itself can't live inside `State` (the type would
-//! be circular), so it lives in a sibling struct
-//! ([`crate::LoopData`]) alongside `State`; per-tick dispatch and
-//! flush happens there.
+//! `delegate_*` macros work without intermediate wrappers. The calloop
+//! loop data type *is* `State`; the owned `Display<State>` (which can't
+//! live inside `State` without making the type circular) is moved into
+//! the dispatch source's closure, and outbound flushing goes through the
+//! `DisplayHandle` on `State`.
 
 use std::sync::Arc;
 
@@ -23,6 +23,7 @@ use smithay::delegate_data_control;
 use smithay::delegate_data_device;
 use smithay::delegate_ext_data_control;
 use smithay::delegate_idle_inhibit;
+use smithay::delegate_idle_notify;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_kde_decoration;
@@ -77,6 +78,7 @@ use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
 };
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
+use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
 use smithay::wayland::selection::wlr_data_control::{
     DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
 };
@@ -1006,10 +1008,22 @@ impl ExtDataControlHandler for State {
 impl IdleInhibitHandler for State {
     fn inhibit(&mut self, surface: WlSurface) {
         self.idle_inhibitors.insert(surface);
+        self.sync_idle_inhibition();
     }
 
     fn uninhibit(&mut self, surface: WlSurface) {
         self.idle_inhibitors.remove(&surface);
+        self.sync_idle_inhibition();
+    }
+}
+
+// ext-idle-notify: lets idle daemons (swayidle, etc.) learn when the
+// user goes idle. We feed it `notify_activity` on every input event
+// (see `State::note_input_activity`) and pause it while an idle
+// inhibitor is active (`State::sync_idle_inhibition`).
+impl IdleNotifierHandler for State {
+    fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
+        &mut self.idle_notifier
     }
 }
 
@@ -1218,6 +1232,7 @@ delegate_primary_selection!(State);
 delegate_data_control!(State);
 delegate_ext_data_control!(State);
 delegate_idle_inhibit!(State);
+delegate_idle_notify!(State);
 smithay::delegate_session_lock!(State);
 
 impl SessionLockHandler for State {

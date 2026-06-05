@@ -107,9 +107,10 @@ enum RedrawState {
 ///
 /// Holds the existing libseat / DRM / renderer / xkb / config state
 /// plus the Wayland frontend substate added in milestone 4a
-/// (compositor, shm, seat, `xdg_shell`, `output_manager`). The owned
-/// `Display<State>` itself can't live here (the type would be
-/// circular), so it sits beside `State` in [`LoopData`].
+/// (compositor, shm, seat, `xdg_shell`, `output_manager`). `State` is
+/// the calloop loop-data type itself; the owned `Display<State>` can't
+/// live here (the type would be circular), so it's moved into the
+/// Wayland dispatch source's closure instead.
 ///
 /// All fields are `pub(crate)` so handler impls in sibling modules
 /// (especially [`crate::wayland`]) can reach them directly without
@@ -291,6 +292,11 @@ pub(crate) struct State {
     pub(crate) idle_last_input: std::time::Instant,
     pub(crate) idle_screen_off: bool,
     pub(crate) idle_lock_spawned: bool,
+    /// `ext_idle_notifier_v1` — lets idle daemons (swayidle, etc.) learn
+    /// when the user goes idle. Fed `notify_activity` on every input and
+    /// told `set_is_inhibited` while an idle inhibitor is up. It schedules
+    /// its own calloop timers, which is why the loop data type is `State`.
+    pub(crate) idle_notifier: smithay::wayland::idle_notify::IdleNotifierState<State>,
     /// `zwp_idle_inhibit_manager_v1` global. Held so it stays registered;
     /// dispatch routes through `State`.
     #[allow(dead_code, reason = "held to keep the idle-inhibit global alive")]
@@ -350,7 +356,7 @@ pub(crate) struct State {
     pub(crate) screencopy_pending: Vec<screencopy::PendingCapture>,
     /// Calloop handle, used to register the async pipe reads/writes
     /// that drain and serve cached selections without blocking.
-    pub(crate) loop_handle: smithay::reexports::calloop::LoopHandle<'static, LoopData>,
+    pub(crate) loop_handle: smithay::reexports::calloop::LoopHandle<'static, State>,
     /// Per-output on-demand render state, keyed by CRTC. See
     /// [`RedrawState`] and [`State::queue_redraw`].
     pub(crate) redraw: std::collections::HashMap<crtc::Handle, RedrawState>,
@@ -490,15 +496,6 @@ const DEFAULT_SESSION_ENV: &[(&str, &str)] = &[
 /// well above this.
 const MIN_DRAG_RESIZE_W: i32 = 100;
 const MIN_DRAG_RESIZE_H: i32 = 60;
-
-/// Calloop user-data wrapper: owns the Wayland `Display<State>` and
-/// the compositor `State` side by side, since they can't be nested
-/// (the type would be circular). Calloop source callbacks receive
-/// `&mut LoopData` and split-borrow the two fields independently.
-pub(crate) struct LoopData {
-    pub(crate) state: State,
-    pub(crate) display: Display<State>,
-}
 
 impl State {
     /// Feed a key event through xkbcommon to get its layout-aware
@@ -640,7 +637,7 @@ impl State {
         };
         if schedule {
             self.loop_handle
-                .insert_idle(move |data| data.state.render_crtc(crtc));
+                .insert_idle(move |state| state.render_crtc(crtc));
         }
     }
 
@@ -688,9 +685,21 @@ impl State {
     /// panels were powered off, wake them. Called on every input event.
     pub(crate) fn note_input_activity(&mut self) {
         self.idle_last_input = std::time::Instant::now();
+        // Reset the ext-idle-notify timers too, so idle daemons see the
+        // user as active.
+        self.idle_notifier.notify_activity(&self.seat);
         if self.idle_screen_off {
             self.set_screen_power(true);
         }
+    }
+
+    /// Reconcile idle inhibition: drop inhibitors whose surface died
+    /// (a crashed client never sends the clean destroy) and tell the
+    /// ext-idle-notify clients whether idle is currently inhibited.
+    pub(crate) fn sync_idle_inhibition(&mut self) {
+        self.idle_inhibitors.retain(IsAlive::alive);
+        self.idle_notifier
+            .set_is_inhibited(!self.idle_inhibitors.is_empty());
     }
 
     /// Idle-timer tick: spawn the lock command and/or DPMS the screens off once
@@ -698,10 +707,9 @@ impl State {
     /// set. The lock command spawns once per idle period (re-armed when the
     /// session unlocks); the screen-off fires once and is undone by input.
     pub(crate) fn idle_tick(&mut self) {
-        // Drop inhibitors whose surface died without a clean destroy (a
-        // crashed client never sends one), so a stale one can't pin the
-        // screen on forever.
-        self.idle_inhibitors.retain(IsAlive::alive);
+        // Prune dead inhibitors and refresh idle-notify's inhibition flag
+        // (runs every tick even when our own idle config is unset).
+        self.sync_idle_inhibition();
         let Some(idle) = self.config.idle.clone() else {
             return;
         };
@@ -3006,19 +3014,18 @@ fn main() -> Result<()> {
         }
     }
 
-    // Wayland frontend bootstrap. Display must exist before the
-    // EventLoop because the EventLoop's user-data type
-    // (`LoopData`) contains the `Display<State>`.
+    // Wayland frontend bootstrap. The calloop loop data type is `State`
+    // itself; the `Display<State>` is owned by the dispatch source's
+    // closure (below) and outbound flushing goes through the
+    // `DisplayHandle` on `State`, so the two never need to be nested.
     info!("phase: creating Wayland Display + substate");
     let mut display: Display<State> = Display::new().context("wayland Display::new failed")?;
     // Wayland init runs *after* the renderer is up — it needs the
     // renderer's per-output descriptors (mode size + compositor
     // position + scale) to create the `wl_output` globals and
-    // seed the fractional-scale state. The Display itself, on
-    // the other hand, has to exist before the EventLoop because
-    // `LoopData` carries it.
+    // seed the fractional-scale state.
 
-    let mut event_loop: EventLoop<LoopData> =
+    let mut event_loop: EventLoop<State> =
         EventLoop::try_new().context("failed to create calloop event loop")?;
     let handle = event_loop.handle();
     let loop_signal = event_loop.get_signal();
@@ -3251,11 +3258,10 @@ fn main() -> Result<()> {
     // Wayland socket source: each accepted UnixStream is registered
     // as a client on the display, attaching our per-client state.
     handle
-        .insert_source(listening_socket, |stream, (), data: &mut LoopData| {
+        .insert_source(listening_socket, |stream, (), state: &mut State| {
             info!("Wayland: accepting new client");
-            if let Err(err) = data
-                .display
-                .handle()
+            if let Err(err) = state
+                .display_handle
                 .insert_client(stream, wayland::new_client_data())
             {
                 warn!(error = %err, "Wayland: insert_client failed");
@@ -3270,8 +3276,11 @@ fn main() -> Result<()> {
     handle
         .insert_source(
             Generic::new(poll_fd, Interest::READ, Mode::Level),
-            |_, _, data: &mut LoopData| {
-                if let Err(err) = data.display.dispatch_clients(&mut data.state) {
+            // The `Display` is owned here by the dispatch closure (calloop's
+            // loop data is `State`); requests are drained into `State` and
+            // outbound flushing happens via `state.display_handle` post-batch.
+            move |_, _, state: &mut State| {
+                if let Err(err) = display.dispatch_clients(state) {
                     warn!(error = %err, "wayland dispatch_clients failed");
                 }
                 Ok(PostAction::Continue)
@@ -3315,14 +3324,14 @@ fn main() -> Result<()> {
         handle
             .insert_source(
                 Timer::from_duration(poll),
-                move |_, (), data: &mut LoopData| {
+                move |_, (), state: &mut State| {
                     let current = stamp(&watch_path);
                     if current != last {
                         // Reload on edit / (re-)creation; ignore deletion
                         // (keep the running config until a file returns).
                         if current.is_some() {
                             info!(path = %watch_path.display(), "config changed; reloading");
-                            data.state.reload_config(&watch_path);
+                            state.reload_config(&watch_path);
                         }
                         last = current;
                     }
@@ -3360,8 +3369,15 @@ fn main() -> Result<()> {
             &wayland_init.display_handle,
             |_client| true,
         );
+    // ext-idle-notify: needs the loop handle to run its own timers (hence
+    // the State-as-loop-data event loop). Built here so it can borrow the
+    // display handle before it moves into State.
+    let idle_notifier = smithay::wayland::idle_notify::IdleNotifierState::<State>::new(
+        &wayland_init.display_handle,
+        handle.clone(),
+    );
 
-    let state = State {
+    let mut state = State {
         session,
         loop_signal,
         drm_device,
@@ -3396,6 +3412,7 @@ fn main() -> Result<()> {
         idle_last_input: std::time::Instant::now(),
         idle_screen_off: false,
         idle_lock_spawned: false,
+        idle_notifier,
         idle_inhibit_state: wayland_init.idle_inhibit_state,
         idle_inhibitors: std::collections::HashSet::new(),
         session_lock_state,
@@ -3421,18 +3438,16 @@ fn main() -> Result<()> {
         local_offset,
         ipc: ipc::IpcState::default(),
     };
-    let mut loop_data = LoopData { state, display };
-
     info!("entering event loop — type to generate events, super+shift+e to exit");
     event_loop
-        .run(None, &mut loop_data, |data| {
+        .run(None, &mut state, |state| {
             // Post-batch: broadcast any IPC state changes (focus, windows,
             // workspaces) to subscribers, then flush Wayland clients so
             // their pending outbound messages don't accumulate. A flush
             // failure typically means a client died mid-flight; log and
             // move on rather than crash the compositor.
-            ipc::poll_events(&mut data.state);
-            if let Err(err) = data.display.flush_clients() {
+            ipc::poll_events(state);
+            if let Err(err) = state.display_handle.flush_clients() {
                 warn!(error = %err, "wayland flush_clients failed");
             }
         })
@@ -3693,14 +3708,14 @@ fn drm_card_paths<T>(devices: &[(T, std::path::PathBuf)]) -> Result<Vec<std::pat
     reason = "one function that wires every backend event source (session, udev, DRM vblank incl. screencopy servicing, libinput); splitting a source out means threading the loop handle + closures through another fn for no clarity gain"
 )]
 fn wire_event_sources(
-    handle: &smithay::reexports::calloop::LoopHandle<'_, LoopData>,
+    handle: &smithay::reexports::calloop::LoopHandle<'_, State>,
     session_notifier: LibSeatSessionNotifier,
     udev: UdevBackend,
     drm_notifier: smithay::backend::drm::DrmDeviceNotifier,
     libinput_backend: LibinputInputBackend,
 ) -> Result<()> {
     handle
-        .insert_source(session_notifier, |event, (), data: &mut LoopData| match event {
+        .insert_source(session_notifier, |event, (), state: &mut State| match event {
             smithay::backend::session::Event::PauseSession => warn!("session paused"),
             smithay::backend::session::Event::ActivateSession => {
                 info!("session activated");
@@ -3708,16 +3723,16 @@ fn wire_event_sources(
                 // switched VTs away, so its vblank will never arrive. Discard
                 // the stale WaitingForVblank bookkeeping (reset to Idle) and
                 // force a fresh render of every output to restore scanout.
-                for crtc in data.state.renderer.crtcs() {
-                    data.state.redraw.insert(crtc, RedrawState::Idle);
+                for crtc in state.renderer.crtcs() {
+                    state.redraw.insert(crtc, RedrawState::Idle);
                 }
-                data.state.queue_redraw_all();
+                state.queue_redraw_all();
             }
         })
         .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
 
     handle
-        .insert_source(udev, |event, (), data: &mut LoopData| match event {
+        .insert_source(udev, |event, (), state: &mut State| match event {
             UdevEvent::Added { device_id, path } => {
                 info!(device_id, path = %path.display(), "udev: device added");
             }
@@ -3731,7 +3746,7 @@ fn wire_event_sources(
                 // card triggers a rescan of ours; the diff makes it a no-op
                 // when nothing we own actually changed.
                 debug!(device_id, "udev: device changed");
-                data.state.handle_drm_changed();
+                state.handle_drm_changed();
             }
         })
         .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
@@ -3739,22 +3754,22 @@ fn wire_event_sources(
     handle
         .insert_source(
             drm_notifier,
-            |event, _meta, data: &mut LoopData| match event {
+            |event, _meta, state: &mut State| match event {
                 smithay::backend::drm::DrmEvent::VBlank(crtc) => {
                     // The flip for this output just completed — ack it so the
                     // swapchain frees the scanned-out buffer.
-                    data.state.renderer.frame_submitted(crtc);
+                    state.renderer.frame_submitted(crtc);
                     // Re-render only if a trigger arrived while the flip was in
                     // flight, or an animation/slide is still running. Otherwise
                     // the output parks until the next trigger queues a redraw.
                     let again = matches!(
-                        data.state.redraw.get(&crtc),
+                        state.redraw.get(&crtc),
                         Some(RedrawState::WaitingForVblank { dirty: true })
                     );
                     if again {
-                        data.state.render_crtc(crtc);
+                        state.render_crtc(crtc);
                     } else {
-                        data.state.redraw.insert(crtc, RedrawState::Idle);
+                        state.redraw.insert(crtc, RedrawState::Idle);
                     }
                 }
                 smithay::backend::drm::DrmEvent::Error(err) => {
@@ -3775,8 +3790,8 @@ fn wire_event_sources(
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         let beat = std::time::Duration::from_secs(1);
         handle
-            .insert_source(Timer::from_duration(beat), move |_, (), data: &mut LoopData| {
-                data.state.queue_redraw_nonfullscreen();
+            .insert_source(Timer::from_duration(beat), move |_, (), state: &mut State| {
+                state.queue_redraw_nonfullscreen();
                 TimeoutAction::ToDuration(beat)
             })
             .map_err(|e| anyhow::anyhow!("failed to insert redraw heartbeat: {e}"))?;
@@ -3790,15 +3805,15 @@ fn wire_event_sources(
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         let tick = std::time::Duration::from_secs(5);
         handle
-            .insert_source(Timer::from_duration(tick), move |_, (), data: &mut LoopData| {
-                data.state.idle_tick();
+            .insert_source(Timer::from_duration(tick), move |_, (), state: &mut State| {
+                state.idle_tick();
                 TimeoutAction::ToDuration(tick)
             })
             .map_err(|e| anyhow::anyhow!("failed to insert idle timer: {e}"))?;
     }
 
     handle
-        .insert_source(libinput_backend, |event, (), data: &mut LoopData| {
+        .insert_source(libinput_backend, |event, (), state: &mut State| {
             log_input_event(&event);
             // Any real user input resets the idle clock and wakes powered-off
             // screens (so a mouse move turns the panels back on). Device
@@ -3810,29 +3825,29 @@ fn wire_event_sources(
                     | InputEvent::PointerButton { .. }
                     | InputEvent::PointerAxis { .. }
             ) {
-                data.state.note_input_activity();
+                state.note_input_activity();
             }
             match event {
-                InputEvent::Keyboard { event: ke } => data.state.handle_key(&ke),
+                InputEvent::Keyboard { event: ke } => state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {
-                    data.state
+                    state
                         .forward_pointer_motion::<LibinputInputBackend>(&pm);
                 }
                 InputEvent::PointerButton { event: pb } => {
-                    data.state
+                    state
                         .forward_pointer_button(pb.button_code(), pb.state(), pb.time_msec());
                 }
                 InputEvent::PointerAxis { event: pa } => {
-                    data.state.forward_pointer_axis::<LibinputInputBackend>(&pa);
+                    state.forward_pointer_axis::<LibinputInputBackend>(&pa);
                 }
                 InputEvent::DeviceAdded { mut device } => {
-                    apply_input_config(&mut device, &data.state.config.input);
+                    apply_input_config(&mut device, &state.config.input);
                     // Keep the handle so a config reload can re-apply
                     // mouse-accel settings to this live device.
-                    data.state.input_devices.push(device);
+                    state.input_devices.push(device);
                 }
                 InputEvent::DeviceRemoved { device } => {
-                    data.state.input_devices.retain(|d| *d != device);
+                    state.input_devices.retain(|d| *d != device);
                 }
                 _ => {}
             }
