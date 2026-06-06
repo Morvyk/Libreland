@@ -926,6 +926,19 @@ impl State {
     /// while a window animation or workspace slide is still running. This is
     /// the old free-run vblank body, now driven on demand by
     /// [`Self::queue_redraw`] and re-driven by the vblank handler.
+    /// Surfaces a client tagged HDR (PQ/HLG) via colour-management. The
+    /// renderer decodes these from PQ (not sRGB) into the linear scene, so
+    /// HDR content composites correctly instead of being treated as SDR.
+    fn hdr_surface_ids(
+        &self,
+    ) -> std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId> {
+        self.color_surfaces
+            .iter()
+            .filter(|(_, c)| c.image_description.is_hdr())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     fn render_crtc(&mut self, crtc: crtc::Handle) {
         let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
         // Workspace slide spec (None when disabled). Clear finished slides,
@@ -1000,6 +1013,7 @@ impl State {
         let hide_cursor =
             self.pointer_locked() || capture_hides_cursor || internal_hides_cursor;
         let client_n = captures.len();
+        let hdr_surface_ids = self.hdr_surface_ids();
         let followup = match self.renderer.render_for_crtc(
             crtc,
             &placements,
@@ -1007,6 +1021,7 @@ impl State {
             &popup_placements,
             hide_cursor,
             &specs,
+            &hdr_surface_ids,
         ) {
             Ok((mut results, followup)) => {
                 // Trailing results belong to the internal specs.

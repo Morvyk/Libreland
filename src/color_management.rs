@@ -140,15 +140,14 @@ pub struct ImageDescriptionData {
 /// which panics (rs backend) — so we queue and flush post-dispatch.
 pub type PendingImageInfo = (WpImageDescriptionInfoV1, ImageDescription);
 
-/// Colour state a client attached to one of its surfaces. Consumed by
-/// the HDR colour pipeline in `render.rs` to decode each source.
+/// Colour state a client attached to one of its surfaces. `image_description`
+/// is read by the HDR colour pipeline (render.rs) to decode tagged surfaces.
 #[derive(Debug, Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "read by the HDR colour pipeline (render.rs) to colour-manage tagged surfaces"
-)]
 pub struct SurfaceColor {
     pub image_description: ImageDescription,
+    /// Render intent the client requested. Not yet differentiated in
+    /// compositing (we always composite perceptually).
+    #[allow(dead_code, reason = "render intent not yet acted on in compositing")]
     pub render_intent: RenderIntent,
 }
 

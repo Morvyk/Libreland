@@ -353,39 +353,144 @@ void main() {
 }
 ";
 
-/// Output-encode shader for HDR scanout: takes the composited scene
-/// (sRGB-encoded, BT.709 primaries — what the SDR pipeline produces) and
-/// re-encodes it to PQ (SMPTE ST 2084) over BT.2020 primaries, with SDR
-/// "white" placed at `reference_white` cd/m². This is the final stage of
-/// the colour pipeline; per-surface HDR-content decode (so a game's PQ
-/// buffer isn't treated as SDR) layers on top of this later.
-///
-/// All maths is standard and luminance-exact, so it needs `highp`;
-/// `GL_FRAGMENT_PRECISION_HIGH` is present on the desktop GLES2 path.
-const HDR_ENCODE_SHADER: &str = r"#version 100
+/// HDR variant of [`ROUND_TEX_SHADER`]: identical rounded-rect + border
+/// composite, but the `win_tex` offscreen and border are sRGB, so the
+/// final composited colour is decoded to linear BT.2020 (scaled to
+/// `reference_white`) before output, for the fp16 linear scene.
+const ROUND_TEX_SHADER_HDR: &str = r"#version 100
 //_DEFINES_
-
+#extension GL_OES_standard_derivatives : enable
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
 precision mediump float;
 #endif
-
 uniform sampler2D tex;
 uniform float alpha;
+uniform vec2 size;
+uniform float radius;
+uniform float border_width;
+uniform vec3 border_top;
+uniform vec3 border_bottom;
+uniform float output_height;
+uniform float cell_origin_y;
 uniform float reference_white;
-
 varying vec2 v_coords;
-
-// sRGB IEC 61966-2-1 EOTF (encoded [0,1] -> linear [0,1], 1.0 = SDR white).
 vec3 srgb_to_linear(vec3 c) {
     vec3 lo = c / 12.92;
     vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
     return mix(lo, hi, step(vec3(0.04045), c));
 }
+void main() {
+    vec2 p = v_coords * size;
+    vec2 half_size = size * 0.5;
+    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
+    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
+    float aa = max(fwidth(dist) * 0.5, 0.5);
+    if (dist > aa) { discard; }
 
-// SMPTE ST 2084 (PQ) inverse-EOTF (OETF): linear normalized to
-// [0,1] where 1.0 == 10000 cd/m² -> PQ-encoded [0,1].
+    vec4 surf = texture2D(tex, v_coords);
+    vec3 surf_straight = surf.a > 0.0 ? (surf.rgb / surf.a) : vec3(0.0);
+
+    float global_y = cell_origin_y + p.y;
+    float t = clamp(global_y / max(output_height, 1.0), 0.0, 1.0);
+    vec3 border_straight = mix(border_top, border_bottom, t);
+
+    float ring = smoothstep(-border_width - aa, -border_width + aa, dist);
+    float outer = 1.0 - smoothstep(-aa, aa, dist);
+
+    // Composite in sRGB straight space (matches the SDR shader's blend),
+    // then decode the composited colour once to linear BT.2020.
+    vec3 composited = mix(surf_straight, border_straight, ring);
+    vec3 lin = srgb_to_linear(composited) * (reference_white / 10000.0);
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = bt709_to_bt2020 * lin;
+    gl_FragColor = vec4(bt2020 * outer, outer) * alpha;
+}
+";
+
+/// HDR variant of [`ROUND_BLUR_SHADER`]: clips the (sRGB) blurred tier to
+/// the rounded shape, then decodes to linear BT.2020 for the fp16 scene.
+const ROUND_BLUR_SHADER_HDR: &str = r"#version 100
+//_DEFINES_
+#extension GL_OES_standard_derivatives : enable
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform vec2 size;
+uniform float radius;
+uniform float reference_white;
+varying vec2 v_coords;
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+void main() {
+    vec2 p = v_coords * size;
+    vec2 half_size = size * 0.5;
+    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
+    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
+    float aa = max(fwidth(dist) * 0.5, 0.5);
+    if (dist > aa) { discard; }
+
+    vec4 c = texture2D(tex, v_coords);
+    vec3 straight = c.a > 0.0 ? (c.rgb / c.a) : vec3(0.0);
+    vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = bt709_to_bt2020 * lin;
+    float outer = 1.0 - smoothstep(-aa, aa, dist);
+    gl_FragColor = vec4(bt2020 * c.a, c.a) * (outer * alpha);
+}
+";
+
+// ----------------------------------------------------------------------
+// HDR colour pipeline (full per-surface linear compositing).
+//
+// HDR outputs composite the whole scene into an fp16 offscreen in a
+// common LINEAR working space: linear light, BT.2020 primaries,
+// normalised so 1.0 == 10000 cd/m² (the PQ peak). Every source is
+// decoded into that space as it is drawn, then a final pass PQ-encodes
+// the linear buffer to the 10-bit scanout. Mechanisms:
+//   - `draw_render_elements` / `render_texture_from_to(None)` consult
+//     GlesFrame::override_default_tex_program → we set SDR_DECODE as the
+//     scene default and swap to HDR_DECODE around PQ-tagged surfaces.
+//   - explicit-program composites (rounded windows, blur clip) bypass the
+//     override → dedicated *_HDR shader variants bake the decode in.
+//   - the per-window `win_tex` offscreen and the Kawase blur pyramid stay
+//     sRGB/8-bit (no override on those sub-frames); they are decoded at
+//     composite time by ROUND_TEX_SHADER_HDR / ROUND_BLUR_SHADER_HDR.
+// All maths needs `highp` (present on the NVIDIA GLES2 path). Textures
+// are premultiplied: un-premultiply, transform straight colour,
+// re-premultiply. Verified adversarially (workflow hdr-linear-effects).
+// ----------------------------------------------------------------------
+
+/// Encode the composited linear-BT.2020 scene (the fp16 offscreen) to PQ
+/// for the 10-bit scanout. Input is already in the working space, so this
+/// is just the PQ OETF (no decode / matrix / reference-white scaling —
+/// those happen per-source at decode time).
+const HDR_ENCODE_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+varying vec2 v_coords;
 vec3 pq_oetf(vec3 l) {
     const float m1 = 0.1593017578125;
     const float m2 = 78.84375;
@@ -393,22 +498,75 @@ vec3 pq_oetf(vec3 l) {
     const float c2 = 18.8515625;
     const float c3 = 18.6875;
     vec3 lp = pow(max(l, vec3(0.0)), vec3(m1));
-    return pow((c1 + c2 * lp) / (1.0 + c3 * lp), vec3(m2));
+    return pow((vec3(c1) + vec3(c2) * lp) / (vec3(1.0) + vec3(c3) * lp), vec3(m2));
 }
-
 void main() {
-    vec3 srgb = texture2D(tex, v_coords).rgb;
-    // Decode to linear light, scale SDR white to the chosen reference
-    // luminance, normalize to the PQ 10000 cd/m² domain.
-    vec3 lin = srgb_to_linear(srgb) * (reference_white / 10000.0);
-    // BT.709 -> BT.2020 primaries (linear RGB).
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 lin = premult.rgb / max(premult.a, 0.001);
+    gl_FragColor = vec4(pq_oetf(lin), 1.0) * alpha;
+}
+";
+
+/// Decode an SDR (sRGB / BT.709) source into the linear BT.2020 working
+/// space, mapping SDR diffuse white to `reference_white` cd/m². Set as
+/// the scene-frame default override for HDR outputs.
+const SDR_DECODE_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform float reference_white;
+varying vec2 v_coords;
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 straight = premult.rgb / max(premult.a, 0.001);
+    vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
     mat3 bt709_to_bt2020 = mat3(
         0.627403896, 0.069097289, 0.016391439,
         0.329283038, 0.919540395, 0.088013308,
         0.043313066, 0.011362316, 0.895595253
     );
     vec3 bt2020 = bt709_to_bt2020 * lin;
-    gl_FragColor = vec4(pq_oetf(bt2020), 1.0) * alpha;
+    gl_FragColor = vec4(bt2020 * premult.a, premult.a) * alpha;
+}
+";
+
+/// Decode an HDR PQ / BT.2020 source (a colour-managed client's buffer)
+/// into the linear BT.2020 working space. Primaries already match and the
+/// PQ EOTF lands in the 1.0 == 10000 cd/m² domain, so no rescale.
+const HDR_DECODE_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+varying vec2 v_coords;
+vec3 pq_eotf(vec3 e) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 ep = pow(e, vec3(1.0 / m2));
+    return pow(max(ep - vec3(c1), vec3(0.0)) / (vec3(c2) - vec3(c3) * ep), vec3(1.0 / m1));
+}
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 straight = premult.rgb / max(premult.a, 0.001);
+    vec3 lin = pq_eotf(straight);
+    gl_FragColor = vec4(lin * premult.a, premult.a) * alpha;
 }
 ";
 
@@ -537,13 +695,25 @@ pub struct Renderer {
     /// mip chain. Built lazily, sized to the output, reused every frame
     /// and rebuilt only when the mode size or pass count changes.
     blur_scratch: HashMap<usize, BlurScratch>,
-    /// Texture shader that encodes the composited (sRGB / BT.709) scene to
-    /// PQ / BT.2020 for an HDR output's 10-bit scanout. See
+    /// Texture shader that PQ-encodes the composited linear-BT.2020 scene
+    /// (the fp16 offscreen) for an HDR output's 10-bit scanout. See
     /// [`HDR_ENCODE_SHADER`]. `Arc`-backed, cheap to clone out per frame.
     hdr_encode_shader: GlesTexProgram,
+    /// Decodes an SDR (sRGB/BT.709) source into the linear BT.2020 working
+    /// space; the scene-frame default override for HDR outputs. See
+    /// [`SDR_DECODE_SHADER`].
+    sdr_decode_shader: GlesTexProgram,
+    /// Decodes an HDR (PQ/BT.2020) source into the linear working space;
+    /// swapped in around colour-managed surfaces. See [`HDR_DECODE_SHADER`].
+    hdr_decode_shader: GlesTexProgram,
+    /// HDR variant of `round_tex_shader` (decodes sRGB→linear BT.2020).
+    /// See [`ROUND_TEX_SHADER_HDR`].
+    round_tex_shader_hdr: GlesTexProgram,
+    /// HDR variant of `round_blur_shader`. See [`ROUND_BLUR_SHADER_HDR`].
+    round_blur_shader_hdr: GlesTexProgram,
     /// Per-output offscreen the HDR scene is composited into before the
-    /// PQ-encode pass, keyed by output name. Sized to the output's mode,
-    /// rebuilt when the size changes; only allocated for HDR outputs.
+    /// PQ-encode pass, keyed by output name. fp16 (linear BT.2020), sized
+    /// to the output's mode, rebuilt when the size changes; only for HDR.
     hdr_scene: HashMap<String, GlesTexture>,
 }
 
@@ -986,13 +1156,47 @@ impl Renderer {
             )
             .context("rounded-blur mask shader compile failed")?;
 
-        info!("phase: compiling HDR output-encode shader");
+        info!("phase: compiling HDR colour-pipeline shaders");
+        // PQ-only encode: input is already linear BT.2020 (no extra uniforms).
         let hdr_encode_shader = gles
+            .compile_custom_texture_shader(HDR_ENCODE_SHADER, &[])
+            .context("HDR output-encode shader compile failed")?;
+        let sdr_decode_shader = gles
             .compile_custom_texture_shader(
-                HDR_ENCODE_SHADER,
+                SDR_DECODE_SHADER,
                 &[UniformName::new("reference_white", UniformType::_1f)],
             )
-            .context("HDR output-encode shader compile failed")?;
+            .context("SDR decode shader compile failed")?;
+        let hdr_decode_shader = gles
+            .compile_custom_texture_shader(HDR_DECODE_SHADER, &[])
+            .context("HDR decode shader compile failed")?;
+        // Rounded-corner / blur HDR variants: same uniforms as their SDR
+        // counterparts plus `reference_white`.
+        let round_tex_shader_hdr = gles
+            .compile_custom_texture_shader(
+                ROUND_TEX_SHADER_HDR,
+                &[
+                    UniformName::new("size", UniformType::_2f),
+                    UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("border_width", UniformType::_1f),
+                    UniformName::new("border_top", UniformType::_3f),
+                    UniformName::new("border_bottom", UniformType::_3f),
+                    UniformName::new("output_height", UniformType::_1f),
+                    UniformName::new("cell_origin_y", UniformType::_1f),
+                    UniformName::new("reference_white", UniformType::_1f),
+                ],
+            )
+            .context("HDR rounded-corner composite shader compile failed")?;
+        let round_blur_shader_hdr = gles
+            .compile_custom_texture_shader(
+                ROUND_BLUR_SHADER_HDR,
+                &[
+                    UniformName::new("size", UniformType::_2f),
+                    UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("reference_white", UniformType::_1f),
+                ],
+            )
+            .context("HDR rounded-blur mask shader compile failed")?;
 
         info!("phase: creating GBM allocator");
         let allocator = GbmAllocator::new(
@@ -1188,6 +1392,10 @@ impl Renderer {
             round_blur_shader,
             blur_scratch: HashMap::new(),
             hdr_encode_shader,
+            sdr_decode_shader,
+            hdr_decode_shader,
+            round_tex_shader_hdr,
+            round_blur_shader_hdr,
             hdr_scene: HashMap::new(),
         })
     }
@@ -1269,7 +1477,7 @@ impl Renderer {
             // Followup ignored: each output is primed once, then parks until
             // a redraw is queued (a flip is now in flight, acked on vblank).
             let _ = self
-                .render_output(idx, &[], &[], &[], false, &[])
+                .render_output(idx, &[], &[], &[], false, &[], &HashSet::new())
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -1323,6 +1531,10 @@ impl Renderer {
     /// `placements` is the caller-snapshot of every visible window as
     /// `(wl_surface, top-left in absolute virtual-layout coords)`;
     /// the layout module owns positioning, the renderer just paints.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "thin pass-through to render_output; the per-frame inputs are all distinct"
+    )]
     pub fn render_for_crtc(
         &mut self,
         crtc: crtc::Handle,
@@ -1331,13 +1543,22 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
+        hdr_surface_ids: &HashSet<ObjectId>,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
         let idx = self
             .outputs
             .iter()
             .position(|o| o.crtc == crtc)
             .with_context(|| format!("vblank for unknown CRTC {crtc:?}"))?;
-        self.render_output(idx, placements, layers, popups, hide_cursor, captures)
+        self.render_output(
+            idx,
+            placements,
+            layers,
+            popups,
+            hide_cursor,
+            captures,
+            hdr_surface_ids,
+        )
     }
 
     /// Ack a completed page-flip for `crtc` so its swapchain frees the
@@ -2239,6 +2460,10 @@ impl Renderer {
         clippy::too_many_lines,
         reason = "this is the per-output render loop — wallpaper, per-window border+surface+rounded-mask, cursor, queue, frame callbacks. Splitting any one piece out would require threading the dmabuf/frame borrow through another method, which adds more friction than length removes."
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "per-frame render inputs (placements, layers, popups, captures, HDR set) are all distinct; bundling them into a struct just moves the noise to the call site"
+    )]
     fn render_output(
         &mut self,
         idx: usize,
@@ -2247,6 +2472,7 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
+        hdr_surface_ids: &HashSet<ObjectId>,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
         // Upload the latest media-wallpaper frame (if the decode thread has
         // produced one) before snapshotting the drawable below, so animated
@@ -2269,6 +2495,10 @@ impl Renderer {
         let round_tex_shader = self.round_tex_shader.clone();
         let round_blur_shader = self.round_blur_shader.clone();
         let hdr_encode_shader = self.hdr_encode_shader.clone();
+        let sdr_decode_shader = self.sdr_decode_shader.clone();
+        let hdr_decode_shader = self.hdr_decode_shader.clone();
+        let round_tex_shader_hdr = self.round_tex_shader_hdr.clone();
+        let round_blur_shader_hdr = self.round_blur_shader_hdr.clone();
         let cursor_size = self.cursor_size;
         let window_opacity = self.decoration.window_opacity;
         // The effective cursor this frame: a compositor override (grab /
@@ -2300,8 +2530,47 @@ impl Renderer {
         let output_name = output.name.clone();
         // HDR outputs composite into an offscreen, then a PQ-encode pass
         // writes the 10-bit scanout (see below). SDR is unaffected.
-        let hdr = output.hdr;
+        // `hdr` may be downgraded to false below if the fp16 scene buffer
+        // can't be allocated (then this output renders as SDR for the frame).
+        let mut hdr = output.hdr;
         let hdr_reference_white = output.hdr_reference_white;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "reference white is a small cd/m² value, exact in f32"
+        )]
+        let ref_white_f32 = hdr_reference_white as f32;
+
+        // Ensure the fp16 linear scene buffer for HDR outputs *before* the
+        // draw closures capture `hdr` (they read it for shader selection).
+        // 8-bit can't hold HDR headroom; if the driver rejects fp16 as a
+        // render target, downgrade this frame to SDR (render straight to the
+        // dmabuf) rather than black-screening — the connector still carries
+        // the HDR signal, so content just looks washed until alloc succeeds.
+        if hdr {
+            let mode_w = u32::try_from(mode_size.w).unwrap_or(0);
+            let mode_h = u32::try_from(mode_size.h).unwrap_or(0);
+            let needs_alloc = match self.hdr_scene.get(&output_name) {
+                Some(tex) => tex.width() != mode_w || tex.height() != mode_h,
+                None => true,
+            };
+            if needs_alloc {
+                match self.gles.create_buffer(
+                    Fourcc::Abgr16161616f,
+                    Size::<i32, smithay::utils::Buffer>::from((mode_size.w, mode_size.h)),
+                ) {
+                    Ok(scene) => {
+                        self.hdr_scene.insert(output_name.clone(), scene);
+                    }
+                    Err(err) => {
+                        warn!(output = %output_name, error = %err,
+                            "fp16 HDR scene buffer alloc failed; rendering this output as SDR");
+                        self.hdr_scene.remove(&output_name);
+                        hdr = false;
+                    }
+                }
+            }
+        }
+
         // Frozen backdrop for this output (freeze-mode screenshot). Cheap
         // Arc-backed clone out before the `self.gles` frame borrow.
         let freeze_texture = self.freeze_textures.get(&output_name).cloned();
@@ -2606,11 +2875,15 @@ impl Renderer {
         // `cell_local`  : a window's animated rect → output-local physical.
         // `draw_window` : one window's surface, composited through the
         //                 rounded mask (decorated Normal) or drawn straight.
-        let draw_base = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
+        // `linear` true when drawing into the fp16 HDR scene (vs the sRGB
+        // blur pyramid): solid fills are then converted to linear BT.2020.
+        // The wallpaper *texture* goes through render_texture_from_to(None),
+        // so it picks up the frame's decode override regardless.
+        let draw_base = |frame: &mut GlesFrame<'_, '_>, linear: bool| -> Result<()> {
             if let Some(wp) = &wallpaper_media {
-                draw_wallpaper_texture(frame, wp, mode_size)?;
+                draw_wallpaper_texture(frame, wp, mode_size, linear, hdr_reference_white)?;
             } else {
-                draw_fill(frame, &wallpaper, mode_size, mode_size)?;
+                draw_fill(frame, &wallpaper, mode_size, mode_size, linear, hdr_reference_white)?;
             }
             for (bucket, elements) in &layer_groups {
                 if matches!(bucket, LayerBucket::Background | LayerBucket::Bottom) {
@@ -2687,15 +2960,24 @@ impl Renderer {
             win_tex.push(tex);
         }
 
+        // `linear` is true when drawing into the fp16 linear-BT.2020 HDR
+        // scene (vs the sRGB blur pyramid): it selects the HDR shader
+        // variants and the per-surface PQ decode. Blur-replay callers pass
+        // false so the pyramid stays sRGB.
         let draw_window = |frame: &mut GlesFrame<'_, '_>,
                            p: &Placement,
                            elements: &[RescaleRenderElement<
             WaylandSurfaceRenderElement<GlesRenderer>,
         >],
                            wd: &WinDraw,
-                           tex: Option<&GlesTexture>|
+                           tex: Option<&GlesTexture>,
+                           linear: bool|
          -> Result<()> {
-            if p.fill == FillMode::Normal && decorated {
+            // A colour-managed (PQ) surface in the linear scene is drawn
+            // straight (skipping decoration — option A) with the PQ decode,
+            // so its content isn't mis-decoded as SDR.
+            let surface_is_hdr = linear && hdr_surface_ids.contains(&p.surface.id());
+            if p.fill == FillMode::Normal && decorated && !surface_is_hdr {
                 // Composite the window's pre-rendered surface through the
                 // rounded mask: surface inside, opaque border ring, and the
                 // corners discarded → genuinely transparent so the backdrop
@@ -2724,7 +3006,7 @@ impl Renderer {
                     clippy::cast_precision_loss,
                     reason = "cell pixel sizes / radius / border are bounded by the output, exact in f32"
                 )]
-                let uniforms = [
+                let mut uniforms = vec![
                     Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
                     Uniform::new("radius", radius as f32),
                     Uniform::new("border_width", bw as f32),
@@ -2733,6 +3015,14 @@ impl Renderer {
                     Uniform::new("output_height", mode_size.h as f32),
                     Uniform::new("cell_origin_y", dst.loc.y as f32),
                 ];
+                // Into the linear scene → HDR variant decodes its sRGB
+                // composite to linear BT.2020 (needs reference_white).
+                let program = if linear {
+                    uniforms.push(Uniform::new("reference_white", ref_white_f32));
+                    &round_tex_shader_hdr
+                } else {
+                    &round_tex_shader
+                };
                 frame
                     .render_texture_from_to(
                         tex,
@@ -2744,16 +3034,27 @@ impl Renderer {
                         // Window opacity + animation alpha, applied here (the
                         // offscreen surface itself was rendered fully opaque).
                         wd.alpha * window_opacity,
-                        Some(&round_tex_shader),
+                        Some(program),
                         &uniforms,
                     )
                     .context("rounded window composite failed")?;
             } else {
-                // Plain rectangle (fullscreen / maximized / undecorated):
-                // draw the surface straight to the frame at its output-local
-                // position. Border tracks the window's *animated* rect.
-                draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
-                    .context("draw_render_elements failed")?;
+                // Plain rectangle (fullscreen / maximized / undecorated, or an
+                // HDR-tagged surface): draw the surface straight to the frame.
+                // For HDR content swap the frame's decode override to PQ for
+                // this draw, then restore the scene's SDR default.
+                if surface_is_hdr {
+                    frame.override_default_tex_program(hdr_decode_shader.clone(), Vec::new());
+                }
+                let res =
+                    draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage);
+                if surface_is_hdr {
+                    frame.override_default_tex_program(
+                        sdr_decode_shader.clone(),
+                        vec![Uniform::new("reference_white", ref_white_f32)],
+                    );
+                }
+                res.context("draw_render_elements failed")?;
             }
             Ok(())
         };
@@ -2767,7 +3068,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
             {
-                draw_window(frame, p, elements, wd, tex.as_ref())?;
+                draw_window(frame, p, elements, wd, tex.as_ref(), false)?;
             }
             Ok(())
         };
@@ -2779,7 +3080,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
             {
-                draw_window(frame, p, elements, wd, tex.as_ref())?;
+                draw_window(frame, p, elements, wd, tex.as_ref(), false)?;
             }
             for (((p, elements), wd), tex) in placements
                 .iter()
@@ -2788,7 +3089,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
             {
-                draw_window(frame, p, elements, wd, tex.as_ref())?;
+                draw_window(frame, p, elements, wd, tex.as_ref(), false)?;
             }
             Ok(())
         };
@@ -2830,7 +3131,9 @@ impl Renderer {
                 .remove(&idx)
                 .expect("ensure_blur_scratch inserted it");
             let res: Result<()> = (|| {
-                render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_base)?;
+                render_scene_stage(&mut self.gles, &mut scratch, mode_size, &|f| {
+                    draw_base(f, false)
+                })?;
                 if need_window {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 0)?;
                     tier_tiled = Some(scratch.tiers[0].clone());
@@ -2893,10 +3196,18 @@ impl Renderer {
                 clippy::cast_precision_loss,
                 reason = "cell pixel sizes / radius are bounded by the output, exact in f32"
             )]
-            let uniforms = [
+            let mut uniforms = vec![
                 Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
                 Uniform::new("radius", radius as f32),
             ];
+            // The blur pyramid is sRGB; into the linear HDR scene the HDR
+            // variant decodes it to linear BT.2020 (needs reference_white).
+            let program = if hdr {
+                uniforms.push(Uniform::new("reference_white", ref_white_f32));
+                &round_blur_shader_hdr
+            } else {
+                &round_blur_shader
+            };
             frame
                 .render_texture_from_to(
                     tier,
@@ -2906,35 +3217,13 @@ impl Renderer {
                     &[],
                     Transform::Normal,
                     1.0,
-                    Some(&round_blur_shader),
+                    Some(program),
                     &uniforms,
                 )
                 .context("blur: backdrop sub-rect")?;
             Ok(())
         };
 
-        // HDR outputs composite into an offscreen sRGB scene buffer (sized
-        // to the output, cached + reused) and then run a PQ/BT.2020 encode
-        // pass into the scanout dmabuf below. SDR composites straight to
-        // the dmabuf (unchanged path).
-        let mode_w = u32::try_from(mode_size.w).unwrap_or(0);
-        let mode_h = u32::try_from(mode_size.h).unwrap_or(0);
-        if hdr {
-            let needs_alloc = match self.hdr_scene.get(&output_name) {
-                Some(tex) => tex.width() != mode_w || tex.height() != mode_h,
-                None => true,
-            };
-            if needs_alloc {
-                let scene = self
-                    .gles
-                    .create_buffer(
-                        Fourcc::Abgr8888,
-                        Size::<i32, smithay::utils::Buffer>::from((mode_size.w, mode_size.h)),
-                    )
-                    .with_context(|| format!("HDR scene buffer alloc failed for {output_name}"))?;
-                self.hdr_scene.insert(output_name.clone(), scene);
-            }
-        }
         let mut target = if hdr {
             let scene = self
                 .hdr_scene
@@ -2954,6 +3243,17 @@ impl Renderer {
                 .render(&mut target, mode_size, Transform::Normal)
                 .with_context(|| format!("GlesRenderer::render failed for {output_name}"))?;
 
+            // HDR output: composite in the linear BT.2020 working space.
+            // Default every override-respecting source draw (wallpaper,
+            // windows, layers, popups, cursor) to the SDR decode; HDR-tagged
+            // surfaces swap to the PQ decode inside draw_window.
+            if hdr {
+                frame.override_default_tex_program(
+                    sdr_decode_shader.clone(),
+                    vec![Uniform::new("reference_white", ref_white_f32)],
+                );
+            }
+
             // Backdrop bands drawn fresh, interleaving the blurred tiers so
             // each translucent surface reveals a blurred copy of whatever
             // sits beneath it. Layer-shell order (wlr-layer-shell spec):
@@ -2961,7 +3261,7 @@ impl Renderer {
             // Each window keeps its own `draw_render_elements` call
             // (single-element slice) so smithay's opaque-region culling
             // can't skip floats behind earlier tiles.
-            draw_base(&mut frame)?;
+            draw_base(&mut frame, hdr)?;
             // Tiled windows blur against the base (tier 0).
             for (((p, elements), wd), tex) in placements
                 .iter()
@@ -2973,7 +3273,7 @@ impl Renderer {
                 if let Some(t) = &tier_tiled {
                     blur_rect(&mut frame, t, cell_local(wd.effective))?;
                 }
-                draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
             }
             // Floating windows draw above tiled and blur against base +
             // tiled (tier 1), so a float reveals the windows beneath it.
@@ -2987,7 +3287,7 @@ impl Renderer {
                 if let Some(t) = &tier_float {
                     blur_rect(&mut frame, t, cell_local(wd.effective))?;
                 }
-                draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
             }
             // Maximized windows: borderless, above normal windows but below
             // Top/Overlay panels. Opaque — no backdrop blur.
@@ -2998,7 +3298,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
             {
-                draw_window(&mut frame, p, elements, wd, tex.as_ref())?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
             }
 
             // Top layer surfaces go above windows but below a fullscreen
@@ -3131,6 +3431,8 @@ impl Renderer {
                     compositor_position,
                     mode_size,
                     scale,
+                    hdr,
+                    hdr_reference_white,
                 )?;
             }
 
@@ -3180,6 +3482,8 @@ impl Renderer {
                             cursor_size,
                             hotspot,
                             scale,
+                            hdr,
+                            hdr_reference_white,
                         )?;
                     }
                 }
@@ -3235,14 +3539,6 @@ impl Renderer {
                     f64::from(mode_size.w),
                     f64::from(mode_size.h),
                 )));
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "reference white is a small cd/m² value, exact in f32"
-                )]
-                let uniforms = [Uniform::new(
-                    "reference_white",
-                    hdr_reference_white as f32,
-                )];
                 frame
                     .render_texture_from_to(
                         scene_tex,
@@ -3253,7 +3549,8 @@ impl Renderer {
                         Transform::Normal,
                         1.0,
                         Some(&hdr_encode_shader),
-                        &uniforms,
+                        // PQ-only encode: scene is already linear BT.2020.
+                        &[],
                     )
                     .context("HDR encode pass")?;
                 frame.finish().context("HDR encode finish")?
@@ -3540,6 +3837,36 @@ fn blur_pass(
     Ok(())
 }
 
+/// Convert an sRGB / BT.709 straight colour into the linear BT.2020 HDR
+/// working space (1.0 == 10000 cd/m², SDR white at `reference_white`).
+///
+/// Solid draws (`GlesFrame::draw_solid`) bypass the texture-decode
+/// override, so their colours must be converted here when compositing
+/// into the fp16 HDR scene. Matches the GLSL decode (column-major
+/// BT.709→BT.2020). Alpha is preserved; the solids we draw are opaque or
+/// black-translucent, so premultiplication is a no-op.
+fn srgb_to_linear_bt2020(color: Color32F, reference_white: u32) -> Color32F {
+    fn eotf(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "reference white is a small cd/m² value, exact in f32"
+    )]
+    let scale = reference_white as f32 / 10000.0;
+    let [r, g, b, a] = color.components();
+    let (lr, lg, lb) = (eotf(r) * scale, eotf(g) * scale, eotf(b) * scale);
+    // BT.709 → BT.2020 (same coefficients as the GLSL `mat3 * vec`).
+    let br = 0.627_403_9 * lr + 0.329_283_04 * lg + 0.043_313_06 * lb;
+    let bg = 0.069_097_29 * lr + 0.919_540_4 * lg + 0.011_362_316 * lb;
+    let bb = 0.016_391_44 * lr + 0.088_013_31 * lg + 0.895_595_3 * lb;
+    Color32F::new(br, bg, bb, a)
+}
+
 /// Paint `fill` inside the output-local rect `rect`. `Solid` is
 /// one `draw_solid` call. `VerticalGradient` walks 256 horizontal
 /// stripes spanning the full output height (so the gradient stays
@@ -3558,6 +3885,8 @@ fn draw_wallpaper_texture(
     frame: &mut GlesFrame<'_, '_>,
     wp: &WpDraw,
     output: Size<i32, Physical>,
+    hdr: bool,
+    reference_white: u32,
 ) -> Result<()> {
     let (ow, oh) = (f64::from(output.w), f64::from(output.h));
     let (tw, th) = (f64::from(wp.width.max(1)), f64::from(wp.height.max(1)));
@@ -3599,7 +3928,7 @@ fn draw_wallpaper_texture(
             )?;
         }
         ScaleMode::Fit => {
-            draw_fill(frame, &black, output, output)?;
+            draw_fill(frame, &black, output, output, hdr, reference_white)?;
             let scale = (ow / tw).min(oh / th);
             let (dw, dh) = ((tw * scale) as i32, (th * scale) as i32);
             let dst = Rectangle::new(
@@ -3609,7 +3938,7 @@ fn draw_wallpaper_texture(
             draw(frame, buf(0.0, 0.0, tw, th), dst)?;
         }
         ScaleMode::Center => {
-            draw_fill(frame, &black, output, output)?;
+            draw_fill(frame, &black, output, output, hdr, reference_white)?;
             // Native size, centred, cropped to the output.
             let (off_x, off_y) = ((output.w - wp.width) / 2, (output.h - wp.height) / 2);
             let (x0, x1) = (off_x.max(0), (off_x + wp.width).min(output.w));
@@ -3635,12 +3964,16 @@ fn draw_fill(
     fill: &Fill,
     rect: Size<i32, Physical>,
     output_size: Size<i32, Physical>,
+    hdr: bool,
+    reference_white: u32,
 ) -> Result<()> {
     draw_fill_rect(
         frame,
         fill,
         Rectangle::<i32, Physical>::from_size(rect),
         output_size,
+        hdr,
+        reference_white,
     )
 }
 
@@ -3649,15 +3982,26 @@ fn draw_fill_rect(
     fill: &Fill,
     rect: Rectangle<i32, Physical>,
     output_size: Size<i32, Physical>,
+    hdr: bool,
+    reference_white: u32,
 ) -> Result<()> {
     if rect.size.w <= 0 || rect.size.h <= 0 {
         return Ok(());
     }
+    // Solid fills bypass the texture-decode override, so convert to the
+    // linear BT.2020 working space ourselves when drawing into the HDR scene.
+    let conv = |c: Color32F| {
+        if hdr {
+            srgb_to_linear_bt2020(c, reference_white)
+        } else {
+            c
+        }
+    };
     match fill {
         Fill::Solid(rgb) => {
             let damage = [Rectangle::from_size(rect.size)];
             frame
-                .draw_solid(rect, &damage, Color32F::new(rgb[0], rgb[1], rgb[2], 1.0))
+                .draw_solid(rect, &damage, conv(Color32F::new(rgb[0], rgb[1], rgb[2], 1.0)))
                 .context("Frame::draw_solid (fill solid) failed")?;
         }
         Fill::VerticalGradient { top, bottom } => {
@@ -3666,12 +4010,12 @@ fn draw_fill_rect(
             let rect_y_end = rect.loc.y + rect.size.h;
             for stripe in 0u8..=u8::MAX {
                 let t = f32::from(stripe) / 255.0;
-                let color = Color32F::new(
+                let color = conv(Color32F::new(
                     top[0].mul_add(1.0 - t, bottom[0] * t),
                     top[1].mul_add(1.0 - t, bottom[1] * t),
                     top[2].mul_add(1.0 - t, bottom[2] * t),
                     1.0,
-                );
+                ));
 
                 let idx = i32::from(stripe);
                 let stripe_y_start = (idx * height) / STRIPE_COUNT;
@@ -3730,6 +4074,8 @@ fn draw_screenshot_overlay(
     compositor_position: Point<i32, Physical>,
     mode_size: Size<i32, Physical>,
     scale: f64,
+    hdr: bool,
+    reference_white: u32,
 ) -> Result<()> {
     const DIM: Color32F = Color32F::new(0.0, 0.0, 0.0, 0.45);
     const OUTLINE: Color32F = Color32F::new(0.25, 0.62, 1.0, 1.0);
@@ -3739,6 +4085,12 @@ fn draw_screenshot_overlay(
         if w <= 0 || h <= 0 {
             return Ok(());
         }
+        // draw_solid bypasses the decode override → convert for the HDR scene.
+        let color = if hdr {
+            srgb_to_linear_bt2020(color, reference_white)
+        } else {
+            color
+        };
         let rect = Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, h)));
         frame
             .draw_solid(rect, &[Rectangle::from_size(rect.size)], color)
@@ -3890,6 +4242,8 @@ fn draw_cursor(
     cursor_size: i32,
     hotspot: Point<i32, Physical>,
     scale: f64,
+    hdr: bool,
+    reference_white: u32,
 ) -> Result<()> {
     if let Some(sprite) = sprite {
         // Image px → physical px: normalise to the requested logical
@@ -3945,12 +4299,14 @@ fn draw_cursor(
     let cursor_damage: Vec<Rectangle<i32, Physical>> = (0..size)
         .map(|row| Rectangle::new(Point::from((0, row)), Size::new(row + 1, 1)))
         .collect();
+    let white = Color32F::new(1.0, 1.0, 1.0, 1.0);
+    let color = if hdr {
+        srgb_to_linear_bt2020(white, reference_white)
+    } else {
+        white
+    };
     frame
-        .draw_solid(
-            cursor_bbox,
-            &cursor_damage,
-            Color32F::new(1.0, 1.0, 1.0, 1.0),
-        )
+        .draw_solid(cursor_bbox, &cursor_damage, color)
         .context("Frame::draw_solid (cursor) failed")?;
     Ok(())
 }
