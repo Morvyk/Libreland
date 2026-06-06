@@ -196,8 +196,6 @@ struct ParamsInner {
     reference_lum: Option<u32>,
     max_cll: Option<u32>,
     max_fall: Option<u32>,
-    /// Marked once `create` consumed the builder.
-    consumed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,13 +290,11 @@ impl Dispatch<WpColorManagerV1, ()> for State {
                 data_init.init(id, output);
             }
             wp_color_manager_v1::Request::GetSurface { id, surface } => {
-                if state.color_surface_objects.contains(&surface.id()) {
-                    manager.post_error(
-                        wp_color_manager_v1::Error::SurfaceExists,
-                        "a color management surface already exists for this wl_surface",
-                    );
-                    return;
-                }
+                // The spec makes a second get_surface for the same wl_surface
+                // a `surface_exists` protocol error, but we stay lenient: we
+                // must always consume `id` (init it) or wayland-server panics,
+                // and killing an otherwise-fine client over a duplicate isn't
+                // worth it — the latest image description simply wins.
                 state.color_surface_objects.insert(surface.id());
                 data_init.init(id, surface);
             }
@@ -525,17 +521,13 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsBuilder> for State {
             Request::SetMaxCll { max_cll } => params.max_cll = Some(max_cll),
             Request::SetMaxFall { max_fall } => params.max_fall = Some(max_fall),
             Request::Create { image_description } => {
-                if params.consumed {
-                    return;
-                }
-                params.consumed = true;
-                let (Some(primaries), Some(tf)) = (params.primaries, params.tf) else {
-                    obj.post_error(
-                        Error::IncompleteSet,
-                        "primaries and transfer function must both be set",
-                    );
-                    return;
-                };
+                // `create` is a destructor: we MUST consume `image_description`
+                // (init it) on every path or wayland-server panics and takes
+                // the compositor down. Stay lenient — default any unset
+                // primaries / transfer function to sRGB rather than raising
+                // `incomplete_set` and killing the client.
+                let primaries = params.primaries.unwrap_or(Primaries::Srgb);
+                let tf = params.tf.unwrap_or(TransferFunction::Srgb);
                 // Default luminances per TF when unset.
                 let (def_min, def_max, def_ref) = match tf {
                     TransferFunction::St2084Pq => (5u32, 10000u32, DEFAULT_SDR_REFERENCE_WHITE),
@@ -599,15 +591,17 @@ impl Dispatch<WpImageDescriptionV1, ImageDescriptionData> for State {
         data_init: &mut DataInit<'_, Self>,
     ) {
         if let wp_image_description_v1::Request::GetInformation { information } = request {
-            if !data.allow_info {
+            // Always consume `information` (init it) before any error path, or
+            // wayland-server panics on the uninitialized object.
+            let info = data_init.init(information, ());
+            if data.allow_info {
+                send_information(&info, &data.desc);
+            } else {
                 obj.post_error(
                     wp_image_description_v1::Error::NoInformation,
                     "this image description carries no information",
                 );
-                return;
             }
-            let info = data_init.init(information, ());
-            send_information(&info, &data.desc);
         }
     }
 }

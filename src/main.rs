@@ -3613,7 +3613,7 @@ fn init_tracing() -> Result<WorkerGuard> {
         .init();
 
     info!(log_file = %log_path.display(), "tracing initialised (file + stderr)");
-    install_panic_hook();
+    install_panic_hook(&log_dir);
     Ok(guard)
 }
 
@@ -3623,9 +3623,24 @@ fn init_tracing() -> Result<WorkerGuard> {
 /// first place — without this, a panic would crash the compositor with
 /// no on-disk record. We delegate to the previous hook so the default
 /// stderr + backtrace behaviour is preserved unchanged.
-fn install_panic_hook() {
+fn install_panic_hook(log_dir: &std::path::Path) {
+    use std::io::Write as _;
+    // The normal log uses a non-blocking writer whose in-flight buffer is
+    // lost when a panic aborts the process — so panics were vanishing. Also
+    // append synchronously to a dedicated panic.log (with a backtrace) that
+    // survives the abort, on top of the tracing + default stderr behaviour.
+    let panic_log = log_dir.join("panic.log");
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log)
+        {
+            let _ = writeln!(file, "==== compositor panic ====\n{panic_info}\n{backtrace}");
+            let _ = file.flush();
+        }
         tracing::error!(panic = %panic_info, "compositor panicked");
         default_hook(panic_info);
     }));
