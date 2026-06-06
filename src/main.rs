@@ -321,10 +321,14 @@ pub(crate) struct State {
         smithay::reexports::wayland_server::backend::ObjectId,
         crate::color_management::SurfaceColor,
     >,
-    /// `wl_surface`s that already own a `wp_color_management_surface_v1`
-    /// (a second `get_surface` for the same surface is a protocol error).
+    /// `wl_surface`s that already own a `wp_color_management_surface_v1`.
     pub(crate) color_surface_objects:
         std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>,
+    /// Deferred `wp_image_description_info_v1` responses: drained after
+    /// each dispatch (see [`color_management::flush_pending_image_info`])
+    /// because sending the `done` destructor inside the creating request
+    /// panics the wayland backend.
+    pub(crate) pending_image_info: Vec<color_management::PendingImageInfo>,
     /// Surfaces holding an active idle inhibitor (e.g. a playing video).
     /// While any is alive, `idle_tick` suppresses the built-in lock/DPMS.
     /// Populated by the `IdleInhibitHandler`; pruned of dead surfaces each
@@ -3473,6 +3477,7 @@ fn main() -> Result<()> {
         color_management: wayland_init.color_management,
         color_surfaces: std::collections::HashMap::new(),
         color_surface_objects: std::collections::HashSet::new(),
+        pending_image_info: Vec::new(),
         session_lock_state,
         lock_surfaces: std::collections::HashMap::new(),
         session_locked: false,
@@ -3505,6 +3510,10 @@ fn main() -> Result<()> {
             // failure typically means a client died mid-flight; log and
             // move on rather than crash the compositor.
             ipc::poll_events(state);
+            // Send any colour-management get_information responses queued
+            // during this iteration's dispatch (deferred so the `done`
+            // destructor doesn't fire inside the creating request).
+            color_management::flush_pending_image_info(state);
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(error = %err, "wayland flush_clients failed");
             }

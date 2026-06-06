@@ -131,10 +131,14 @@ impl IdentityRegistry {
 #[derive(Debug, Clone, Copy)]
 pub struct ImageDescriptionData {
     desc: ImageDescription,
-    /// Whether `get_information` is allowed (true for parametric- and
-    /// output-derived descriptions).
-    allow_info: bool,
 }
+
+/// A `get_information` request whose info events are sent *after* the
+/// current dispatch returns. `wp_image_description_info_v1.done` is a
+/// destructor event: sending it inside the creating request's handler
+/// destroys the object before the wayland backend assigns its data,
+/// which panics (rs backend) — so we queue and flush post-dispatch.
+pub type PendingImageInfo = (WpImageDescriptionInfoV1, ImageDescription);
 
 /// Colour state a client attached to one of its surfaces. Consumed by
 /// the HDR colour pipeline in `render.rs` to decode each source.
@@ -344,7 +348,6 @@ impl Dispatch<WpColorManagementOutputV1, WlOutput> for State {
                 image_description,
                 ImageDescriptionData {
                     desc,
-                    allow_info: true,
                 },
             );
             obj.ready(identity);
@@ -432,7 +435,6 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, WlSurface> for State {
                 image_description,
                 ImageDescriptionData {
                     desc,
-                    allow_info: true,
                 },
             );
             obj.ready(identity);
@@ -548,7 +550,6 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsBuilder> for State {
                     image_description,
                     ImageDescriptionData {
                         desc,
-                        allow_info: true,
                     },
                 );
                 img.ready(identity);
@@ -582,26 +583,21 @@ impl Dispatch<smithay::reexports::wayland_protocols::wp::color_management::v1::s
 
 impl Dispatch<WpImageDescriptionV1, ImageDescriptionData> for State {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        obj: &WpImageDescriptionV1,
+        _obj: &WpImageDescriptionV1,
         request: wp_image_description_v1::Request,
         data: &ImageDescriptionData,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
         if let wp_image_description_v1::Request::GetInformation { information } = request {
-            // Always consume `information` (init it) before any error path, or
-            // wayland-server panics on the uninitialized object.
+            // Init the info object, but DEFER its events: send_information
+            // ends with `done`, a destructor that would destroy this
+            // just-created object before the wayland backend assigns its
+            // data (panic). Flushed right after dispatch instead.
             let info = data_init.init(information, ());
-            if data.allow_info {
-                send_information(&info, &data.desc);
-            } else {
-                obj.post_error(
-                    wp_image_description_v1::Error::NoInformation,
-                    "this image description carries no information",
-                );
-            }
+            state.pending_image_info.push((info, data.desc));
         }
     }
 }
@@ -650,4 +646,13 @@ fn send_information(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
         info.target_max_fall(max_fall);
     }
     info.done();
+}
+
+/// Send the deferred `get_information` responses queued during dispatch.
+/// Call once per event-loop iteration, after `dispatch_clients` (so the
+/// info objects' data is already assigned) and before `flush_clients`.
+pub fn flush_pending_image_info(state: &mut State) {
+    for (info, desc) in std::mem::take(&mut state.pending_image_info) {
+        send_information(&info, &desc);
+    }
 }
