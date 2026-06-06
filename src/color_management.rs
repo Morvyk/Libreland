@@ -247,6 +247,7 @@ impl GlobalDispatch<WpColorManagerV1, ()> for State {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let manager = data_init.init(resource, ());
+        debug!("wp_color_manager_v1: client bound the manager");
 
         // Advertise capabilities (each as its own event), then `done`.
         for intent in [RenderIntent::Perceptual, RenderIntent::Relative] {
@@ -290,6 +291,10 @@ impl Dispatch<WpColorManagerV1, ()> for State {
     ) {
         match request {
             wp_color_manager_v1::Request::GetOutput { id, output } => {
+                debug!(
+                    output = ?Output::from_resource(&output).map(|o| o.name()),
+                    "wp_color_manager_v1: get_output"
+                );
                 data_init.init(id, output);
             }
             wp_color_manager_v1::Request::GetSurface { id, surface } => {
@@ -298,14 +303,22 @@ impl Dispatch<WpColorManagerV1, ()> for State {
                 // must always consume `id` (init it) or wayland-server panics,
                 // and killing an otherwise-fine client over a duplicate isn't
                 // worth it — the latest image description simply wins.
+                debug!(surface = ?surface.id(), "wp_color_manager_v1: get_surface");
                 state.color_surface_objects.insert(surface.id());
                 data_init.init(id, surface);
             }
             wp_color_manager_v1::Request::GetSurfaceFeedback { id, surface } => {
+                let sid = surface.id();
                 let feedback = data_init.init(id, surface);
                 // Inform the client of the current preferred description.
                 let desc = state.preferred_image_description();
                 let identity = state.color_management.identity_for(&desc);
+                debug!(
+                    surface = ?sid,
+                    preferred_hdr = desc.is_hdr(),
+                    preferred_tf = ?desc.tf,
+                    "wp_color_manager_v1: get_surface_feedback (reported preferred description)"
+                );
                 feedback.preferred_changed(identity);
             }
             wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
@@ -342,6 +355,13 @@ impl Dispatch<WpColorManagementOutputV1, WlOutput> for State {
             request
         {
             let desc = state.output_image_description(wl_output);
+            debug!(
+                output = ?Output::from_resource(wl_output).map(|o| o.name()),
+                hdr = desc.is_hdr(),
+                tf = ?desc.tf,
+                primaries = ?desc.primaries,
+                "wp_color_management_output_v1: get_image_description (sent output's colour description)"
+            );
             let identity = state.color_management.identity_for(&desc);
             let obj = data_init.init(
                 image_description,
@@ -398,6 +418,7 @@ impl Dispatch<WpColorManagementSurfaceV1, WlSurface> for State {
                     },
                 );
                 debug!(
+                    surface = ?surface.id(),
                     ?intent,
                     hdr = data.desc.is_hdr(),
                     tf = ?data.desc.tf,
@@ -551,6 +572,13 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsBuilder> for State {
                     max_cll: params.max_cll,
                     max_fall: params.max_fall,
                 };
+                debug!(
+                    hdr = desc.is_hdr(),
+                    tf = ?desc.tf,
+                    primaries = ?desc.primaries,
+                    max_lum = desc.max_lum,
+                    "wp_image_description_creator_params_v1: create (client built its own description)"
+                );
                 let identity = state.color_management.identity_for(&desc);
                 let img = data_init.init(
                     image_description,
@@ -602,6 +630,12 @@ impl Dispatch<WpImageDescriptionV1, ImageDescriptionData> for State {
             // ends with `done`, a destructor that would destroy this
             // just-created object before the wayland backend assigns its
             // data (panic). Flushed right after dispatch instead.
+            debug!(
+                hdr = data.desc.is_hdr(),
+                tf = ?data.desc.tf,
+                primaries = ?data.desc.primaries,
+                "wp_image_description_v1: get_information (client reading a description's details)"
+            );
             let info = data_init.init(information, ());
             state.pending_image_info.push((info, data.desc));
         }

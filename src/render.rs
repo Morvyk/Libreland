@@ -891,6 +891,8 @@ fn stage_hdr(
         Ok(Some(meta)) => {
             if let Err(err) = surface.surface().set_hdr(Some(meta)) {
                 warn!(output = %name, error = %err, "DrmSurface::set_hdr failed; output stays SDR");
+            } else {
+                info!(output = %name, "HDR connector props staged (BT2020/PQ/max-bpc); output is HDR");
             }
         }
         Ok(None) => warn!(
@@ -1320,6 +1322,7 @@ impl Renderer {
                 scale,
                 ?vrr_mode,
                 ?vrr_support,
+                hdr,
                 "output swapchain ready"
             );
 

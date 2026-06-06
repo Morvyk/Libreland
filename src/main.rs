@@ -945,6 +945,9 @@ impl State {
         if tagged.is_empty() {
             return out;
         }
+        // A window counts as HDR if any surface in its tree (toplevel or a
+        // subsurface — e.g. a game's swapchain child) carries an HDR-tagged
+        // image description.
         for p in placements {
             let mut hit = false;
             smithay::wayland::compositor::with_surface_tree_downward(
