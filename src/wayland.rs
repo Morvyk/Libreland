@@ -212,6 +212,9 @@ pub struct WaylandInit {
     /// `zwlr_screencopy_manager_v1` — output capture for screenshots
     /// and screen sharing. Held so the global stays alive.
     pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
+    /// `wp_color_management_v1` — clients detect output HDR and tag their
+    /// surfaces' colour space. Held so the global stays alive.
+    pub color_management: crate::color_management::ColorManagementState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -383,6 +386,9 @@ pub fn init(
     // zwlr_screencopy_manager_v1: lets grim / xdg-desktop-portal-wlr
     // capture outputs for screenshots and screen sharing.
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
+    // wp_color_management_v1: clients detect output HDR + tag surface
+    // colour spaces (Proton/mpv use this to enable HDR).
+    let color_management = crate::color_management::ColorManagementState::new(&dh);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -457,6 +463,7 @@ pub fn init(
         xdg_activation_state,
         pointer_gestures_state,
         screencopy_manager,
+        color_management,
         popup_manager,
         outputs,
         output_globals,

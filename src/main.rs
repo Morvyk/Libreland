@@ -63,6 +63,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 mod anim;
 mod clipboard;
+mod color_management;
 mod config;
 mod cursor;
 mod drm;
@@ -309,6 +310,21 @@ pub(crate) struct State {
     /// dispatch routes through `State`.
     #[allow(dead_code, reason = "held to keep the pointer-gestures global alive")]
     pub(crate) pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
+    /// `wp_color_management_v1` global + image-description identity
+    /// registry. Held so the global stays registered; dispatch routes
+    /// through `State`.
+    pub(crate) color_management: crate::color_management::ColorManagementState,
+    /// Per-surface colour state set via the colour-management protocol,
+    /// keyed by `wl_surface` id. Read by the renderer to colour-manage an
+    /// HDR output; pruned on surface/object destroy.
+    pub(crate) color_surfaces: std::collections::HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        crate::color_management::SurfaceColor,
+    >,
+    /// `wl_surface`s that already own a `wp_color_management_surface_v1`
+    /// (a second `get_surface` for the same surface is a protocol error).
+    pub(crate) color_surface_objects:
+        std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>,
     /// Surfaces holding an active idle inhibitor (e.g. a playing video).
     /// While any is alive, `idle_tick` suppresses the built-in lock/DPMS.
     /// Populated by the `IdleInhibitHandler`; pruned of dead surfaces each
@@ -3454,6 +3470,9 @@ fn main() -> Result<()> {
         idle_inhibitors: std::collections::HashSet::new(),
         xdg_activation_state: wayland_init.xdg_activation_state,
         pointer_gestures_state: wayland_init.pointer_gestures_state,
+        color_management: wayland_init.color_management,
+        color_surfaces: std::collections::HashMap::new(),
+        color_surface_objects: std::collections::HashSet::new(),
         session_lock_state,
         lock_surfaces: std::collections::HashMap::new(),
         session_locked: false,

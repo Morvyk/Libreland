@@ -286,6 +286,11 @@ pub struct OutputConfig {
     /// `HDR_OUTPUT_METADATA`). A no-op on connectors/drivers that don't
     /// expose the HDR properties (logged, output stays SDR).
     pub hdr: bool,
+    /// Reference white luminance (cd/m²) for SDR content shown on this
+    /// output while HDR is on — how bright "white" SDR pixels get mapped
+    /// in the HDR signal. `None` uses the BT.2408 standard 203 cd/m².
+    /// Raise it if the desktop/SDR apps look too dim in HDR mode.
+    pub sdr_reference_white: Option<u32>,
 }
 
 impl Default for OutputConfig {
@@ -296,6 +301,7 @@ impl Default for OutputConfig {
             scale: 1.0,
             vrr: VrrMode::default(),
             hdr: false,
+            sdr_reference_white: None,
         }
     }
 }
@@ -734,6 +740,12 @@ fn parse_output(t: &Table) -> mlua::Result<OutputConfig> {
     }
     if let Some(hdr) = t.get::<Option<bool>>("hdr")? {
         cfg.hdr = hdr;
+    }
+    if let Some(white) = t.get::<Option<u32>>("sdr_reference_white")? {
+        if white == 0 {
+            lua_bail!("sdr_reference_white must be a positive cd/m² value");
+        }
+        cfg.sdr_reference_white = Some(white);
     }
     Ok(cfg)
 }
@@ -1465,5 +1477,24 @@ mod monitors_tests {
         // Explicit toggle is honoured.
         let c = parse(r#"monitors = { outputs = { ["DP-1"] = { hdr = true } } }"#);
         assert!(c.monitors.outputs["DP-1"].hdr);
+    }
+
+    #[test]
+    fn sdr_reference_white_parses_and_defaults() {
+        let c = parse(r#"monitors = { outputs = { ["DP-1"] = { scale = 1.0 } } }"#);
+        assert_eq!(c.monitors.outputs["DP-1"].sdr_reference_white, None);
+        let c = parse(
+            r#"monitors = { outputs = { ["DP-1"] = { hdr = true, sdr_reference_white = 250 } } }"#,
+        );
+        assert_eq!(c.monitors.outputs["DP-1"].sdr_reference_white, Some(250));
+    }
+
+    #[test]
+    fn sdr_reference_white_rejects_zero() {
+        let lua = Lua::new();
+        lua.load(r#"monitors = { outputs = { ["DP-1"] = { sdr_reference_white = 0 } } }"#)
+            .exec()
+            .unwrap();
+        assert!(Config::populate_from_globals(&lua.globals()).is_err());
     }
 }
