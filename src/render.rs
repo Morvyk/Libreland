@@ -513,6 +513,46 @@ void main() {
 }
 ";
 
+/// Tonemap the composited linear-BT.2020 scene (the fp16 offscreen) down to
+/// an 8-bit **sRGB** image for screenshots, so a capture of an HDR output
+/// "looks like SDR". GLES can't read the fp16 scanout back as an 8-bit
+/// format, and even if it could the pixels would be linear BT.2020 — so on
+/// HDR outputs captures render through this into an `Abgr8888` buffer first.
+///
+/// Inverse of the SDR decode for SDR content (exact round-trip): BT.2020→
+/// BT.709 gamut, scale so `reference_white` maps back to 1.0, clamp (HDR
+/// highlights clip to white, as they would on an SDR display), sRGB OETF.
+const SCREENSHOT_TONEMAP_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform float reference_white;
+varying vec2 v_coords;
+vec3 linear_to_srgb(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(lo, hi, step(vec3(0.0031308), c));
+}
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 bt2020 = premult.rgb / max(premult.a, 0.001);
+    mat3 bt2020_to_bt709 = mat3(
+        1.660491, -0.124550, -0.018151,
+        -0.587641, 1.132900, -0.100579,
+        -0.072850, -0.008349, 1.118730
+    );
+    vec3 lin = bt2020_to_bt709 * bt2020;
+    lin *= (10000.0 / reference_white);
+    lin = clamp(lin, 0.0, 1.0);
+    gl_FragColor = vec4(linear_to_srgb(lin), 1.0) * alpha;
+}
+";
+
 /// Decode an SDR (sRGB / BT.709) source into the linear BT.2020 working
 /// space, mapping SDR diffuse white to `reference_white` cd/m². Set as
 /// the scene-frame default override for HDR outputs.
@@ -712,6 +752,10 @@ pub struct Renderer {
     /// (the fp16 offscreen) for an HDR output's 10-bit scanout. See
     /// [`HDR_ENCODE_SHADER`]. `Arc`-backed, cheap to clone out per frame.
     hdr_encode_shader: GlesTexProgram,
+    /// Tonemaps the linear-BT.2020 scene to 8-bit sRGB for screenshots of
+    /// an HDR output (the fp16 scanout can't be read back as 8-bit). See
+    /// [`SCREENSHOT_TONEMAP_SHADER`].
+    screenshot_tonemap_shader: GlesTexProgram,
     /// Decodes an SDR (sRGB/BT.709) source into the linear BT.2020 working
     /// space; the scene-frame default override for HDR outputs. See
     /// [`SDR_DECODE_SHADER`].
@@ -728,6 +772,11 @@ pub struct Renderer {
     /// PQ-encode pass, keyed by output name. fp16 (linear BT.2020), sized
     /// to the output's mode, rebuilt when the size changes; only for HDR.
     hdr_scene: HashMap<String, GlesTexture>,
+    /// Per-output 8-bit `Abgr8888` scratch the HDR scene is tonemapped into
+    /// for screenshots / screencopy (the fp16 scanout can't be read back as
+    /// 8-bit). Cached + reused so continuous capture (OBS) doesn't re-alloc a
+    /// full-output buffer every frame; rebuilt only on size change.
+    sdr_capture: HashMap<String, GlesTexture>,
 }
 
 /// Number of backdrop blur tiers: 0 = base (wallpaper + lower layers,
@@ -1190,6 +1239,12 @@ impl Renderer {
         let hdr_encode_shader = gles
             .compile_custom_texture_shader(HDR_ENCODE_SHADER, &[])
             .context("HDR output-encode shader compile failed")?;
+        let screenshot_tonemap_shader = gles
+            .compile_custom_texture_shader(
+                SCREENSHOT_TONEMAP_SHADER,
+                &[UniformName::new("reference_white", UniformType::_1f)],
+            )
+            .context("screenshot tonemap shader compile failed")?;
         let sdr_decode_shader = gles
             .compile_custom_texture_shader(
                 SDR_DECODE_SHADER,
@@ -1428,11 +1483,13 @@ impl Renderer {
             round_blur_shader,
             blur_scratch: HashMap::new(),
             hdr_encode_shader,
+            screenshot_tonemap_shader,
             sdr_decode_shader,
             hdr_decode_shader,
             round_tex_shader_hdr,
             round_blur_shader_hdr,
             hdr_scene: HashMap::new(),
+            sdr_capture: HashMap::new(),
         })
     }
 
@@ -2208,6 +2265,114 @@ impl Renderer {
                 cfg.window_close.curve,
             ),
         });
+    }
+
+    /// Tonemap an HDR output's linear-BT.2020 scene to an 8-bit sRGB scratch
+    /// buffer and service `captures` from it. GLES can't read the fp16 scanout
+    /// back as an 8-bit format (and it'd be linear BT.2020 anyway), so HDR
+    /// captures go through [`SCREENSHOT_TONEMAP_SHADER`] first; the result is
+    /// SDR-correct ("looks like SDR"). The scratch buffer is cached per output
+    /// (reused across frames). Any GL failure fails just the captures, not the
+    /// frame.
+    fn capture_tonemapped(
+        &mut self,
+        output_name: &str,
+        mode_size: Size<i32, Physical>,
+        reference_white: f32,
+        captures: &[CaptureSpec],
+    ) -> Vec<CaptureOutcome> {
+        let failed = || captures.iter().map(|_| CaptureOutcome::Failed).collect();
+        // Ensure a cached 8-bit scratch sized to the output (reused across
+        // frames so continuous screencopy doesn't re-alloc every frame).
+        let mode_w = u32::try_from(mode_size.w).unwrap_or(0);
+        let mode_h = u32::try_from(mode_size.h).unwrap_or(0);
+        let needs_alloc = match self.sdr_capture.get(output_name) {
+            Some(tex) => tex.width() != mode_w || tex.height() != mode_h,
+            None => true,
+        };
+        if needs_alloc {
+            let buf_size = Size::<i32, smithay::utils::Buffer>::from((mode_size.w, mode_size.h));
+            match self.gles.create_buffer(Fourcc::Abgr8888, buf_size) {
+                Ok(b) => {
+                    self.sdr_capture.insert(output_name.to_string(), b);
+                }
+                Err(err) => {
+                    warn!(error = %err, output = %output_name, "screenshot: tonemap buffer alloc failed");
+                    self.sdr_capture.remove(output_name);
+                    return failed();
+                }
+            }
+        }
+        let tonemap = self.screenshot_tonemap_shader.clone();
+        // `GlesTexture` is `Arc`-backed, so clone the scene handle out to drop
+        // the immutable `hdr_scene` borrow before re-borrowing `self.gles`.
+        let scene_tex = self
+            .hdr_scene
+            .get(output_name)
+            .expect("HDR scene buffer present")
+            .clone();
+        // Disjoint field borrows: `&mut self.sdr_capture[..]` and `&mut
+        // self.gles` are separate fields, so binding the scratch is fine.
+        let mut sdr = self.sdr_capture.remove(output_name).expect("just ensured");
+        let mut target = match self.gles.bind(&mut sdr) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(error = %err, output = %output_name, "screenshot: bind tonemap buffer failed");
+                // `sdr` drops here (cache entry stays removed → re-alloc next frame).
+                return failed();
+            }
+        };
+        let render = (|| -> Result<()> {
+            let mut frame = self
+                .gles
+                .render(&mut target, mode_size, Transform::Normal)
+                .context("screenshot tonemap render")?;
+            let dst = Rectangle::from_size(mode_size);
+            let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                f64::from(mode_size.w),
+                f64::from(mode_size.h),
+            )));
+            frame
+                .render_texture_from_to(
+                    &scene_tex,
+                    src,
+                    dst,
+                    &[dst],
+                    &[dst],
+                    Transform::Normal,
+                    1.0,
+                    Some(&tonemap),
+                    &[Uniform::new("reference_white", reference_white)],
+                )
+                .context("screenshot tonemap pass")?;
+            // Same-context sequential GL: the copy_framebuffer read-back below
+            // is ordered after this draw, so the sync fence needn't be awaited.
+            let _ = frame.finish().context("screenshot tonemap finish")?;
+            Ok(())
+        })();
+        if let Err(err) = render {
+            warn!(error = %err, output = %output_name, "screenshot: tonemap failed");
+            return failed();
+        }
+        // The scratch buffer now holds an upright 8-bit sRGB copy — service
+        // every capture from it exactly like the SDR scanout path (both the
+        // CPU read-back and the zero-copy dmabuf blit, so OBS et al. record
+        // SDR-correct frames instead of the dark linear scene).
+        let results: Vec<CaptureOutcome> = captures
+            .iter()
+            .map(|spec| match &spec.target {
+                CaptureTarget::Shm => {
+                    capture_shm(&mut self.gles, &target, spec, mode_size.h, output_name)
+                }
+                CaptureTarget::Dmabuf(client) => {
+                    capture_dmabuf(&mut self.gles, &target, client, spec, mode_size.h, output_name)
+                }
+            })
+            .collect();
+        // `target` borrows `sdr`; drop it before caching the buffer back.
+        drop(target);
+        self.sdr_capture.insert(output_name.to_string(), sdr);
+        results
     }
 
     /// Render `surface`'s current surface tree into an offscreen and read it
@@ -3570,27 +3735,42 @@ impl Renderer {
         // caller, which writes them into client buffers + signals the
         // frames. Done before `queue_buffer` so we read the buffer
         // while it's unambiguously ours.
-        let capture_results: Vec<CaptureOutcome> = captures
-            .iter()
-            .map(|spec| match &spec.target {
-                CaptureTarget::Shm => {
-                    capture_shm(&mut self.gles, &target, spec, mode_size.h, &output_name)
-                }
-                CaptureTarget::Dmabuf(client) => capture_dmabuf(
-                    &mut self.gles,
-                    &target,
-                    client,
-                    spec,
-                    mode_size.h,
-                    &output_name,
-                ),
-            })
-            .collect();
+        // SDR composited straight to the 8-bit scanout, so captures read
+        // `target` directly. HDR's `target` is the fp16 linear-BT.2020
+        // offscreen, which GLES can't read back as an 8-bit format (and
+        // wouldn't be SDR colour anyway) — those are serviced below via a
+        // tonemap-to-sRGB pass once `target` is released.
+        let mut capture_results: Vec<CaptureOutcome> = if hdr {
+            Vec::new()
+        } else {
+            captures
+                .iter()
+                .map(|spec| match &spec.target {
+                    CaptureTarget::Shm => {
+                        capture_shm(&mut self.gles, &target, spec, mode_size.h, &output_name)
+                    }
+                    CaptureTarget::Dmabuf(client) => capture_dmabuf(
+                        &mut self.gles,
+                        &target,
+                        client,
+                        spec,
+                        mode_size.h,
+                        &output_name,
+                    ),
+                })
+                .collect()
+        };
         drop(target);
 
-        // HDR: encode the composited scene (sRGB / BT.709, in the offscreen)
-        // to PQ / BT.2020 into the 10-bit scanout dmabuf. (Screenshots above
-        // read the offscreen, so captures stay SDR-correct.) SDR keeps the
+        // HDR screenshots: tonemap the linear scene to 8-bit sRGB and read
+        // that, so a capture of an HDR output "looks like SDR".
+        if hdr && !captures.is_empty() {
+            capture_results =
+                self.capture_tonemapped(&output_name, mode_size, ref_white_f32, captures);
+        }
+
+        // HDR: encode the composited linear-BT.2020 scene (the fp16 offscreen)
+        // to PQ / BT.2020 into the 10-bit scanout dmabuf. SDR keeps the
         // scene's own sync — it composited straight to the dmabuf.
         let sync = if hdr {
             let scene_tex = self
