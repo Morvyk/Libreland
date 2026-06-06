@@ -585,6 +585,63 @@ pub struct ScreenshotOverlay {
 /// (`mode_size = compositor_size * scale`, give or take rounding).
 /// Per-output `render` multiplies everything that hits the
 /// `GlesFrame` by `scale` to land at the right physical pixel.
+/// Scanout format preference for an output's swapchain. HDR outputs try
+/// 10-bit first so the link can carry a Rec.2020 / PQ signal, then fall
+/// back to 8-bit so allocation still succeeds on a panel/driver that
+/// rejects 10-bit (the HDR apply then logs that the link stayed SDR).
+fn scanout_formats(hdr: bool) -> &'static [Fourcc] {
+    if hdr {
+        &[Fourcc::Abgr2101010, Fourcc::Xbgr2101010, Fourcc::Xrgb8888]
+    } else {
+        &[Fourcc::Xrgb8888]
+    }
+}
+
+/// Whether a chosen scanout fourcc carries 10 bits per colour channel.
+fn is_10bit(format: Fourcc) -> bool {
+    matches!(
+        format,
+        Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010
+    )
+}
+
+/// Stage this output's HDR connector properties on the freshly-built
+/// surface so they ride smithay's first modeset (the surface's initial
+/// commit) in one coherent commit, rather than a separate side-channel
+/// commit that wedges the pipe.
+///
+/// Only acts when `hdr` is `true`: the SDR path is left completely
+/// untouched so a non-HDR output's modeset is byte-for-byte what it was
+/// before HDR support existed (no regression risk). A consequence is
+/// that toggling HDR *off* at runtime does not actively clear the
+/// connector's BT2020/PQ signalling — the panel may stay in HDR mode
+/// (showing SDR content) until the compositor restarts. Never fails the
+/// build: a connector that can't do HDR just stays SDR, logged.
+fn stage_hdr(
+    surface: &GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
+    connector: connector::Handle,
+    hdr: bool,
+    name: &str,
+) {
+    if !hdr {
+        return;
+    }
+    match crate::hdr::hdr_metadata(surface.surface(), connector) {
+        Ok(Some(meta)) => {
+            if let Err(err) = surface.surface().set_hdr(Some(meta)) {
+                warn!(output = %name, error = %err, "DrmSurface::set_hdr failed; output stays SDR");
+            }
+        }
+        Ok(None) => warn!(
+            output = %name,
+            "HDR requested but connector exposes no HDR_OUTPUT_METADATA; staying SDR"
+        ),
+        Err(err) => {
+            warn!(output = %name, error = %err, "could not read connector properties for HDR");
+        }
+    }
+}
+
 struct OutputRender {
     name: String,
     crtc: crtc::Handle,
@@ -900,10 +957,11 @@ impl Renderer {
             // Grab the connector before the surface is moved into the
             // GBM swapchain — adaptive-sync support is a connector property.
             let connector = drm_output.connector;
+            let hdr = output_cfg.is_some_and(|c| c.hdr);
             let surface = GbmBufferedSurface::new(
                 drm_output.surface,
                 allocator.clone(),
-                &[Fourcc::Xrgb8888],
+                scanout_formats(hdr),
                 renderer_formats.clone(),
             )
             .with_context(|| {
@@ -912,6 +970,16 @@ impl Renderer {
                     drm_output.name
                 )
             })?;
+            if hdr && !is_10bit(surface.format()) {
+                warn!(
+                    output = %drm_output.name,
+                    format = ?surface.format(),
+                    "HDR requested but driver/plane selected a non-10-bit scanout format; HDR will likely not engage"
+                );
+            }
+            // Stage HDR (or SDR reset) so the surface's first modeset
+            // carries the connector properties in one coherent commit.
+            stage_hdr(&surface, connector, hdr, &drm_output.name);
 
             let vrr_mode = output_cfg.map_or_else(VrrMode::default, |c| c.vrr);
             // Query once: the connector's advertised adaptive-sync support.
@@ -1239,11 +1307,12 @@ impl Renderer {
         );
 
         let connector = drm_output.connector;
+        let hdr = output_cfg.is_some_and(|c| c.hdr);
         let renderer_formats = self.gles.egl_context().dmabuf_render_formats().clone();
         let surface = GbmBufferedSurface::new(
             drm_output.surface,
             self.allocator.clone(),
-            &[Fourcc::Xrgb8888],
+            scanout_formats(hdr),
             renderer_formats,
         )
         .with_context(|| {
@@ -1252,6 +1321,14 @@ impl Renderer {
                 drm_output.name
             )
         })?;
+        if hdr && !is_10bit(surface.format()) {
+            warn!(
+                output = %drm_output.name,
+                format = ?surface.format(),
+                "HDR requested but driver/plane selected a non-10-bit scanout format; HDR will likely not engage"
+            );
+        }
+        stage_hdr(&surface, connector, hdr, &drm_output.name);
 
         let vrr_mode = output_cfg.map_or_else(VrrMode::default, |c| c.vrr);
         let vrr_support = surface

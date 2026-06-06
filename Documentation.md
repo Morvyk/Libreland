@@ -9,7 +9,7 @@ session, though APIs and config may still shift. What works today:
 
 - **Multi-output DRM/KMS** on a **GBM + EGL + GLES2** pipeline (one
   `GbmBufferedSurface` per connector), with **live hotplug** (connect /
-  disconnect) and per-output `mode` / `position` / `scale` / `vrr`
+  disconnect) and per-output `mode` / `position` / `scale` / `vrr` / `hdr`
   config — all applicable on a live reload (see
   [Live reload](#live-reload)). The compositor picks a DRM card that can
   actually drive a display, and handles multi-GPU setups. Frame GPU work
@@ -80,8 +80,9 @@ breaks your session. You can also force a reload at any time with
   whole `animations` and `decoration` sections — take effect on the
   next frame / window reconfigure.
 - `monitors` — `position`, `scale`, `primary` and `vrr` reflow the
-  outputs immediately; a changed `mode` triggers a live DRM modeset
-  (the affected output blinks once, windows are preserved).
+  outputs immediately; a changed `mode` or `hdr` toggle rebuilds the
+  affected output's swapchain via a live DRM modeset (the output blinks
+  once, windows are preserved).
 - `input` — `repeat_rate`/`repeat_delay`, `keyboard_layout` (both the
   keymap clients receive and the one hotkeys match against), and the
   `mouse_accel_*` settings (re-applied to the connected pointers).
@@ -111,6 +112,7 @@ monitors = {
             position = { x = 0, y = 0 },
             scale = 1.0,
             vrr = "auto",  -- "auto" (default) | "always" | "off"
+            hdr = false,   -- default false; true = 10-bit Rec.2020/PQ signal (see note below)
         },
         ["HDMI-A-1"] = {
             position = { x = 3840, y = 0 },
@@ -332,6 +334,7 @@ the runtime today (✅) or just held in `Config` for a later consumer
 | `outputs[name].position` | `nil`    | ✅    | Top-left of this output in the virtual layout, in *logical* pixels (`{ x = …, y = … }`). `nil` falls back to the auto left-to-right layout. Mixing configured and auto-positioned outputs is fine. Outputs are never allowed to overlap: a configured position is honoured exactly unless it would collide with an already-placed output (e.g. a live `scale` change widens a monitor past its neighbour's `x`), in which case it's nudged right just enough to clear the collision — only on the X axis, so vertical/stacked layouts (same `x`, different `y`) keep their exact position. The shift is logged. |
 | `outputs[name].scale`    | `1.0`    | ✅    | Fractional scale. The renderer scales every layout coordinate from compositor (= logical) to physical by this factor. Clients see the exact fractional value via `wp_fractional_scale_manager_v1` and a rounded integer fallback via `wl_output.scale`; `wp_viewporter` is advertised so fractional-aware clients can map their oversized buffer down to the logical rect (without it their content composites at the wrong size). Must be positive. Per-surface scale tracking is single-output for now — every surface gets the primary's scale until per-output workspaces ship. |
 | `outputs[name].vrr`      | `"auto"` | ✅    | Variable Refresh Rate (adaptive-sync / FreeSync / G-Sync) policy. `"auto"` enables VRR only while a window fills this output (fullscreen or maximized) — where it actually helps (games, fullscreen video) — and disables it on the desktop, avoiding the flicker some panels show under idle VRR. `"always"` keeps it on; `"off"` never uses it. A no-op on outputs whose connector doesn't advertise adaptive-sync (logged at startup as `vrr_support=NotSupported`). On DisplayPort toggling is seamless; on HDMI the kernel currently needs a modeset (brief blink) to switch, which Libreland performs automatically. |
+| `outputs[name].hdr`      | `false`  | ✅    | Enable HDR on this output. `true` requests a 10-bit scanout buffer and folds the connector's HDR properties (`Colorspace=BT2020_RGB`, `max bpc=10`, `HDR_OUTPUT_METADATA` — PQ / Rec.2020) into the same atomic modeset that brings the pipe up. A no-op (output stays SDR, logged) on connectors/drivers that don't expose the HDR properties or reject 10-bit. Toggling at runtime rebuilds the output's swapchain (brief modeset/blink), same as a `mode` change. **Turning HDR off** currently does not actively clear the signalling, so the panel may stay in HDR mode until the compositor restarts. Requires the vendored smithay patch under `vendor/smithay` (upstream smithay 0.7 can't attach these properties to its modeset, and a separate side-channel commit wedges the display). **⚠ Work in progress:** this sets up only the *signal path* — it does not yet colour-manage compositing, so SDR content looks washed-out/over-bright on an HDR output, and there is no per-client `wp_color_management_v1` support or HDR→SDR tonemapping for screenshots yet. Leave it `false` for normal use until the colour pipeline lands. |
 | `primary`                | `nil`    | ✅    | Connector name of the primary output. The tile area's bounds + the initial cursor position come from this output. `nil` falls back to the first connected output in DRM enumeration order.                                                                                                                      |
 
 ### input

@@ -66,6 +66,7 @@ mod clipboard;
 mod config;
 mod cursor;
 mod drm;
+mod hdr;
 mod ipc;
 mod keyboard;
 mod media;
@@ -2467,16 +2468,23 @@ impl State {
 
         // ---- Detect what changed (before any mutation). ----
         let monitors_changed = new.monitors != self.config.monitors;
-        // Outputs whose forced-mode override changed need a real DRM
-        // modeset; reflow alone only re-positions/-scales/-VRRs.
-        let mode_changed: Vec<String> = if monitors_changed {
+        // Outputs whose forced-mode override OR HDR toggle changed need a
+        // real DRM surface rebuild (modeset / new buffer format); reflow
+        // alone only re-positions/-scales/-VRRs. The HDR scanout format is
+        // fixed at swapchain creation, so toggling it means recreating the
+        // surface — the same path a mode change takes.
+        let rebuild_outputs: Vec<String> = if monitors_changed {
             self.renderer
                 .output_names()
                 .into_iter()
                 .filter(|name| {
-                    let old = self.config.monitors.outputs.get(name).and_then(|c| c.mode);
-                    let new_m = new.monitors.outputs.get(name).and_then(|c| c.mode);
-                    old != new_m
+                    let old = self.config.monitors.outputs.get(name);
+                    let new_o = new.monitors.outputs.get(name);
+                    let old_mode = old.and_then(|c| c.mode);
+                    let new_mode = new_o.and_then(|c| c.mode);
+                    let old_hdr = old.is_some_and(|c| c.hdr);
+                    let new_hdr = new_o.is_some_and(|c| c.hdr);
+                    old_mode != new_mode || old_hdr != new_hdr
                 })
                 .collect()
         } else {
@@ -2504,14 +2512,14 @@ impl State {
 
         // ---- Monitors: modeset changed modes, then reflow the rest. ----
         if monitors_changed {
-            for name in &mode_changed {
+            for name in &rebuild_outputs {
                 self.change_output_mode(name, &new.monitors);
             }
             let descs = self.renderer.reflow_outputs(&new.monitors);
             self.sync_output_globals(&descs);
             self.recompute_layer_layout();
             self.preferred_scale = self.renderer.primary_scale();
-            info!("monitor config reloaded (position/scale/primary/vrr/mode)");
+            info!("monitor config reloaded (position/scale/primary/vrr/mode/hdr)");
         }
 
         // ---- XWayland: start or stop the satellite to match the toggle. ----

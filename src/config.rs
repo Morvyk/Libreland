@@ -280,6 +280,12 @@ pub struct OutputConfig {
     /// a no-op on outputs whose connector doesn't advertise
     /// adaptive-sync.
     pub vrr: VrrMode,
+    /// Enable HDR on this output. Defaults to `false`. When `true` the
+    /// output requests a 10-bit scanout buffer and drives the connector
+    /// into a Rec.2020 / PQ HDR signal (`Colorspace`, `max bpc`,
+    /// `HDR_OUTPUT_METADATA`). A no-op on connectors/drivers that don't
+    /// expose the HDR properties (logged, output stays SDR).
+    pub hdr: bool,
 }
 
 impl Default for OutputConfig {
@@ -289,6 +295,7 @@ impl Default for OutputConfig {
             position: None,
             scale: 1.0,
             vrr: VrrMode::default(),
+            hdr: false,
         }
     }
 }
@@ -724,6 +731,9 @@ fn parse_output(t: &Table) -> mlua::Result<OutputConfig> {
     }
     if let Some(vrr) = t.get::<Option<String>>("vrr")? {
         cfg.vrr = parse_vrr_mode(&vrr)?;
+    }
+    if let Some(hdr) = t.get::<Option<bool>>("hdr")? {
+        cfg.hdr = hdr;
     }
     Ok(cfg)
 }
@@ -1444,5 +1454,16 @@ mod monitors_tests {
             .exec()
             .unwrap();
         assert!(Config::populate_from_globals(&lua.globals()).is_err());
+    }
+
+    #[test]
+    fn hdr_defaults_off_and_parses() {
+        // Absent key (and an output not listed at all) defaults to off.
+        let c = parse(r#"monitors = { outputs = { ["DP-1"] = { scale = 1.0 } } }"#);
+        assert!(!c.monitors.outputs["DP-1"].hdr);
+        assert!(!OutputConfig::default().hdr);
+        // Explicit toggle is honoured.
+        let c = parse(r#"monitors = { outputs = { ["DP-1"] = { hdr = true } } }"#);
+        assert!(c.monitors.outputs["DP-1"].hdr);
     }
 }
