@@ -416,6 +416,54 @@ void main() {
 }
 ";
 
+/// Rounded-corner / border composite for an **HDR window** whose surface is
+/// already decoded to linear BT.2020 in its fp16 `win_tex` (PQ clients can't
+/// round-trip through the 8-bit sRGB offscreen the SDR variant assumes). Same
+/// geometry as [`ROUND_TEX_SHADER_HDR`] but it composites the (already-linear)
+/// surface with a linear border ring — no sRGB decode, no matrix. The border
+/// colours are converted to linear BT.2020 on the CPU and passed in.
+const ROUND_TEX_SHADER_LINEAR: &str = r"#version 100
+//_DEFINES_
+#extension GL_OES_standard_derivatives : enable
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform vec2 size;
+uniform float radius;
+uniform float border_width;
+uniform vec3 border_top;
+uniform vec3 border_bottom;
+uniform float output_height;
+uniform float cell_origin_y;
+varying vec2 v_coords;
+void main() {
+    vec2 p = v_coords * size;
+    vec2 half_size = size * 0.5;
+    vec2 d = abs(p - half_size) - (half_size - vec2(radius));
+    float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
+    float aa = max(fwidth(dist) * 0.5, 0.5);
+    if (dist > aa) { discard; }
+
+    vec4 surf = texture2D(tex, v_coords);
+    vec3 surf_straight = surf.a > 0.0 ? (surf.rgb / surf.a) : vec3(0.0);
+
+    float global_y = cell_origin_y + p.y;
+    float t = clamp(global_y / max(output_height, 1.0), 0.0, 1.0);
+    vec3 border_straight = mix(border_top, border_bottom, t);
+
+    float ring = smoothstep(-border_width - aa, -border_width + aa, dist);
+    float outer = 1.0 - smoothstep(-aa, aa, dist);
+
+    // Surface and border are already linear BT.2020 — composite directly.
+    vec3 composited = mix(surf_straight, border_straight, ring);
+    gl_FragColor = vec4(composited * outer, outer) * alpha;
+}
+";
+
 /// HDR variant of [`ROUND_BLUR_SHADER`]: clips the (sRGB) blurred tier to
 /// the rounded shape, then decodes to linear BT.2020 for the fp16 scene.
 const ROUND_BLUR_SHADER_HDR: &str = r"#version 100
@@ -763,9 +811,14 @@ pub struct Renderer {
     /// Decodes an HDR (PQ/BT.2020) source into the linear working space;
     /// swapped in around colour-managed surfaces. See [`HDR_DECODE_SHADER`].
     hdr_decode_shader: GlesTexProgram,
-    /// HDR variant of `round_tex_shader` (decodes sRGB→linear BT.2020).
-    /// See [`ROUND_TEX_SHADER_HDR`].
+    /// HDR variant of `round_tex_shader` for SDR windows on an HDR output
+    /// (decodes their sRGB offscreen → linear BT.2020). See
+    /// [`ROUND_TEX_SHADER_HDR`].
     round_tex_shader_hdr: GlesTexProgram,
+    /// Composite for HDR *windows* whose fp16 offscreen is already linear
+    /// BT.2020 (no decode; border passed pre-linearised). See
+    /// [`ROUND_TEX_SHADER_LINEAR`].
+    round_tex_shader_linear: GlesTexProgram,
     /// HDR variant of `round_blur_shader`. See [`ROUND_BLUR_SHADER_HDR`].
     round_blur_shader_hdr: GlesTexProgram,
     /// Per-output offscreen the HDR scene is composited into before the
@@ -1275,6 +1328,22 @@ impl Renderer {
                 ],
             )
             .context("HDR rounded-corner composite shader compile failed")?;
+        // Linear variant for HDR *windows* (surface already decoded in its
+        // fp16 win_tex): same geometry uniforms as the SDR shader, no decode.
+        let round_tex_shader_linear = gles
+            .compile_custom_texture_shader(
+                ROUND_TEX_SHADER_LINEAR,
+                &[
+                    UniformName::new("size", UniformType::_2f),
+                    UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("border_width", UniformType::_1f),
+                    UniformName::new("border_top", UniformType::_3f),
+                    UniformName::new("border_bottom", UniformType::_3f),
+                    UniformName::new("output_height", UniformType::_1f),
+                    UniformName::new("cell_origin_y", UniformType::_1f),
+                ],
+            )
+            .context("HDR-window linear composite shader compile failed")?;
         let round_blur_shader_hdr = gles
             .compile_custom_texture_shader(
                 ROUND_BLUR_SHADER_HDR,
@@ -1487,6 +1556,7 @@ impl Renderer {
             sdr_decode_shader,
             hdr_decode_shader,
             round_tex_shader_hdr,
+            round_tex_shader_linear,
             round_blur_shader_hdr,
             hdr_scene: HashMap::new(),
             sdr_capture: HashMap::new(),
@@ -2707,6 +2777,7 @@ impl Renderer {
         let sdr_decode_shader = self.sdr_decode_shader.clone();
         let hdr_decode_shader = self.hdr_decode_shader.clone();
         let round_tex_shader_hdr = self.round_tex_shader_hdr.clone();
+        let round_tex_shader_linear = self.round_tex_shader_linear.clone();
         let round_blur_shader_hdr = self.round_blur_shader_hdr.clone();
         let cursor_size = self.cursor_size;
         let window_opacity = self.decoration.window_opacity;
@@ -2858,7 +2929,9 @@ impl Renderer {
                     // opaque across the border boundary (no transparent seam).
                     // Everything else (fullscreen/maximized/undecorated) draws
                     // straight to the frame at its output-local cell position,
-                    // inset by the border.
+                    // inset by the border. HDR surfaces use this offscreen path
+                    // too — the offscreen is fp16 and the surface is decoded
+                    // into it (see Phase A), so decoration works in HDR.
                     let offscreen = p.fill == FillMode::Normal && decorated;
                     // Draw the window into its *animated* rect
                     // (`wd.effective`), scaling the surface's actual
@@ -3131,6 +3204,16 @@ impl Renderer {
                 win_tex.push(None);
                 continue;
             }
+            // An HDR window's offscreen is fp16 and holds *linear BT.2020*
+            // (the surface is PQ-decoded into it here), so its decoration can
+            // be composited in linear by `ROUND_TEX_SHADER_LINEAR`. SDR windows
+            // keep the 8-bit sRGB offscreen the SDR/HDR-decode composite expects.
+            let win_is_hdr = hdr && hdr_surface_ids.contains(&p.surface.id());
+            let fmt = if win_is_hdr {
+                Fourcc::Abgr16161616f
+            } else {
+                Fourcc::Abgr8888
+            };
             let cell = cell_local(wd.effective);
             let size = Size::<i32, smithay::utils::Buffer>::from((
                 cell.size.w.max(1),
@@ -3141,7 +3224,7 @@ impl Renderer {
             let tex = (|| -> Option<GlesTexture> {
                 let mut tex = self
                     .gles
-                    .create_buffer(Fourcc::Abgr8888, size)
+                    .create_buffer(fmt, size)
                     .inspect_err(|err| warn!(error = %err, "rounded window: offscreen alloc failed"))
                     .ok()?;
                 let mut target = self
@@ -3155,6 +3238,11 @@ impl Renderer {
                     .inspect_err(|err| warn!(error = %err, "rounded window: render failed"))
                     .ok()?;
                 let _ = frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full);
+                // HDR window: decode its PQ surface to linear BT.2020 as it's
+                // drawn into the fp16 offscreen (the composite then stays linear).
+                if win_is_hdr {
+                    frame.override_default_tex_program(hdr_decode_shader.clone(), Vec::new());
+                }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full)
                     .inspect_err(|err| warn!(error = %err, "rounded window: draw failed"))
                     .ok()?;
@@ -3187,7 +3275,17 @@ impl Renderer {
             // straight (skipping decoration — option A) with the PQ decode,
             // so its content isn't mis-decoded as SDR.
             let surface_is_hdr = linear && hdr_surface_ids.contains(&p.surface.id());
-            if p.fill == FillMode::Normal && decorated && !surface_is_hdr {
+            // Whether THIS window's offscreen is the fp16 *linear* one built in
+            // Phase A — format-based, so independent of `linear` (which is
+            // false during the sRGB blur replay).
+            let win_is_hdr = hdr && hdr_surface_ids.contains(&p.surface.id());
+            if p.fill == FillMode::Normal && decorated {
+                // An HDR window's fp16-linear offscreen can't composite into the
+                // sRGB blur pyramid, so skip it during the blur replay; it still
+                // gets its own background blur in the main pass.
+                if win_is_hdr && !linear {
+                    return Ok(());
+                }
                 // Composite the window's pre-rendered surface through the
                 // rounded mask: surface inside, opaque border ring, and the
                 // corners discarded → genuinely transparent so the backdrop
@@ -3202,10 +3300,26 @@ impl Renderer {
                 } else {
                     &border.inactive
                 };
-                let (border_top, border_bottom) = match fill {
+                let (mut border_top, mut border_bottom) = match fill {
                     Fill::Solid(rgb) => (*rgb, *rgb),
                     Fill::VerticalGradient { top, bottom } => (*top, *bottom),
                 };
+                // The linear composite (HDR window) needs the border in linear
+                // BT.2020 too — the surface in its fp16 offscreen is already
+                // decoded to linear, so the shader doesn't decode.
+                if win_is_hdr {
+                    let to_lin = |c: [f32; 3]| {
+                        let lc = srgb_to_linear_bt2020(
+                            Color32F::new(c[0], c[1], c[2], 1.0),
+                            hdr_reference_white,
+                            hdr_saturation,
+                        );
+                        let [r, g, b, _] = lc.components();
+                        [r, g, b]
+                    };
+                    border_top = to_lin(border_top);
+                    border_bottom = to_lin(border_bottom);
+                }
                 // Clamp like the old frame mask: radius/border never exceed
                 // half the cell, and leave >=1px of surface for the border.
                 let max_half = (dst.size.w / 2).min(dst.size.h / 2);
@@ -3225,9 +3339,13 @@ impl Renderer {
                     Uniform::new("output_height", mode_size.h as f32),
                     Uniform::new("cell_origin_y", dst.loc.y as f32),
                 ];
-                // Into the linear scene → HDR variant decodes its sRGB
-                // composite to linear BT.2020 (needs reference_white).
-                let program = if linear {
+                // HDR window: surface + border already linear → composite
+                // directly. SDR window into the linear scene: decode its sRGB
+                // offscreen (HDR variant, needs reference_white). SDR scene /
+                // blur replay: the plain sRGB composite.
+                let program = if win_is_hdr {
+                    &round_tex_shader_linear
+                } else if linear {
                     uniforms.push(Uniform::new("reference_white", ref_white_f32));
                     uniforms.push(Uniform::new("saturation", hdr_saturation));
                     &round_tex_shader_hdr
