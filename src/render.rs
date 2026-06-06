@@ -353,6 +353,65 @@ void main() {
 }
 ";
 
+/// Output-encode shader for HDR scanout: takes the composited scene
+/// (sRGB-encoded, BT.709 primaries — what the SDR pipeline produces) and
+/// re-encodes it to PQ (SMPTE ST 2084) over BT.2020 primaries, with SDR
+/// "white" placed at `reference_white` cd/m². This is the final stage of
+/// the colour pipeline; per-surface HDR-content decode (so a game's PQ
+/// buffer isn't treated as SDR) layers on top of this later.
+///
+/// All maths is standard and luminance-exact, so it needs `highp`;
+/// `GL_FRAGMENT_PRECISION_HIGH` is present on the desktop GLES2 path.
+const HDR_ENCODE_SHADER: &str = r"#version 100
+//_DEFINES_
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform sampler2D tex;
+uniform float alpha;
+uniform float reference_white;
+
+varying vec2 v_coords;
+
+// sRGB IEC 61966-2-1 EOTF (encoded [0,1] -> linear [0,1], 1.0 = SDR white).
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+
+// SMPTE ST 2084 (PQ) inverse-EOTF (OETF): linear normalized to
+// [0,1] where 1.0 == 10000 cd/m² -> PQ-encoded [0,1].
+vec3 pq_oetf(vec3 l) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 lp = pow(max(l, vec3(0.0)), vec3(m1));
+    return pow((c1 + c2 * lp) / (1.0 + c3 * lp), vec3(m2));
+}
+
+void main() {
+    vec3 srgb = texture2D(tex, v_coords).rgb;
+    // Decode to linear light, scale SDR white to the chosen reference
+    // luminance, normalize to the PQ 10000 cd/m² domain.
+    vec3 lin = srgb_to_linear(srgb) * (reference_white / 10000.0);
+    // BT.709 -> BT.2020 primaries (linear RGB).
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = bt709_to_bt2020 * lin;
+    gl_FragColor = vec4(pq_oetf(bt2020), 1.0) * alpha;
+}
+";
+
 /// Renderer for every connected output on a single GPU.
 pub struct Renderer {
     /// Shared GLES2 renderer; owns the EGL context.
@@ -478,6 +537,14 @@ pub struct Renderer {
     /// mip chain. Built lazily, sized to the output, reused every frame
     /// and rebuilt only when the mode size or pass count changes.
     blur_scratch: HashMap<usize, BlurScratch>,
+    /// Texture shader that encodes the composited (sRGB / BT.709) scene to
+    /// PQ / BT.2020 for an HDR output's 10-bit scanout. See
+    /// [`HDR_ENCODE_SHADER`]. `Arc`-backed, cheap to clone out per frame.
+    hdr_encode_shader: GlesTexProgram,
+    /// Per-output offscreen the HDR scene is composited into before the
+    /// PQ-encode pass, keyed by output name. Sized to the output's mode,
+    /// rebuilt when the size changes; only allocated for HDR outputs.
+    hdr_scene: HashMap<String, GlesTexture>,
 }
 
 /// Number of backdrop blur tiers: 0 = base (wallpaper + lower layers,
@@ -666,6 +733,14 @@ struct OutputRender {
     /// once at init. `NotSupported` outputs ignore `vrr_mode` entirely
     /// (we never touch their `VRR_ENABLED` property).
     vrr_support: VrrSupport,
+    /// Whether this output is in HDR mode. When set, the scene is
+    /// composited into an offscreen and a post-process pass encodes it to
+    /// PQ / BT.2020 (see `render_output`). SDR outputs (`false`) take the
+    /// unchanged direct-to-scanout path.
+    hdr: bool,
+    /// SDR reference white (cd/m²) for this output's HDR encode — how
+    /// bright SDR content maps into the PQ signal. Ignored unless `hdr`.
+    hdr_reference_white: u32,
 }
 
 /// Public snapshot of one output's geometry for callers (the screenshot
@@ -911,6 +986,14 @@ impl Renderer {
             )
             .context("rounded-blur mask shader compile failed")?;
 
+        info!("phase: compiling HDR output-encode shader");
+        let hdr_encode_shader = gles
+            .compile_custom_texture_shader(
+                HDR_ENCODE_SHADER,
+                &[UniformName::new("reference_white", UniformType::_1f)],
+            )
+            .context("HDR output-encode shader compile failed")?;
+
         info!("phase: creating GBM allocator");
         let allocator = GbmAllocator::new(
             gbm_device,
@@ -1016,6 +1099,10 @@ impl Renderer {
                 scale,
                 vrr_mode,
                 vrr_support,
+                hdr,
+                hdr_reference_white: output_cfg
+                    .and_then(|c| c.sdr_reference_white)
+                    .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
             });
         }
 
@@ -1100,6 +1187,8 @@ impl Renderer {
             round_tex_shader,
             round_blur_shader,
             blur_scratch: HashMap::new(),
+            hdr_encode_shader,
+            hdr_scene: HashMap::new(),
         })
     }
 
@@ -1349,6 +1438,10 @@ impl Renderer {
             scale,
             vrr_mode,
             vrr_support,
+            hdr,
+            hdr_reference_white: output_cfg
+                .and_then(|c| c.sdr_reference_white)
+                .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -2175,6 +2268,7 @@ impl Renderer {
         let border = self.border.clone();
         let round_tex_shader = self.round_tex_shader.clone();
         let round_blur_shader = self.round_blur_shader.clone();
+        let hdr_encode_shader = self.hdr_encode_shader.clone();
         let cursor_size = self.cursor_size;
         let window_opacity = self.decoration.window_opacity;
         // The effective cursor this frame: a compositor override (grab /
@@ -2204,6 +2298,10 @@ impl Renderer {
         let compositor_size = output.compositor_size;
         let scale = output.scale;
         let output_name = output.name.clone();
+        // HDR outputs composite into an offscreen, then a PQ-encode pass
+        // writes the 10-bit scanout (see below). SDR is unaffected.
+        let hdr = output.hdr;
+        let hdr_reference_white = output.hdr_reference_white;
         // Frozen backdrop for this output (freeze-mode screenshot). Cheap
         // Arc-backed clone out before the `self.gles` frame borrow.
         let freeze_texture = self.freeze_textures.get(&output_name).cloned();
@@ -2815,11 +2913,42 @@ impl Renderer {
             Ok(())
         };
 
-        let mut target = self
-            .gles
-            .bind(&mut dmabuf)
-            .with_context(|| format!("GlesRenderer::bind failed for {output_name}"))?;
-        let sync = {
+        // HDR outputs composite into an offscreen sRGB scene buffer (sized
+        // to the output, cached + reused) and then run a PQ/BT.2020 encode
+        // pass into the scanout dmabuf below. SDR composites straight to
+        // the dmabuf (unchanged path).
+        let mode_w = u32::try_from(mode_size.w).unwrap_or(0);
+        let mode_h = u32::try_from(mode_size.h).unwrap_or(0);
+        if hdr {
+            let needs_alloc = match self.hdr_scene.get(&output_name) {
+                Some(tex) => tex.width() != mode_w || tex.height() != mode_h,
+                None => true,
+            };
+            if needs_alloc {
+                let scene = self
+                    .gles
+                    .create_buffer(
+                        Fourcc::Abgr8888,
+                        Size::<i32, smithay::utils::Buffer>::from((mode_size.w, mode_size.h)),
+                    )
+                    .with_context(|| format!("HDR scene buffer alloc failed for {output_name}"))?;
+                self.hdr_scene.insert(output_name.clone(), scene);
+            }
+        }
+        let mut target = if hdr {
+            let scene = self
+                .hdr_scene
+                .get_mut(&output_name)
+                .expect("HDR scene buffer just ensured");
+            self.gles.bind(scene).with_context(|| {
+                format!("GlesRenderer::bind (HDR scene) failed for {output_name}")
+            })?
+        } else {
+            self.gles
+                .bind(&mut dmabuf)
+                .with_context(|| format!("GlesRenderer::bind failed for {output_name}"))?
+        };
+        let scene_sync = {
             let mut frame = self
                 .gles
                 .render(&mut target, mode_size, Transform::Normal)
@@ -3083,6 +3212,57 @@ impl Renderer {
             })
             .collect();
         drop(target);
+
+        // HDR: encode the composited scene (sRGB / BT.709, in the offscreen)
+        // to PQ / BT.2020 into the 10-bit scanout dmabuf. (Screenshots above
+        // read the offscreen, so captures stay SDR-correct.) SDR keeps the
+        // scene's own sync — it composited straight to the dmabuf.
+        let sync = if hdr {
+            let scene_tex = self
+                .hdr_scene
+                .get(&output_name)
+                .expect("HDR scene buffer present");
+            let mut hdr_target = self.gles.bind(&mut dmabuf).with_context(|| {
+                format!("GlesRenderer::bind (HDR scanout) failed for {output_name}")
+            })?;
+            let encoded = {
+                let mut frame = self
+                    .gles
+                    .render(&mut hdr_target, mode_size, Transform::Normal)
+                    .with_context(|| format!("HDR encode render failed for {output_name}"))?;
+                let dst = Rectangle::from_size(mode_size);
+                let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                    f64::from(mode_size.w),
+                    f64::from(mode_size.h),
+                )));
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "reference white is a small cd/m² value, exact in f32"
+                )]
+                let uniforms = [Uniform::new(
+                    "reference_white",
+                    hdr_reference_white as f32,
+                )];
+                frame
+                    .render_texture_from_to(
+                        scene_tex,
+                        src,
+                        dst,
+                        &[dst],
+                        &[dst],
+                        Transform::Normal,
+                        1.0,
+                        Some(&hdr_encode_shader),
+                        &uniforms,
+                    )
+                    .context("HDR encode pass")?;
+                frame.finish().context("HDR encode finish")?
+            };
+            drop(hdr_target);
+            encoded
+        } else {
+            scene_sync
+        };
 
         // Settle this output's adaptive-sync state for the frame we're
         // about to queue. Must run before `queue_buffer` so the commit it
