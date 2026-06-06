@@ -926,17 +926,43 @@ impl State {
     /// while a window animation or workspace slide is still running. This is
     /// the old free-run vblank body, now driven on demand by
     /// [`Self::queue_redraw`] and re-driven by the vblank handler.
-    /// Surfaces a client tagged HDR (PQ/HLG) via colour-management. The
-    /// renderer decodes these from PQ (not sRGB) into the linear scene, so
-    /// HDR content composites correctly instead of being treated as SDR.
+    /// Toplevel placement surfaces whose window should be HDR-decoded. A
+    /// client may tag a *subsurface* (e.g. a Proton/Wine game's swapchain)
+    /// rather than its toplevel, and the renderer keys on the toplevel
+    /// placement surface — so a window counts as HDR if its toplevel OR any
+    /// surface in its tree carries an HDR (PQ/HLG) image description.
     fn hdr_surface_ids(
         &self,
+        placements: &[layout::Placement],
     ) -> std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId> {
-        self.color_surfaces
+        let tagged: std::collections::HashSet<_> = self
+            .color_surfaces
             .iter()
             .filter(|(_, c)| c.image_description.is_hdr())
             .map(|(id, _)| id.clone())
-            .collect()
+            .collect();
+        let mut out = std::collections::HashSet::new();
+        if tagged.is_empty() {
+            return out;
+        }
+        for p in placements {
+            let mut hit = false;
+            smithay::wayland::compositor::with_surface_tree_downward(
+                &p.surface,
+                (),
+                |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+                |s, _, ()| {
+                    if tagged.contains(&s.id()) {
+                        hit = true;
+                    }
+                },
+                |_, _, ()| true,
+            );
+            if hit {
+                out.insert(p.surface.id());
+            }
+        }
+        out
     }
 
     fn render_crtc(&mut self, crtc: crtc::Handle) {
@@ -1013,7 +1039,7 @@ impl State {
         let hide_cursor =
             self.pointer_locked() || capture_hides_cursor || internal_hides_cursor;
         let client_n = captures.len();
-        let hdr_surface_ids = self.hdr_surface_ids();
+        let hdr_surface_ids = self.hdr_surface_ids(&placements);
         let followup = match self.renderer.render_for_crtc(
             crtc,
             &placements,

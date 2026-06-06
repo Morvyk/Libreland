@@ -291,6 +291,13 @@ pub struct OutputConfig {
     /// in the HDR signal. `None` uses the BT.2408 standard 203 cd/m².
     /// Raise it if the desktop/SDR apps look too dim in HDR mode.
     pub sdr_reference_white: Option<u32>,
+    /// Saturation multiplier for SDR content shown on this output while
+    /// HDR is on. `1.0` (default) is colorimetrically accurate; mapping
+    /// BT.709 into the wider BT.2020 container makes SDR look slightly
+    /// tame on a wide-gamut panel, so raise this (e.g. `1.1`–`1.3`) to
+    /// punch it up. Applied to SDR sources only — HDR content is
+    /// untouched. Must be positive (`0.0` would greyscale).
+    pub sdr_saturation: f64,
 }
 
 impl Default for OutputConfig {
@@ -302,6 +309,7 @@ impl Default for OutputConfig {
             vrr: VrrMode::default(),
             hdr: false,
             sdr_reference_white: None,
+            sdr_saturation: 1.0,
         }
     }
 }
@@ -746,6 +754,12 @@ fn parse_output(t: &Table) -> mlua::Result<OutputConfig> {
             lua_bail!("sdr_reference_white must be a positive cd/m² value");
         }
         cfg.sdr_reference_white = Some(white);
+    }
+    if let Some(sat) = t.get::<Option<f64>>("sdr_saturation")? {
+        if !sat.is_finite() || sat <= 0.0 {
+            lua_bail!("sdr_saturation {sat} invalid; expected a positive finite number");
+        }
+        cfg.sdr_saturation = sat;
     }
     Ok(cfg)
 }
@@ -1493,6 +1507,22 @@ mod monitors_tests {
     fn sdr_reference_white_rejects_zero() {
         let lua = Lua::new();
         lua.load(r#"monitors = { outputs = { ["DP-1"] = { sdr_reference_white = 0 } } }"#)
+            .exec()
+            .unwrap();
+        assert!(Config::populate_from_globals(&lua.globals()).is_err());
+    }
+
+    #[test]
+    fn sdr_saturation_parses_defaults_and_rejects_nonpositive() {
+        #[allow(clippy::float_cmp, reason = "exact default/parsed value check")]
+        {
+            let c = parse(r#"monitors = { outputs = { ["DP-1"] = { scale = 1.0 } } }"#);
+            assert_eq!(c.monitors.outputs["DP-1"].sdr_saturation, 1.0);
+            let c = parse(r#"monitors = { outputs = { ["DP-1"] = { sdr_saturation = 1.2 } } }"#);
+            assert_eq!(c.monitors.outputs["DP-1"].sdr_saturation, 1.2);
+        }
+        let lua = Lua::new();
+        lua.load(r#"monitors = { outputs = { ["DP-1"] = { sdr_saturation = 0.0 } } }"#)
             .exec()
             .unwrap();
         assert!(Config::populate_from_globals(&lua.globals()).is_err());

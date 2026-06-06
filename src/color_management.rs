@@ -397,7 +397,14 @@ impl Dispatch<WpColorManagementSurfaceV1, WlSurface> for State {
                         render_intent: intent,
                     },
                 );
-                debug!(?intent, hdr = data.desc.is_hdr(), "surface image description set");
+                debug!(
+                    ?intent,
+                    hdr = data.desc.is_hdr(),
+                    tf = ?data.desc.tf,
+                    primaries = ?data.desc.primaries,
+                    max_lum = data.desc.max_lum,
+                    "surface image description set"
+                );
             }
             wp_color_management_surface_v1::Request::UnsetImageDescription => {
                 state.color_surfaces.remove(&surface.id());
