@@ -47,7 +47,7 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{
-    SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
+    BufferAssignment, SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 use tracing::{debug, info, warn};
@@ -1235,7 +1235,12 @@ struct HwCursorImage {
     height: i32,
     xhot: i32,
     yhot: i32,
+    /// Nominal authored size (themed cursors) — the basis for the draw scale
+    /// `cursor_size / nominal × output_scale`. Unused when `surface_scale` is
+    /// `Some` (client surface cursors scale by `output_scale / buffer_scale`).
     nominal: i32,
+    /// Client cursor surface buffer scale; `None` for themed cursors.
+    surface_scale: Option<i32>,
 }
 
 impl From<crate::cursor::CursorImage> for HwCursorImage {
@@ -1247,8 +1252,30 @@ impl From<crate::cursor::CursorImage> for HwCursorImage {
             xhot: c.xhot,
             yhot: c.yhot,
             nominal: c.nominal.max(1),
+            surface_scale: None,
         }
     }
+}
+
+/// Identifies which cursor is loaded into the plane buffer, so a redraw can
+/// skip re-rasterising when it hasn't changed (re-reading a client cursor via
+/// GPU readback every frame would be wasteful).
+#[derive(Clone, PartialEq)]
+enum CursorKey {
+    Named(CursorIcon),
+    Surface(ObjectId),
+}
+
+/// The `ObjectId` of a cursor surface's currently-committed buffer, used to
+/// detect when a client surface cursor changed (incl. animation frames).
+fn current_buffer_id(surface: &WlSurface) -> Option<ObjectId> {
+    with_states(surface, |states| {
+        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+        match &attrs.current().buffer {
+            Some(BufferAssignment::NewBuffer(b)) => Some(b.id()),
+            _ => None,
+        }
+    })
 }
 
 /// Key describing what is currently rasterised into the cursor BO, so a
@@ -1288,6 +1315,9 @@ struct CursorPlane {
     software: bool,
     /// Bumped whenever `image` changes; part of [`RenderedCursor`].
     image_gen: u64,
+    /// Which cursor `image` currently holds — so a redraw can skip rebuilding
+    /// it (esp. the GPU readback for client surface cursors) when unchanged.
+    loaded_key: Option<CursorKey>,
     /// What's currently in `bo` (skips redundant re-uploads).
     rendered: Option<RenderedCursor>,
 }
@@ -1321,6 +1351,7 @@ impl CursorPlane {
             image: None,
             software: false,
             image_gen: 0,
+            loaded_key: None,
             rendered: None,
         })
     }
@@ -1921,9 +1952,10 @@ impl Renderer {
             .or_else(|| self.cursor.clone())
     }
 
-    /// Whether the hardware cursor plane is currently showing the themed
-    /// cursor on `crtc` — so the render path can skip compositing it.
-    fn hw_named_active(&self, crtc: crtc::Handle) -> bool {
+    /// Whether the hardware cursor plane is currently showing the cursor
+    /// (themed or client surface) on `crtc` — so the render path can skip
+    /// compositing it.
+    fn hw_cursor_active(&self, crtc: crtc::Handle) -> bool {
         self.cursor_plane
             .as_ref()
             .is_some_and(|cp| cp.image.is_some() && cp.active_crtc == Some(crtc))
@@ -1962,8 +1994,9 @@ impl Renderer {
 
     /// Sync the hardware cursor plane to the effective cursor status (client
     /// request or compositor override) and program it on the output under the
-    /// pointer. Idempotent + cheap — safe to call each redraw. No-op without a
-    /// cursor plane.
+    /// pointer. Idempotent + cheap — safe to call each redraw; it rebuilds the
+    /// plane image only when the cursor actually changed (keyed by icon /
+    /// surface buffer). No-op without a cursor plane.
     pub fn refresh_hw_cursor(&mut self, pointer_locked: bool) {
         if self.cursor_plane.is_none() {
             return;
@@ -1972,24 +2005,131 @@ impl Renderer {
             .cursor_override
             .clone()
             .unwrap_or_else(|| self.cursor_status.clone());
-        // Resolve the desired image first (borrows self for the cache).
-        let (image, software) = if pointer_locked {
-            (None, false)
-        } else {
-            match status {
-                CursorImageStatus::Named(icon) => (self.hw_cursor_image_for(icon), false),
-                CursorImageStatus::Surface(_) => (None, true),
-                CursorImageStatus::Hidden => (None, false),
+        if pointer_locked {
+            self.clear_hw_cursor_image();
+            return;
+        }
+        match status {
+            CursorImageStatus::Hidden => self.clear_hw_cursor_image(),
+            CursorImageStatus::Named(icon) => {
+                let key = CursorKey::Named(icon);
+                let unchanged = self
+                    .cursor_plane
+                    .as_ref()
+                    .is_some_and(|cp| cp.loaded_key.as_ref() == Some(&key) && cp.image.is_some());
+                if !unchanged {
+                    let img = self.hw_cursor_image_for(icon);
+                    if let Some(cp) = self.cursor_plane.as_mut() {
+                        cp.software = false;
+                        cp.loaded_key = Some(key);
+                        cp.set_image(img);
+                    }
+                }
+                self.program_hw_cursor_current();
             }
-        };
-        if let Some(cp) = self.cursor_plane.as_mut() {
-            cp.set_image(image);
-            cp.software = software;
-            if cp.image.is_none() {
-                cp.disable();
+            CursorImageStatus::Surface(surface) => {
+                let key = current_buffer_id(&surface).map(CursorKey::Surface);
+                let unchanged = key.is_some()
+                    && self
+                        .cursor_plane
+                        .as_ref()
+                        .is_some_and(|cp| cp.loaded_key == key && cp.image.is_some());
+                if !unchanged {
+                    let img = self.hw_cursor_from_surface(&surface);
+                    let ok = img.is_some();
+                    if let Some(cp) = self.cursor_plane.as_mut() {
+                        if ok {
+                            cp.software = false;
+                            cp.loaded_key = key;
+                            cp.set_image(img);
+                        } else {
+                            // No buffer yet, or readback failed → software path.
+                            cp.software = true;
+                            cp.loaded_key = None;
+                            cp.set_image(None);
+                            cp.disable();
+                        }
+                    }
+                }
+                self.program_hw_cursor_current();
             }
         }
-        self.program_hw_cursor_current();
+    }
+
+    /// Clear the plane image (hidden / locked): nothing on the plane, not a
+    /// software cursor either.
+    fn clear_hw_cursor_image(&mut self) {
+        if let Some(cp) = self.cursor_plane.as_mut() {
+            cp.software = false;
+            cp.loaded_key = None;
+            cp.set_image(None);
+            cp.disable();
+        }
+    }
+
+    /// Rasterise a client cursor *surface* into a hardware-cursor image by
+    /// rendering its buffer (shm or dmabuf — the GLES importer handles both)
+    /// into a native-size offscreen and reading it back. `None` (→ software
+    /// fallback) when there's no committed buffer or the readback fails.
+    fn hw_cursor_from_surface(&mut self, surface: &WlSurface) -> Option<HwCursorImage> {
+        use smithay::backend::renderer::buffer_dimensions;
+        let (buffer, hot, bscale) = with_states(surface, |states| {
+            let hot = states
+                .data_map
+                .get::<CursorImageSurfaceData>()
+                .map(|a| a.lock().unwrap().hotspot)
+                .unwrap_or_default();
+            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+            let cur = attrs.current();
+            let buffer = match &cur.buffer {
+                Some(BufferAssignment::NewBuffer(b)) => Some(b.clone()),
+                _ => None,
+            };
+            (buffer, hot, cur.buffer_scale.max(1))
+        });
+        let buffer = buffer?;
+        let dims = buffer_dimensions(&buffer)?;
+        if dims.w <= 0 || dims.h <= 0 {
+            return None;
+        }
+        // Render the surface at scale 1.0 into a native-buffer-sized offscreen,
+        // then read it back to premultiplied RGBA (same path as screenshots).
+        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            render_elements_from_surface_tree(
+                &mut self.gles,
+                surface,
+                Point::from((0, 0)),
+                1.0,
+                1.0_f32,
+                Kind::Cursor,
+            );
+        if elements.is_empty() {
+            return None;
+        }
+        let tex_size = Size::<i32, smithay::utils::Buffer>::from((dims.w, dims.h));
+        let phys = Size::<i32, Physical>::from((dims.w, dims.h));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let mut texture: GlesTexture = self.gles.create_buffer(Fourcc::Abgr8888, tex_size).ok()?;
+        let mut target = self.gles.bind(&mut texture).ok()?;
+        {
+            let mut frame = self.gles.render(&mut target, phys, Transform::Normal).ok()?;
+            frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full).ok()?;
+            draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, &elements, &full).ok()?;
+            let _ = frame.finish().ok()?;
+        }
+        let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(tex_size);
+        let mapping = self.gles.copy_framebuffer(&target, region, Fourcc::Abgr8888).ok()?;
+        let rgba = self.gles.map_texture(&mapping).ok()?.to_vec();
+        drop(target);
+        Some(HwCursorImage {
+            rgba,
+            width: dims.w,
+            height: dims.h,
+            xhot: hot.x * bscale,
+            yhot: hot.y * bscale,
+            nominal: 1,
+            surface_scale: Some(bscale),
+        })
     }
 
     /// Reposition (re-programming if needed) the hardware cursor for the
@@ -2032,8 +2172,14 @@ impl Renderer {
         let Some(cp) = self.cursor_plane.as_mut() else {
             return false;
         };
-        let nominal = cp.image.as_ref().map_or(1, |i| i.nominal.max(1));
-        let factor = f64::from(cursor_size) / f64::from(nominal) * scale;
+        // Themed cursors normalise to the configured logical size; client
+        // surface cursors scale by output_scale / buffer_scale.
+        let factor = if let Some(bs) = cp.image.as_ref().and_then(|i| i.surface_scale) {
+            scale / f64::from(bs.max(1))
+        } else {
+            let nominal = cp.image.as_ref().map_or(1, |i| i.nominal.max(1));
+            f64::from(cursor_size) / f64::from(nominal) * scale
+        };
         if !cp.program(crtc, factor, hdr, refw) {
             cp.disable();
             return false;
@@ -3178,10 +3324,10 @@ impl Renderer {
         hdr_surface_ids: &HashSet<ObjectId>,
         compose_cursor: bool,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
-        // Is the themed cursor already on the hardware plane for this output?
-        // If so, skip compositing it (the plane scans it out) — unless this
-        // frame must bake the cursor into the framebuffer for a capture.
-        let hw_named_active = self.hw_named_active(self.outputs[idx].crtc);
+        // Is the cursor already on the hardware plane for this output? If so,
+        // skip compositing it (the plane scans it out) — unless this frame
+        // must bake the cursor into the framebuffer for a capture.
+        let hw_cursor_active = self.hw_cursor_active(self.outputs[idx].crtc);
         // Upload the latest media-wallpaper frame (if the decode thread has
         // produced one) before snapshotting the drawable below, so animated
         // wallpapers advance each vblank.
@@ -4239,10 +4385,14 @@ impl Renderer {
                 match &cursor_status {
                     CursorImageStatus::Hidden => {}
                     CursorImageStatus::Surface(_) => {
-                        // An empty element list (surface with no committed
-                        // buffer) is the client's way of hiding the
-                        // cursor — draw nothing in that case.
-                        if !cursor_surface_elements.is_empty() {
+                        // The plane scans the client cursor out directly, so
+                        // skip compositing it — unless a capture needs it baked
+                        // in, or the plane isn't handling it (readback failed /
+                        // no buffer yet). An empty element list (surface with no
+                        // committed buffer) is the client hiding the cursor.
+                        if (compose_cursor || !hw_cursor_active)
+                            && !cursor_surface_elements.is_empty()
+                        {
                             draw_render_elements::<GlesRenderer, _, _>(
                                 &mut frame,
                                 scale,
@@ -4257,7 +4407,7 @@ impl Renderer {
                         // directly, so skip compositing it — unless this frame
                         // must bake it into the framebuffer for a capture, or
                         // the plane isn't handling it (no plane / oversize).
-                        if compose_cursor || !hw_named_active {
+                        if compose_cursor || !hw_cursor_active {
                             // Pointer hotspot in this output's physical pixels.
                             let hotspot = Point::<i32, Physical>::from((
                                 scale_f(cursor_local_x, scale),
