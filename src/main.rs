@@ -430,6 +430,13 @@ pub(crate) struct State {
     /// the process goes multithreaded) so screenshot filenames can use
     /// local time reliably.
     pub(crate) local_offset: time::UtcOffset,
+    /// PNG encode + disk write for a finished screenshot run on a worker
+    /// thread (they'd otherwise freeze the compositor for the duration of a
+    /// large capture's zlib compression). The worker sends the encoded PNG
+    /// back over this channel when the bind also wants the clipboard, since
+    /// setting the selection must happen on the main thread.
+    pub(crate) screenshot_clipboard_tx:
+        smithay::reexports::calloop::channel::Sender<Vec<u8>>,
     /// Control-IPC state: the stable window-id registry (and, later,
     /// event subscribers). The socket lives on the event loop; this is
     /// the bookkeeping its dispatch reads + writes.
@@ -2930,15 +2937,15 @@ impl State {
             return;
         };
         if bind.freeze {
-            let png = self
+            // Clone the frozen output's raw bytes (a fast memcpy) so the encode
+            // can run on a worker thread instead of freezing the compositor.
+            let frozen = self
                 .screenshot
                 .as_ref()
                 .and_then(|s| s.frozen.get(&geom.name))
-                .and_then(|f| {
-                    screenshot::encode_region(&f.bytes, f.width, f.height, phys).ok()
-                });
-            if let Some(bytes) = png {
-                self.deliver_screenshot(&bytes, &bind);
+                .map(|f| (f.bytes.clone(), f.width, f.height));
+            if let Some((bytes, w, h)) = frozen {
+                self.spawn_screenshot_encode(bytes, w, h, phys, &bind);
             } else {
                 warn!(output = %geom.name, "screenshot: freeze snapshot unavailable");
             }
@@ -2953,32 +2960,66 @@ impl State {
         self.end_screenshot();
     }
 
-    /// Save a finished PNG to disk (if a directory is configured) and copy
-    /// it to the clipboard (if requested).
-    fn deliver_screenshot(&mut self, png: &[u8], bind: &config::ScreenshotBind) {
-        if let Some(dir) = &bind.directory {
-            let dir = screenshot::expand_dir(dir);
-            let filename = screenshot::timestamp_filename(self.local_offset);
-            match screenshot::save(&dir, &filename, png) {
-                Ok(path) => info!(path = %path.display(), "screenshot saved"),
-                Err(err) => warn!(error = %err, dir = %dir.display(), "screenshot save failed"),
-            }
+    /// Encode `region` of `bytes` (BGRX, `width`×`height`) to PNG on a worker
+    /// thread, then save it to the bind's directory and/or hand it back for
+    /// the clipboard. Keeps the heavy zlib compression off the render thread
+    /// so a large capture doesn't freeze the compositor.
+    fn spawn_screenshot_encode(
+        &self,
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        region: smithay::utils::Rectangle<i32, Physical>,
+        bind: &config::ScreenshotBind,
+    ) {
+        let dir = bind.directory.as_ref().map(|d| screenshot::expand_dir(d));
+        let filename = screenshot::timestamp_filename(self.local_offset);
+        let clipboard = bind.clipboard;
+        let tx = self.screenshot_clipboard_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("screenshot-encode".to_owned())
+            .spawn(move || {
+                let png = match screenshot::encode_region(&bytes, width, height, region) {
+                    Ok(png) => png,
+                    Err(err) => {
+                        warn!(error = %err, "screenshot: PNG encode failed");
+                        return;
+                    }
+                };
+                if let Some(dir) = dir {
+                    match screenshot::save(&dir, &filename, &png) {
+                        Ok(path) => info!(path = %path.display(), "screenshot saved"),
+                        Err(err) => {
+                            warn!(error = %err, dir = %dir.display(), "screenshot save failed");
+                        }
+                    }
+                }
+                if clipboard {
+                    // Receiver gone (compositor exiting) → just drop it.
+                    let _ = tx.send(png);
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(error = %err, "screenshot: failed to spawn encode thread");
         }
-        if bind.clipboard {
-            self.clipboard.set_image(
-                smithay::wayland::selection::SelectionTarget::Clipboard,
-                "image/png".to_owned(),
-                png.to_vec(),
-            );
-            let dh = self.display_handle.clone();
-            smithay::wayland::selection::data_device::set_data_device_selection::<State>(
-                &dh,
-                &self.seat,
-                vec!["image/png".to_owned()],
-                (),
-            );
-            info!("screenshot copied to clipboard (image/png)");
-        }
+    }
+
+    /// Put a finished screenshot PNG on the clipboard. Called on the main
+    /// thread from the worker-thread channel (selections must be set here).
+    fn set_screenshot_clipboard(&mut self, png: Vec<u8>) {
+        self.clipboard.set_image(
+            smithay::wayland::selection::SelectionTarget::Clipboard,
+            "image/png".to_owned(),
+            png,
+        );
+        let dh = self.display_handle.clone();
+        smithay::wayland::selection::data_device::set_data_device_selection::<State>(
+            &dh,
+            &self.seat,
+            vec!["image/png".to_owned()],
+            (),
+        );
+        info!("screenshot copied to clipboard (image/png)");
     }
 
     /// Route a compositor-originated capture's pixels (serviced in the
@@ -3020,15 +3061,12 @@ impl State {
                 }
             }
             CapturePurpose::Finalize { bind } => {
-                // The capture already read exactly the wanted region, so
-                // encode the whole buffer.
+                // The capture already read exactly the wanted region, so encode
+                // the whole buffer — off the render thread (see helper).
                 let full = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
                     w_i, h_i,
                 )));
-                match screenshot::encode_region(&bytes, width, height, full) {
-                    Ok(png) => self.deliver_screenshot(&png, &bind),
-                    Err(err) => warn!(error = %err, "screenshot: PNG encode failed"),
-                }
+                self.spawn_screenshot_encode(bytes, width, height, full, &bind);
             }
         }
     }
@@ -3478,6 +3516,19 @@ fn main() -> Result<()> {
         handle.clone(),
     );
 
+    // Worker-thread screenshots: the encode/save run off the render thread;
+    // when the bind also wants the clipboard the worker sends the encoded PNG
+    // back here, and the loop sets the selection on the main thread.
+    let (screenshot_clipboard_tx, screenshot_clipboard_rx) =
+        smithay::reexports::calloop::channel::channel::<Vec<u8>>();
+    handle
+        .insert_source(screenshot_clipboard_rx, |event, (), state: &mut State| {
+            if let smithay::reexports::calloop::channel::Event::Msg(png) = event {
+                state.set_screenshot_clipboard(png);
+            }
+        })
+        .expect("insert screenshot clipboard channel");
+
     let mut state = State {
         session,
         loop_signal,
@@ -3543,6 +3594,7 @@ fn main() -> Result<()> {
         screenshot: None,
         screenshot_pending: Vec::new(),
         local_offset,
+        screenshot_clipboard_tx,
         ipc: ipc::IpcState::default(),
     };
     info!("entering event loop — type to generate events, super+shift+e to exit");

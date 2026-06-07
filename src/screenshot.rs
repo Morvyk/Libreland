@@ -58,6 +58,9 @@ pub(crate) fn encode_region(
         let mut enc = png::Encoder::new(Cursor::new(&mut out), rw as u32, rh as u32);
         enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
+        // Favour encode speed over file size — a screenshot is written once and
+        // the worker thread should finish quickly even for a 4K capture.
+        enc.set_compression(png::Compression::Fast);
         let mut writer = enc.write_header()?;
         writer.write_image_data(&rgb)?;
     } // writer dropped here — flushes IDAT/IEND into `out`
