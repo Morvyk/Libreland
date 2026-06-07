@@ -56,7 +56,7 @@ use smithay::utils::{SERIAL_COUNTER, Serial, Transform};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Format};
 use smithay::backend::drm::DrmNode;
-use smithay::desktop::{PopupKind, PopupManager};
+use smithay::desktop::{PopupKind, PopupManager, find_popup_root_surface};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, with_states,
@@ -825,12 +825,15 @@ impl XdgShellHandler for State {
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         info!(surface = ?surface.wl_surface().id(), "wayland: new xdg_popup");
-        // Stamp the positioner-computed geometry into pending state
-        // before the first configure so the popup reports the right
-        // size/anchor; then track it so it joins its parent's tree
-        // (and so the renderer can find + place it).
+        // Stamp the constrained geometry into pending state before the
+        // first configure so the popup reports the right size/anchor and,
+        // crucially, is kept on-screen (flip/slide/resize per the client's
+        // constraint_adjustment) instead of opening into the void near a
+        // screen edge; then track it so it joins its parent's tree (and so
+        // the renderer can find + place it).
+        let geometry = self.unconstrain_popup_geometry(&surface, &positioner);
         surface.with_pending_state(|state| {
-            state.geometry = positioner.get_geometry();
+            state.geometry = geometry;
             state.positioner = positioner;
         });
         if let Err(err) = self
@@ -845,12 +848,25 @@ impl XdgShellHandler for State {
         }
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // A real seat grab needs `SeatHandler::KeyboardFocus: From<PopupKind>`
-        // (ours is `WlSurface`), so smithay's PopupGrab can't be used
-        // without a focus-type refactor. Dismiss-on-click-outside is
-        // handled pragmatically in `forward_pointer_button` instead;
-        // keyboard menu navigation is deferred.
+    fn grab(&mut self, surface: PopupSurface, _seat: WlSeat, serial: Serial) {
+        // A full smithay `PopupGrab` needs `SeatHandler::KeyboardFocus:
+        // From<PopupKind>` (ours is `WlSurface`), so we can't use it
+        // without a focus-type refactor. Instead, honour the grab by
+        // pinning keyboard focus to the popup's root toplevel/layer
+        // surface and recording the grab: while it's set, the hover focus
+        // model is frozen (see `forward_pointer_motion`), so moving the
+        // pointer off the parent no longer makes the client dismiss its
+        // own menu. Dismiss-on-click-outside stays in `forward_pointer_button`,
+        // and the grab expires via `refresh_popup_grab` once the chain closes.
+        let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) else {
+            return;
+        };
+        if let Some(kbd) = self.seat.get_keyboard()
+            && kbd.current_focus().as_ref() != Some(&root)
+        {
+            kbd.set_focus(self, Some(root.clone()), serial);
+        }
+        self.popup_grab = Some(root);
     }
 
     fn reposition_request(
@@ -859,11 +875,12 @@ impl XdgShellHandler for State {
         positioner: PositionerState,
         token: u32,
     ) {
-        // Recompute geometry from the new positioner and tell the
-        // client (send_repositioned must precede the configure so it
+        // Recompute constrained geometry from the new positioner and tell
+        // the client (send_repositioned must precede the configure so it
         // can correlate the new geometry with its token).
+        let geometry = self.unconstrain_popup_geometry(&surface, &positioner);
         surface.with_pending_state(|state| {
-            state.geometry = positioner.get_geometry();
+            state.geometry = geometry;
             state.positioner = positioner;
         });
         surface.send_repositioned(token);

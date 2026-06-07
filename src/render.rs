@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Format, Fourcc};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode, GbmBufferedSurface, VrrSupport};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
@@ -38,7 +38,10 @@ use smithay::backend::renderer::{
     Offscreen as _, Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
 };
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
-use smithay::reexports::drm::control::{connector, crtc};
+use smithay::reexports::drm::Device as _;
+use smithay::reexports::drm::DriverCapability;
+use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
+use smithay::reexports::drm::control::{Device as ControlDevice, connector, crtc};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
@@ -734,6 +737,13 @@ pub struct Renderer {
     /// we don't retry the disk every frame) and the renderer falls back
     /// to the default arrow.
     named_cursors: HashMap<CursorIcon, Option<CursorSprite>>,
+    /// Hardware cursor plane (`None` when the driver exposes no cursor plane
+    /// or allocation failed → software cursor). Lets pointer motion reposition
+    /// the cursor without recompositing the output.
+    cursor_plane: Option<CursorPlane>,
+    /// Raw (un-uploaded) themed cursor images, cached for the hardware cursor
+    /// plane keyed by icon (`None` = not in the theme → falls back to default).
+    hw_named: HashMap<CursorIcon, Option<HwCursorImage>>,
     /// Origin used for the monotonic ms timestamp fed into
     /// `wl_callback.done` after each output is queued for scanout.
     /// Clients use this value to schedule their next frame's draw —
@@ -1201,6 +1211,275 @@ struct CursorSprite {
     nominal: i32,
 }
 
+/// SMPTE 2084 PQ OETF (linear → PQ-encoded, 0..1), the CPU mirror of
+/// `HDR_ENCODE_SHADER`'s `pq_oetf`. Used to encode the cursor image for the
+/// hardware cursor plane on HDR outputs (the plane is scanned out by the
+/// display, bypassing our GLES PQ-encode, so we must bake PQ into its pixels).
+fn pq_oetf(l: f32) -> f32 {
+    const M1: f32 = 0.159_301_76;
+    const M2: f32 = 78.843_75;
+    const C1: f32 = 0.835_937_5;
+    const C2: f32 = 18.851_562;
+    const C3: f32 = 18.687_5;
+    let lp = l.max(0.0).powf(M1);
+    ((C1 + C2 * lp) / (1.0 + C3 * lp)).powf(M2)
+}
+
+/// A themed cursor sprite as raw premultiplied RGBA (top row first), kept so
+/// it can be rasterised into the hardware cursor-plane buffer at any output
+/// scale / colour space without re-decoding the theme.
+#[derive(Clone)]
+struct HwCursorImage {
+    rgba: Vec<u8>,
+    width: i32,
+    height: i32,
+    xhot: i32,
+    yhot: i32,
+    nominal: i32,
+}
+
+impl From<crate::cursor::CursorImage> for HwCursorImage {
+    fn from(c: crate::cursor::CursorImage) -> Self {
+        Self {
+            rgba: c.rgba,
+            width: c.width,
+            height: c.height,
+            xhot: c.xhot,
+            yhot: c.yhot,
+            nominal: c.nominal.max(1),
+        }
+    }
+}
+
+/// Key describing what is currently rasterised into the cursor BO, so a
+/// reposition or redraw can skip a redundant re-upload + `set_cursor2`.
+#[derive(Clone, Copy, PartialEq)]
+struct RenderedCursor {
+    crtc: crtc::Handle,
+    hdr: bool,
+    reference_white: u32,
+    image_gen: u64,
+    /// Scale ×1000 (so the key is `Eq`) the sprite was rasterised at.
+    factor_milli: u32,
+    /// Hotspot in plane pixels (the point that tracks the pointer).
+    hot_x: i32,
+    hot_y: i32,
+}
+
+/// Hardware cursor plane. The cursor image lives in a small GBM buffer handed
+/// to the DRM cursor plane via the legacy `set_cursor2` / `move_cursor`
+/// ioctls; on atomic drivers (including NVIDIA) the kernel routes these to the
+/// universal cursor plane (same path [`crate::drm`] uses to clear the DM's
+/// leftover cursor). Moving the pointer becomes a cheap `move_cursor` instead
+/// of recompositing the whole output, and the cursor is scanned out by the
+/// display hardware rather than blended into every frame.
+struct CursorPlane {
+    /// `ControlDevice` handle for the cursor ioctls (clone of the DRM fd).
+    fd: DrmDeviceFd,
+    /// Plane-sized, `Argb8888`, mappable cursor image buffer.
+    bo: GbmBuffer,
+    /// CRTC the cursor is currently programmed on (`None` = plane disabled).
+    active_crtc: Option<crtc::Handle>,
+    /// Sprite the plane should show. `None` while the effective cursor is
+    /// hidden or a client surface (handled by the software path).
+    image: Option<HwCursorImage>,
+    /// `true` while the effective cursor is a client *surface* — the software
+    /// path draws it, so pointer motion must still trigger a redraw.
+    software: bool,
+    /// Bumped whenever `image` changes; part of [`RenderedCursor`].
+    image_gen: u64,
+    /// What's currently in `bo` (skips redundant re-uploads).
+    rendered: Option<RenderedCursor>,
+}
+
+impl CursorPlane {
+    /// Create the cursor plane: query the driver's cursor size cap and
+    /// allocate one `CURSOR | WRITE` buffer at that size. Returns `None` (so
+    /// the caller keeps the software cursor) if the device reports no cursor
+    /// dimensions or the allocation fails.
+    fn new(fd: &DrmDeviceFd, gbm: &GbmDevice<DrmDeviceFd>) -> Option<Self> {
+        let w = fd.get_driver_capability(DriverCapability::CursorWidth).ok()?;
+        let h = fd.get_driver_capability(DriverCapability::CursorHeight).ok()?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor cap dims are small (<=256 on real hardware)"
+        )]
+        let (plane_w, plane_h) = (w.max(64) as u32, h.max(64) as u32);
+        let bo = gbm
+            .create_buffer_object::<()>(
+                plane_w,
+                plane_h,
+                Fourcc::Argb8888,
+                GbmBufferFlags::CURSOR | GbmBufferFlags::WRITE,
+            )
+            .ok()?;
+        info!(plane_w, plane_h, "hardware cursor plane ready");
+        Some(Self {
+            fd: fd.clone(),
+            bo: GbmBuffer::from_bo(bo, true),
+            active_crtc: None,
+            image: None,
+            software: false,
+            image_gen: 0,
+            rendered: None,
+        })
+    }
+
+    /// Plane buffer width / height in pixels.
+    fn plane_size(&self) -> (i32, i32) {
+        use smithay::backend::allocator::Buffer as _;
+        let s = self.bo.size();
+        (s.w, s.h)
+    }
+
+    /// Set the sprite the plane should show (`None` = nothing on the plane).
+    /// Bumps the generation so the next program re-rasterises.
+    fn set_image(&mut self, image: Option<HwCursorImage>) {
+        self.image = image;
+        self.image_gen = self.image_gen.wrapping_add(1);
+    }
+
+    /// Disable the cursor plane (clear the cursor on its CRTC).
+    fn disable(&mut self) {
+        if let Some(crtc) = self.active_crtc.take() {
+            #[allow(
+                deprecated,
+                reason = "legacy set_cursor is the portable way to disable the cursor plane on atomic drivers; see crate::drm"
+            )]
+            let _ = ControlDevice::set_cursor(&self.fd, crtc, None::<&DumbBuffer>);
+        }
+        self.rendered = None;
+    }
+
+    /// (Re)rasterise the current image at `factor` for output colour
+    /// (`hdr`/`reference_white`) and bind it to `crtc` via `set_cursor2`,
+    /// skipping the work when nothing changed. Returns `false` (caller should
+    /// fall back to software) if there's no image or it's too big for the
+    /// plane.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        clippy::many_single_char_names,
+        reason = "cursor dims/scale are small positive values; r/g/b/a are pixel channels"
+    )]
+    fn program(&mut self, crtc: crtc::Handle, factor: f64, hdr: bool, reference_white: u32) -> bool {
+        let Some(image) = self.image.clone() else {
+            return false;
+        };
+        let (plane_w, plane_h) = self.plane_size();
+        let dst_w = ((f64::from(image.width) * factor).round() as i32).max(1);
+        let dst_h = ((f64::from(image.height) * factor).round() as i32).max(1);
+        if dst_w > plane_w || dst_h > plane_h {
+            return false; // doesn't fit the plane → software fallback
+        }
+        let hot_x = (f64::from(image.xhot) * factor).round() as i32;
+        let hot_y = (f64::from(image.yhot) * factor).round() as i32;
+        let key = RenderedCursor {
+            crtc,
+            hdr,
+            reference_white,
+            image_gen: self.image_gen,
+            factor_milli: (factor * 1000.0).round() as u32,
+            hot_x,
+            hot_y,
+        };
+        if self.rendered == Some(key) && self.active_crtc == Some(crtc) {
+            return true; // already programmed identically
+        }
+        // Crossed to a different output: clear the cursor off the old CRTC so
+        // it doesn't leave a frozen ghost on the monitor we just left.
+        if let Some(old) = self.active_crtc
+            && old != crtc
+        {
+            #[allow(
+                deprecated,
+                reason = "legacy set_cursor disables the cursor plane on atomic drivers; see crate::drm"
+            )]
+            let _ = ControlDevice::set_cursor(&self.fd, old, None::<&DumbBuffer>);
+        }
+        // Rasterise into a plane-sized ARGB8888 (memory order B,G,R,A),
+        // nearest-neighbour scaling the (near-1×) sprite, PQ-encoding when the
+        // target output is HDR so the plane's colours match the PQ scanout.
+        let (pw, ph) = (plane_w as usize, plane_h as usize);
+        let mut buf = vec![0u8; pw * ph * 4];
+        let (sw, sh) = (image.width as usize, image.height as usize);
+        for dy in 0..dst_h as usize {
+            let sy = ((dy as f64) / factor) as usize;
+            if sy >= sh {
+                break;
+            }
+            for dx in 0..dst_w as usize {
+                let sx = ((dx as f64) / factor) as usize;
+                if sx >= sw {
+                    break;
+                }
+                let s = (sy * sw + sx) * 4;
+                let (r, g, b, a) = (
+                    image.rgba[s],
+                    image.rgba[s + 1],
+                    image.rgba[s + 2],
+                    image.rgba[s + 3],
+                );
+                let (ob, og, or) = if hdr && a > 0 {
+                    // Un-premultiply → sRGB→linear-BT.2020 (ref-white scaled)
+                    // → PQ → re-premultiply, matching the SDR-decode + encode
+                    // shaders so the cursor reads correctly on a PQ output.
+                    let af = f32::from(a) / 255.0;
+                    let straight = Color32F::new(
+                        f32::from(r) / 255.0 / af,
+                        f32::from(g) / 255.0 / af,
+                        f32::from(b) / 255.0 / af,
+                        1.0,
+                    );
+                    let lin = srgb_to_linear_bt2020(straight, reference_white, 1.0);
+                    let [lr, lg, lb, _] = lin.components();
+                    (
+                        (pq_oetf(lb) * af * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (pq_oetf(lg) * af * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (pq_oetf(lr) * af * 255.0).round().clamp(0.0, 255.0) as u8,
+                    )
+                } else {
+                    (b, g, r) // SDR: source is already premultiplied sRGB
+                };
+                let d = (dy * pw + dx) * 4;
+                buf[d] = ob;
+                buf[d + 1] = og;
+                buf[d + 2] = or;
+                buf[d + 3] = a;
+            }
+        }
+        if self.bo.write(&buf).is_err() {
+            return false;
+        }
+        #[allow(
+            deprecated,
+            reason = "legacy set_cursor2 routes to the cursor plane on atomic drivers (incl. NVIDIA); see crate::drm"
+        )]
+        let set = ControlDevice::set_cursor2(&self.fd, crtc, Some(&*self.bo), (hot_x, hot_y));
+        if let Err(err) = set {
+            warn!(error = %err, ?crtc, "set_cursor2 failed; falling back to software cursor");
+            self.active_crtc = None;
+            self.rendered = None;
+            return false;
+        }
+        self.active_crtc = Some(crtc);
+        self.rendered = Some(key);
+        true
+    }
+
+    /// Move the (already-programmed) cursor so its hotspot sits at output-local
+    /// physical pixel `(x, y)`.
+    fn position(&self, crtc: crtc::Handle, x: i32, y: i32) {
+        let (hot_x, hot_y) = self.rendered.map_or((0, 0), |r| (r.hot_x, r.hot_y));
+        #[allow(
+            deprecated,
+            reason = "legacy move_cursor routes to the cursor plane on atomic drivers; see crate::drm"
+        )]
+        let _ = ControlDevice::move_cursor(&self.fd, crtc, (x - hot_x, y - hot_y));
+    }
+}
+
 impl Renderer {
     /// Build the shared EGL/GLES context plus one `GbmBufferedSurface`
     /// per output. Outputs are placed left-to-right at `y=0` in the
@@ -1218,6 +1497,9 @@ impl Renderer {
         monitors: &MonitorsConfig,
     ) -> Result<Self> {
         info!("phase: opening GBM device");
+        // Keep a fd clone for the hardware cursor-plane ioctls (set_cursor2 /
+        // move_cursor) before the fd is moved into the GBM device.
+        let cursor_fd = drm_fd.clone();
         let gbm_device = GbmDevice::new(drm_fd).context("GbmDevice::new failed")?;
         info!("GBM device created");
 
@@ -1357,6 +1639,13 @@ impl Renderer {
             .context("HDR rounded-blur mask shader compile failed")?;
 
         info!("phase: creating GBM allocator");
+        // Clone the GBM device for cursor-BO allocation before it's moved
+        // into the swapchain allocator, then build the hardware cursor plane
+        // (None → keep the software cursor).
+        let cursor_plane = CursorPlane::new(&cursor_fd, &gbm_device);
+        if cursor_plane.is_none() {
+            warn!("hardware cursor plane unavailable; using software cursor");
+        }
         let allocator = GbmAllocator::new(
             gbm_device,
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
@@ -1560,6 +1849,8 @@ impl Renderer {
             round_blur_shader_hdr,
             hdr_scene: HashMap::new(),
             sdr_capture: HashMap::new(),
+            cursor_plane,
+            hw_named: HashMap::new(),
         })
     }
 
@@ -1630,6 +1921,137 @@ impl Renderer {
             .or_else(|| self.cursor.clone())
     }
 
+    /// Whether the hardware cursor plane is currently showing the themed
+    /// cursor on `crtc` — so the render path can skip compositing it.
+    fn hw_named_active(&self, crtc: crtc::Handle) -> bool {
+        self.cursor_plane
+            .as_ref()
+            .is_some_and(|cp| cp.image.is_some() && cp.active_crtc == Some(crtc))
+    }
+
+    /// True while a drag-and-drop icon is following the pointer (it's drawn in
+    /// the composite, so motion must redraw even with a hardware cursor).
+    pub fn has_dnd_icon(&self) -> bool {
+        self.dnd_icon.is_some()
+    }
+
+    /// Index of the output whose compositor rect contains the cursor hotspot.
+    fn cursor_output_idx(&self) -> Option<usize> {
+        let (cx, cy) = (self.cursor_x, self.cursor_y);
+        self.outputs.iter().position(|o| {
+            let r = Rectangle::new(o.compositor_position, o.compositor_size);
+            cx >= f64::from(r.loc.x)
+                && cy >= f64::from(r.loc.y)
+                && cx < f64::from(r.loc.x + r.size.w)
+                && cy < f64::from(r.loc.y + r.size.h)
+        })
+    }
+
+    /// Resolve a named cursor to a raw image for the hardware plane, caching
+    /// by icon (falls back to the default arrow when the theme lacks it).
+    fn hw_cursor_image_for(&mut self, icon: CursorIcon) -> Option<HwCursorImage> {
+        if let Some(cached) = self.hw_named.get(&icon) {
+            return cached.clone();
+        }
+        let img = crate::cursor::load_named_cursor(icon, self.cursor_target_px)
+            .or_else(|| crate::cursor::load_default_cursor(self.cursor_target_px))
+            .map(HwCursorImage::from);
+        self.hw_named.insert(icon, img.clone());
+        img
+    }
+
+    /// Sync the hardware cursor plane to the effective cursor status (client
+    /// request or compositor override) and program it on the output under the
+    /// pointer. Idempotent + cheap — safe to call each redraw. No-op without a
+    /// cursor plane.
+    pub fn refresh_hw_cursor(&mut self, pointer_locked: bool) {
+        if self.cursor_plane.is_none() {
+            return;
+        }
+        let status = self
+            .cursor_override
+            .clone()
+            .unwrap_or_else(|| self.cursor_status.clone());
+        // Resolve the desired image first (borrows self for the cache).
+        let (image, software) = if pointer_locked {
+            (None, false)
+        } else {
+            match status {
+                CursorImageStatus::Named(icon) => (self.hw_cursor_image_for(icon), false),
+                CursorImageStatus::Surface(_) => (None, true),
+                CursorImageStatus::Hidden => (None, false),
+            }
+        };
+        if let Some(cp) = self.cursor_plane.as_mut() {
+            cp.set_image(image);
+            cp.software = software;
+            if cp.image.is_none() {
+                cp.disable();
+            }
+        }
+        self.program_hw_cursor_current();
+    }
+
+    /// Reposition (re-programming if needed) the hardware cursor for the
+    /// current pointer location. Returns `true` if the plane handled it (the
+    /// caller can skip a full redraw), `false` if the cursor is software
+    /// (client surface / no plane / oversize) and a redraw is still needed.
+    pub fn move_hw_cursor(&mut self) -> bool {
+        let Some(cp) = self.cursor_plane.as_ref() else {
+            return false;
+        };
+        if cp.image.is_none() {
+            // Hidden → handled (nothing to draw); surface → software redraw.
+            return !cp.software;
+        }
+        self.program_hw_cursor_current()
+    }
+
+    /// Program + position the cursor plane on the output under the pointer.
+    /// Returns whether the plane is showing the cursor.
+    fn program_hw_cursor_current(&mut self) -> bool {
+        if self.cursor_plane.as_ref().is_none_or(|cp| cp.image.is_none()) {
+            return false;
+        }
+        let Some(idx) = self.cursor_output_idx() else {
+            if let Some(cp) = self.cursor_plane.as_mut() {
+                cp.disable();
+            }
+            return false;
+        };
+        let o = &self.outputs[idx];
+        let (crtc, scale, hdr, refw, opos) = (
+            o.crtc,
+            o.scale,
+            o.hdr,
+            o.hdr_reference_white,
+            o.compositor_position,
+        );
+        let cursor_size = self.cursor_size;
+        let (cx, cy) = (self.cursor_x, self.cursor_y);
+        let Some(cp) = self.cursor_plane.as_mut() else {
+            return false;
+        };
+        let nominal = cp.image.as_ref().map_or(1, |i| i.nominal.max(1));
+        let factor = f64::from(cursor_size) / f64::from(nominal) * scale;
+        if !cp.program(crtc, factor, hdr, refw) {
+            cp.disable();
+            return false;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "output-local physical cursor coords fit i32"
+        )]
+        let lx = ((cx - f64::from(opos.x)) * scale) as i32;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "output-local physical cursor coords fit i32"
+        )]
+        let ly = ((cy - f64::from(opos.y)) * scale) as i32;
+        cp.position(crtc, lx, ly);
+        true
+    }
+
     /// Render every output's initial frame to prime its swapchain.
     /// Called once at startup before the event loop runs; thereafter
     /// each output's frames are driven by its own vblank events. No
@@ -1640,7 +2062,7 @@ impl Renderer {
             // Followup ignored: each output is primed once, then parks until
             // a redraw is queued (a flip is now in flight, acked on vblank).
             let _ = self
-                .render_output(idx, &[], &[], &[], false, &[], &HashSet::new())
+                .render_output(idx, &[], &[], &[], false, &[], &HashSet::new(), false)
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -1707,6 +2129,7 @@ impl Renderer {
         hide_cursor: bool,
         captures: &[CaptureSpec],
         hdr_surface_ids: &HashSet<ObjectId>,
+        compose_cursor: bool,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
         let idx = self
             .outputs
@@ -1721,6 +2144,7 @@ impl Renderer {
             hide_cursor,
             captures,
             hdr_surface_ids,
+            compose_cursor,
         )
     }
 
@@ -2752,7 +3176,12 @@ impl Renderer {
         hide_cursor: bool,
         captures: &[CaptureSpec],
         hdr_surface_ids: &HashSet<ObjectId>,
+        compose_cursor: bool,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
+        // Is the themed cursor already on the hardware plane for this output?
+        // If so, skip compositing it (the plane scans it out) — unless this
+        // frame must bake the cursor into the framebuffer for a capture.
+        let hw_named_active = self.hw_named_active(self.outputs[idx].crtc);
         // Upload the latest media-wallpaper frame (if the decode thread has
         // produced one) before snapshotting the drawable below, so animated
         // wallpapers advance each vblank.
@@ -3824,21 +4253,27 @@ impl Renderer {
                         }
                     }
                     CursorImageStatus::Named(_) => {
-                        // Pointer hotspot in this output's physical pixels.
-                        let hotspot = Point::<i32, Physical>::from((
-                            scale_f(cursor_local_x, scale),
-                            scale_f(cursor_local_y, scale),
-                        ));
-                        draw_cursor(
-                            &mut frame,
-                            cursor_sprite.as_ref(),
-                            cursor_size,
-                            hotspot,
-                            scale,
-                            hdr,
-                            hdr_reference_white,
-                            hdr_saturation,
-                        )?;
+                        // The hardware cursor plane scans the themed cursor out
+                        // directly, so skip compositing it — unless this frame
+                        // must bake it into the framebuffer for a capture, or
+                        // the plane isn't handling it (no plane / oversize).
+                        if compose_cursor || !hw_named_active {
+                            // Pointer hotspot in this output's physical pixels.
+                            let hotspot = Point::<i32, Physical>::from((
+                                scale_f(cursor_local_x, scale),
+                                scale_f(cursor_local_y, scale),
+                            ));
+                            draw_cursor(
+                                &mut frame,
+                                cursor_sprite.as_ref(),
+                                cursor_size,
+                                hotspot,
+                                scale,
+                                hdr,
+                                hdr_reference_white,
+                                hdr_saturation,
+                            )?;
+                        }
                     }
                 }
             }

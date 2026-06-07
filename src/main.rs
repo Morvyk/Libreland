@@ -404,6 +404,13 @@ pub(crate) struct State {
     /// frame via `PopupManager::popups_for_surface` to render menus /
     /// submenus on top of their parent window.
     pub(crate) popup_manager: smithay::desktop::PopupManager,
+    /// Root toplevel/layer surface that owns the currently-grabbing
+    /// popup chain (set from `XdgShellHandler::grab`), or `None` when no
+    /// menu has an active grab. While set, the hover focus model is
+    /// frozen on this root so moving the pointer off the parent can't
+    /// steal keyboard focus and make the client dismiss its own menu.
+    /// Expired by `refresh_popup_grab` once the chain closes.
+    pub(crate) popup_grab: Option<WlSurface>,
     /// Active interactive drag (Super + LMB to move, Super + RMB
     /// to resize). `Some` only between the initiating press and
     /// the matching release; during that window, pointer motion
@@ -975,6 +982,10 @@ impl State {
         out
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear per-output render driver: snapshot placements/layers/popups, drain captures, sync the hardware cursor, render, then park/retry on the result. Splitting it just threads frame state through extra functions."
+    )]
     fn render_crtc(&mut self, crtc: crtc::Handle) {
         let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
         // Workspace slide spec (None when disabled). Clear finished slides,
@@ -1046,8 +1057,15 @@ impl State {
             !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
         let internal_hides_cursor =
             !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
-        let hide_cursor =
-            self.pointer_locked() || capture_hides_cursor || internal_hides_cursor;
+        let locked = self.pointer_locked();
+        let hide_cursor = locked || capture_hides_cursor || internal_hides_cursor;
+        // A capture this frame wants the cursor baked into the framebuffer —
+        // composite the themed cursor even though the hardware plane shows it.
+        let compose_cursor = captures.iter().any(|c| c.overlay_cursor)
+            || internal.iter().any(|c| c.show_cursor);
+        // Sync the hardware cursor plane to the current status before rendering
+        // (cheap + idempotent; programs it on the output under the pointer).
+        self.renderer.refresh_hw_cursor(locked);
         let client_n = captures.len();
         let hdr_surface_ids = self.hdr_surface_ids(&placements);
         let followup = match self.renderer.render_for_crtc(
@@ -1058,6 +1076,7 @@ impl State {
             hide_cursor,
             &specs,
             &hdr_surface_ids,
+            compose_cursor,
         ) {
             Ok((mut results, followup)) => {
                 // Trailing results belong to the internal specs.
@@ -1116,12 +1135,20 @@ impl State {
         let time = evt.time_msec();
         let utime = evt.time();
 
-        // The cursor sprite (and any drag / screenshot selection) moves on
-        // every motion, so this output needs a fresh frame — unless the
-        // pointer is locked, where the cursor is hidden and the locked
-        // client redraws via its own commits (keeping its VRR untouched).
+        // Move the pointer. With a hardware cursor plane the themed cursor is
+        // repositioned by a cheap `move_cursor` ioctl with NO full re-render —
+        // the whole point of the plane. Fall back to a redraw only when the
+        // cursor is software (client surface / no plane / oversize) or
+        // something else tracks the pointer (a DnD icon or screenshot
+        // selection follows it in the composite). Skip entirely while the
+        // pointer is locked (cursor hidden; the client drives its own frames).
         if !self.pointer_locked() {
-            self.queue_redraw_all();
+            let needs_redraw = self.renderer.has_dnd_icon()
+                || self.screenshot.is_some()
+                || !self.renderer.move_hw_cursor();
+            if needs_redraw {
+                self.queue_redraw_all();
+            }
         }
 
         // A screenshot session owns the pointer: move the cursor and
@@ -1320,9 +1347,15 @@ impl State {
         // move/resize the cursor sweeps over windows that shouldn't grab
         // focus. Never steal focus from an exclusive-keyboard layer surface
         // (e.g. rofi) either.
+        // An open popup grab (a menu) pins keyboard focus to its owner
+        // so hover can't move focus away — otherwise the client sees its
+        // toplevel lose focus and dismisses the menu. Expire the grab
+        // first so focus resumes the instant the chain closes.
+        self.refresh_popup_grab();
         if matches!(self.config.input.focus_model, config::FocusModel::Hover)
             && !pointer.is_grabbed()
             && !self.focus_locked_by_layer()
+            && self.popup_grab.is_none()
             && let Some(kbd) = self.seat.get_keyboard()
             && kbd.current_focus() != kbd_target
         {
@@ -1980,6 +2013,97 @@ impl State {
         for (root, popup) in pairs {
             let _ = PopupManager::dismiss_popup(&root, &popup);
         }
+        // The whole chain is gone — release the grab so hover focus resumes.
+        self.popup_grab = None;
+    }
+
+    /// Drop the popup grab once its menu chain has closed (the client
+    /// tore the popups down itself, e.g. after an item was clicked) so
+    /// the hover focus model can move focus again. Cheap; called from the
+    /// pointer-motion focus path.
+    fn refresh_popup_grab(&mut self) {
+        use smithay::desktop::PopupManager;
+        if let Some(root) = &self.popup_grab {
+            let still_open =
+                root.alive() && PopupManager::popups_for_surface(root).next().is_some();
+            if !still_open {
+                self.popup_grab = None;
+            }
+        }
+    }
+
+    /// Constrain a popup's window geometry to fit on the output it opens
+    /// on, honouring the client's `constraint_adjustment` (flip → slide →
+    /// resize) per xdg-shell, and return geometry relative to the popup's
+    /// parent surface's window geometry (ready to stamp into pending
+    /// state and send to the client). Without this a menu near a screen
+    /// edge is placed off-screen ("into the void"); telling the client
+    /// the constrained geometry lets it flip submenus and render where it
+    /// will actually be shown. Falls back to the raw positioner geometry
+    /// when the parent window / output can't be located.
+    ///
+    /// Coordinates: the compositor works in logical units (the output
+    /// rects are `mode / scale`, just `Physical`-tagged), which is the
+    /// same space the client's positioner uses, so the arithmetic is a
+    /// plain translate; we only rebuild the `target` as `Logical` to
+    /// match the API's unit tag.
+    pub(crate) fn unconstrain_popup_geometry(
+        &self,
+        surface: &smithay::wayland::shell::xdg::PopupSurface,
+        positioner: &smithay::wayland::shell::xdg::PositionerState,
+    ) -> smithay::utils::Rectangle<i32, Logical> {
+        use smithay::desktop::{PopupKind, PopupManager, find_popup_root_surface};
+        use smithay::utils::{Rectangle, Size};
+
+        let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface.clone())) else {
+            return positioner.get_geometry();
+        };
+        // Root window-geometry origin in compositor space: a tiled/floating
+        // toplevel's cell origin + border, or a layer surface's rect origin.
+        let bw = self.layout.border_width();
+        let root_origin = self
+            .layout
+            .placements(None, None)
+            .into_iter()
+            .find(|p| p.surface == root)
+            .map(|p| (p.cell_rect.loc.x + bw, p.cell_rect.loc.y + bw))
+            .or_else(|| {
+                self.snapshot_layer_placements()
+                    .into_iter()
+                    .find(|l| l.surface == root)
+                    .map(|l| (l.rect.loc.x, l.rect.loc.y))
+            });
+        let Some((rgx, rgy)) = root_origin else {
+            return positioner.get_geometry();
+        };
+        // Output to fit into: the one containing the root origin, falling
+        // back to the first so a root in an inter-output gap still gets
+        // constrained somewhere on-screen.
+        let outputs = self.renderer.output_rects();
+        let Some((_, out)) = outputs
+            .iter()
+            .find(|(_, r)| {
+                rgx >= r.loc.x && rgx < r.loc.x + r.size.w && rgy >= r.loc.y && rgy < r.loc.y + r.size.h
+            })
+            .or_else(|| outputs.first())
+        else {
+            return positioner.get_geometry();
+        };
+        // The positioner's anchor rect is relative to the *immediate*
+        // parent's window geometry: the root itself for a top-level popup,
+        // or the parent popup's on-screen geometry top-left for a submenu
+        // (its location from the manager is relative to the root geometry).
+        let (pgx, pgy) = match surface.get_parent_surface() {
+            Some(parent) if parent != root => PopupManager::popups_for_surface(&root)
+                .find(|(p, _)| p.wl_surface() == &parent)
+                .map_or((rgx, rgy), |(_, loc)| (rgx + loc.x, rgy + loc.y)),
+            _ => (rgx, rgy),
+        };
+        let target = Rectangle::<i32, Logical>::new(
+            Point::from((out.loc.x - pgx, out.loc.y - pgy)),
+            Size::from((out.size.w, out.size.h)),
+        );
+        (*positioner).get_unconstrained_geometry(target)
     }
 
     /// Walk the layer-surface list in top-down z-order (`Overlay`
@@ -3587,6 +3711,7 @@ fn main() -> Result<()> {
         loop_handle: handle.clone(),
         redraw,
         popup_manager: wayland_init.popup_manager,
+        popup_grab: None,
         kbd_focus_before_layer: None,
         layout,
         drag: None,
