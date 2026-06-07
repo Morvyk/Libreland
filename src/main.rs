@@ -314,6 +314,10 @@ pub(crate) struct State {
     /// registry. Held so the global stays registered; dispatch routes
     /// through `State`.
     pub(crate) color_management: crate::color_management::ColorManagementState,
+    /// `wp_content_type_v1` global. Held so the global stays registered;
+    /// clients tag a surface's content type (game / video / photo).
+    #[allow(dead_code, reason = "held to keep the wp_content_type_v1 global alive")]
+    pub(crate) content_type_state: smithay::wayland::content_type::ContentTypeState,
     /// Per-surface colour state set via the colour-management protocol,
     /// keyed by `wl_surface` id. Read by the renderer to colour-manage an
     /// HDR output; pruned on surface/object destroy.
@@ -3694,6 +3698,7 @@ fn main() -> Result<()> {
         xdg_activation_state: wayland_init.xdg_activation_state,
         pointer_gestures_state: wayland_init.pointer_gestures_state,
         color_management: wayland_init.color_management,
+        content_type_state: wayland_init.content_type_state,
         color_surfaces: std::collections::HashMap::new(),
         color_surface_objects: std::collections::HashSet::new(),
         pending_image_info: Vec::new(),

@@ -26,6 +26,7 @@ use smithay::delegate_idle_inhibit;
 use smithay::delegate_idle_notify;
 use smithay::delegate_pointer_gestures;
 use smithay::delegate_xdg_activation;
+use smithay::delegate_content_type;
 use smithay::delegate_dmabuf;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_kde_decoration;
@@ -215,6 +216,10 @@ pub struct WaylandInit {
     /// `wp_color_management_v1` — clients detect output HDR and tag their
     /// surfaces' colour space. Held so the global stays alive.
     pub color_management: crate::color_management::ColorManagementState,
+    /// `wp_content_type_v1` — clients hint a surface's content (game / video /
+    /// photo). Held so the global stays alive; the hint is read from the
+    /// surface's cached state when we want to drive per-content behaviour.
+    pub content_type_state: smithay::wayland::content_type::ContentTypeState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -389,6 +394,11 @@ pub fn init(
     // wp_color_management_v1: clients detect output HDR + tag surface
     // colour spaces (Proton/mpv use this to enable HDR).
     let color_management = crate::color_management::ColorManagementState::new(&dh);
+    // wp_content_type_v1: clients tag a surface's content type (game / video /
+    // photo). Advertised now so clients can hint; read from cached state when
+    // we drive per-content behaviour (e.g. future tearing / scanout choices).
+    let content_type_state =
+        smithay::wayland::content_type::ContentTypeState::new::<State>(&dh);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -464,6 +474,7 @@ pub fn init(
         pointer_gestures_state,
         screencopy_manager,
         color_management,
+        content_type_state,
         popup_manager,
         outputs,
         output_globals,
@@ -1303,6 +1314,7 @@ delegate_idle_inhibit!(State);
 delegate_idle_notify!(State);
 delegate_xdg_activation!(State);
 delegate_pointer_gestures!(State);
+delegate_content_type!(State);
 smithay::delegate_session_lock!(State);
 
 impl SessionLockHandler for State {

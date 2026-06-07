@@ -723,6 +723,7 @@ present and elided here.)
 | `zwp_pointer_gestures_v1`                                      | Touchpad pinch / swipe / hold gestures to clients (browser pinch-zoom, GTK swipe). |
 | `zwp_pointer_constraints_v1`                                   | Pointer lock / confinement (FPS games).                                 |
 | `wp_color_manager_v1` (colour-management-v1, staging, v1)      | Clients detect an output's HDR colour properties and tag surfaces with an image description (BT.2020/PQ). Enables HDR detection for Proton/mpv. Parametric descriptions only (no ICC); per-surface state feeds the HDR colour pipeline. |
+| `wp_content_type_v1`                                           | Clients hint a surface's content type (game / video / photo). Advertised so toolkits/Proton can tag content; read from surface cached state to drive future per-content behaviour (e.g. tearing / scanout choices). |
 | `zwp_idle_inhibit_manager_v1`                                  | Clients (e.g. video players) inhibit idle while a surface is up — see [idle](#idle). |
 | `ext_idle_notifier_v1`                                         | Idle daemons (e.g. swayidle) learn when the user goes idle; paused while an inhibitor is active. |
 | `wl_data_device_manager`                                       | Clipboard + drag-and-drop.                                              |
