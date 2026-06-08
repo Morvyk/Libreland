@@ -3,7 +3,7 @@
 //!
 //! A single EGL context + GLES renderer + GBM allocator is shared by
 //! every output on a given GPU. Each output has its own
-//! `GbmBufferedSurface` (its own swapchain + page-flip cadence) and
+//! `ScanoutSurface` (its own swapchain + page-flip cadence) and
 //! is rendered independently when *its* CRTC reports vblank. Outputs
 //! sit in a virtual layout — by default left-to-right at `y=0` in
 //! connector enumeration order; Lua config will override per-output
@@ -19,9 +19,10 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::format::has_alpha;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Format, Fourcc};
-use smithay::backend::drm::{DrmDeviceFd, DrmNode, GbmBufferedSurface, VrrSupport};
+use smithay::backend::allocator::{Buffer as _, Format, Fourcc};
+use smithay::backend::drm::{DrmDeviceFd, DrmNode, VrrSupport};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
@@ -32,7 +33,9 @@ use smithay::backend::renderer::gles::{
     GlesFrame, GlesRenderer, GlesTarget, GlesTexProgram, GlesTexture, Uniform, UniformName,
     UniformType,
 };
-use smithay::backend::renderer::utils::draw_render_elements;
+use smithay::backend::renderer::utils::{
+    Buffer as ClientBuffer, draw_render_elements, with_renderer_surface_state,
+};
 use smithay::backend::renderer::{
     Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
     Offscreen as _, Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
@@ -45,7 +48,7 @@ use smithay::reexports::drm::control::{Device as ControlDevice, connector, crtc}
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
-use smithay::utils::{IsAlive as _, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{IsAlive as _, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{
     BufferAssignment, SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
@@ -59,6 +62,7 @@ use crate::config::{
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
+use crate::scanout::ScanoutSurface;
 
 /// A layer surface to render this frame. Pre-computed by main
 /// before calling `render_for_crtc` so the renderer doesn't need
@@ -680,7 +684,7 @@ pub struct Renderer {
     gles: GlesRenderer,
     /// GBM scanout allocator, retained so a hot-plugged output can have
     /// its swapchain built at runtime (cloned into each new
-    /// `GbmBufferedSurface`). The dmabuf render formats are re-queried
+    /// `ScanoutSurface`). The dmabuf render formats are re-queried
     /// from `gles` on demand.
     allocator: GbmAllocator<DrmDeviceFd>,
     /// One swapchain + framebuffer chain per output.
@@ -990,12 +994,7 @@ fn output_sdr_saturation(cfg: Option<&crate::config::OutputConfig>) -> f32 {
 /// connector's BT2020/PQ signalling — the panel may stay in HDR mode
 /// (showing SDR content) until the compositor restarts. Never fails the
 /// build: a connector that can't do HDR just stays SDR, logged.
-fn stage_hdr(
-    surface: &GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
-    connector: connector::Handle,
-    hdr: bool,
-    name: &str,
-) {
+fn stage_hdr(surface: &ScanoutSurface, connector: connector::Handle, hdr: bool, name: &str) {
     if !hdr {
         return;
     }
@@ -1023,7 +1022,7 @@ struct OutputRender {
     /// Connector scanning out this output. Kept so idle DPMS power-off can
     /// target it (the DPMS state is a connector property).
     connector: connector::Handle,
-    surface: GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>,
+    surface: ScanoutSurface,
     /// DRM framebuffer dimensions in physical pixels.
     mode_size: Size<i32, Physical>,
     /// DRM mode refresh rate in milli-Hz (so 144 Hz = `144_000`).
@@ -1512,13 +1511,13 @@ impl CursorPlane {
 }
 
 impl Renderer {
-    /// Build the shared EGL/GLES context plus one `GbmBufferedSurface`
+    /// Build the shared EGL/GLES context plus one `ScanoutSurface`
     /// per output. Outputs are placed left-to-right at `y=0` in the
     /// order the DRM layer enumerated them; the cursor is initialised
     /// at the centre of the first output so it's immediately visible.
     #[allow(
         clippy::too_many_lines,
-        reason = "linear initialisation sequence (GBM device, EGL display, EGL context, GLES renderer, custom shader, GBM allocator, per-output GbmBufferedSurfaces). Splitting it forces threading several mid-construction values through extra functions for no real win."
+        reason = "linear initialisation sequence (GBM device, EGL display, EGL context, GLES renderer, custom shader, GBM allocator, per-output ScanoutSurfaces). Splitting it forces threading several mid-construction values through extra functions for no real win."
     )]
     pub fn new(
         drm_fd: DrmDeviceFd,
@@ -1723,15 +1722,15 @@ impl Renderer {
             // GBM swapchain — adaptive-sync support is a connector property.
             let connector = drm_output.connector;
             let hdr = output_cfg.is_some_and(|c| c.hdr);
-            let surface = GbmBufferedSurface::new(
+            let surface = ScanoutSurface::new(
                 drm_output.surface,
-                allocator.clone(),
+                &allocator,
                 scanout_formats(hdr),
                 renderer_formats.clone(),
             )
             .with_context(|| {
                 format!(
-                    "GbmBufferedSurface::new failed for {} (no compatible scanout format?)",
+                    "ScanoutSurface::new failed for {} (no compatible scanout format?)",
                     drm_output.name
                 )
             })?;
@@ -2352,15 +2351,15 @@ impl Renderer {
         let connector = drm_output.connector;
         let hdr = output_cfg.is_some_and(|c| c.hdr);
         let renderer_formats = self.gles.egl_context().dmabuf_render_formats().clone();
-        let surface = GbmBufferedSurface::new(
+        let surface = ScanoutSurface::new(
             drm_output.surface,
-            self.allocator.clone(),
+            &self.allocator,
             scanout_formats(hdr),
             renderer_formats,
         )
         .with_context(|| {
             format!(
-                "GbmBufferedSurface::new failed for hot-plugged {} (no compatible scanout format?)",
+                "ScanoutSurface::new failed for hot-plugged {} (no compatible scanout format?)",
                 drm_output.name
             )
         })?;
@@ -3395,6 +3394,46 @@ impl Renderer {
             reason = "reference white is a small cd/m² value, exact in f32"
         )]
         let ref_white_f32 = hdr_reference_white as f32;
+
+        // ── Direct-scanout fast path ──────────────────────────────────
+        // A single settled fullscreen opaque client whose colour mode
+        // matches the output: scan its buffer straight to the primary
+        // plane, skipping ALL compositing (≈ zero GPU for this output).
+        // Anything that needs compositing — overlays, popups, animations,
+        // captures, a non-1:1 buffer, or a buffer the plane rejects —
+        // falls through to the composite path below.
+        let out_rect = Rectangle::new(compositor_position, compositor_size);
+        if let Some(direct) = self.direct_scanout_inputs(
+            idx,
+            &win_draws,
+            placements,
+            layers,
+            popups,
+            captures,
+            hdr_surface_ids,
+            compose_cursor,
+        ) {
+            // VRR must settle before the flip (it may promote the flip to a
+            // modeset); harmlessly re-applied by the composite path on a miss.
+            self.apply_vrr(idx, placements);
+            match self.outputs[idx].surface.try_queue_external(
+                direct.buffer,
+                &direct.dmabuf,
+                direct.use_opaque,
+            ) {
+                Ok(true) => {
+                    debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
+                    self.send_output_frame_callbacks(placements, layers, popups, out_rect);
+                    // No transient state is active (eligibility required it),
+                    // so the output parks until the client's next commit.
+                    return Ok((Vec::new(), false));
+                }
+                Ok(false) => {} // not scannable this frame → composite below
+                Err(err) => {
+                    warn!(output = %output_name, error = %err, "direct scanout failed; compositing");
+                }
+            }
+        }
 
         // Ensure the fp16 linear scene buffer for HDR outputs *before* the
         // draw closures capture `hdr` (they read it for shader selection).
@@ -4523,38 +4562,14 @@ impl Renderer {
 
         self.outputs[idx]
             .surface
-            .queue_buffer(Some(sync), None, ())
+            .queue_buffer(Some(sync), None)
             .with_context(|| format!("queue_buffer failed for {output_name}"))?;
         debug!(output = %output_name, "frame queued for scanout");
 
-        // Fire wl_callback.done on every surface we rendered. The
-        // callback queue is drained per surface, so calling this again from
-        // a second output's render is a no-op. We deliberately fire only for
-        // surfaces visible on THIS output, though: otherwise a fast output
-        // (a fullscreen game) would drive the clients on every other output
-        // at its own rate, and the resulting cross-output feedback loop
-        // would peg every panel back at max refresh — defeating VRR.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
-        )]
-        let elapsed_ms = self.start.elapsed().as_millis() as u32;
-        let out_rect = Rectangle::new(compositor_position, compositor_size);
-        for p in placements {
-            if p.cell_rect.overlaps(out_rect) {
-                send_frame_callbacks(&p.surface, elapsed_ms);
-            }
-        }
-        for l in layers {
-            if l.rect.overlaps(out_rect) {
-                send_frame_callbacks(&l.surface, elapsed_ms);
-            }
-        }
-        // Popups are tiny, transient, and tied to a parent already covered
-        // above; fire unconditionally rather than track their output.
-        for p in popups {
-            send_frame_callbacks(&p.surface, elapsed_ms);
-        }
+        // Fire wl_callback.done on every surface we rendered, per-output
+        // filtered (see `send_output_frame_callbacks` — shared with the
+        // direct-scanout path).
+        self.send_output_frame_callbacks(placements, layers, popups, out_rect);
 
         // Tell the on-demand driver whether this output still produces
         // frames on its own — an in-flight window/close/open animation, or
@@ -4594,6 +4609,224 @@ impl Renderer {
             .iter()
             .any(|p| p.fill != FillMode::Normal && p.cell_rect.overlaps(rect))
     }
+
+    /// Per-output `wl_callback.done` dispatch. Fires on every surface visible
+    /// on this output (windows/layers filtered by overlap; popups always),
+    /// draining each surface's callback queue so a second output's render is a
+    /// no-op. Per-output filtering keeps a fast output (a fullscreen game)
+    /// from driving clients on other outputs and pegging them to its refresh
+    /// rate — preserving VRR isolation. Shared by the composite and
+    /// direct-scanout paths.
+    fn send_output_frame_callbacks(
+        &self,
+        placements: &[Placement],
+        layers: &[LayerPlacement],
+        popups: &[PopupPlacement],
+        out_rect: Rectangle<i32, Physical>,
+    ) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
+        )]
+        let elapsed_ms = self.start.elapsed().as_millis() as u32;
+        for p in placements {
+            if p.cell_rect.overlaps(out_rect) {
+                send_frame_callbacks(&p.surface, elapsed_ms);
+            }
+        }
+        for l in layers {
+            if l.rect.overlaps(out_rect) {
+                send_frame_callbacks(&l.surface, elapsed_ms);
+            }
+        }
+        // Popups are tiny, transient, and tied to a parent already covered
+        // above; fire unconditionally rather than track their output.
+        for p in popups {
+            send_frame_callbacks(&p.surface, elapsed_ms);
+        }
+    }
+
+    /// Decide whether this output's frame can be served by latching a single
+    /// client's buffer straight onto the primary plane (direct scanout),
+    /// returning the buffer keep-alive + dmabuf when so. `None` means the
+    /// frame must be composited.
+    ///
+    /// Eligible only when nothing needs compositing on this output: no
+    /// captures, the cursor is on the HW plane, no layer-shell/overlay/popup/
+    /// session-lock/transient surface or running animation, and exactly one
+    /// placement covers the output — a settled, 1:1, opaque `Fullscreen`
+    /// window whose colour mode matches the output (HDR output ⇔ PQ surface),
+    /// backed by a single dmabuf buffer with no transform.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors render_output's per-frame inputs; a struct would not simplify"
+    )]
+    fn direct_scanout_inputs(
+        &self,
+        idx: usize,
+        win_draws: &[WinDraw],
+        placements: &[Placement],
+        layers: &[LayerPlacement],
+        popups: &[PopupPlacement],
+        captures: &[CaptureSpec],
+        hdr_surface_ids: &HashSet<ObjectId>,
+        compose_cursor: bool,
+    ) -> Option<DirectInputs> {
+        let output = &self.outputs[idx];
+        let out_rect = Rectangle::new(output.compositor_position, output.compositor_size);
+
+        // A capture must read a composited framebuffer; the cursor must be on
+        // the HW plane (not composited into the primary), with none baked in.
+        if !captures.is_empty() || compose_cursor || !self.hw_cursor_active(output.crtc) {
+            return None;
+        }
+        // Anything that draws above a fullscreen window forces compositing.
+        // `layers` carries real layer-shell surfaces *and* the session-lock
+        // surface (injected as an Overlay layer by render_crtc).
+        if !popups.is_empty() || layers.iter().any(|l| l.rect.overlaps(out_rect)) {
+            return None;
+        }
+        // Transient overlays / running window animations (any of which draws
+        // over, or distorts, the fullscreen window) → composite.
+        if !self.closing.is_empty()
+            || !self.pending_open.is_empty()
+            || self.screenshot_overlay.is_some()
+            || self.dnd_icon.is_some()
+            || self.freeze_textures.contains_key(&output.name)
+            || self
+                .win_anims
+                .values()
+                .any(|w| w.move_anim.is_some() || w.open_anim.is_some())
+        {
+            return None;
+        }
+
+        // Exactly one placement may cover the output.
+        let mut covering = placements
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.cell_rect.overlaps(out_rect));
+        let (i, p) = covering.next()?;
+        if covering.next().is_some() {
+            return None;
+        }
+
+        // It must be a settled (1:1, fully opaque) fullscreen window whose
+        // colour mode matches the output.
+        if p.fill != FillMode::Fullscreen || p.slide_dy != 0 {
+            return None;
+        }
+        let draw = win_draws.get(i)?;
+        if draw.effective != out_rect || draw.alpha < 1.0 {
+            return None;
+        }
+        if output.hdr != hdr_surface_ids.contains(&p.surface.id()) {
+            return None;
+        }
+        // A toplevel with subsurfaces isn't a single scannable buffer.
+        if !surface_is_single_node(&p.surface) {
+            return None;
+        }
+
+        // Extract a scanout-ready dmabuf + keep-alive from the committed
+        // buffer. Rejects shm buffers, transformed buffers, viewport-cropped/
+        // scaled buffers, non-native buffer scale, buffers whose pixels don't
+        // match the mode 1:1, and buffers we can't prove are opaque.
+        let mode_size = output.mode_size;
+        with_renderer_surface_state(&p.surface, |state| {
+            // The buffer must map to the plane 1:1: native buffer scale, no
+            // rotation, and no wp_viewport crop/scale. (A fractional-scale
+            // client commits an oversized buffer + viewport to map it down;
+            // that path must composite, not scan out the raw buffer.)
+            if state.buffer_transform() != Transform::Normal || state.buffer_scale() != 1 {
+                return None;
+            }
+            let buf = state.buffer_size()?;
+            let view = state.view()?;
+            let src_loc = view.src.loc.to_i32_round::<i32>();
+            if src_loc.x != 0
+                || src_loc.y != 0
+                || view.src.size.to_i32_round::<i32>() != buf
+                || view.dst != buf
+            {
+                return None;
+            }
+
+            let buffer = state.buffer()?.clone();
+            let dmabuf = smithay::wayland::dmabuf::get_dmabuf(&buffer).ok()?.clone();
+            let size = dmabuf.size();
+            if size.w != mode_size.w || size.h != mode_size.h {
+                return None;
+            }
+
+            // Provable opacity. The composite path blends an alpha buffer over
+            // the wallpaper; direct scanout ignores the alpha (nothing is below
+            // the primary plane), so the two only agree when the surface is
+            // actually opaque. A no-alpha format is inherently opaque; an alpha
+            // format must declare a full opaque region. An opaque alpha buffer
+            // is scanned out via the opaque sibling fourcc.
+            let code = dmabuf.format().code;
+            if has_alpha(code) && !opaque_region_covers(state.opaque_regions(), buf) {
+                return None;
+            }
+            let use_opaque = has_alpha(code);
+            Some(DirectInputs {
+                buffer,
+                dmabuf,
+                use_opaque,
+            })
+        })
+        .flatten()
+    }
+}
+
+/// Buffer to latch directly onto the primary plane (direct scanout). Produced
+/// by [`Renderer::direct_scanout_inputs`] and consumed by
+/// [`ScanoutSurface::try_queue_external`].
+struct DirectInputs {
+    /// Keep-alive for the client buffer; holding it defers `wl_buffer.release`
+    /// until a later flip replaces this buffer on the plane.
+    buffer: ClientBuffer,
+    dmabuf: Dmabuf,
+    /// Program the plane with the opaque sibling fourcc (ignore the alpha
+    /// channel) — set when the client buffer's format carries unused alpha.
+    use_opaque: bool,
+}
+
+/// Whether the surface's opaque regions cover the whole surface — i.e. it is
+/// provably fully opaque. (smithay auto-fills a full opaque region for no-alpha
+/// buffers; alpha buffers carry whatever region the client declared.) A single
+/// region covering the surface is the common case; partial-tiling regions
+/// conservatively read as "not provably opaque".
+fn opaque_region_covers(
+    regions: Option<&[Rectangle<i32, Logical>]>,
+    size: Size<i32, Logical>,
+) -> bool {
+    regions.is_some_and(|rs| {
+        rs.iter().any(|r| {
+            r.loc.x <= 0
+                && r.loc.y <= 0
+                && r.loc.x + r.size.w >= size.w
+                && r.loc.y + r.size.h >= size.h
+        })
+    })
+}
+
+/// Whether `surface`'s tree is a single node (no subsurfaces). A prerequisite
+/// for direct scanout: subsurfaces would be lost if we latched only the root
+/// buffer onto the plane.
+fn surface_is_single_node(surface: &WlSurface) -> bool {
+    let mut count = 0usize;
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |_, _, &()| {
+            count += 1;
+        },
+        |_, _, &()| true,
+    );
+    count == 1
 }
 
 /// Convert a screencopy region (top-left origin) to the bottom-left

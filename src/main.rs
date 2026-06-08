@@ -73,6 +73,7 @@ mod keyboard;
 mod media;
 mod layout;
 mod render;
+mod scanout;
 mod screencopy;
 mod screenshot;
 mod wayland;
