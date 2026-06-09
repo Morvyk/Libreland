@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use smithay::backend::renderer::sync::Fence as _;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
 use smithay::delegate_cursor_shape;
@@ -220,6 +221,7 @@ pub struct WaylandInit {
     /// photo). Held so the global stays alive; the hint is read from the
     /// surface's cached state when we want to drive per-content behaviour.
     pub content_type_state: smithay::wayland::content_type::ContentTypeState,
+    pub presentation_state: smithay::wayland::presentation::PresentationState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -399,6 +401,11 @@ pub fn init(
     // we drive per-content behaviour (e.g. future tearing / scanout choices).
     let content_type_state =
         smithay::wayland::content_type::ContentTypeState::new::<State>(&dh);
+    // wp_presentation: feeds clients accurate per-frame presentation timing
+    // (the real vblank timestamp + sequence). Advertise CLOCK_MONOTONIC (1) —
+    // the clock our DRM page-flip timestamps and feedback use.
+    let presentation_state =
+        smithay::wayland::presentation::PresentationState::new::<State>(&dh, 1);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -475,6 +482,7 @@ pub fn init(
         screencopy_manager,
         color_management,
         content_type_state,
+        presentation_state,
         popup_manager,
         outputs,
         output_globals,
@@ -516,6 +524,19 @@ pub fn new_client_data() -> Arc<ClientState> {
 
 // ---- Handler implementations on `crate::State` ------------------
 
+/// Absolute `CLOCK_MONOTONIC` deadline ~1s out (nanoseconds) for the
+/// explicit-sync CPU-wait fallback. `DrmSyncPoint::wait` takes an absolute
+/// monotonic deadline; the 1s cap stops a never-signalling fence from wedging
+/// the whole compositor on the (rare) eventfd-setup failure path — at worst
+/// that one frame tears, versus the normal eventfd path which only stalls the
+/// single surface.
+fn acquire_wait_deadline() -> i64 {
+    let now = std::time::Duration::from(
+        smithay::utils::Clock::<smithay::utils::Monotonic>::new().now(),
+    );
+    i64::try_from(now.as_nanos().saturating_add(1_000_000_000)).unwrap_or(i64::MAX)
+}
+
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -530,6 +551,82 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         info!(surface = ?surface.id(), "wayland: new surface");
+        // Explicit sync (linux-drm-syncobj-v1): gate this surface's commits on
+        // its acquire fence. When a client (e.g. Proton/DXVK) commits a buffer
+        // with an acquire timeline point, the GPU hasn't finished rendering it
+        // yet. Hold the commit — so the compositor never composites OR
+        // scans-out a half-rendered buffer (no tearing/glitch) — until the
+        // acquire fence's eventfd signals, then re-apply the transaction. This
+        // is the mechanism smithay's own DrmCompositor assumes; with it in
+        // place a directly-scanned buffer is GPU-ready by render time.
+        smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
+            surface,
+            |state, _dh, surface| {
+                if state.drm_syncobj_state.is_none() {
+                    return;
+                }
+                // Build an eventfd-backed blocker for this surface's acquire
+                // fence (if any). If setting up the eventfd blocker fails, fall
+                // back to a bounded CPU wait so the commit is NEVER left
+                // un-gated — correctness (no half-rendered buffer reaches the
+                // screen) over the rare stall.
+                let blocker_source =
+                    smithay::wayland::compositor::with_states(surface, |states| {
+                        let mut cached = states
+                            .cached_state
+                            .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>();
+                        let acquire = cached.pending().acquire_point.as_ref()?;
+                        // Already signalled (fast GPU / reused fence): no wait.
+                        if acquire.is_signaled() {
+                            return None;
+                        }
+                        match acquire.generate_blocker() {
+                            Ok(blocker_source) => Some(blocker_source),
+                            Err(err) => {
+                                warn!(error = %err, "explicit sync: acquire blocker unavailable; CPU-waiting on fence");
+                                let _ = acquire.wait(acquire_wait_deadline());
+                                None
+                            }
+                        }
+                    });
+                let Some((blocker, source)) = blocker_source else {
+                    return;
+                };
+                let Some(client) = surface.client() else {
+                    return;
+                };
+                let inserted = state.loop_handle.insert_source(
+                    source,
+                    move |(), _metadata, state: &mut State| {
+                        // The client may have disconnected while its fence was
+                        // in flight; skip rather than panic in
+                        // `client_compositor_state`'s expect.
+                        if client.get_data::<ClientState>().is_some() {
+                            let dh = state.display_handle.clone();
+                            state
+                                .client_compositor_state(&client)
+                                .blocker_cleared(state, &dh);
+                        }
+                        Ok(())
+                    },
+                );
+                if inserted.is_ok() {
+                    smithay::wayland::compositor::add_blocker(surface, blocker);
+                } else {
+                    // Couldn't register the eventfd source: CPU-wait now so the
+                    // commit isn't left un-gated (would tear).
+                    warn!("explicit sync: failed to register acquire source; CPU-waiting on fence");
+                    smithay::wayland::compositor::with_states(surface, |states| {
+                        let mut cached = states
+                            .cached_state
+                            .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>();
+                        if let Some(acquire) = cached.pending().acquire_point.as_ref() {
+                            let _ = acquire.wait(acquire_wait_deadline());
+                        }
+                    });
+                }
+            },
+        );
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -1316,6 +1413,16 @@ delegate_xdg_activation!(State);
 delegate_pointer_gestures!(State);
 delegate_content_type!(State);
 smithay::delegate_session_lock!(State);
+smithay::delegate_presentation!(State);
+smithay::delegate_drm_syncobj!(State);
+
+impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
+    fn drm_syncobj_state(
+        &mut self,
+    ) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
+    }
+}
 
 impl SessionLockHandler for State {
     fn lock_state(&mut self) -> &mut SessionLockManagerState {

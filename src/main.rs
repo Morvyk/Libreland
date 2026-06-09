@@ -24,7 +24,7 @@
 //! (e.g. after a freeze that needs recovering from another TTY).
 
 use anyhow::{Context as _, Result};
-use smithay::backend::drm::DrmDevice;
+use smithay::backend::drm::{DrmDevice, DrmEventMetadata, DrmEventTime};
 use smithay::backend::input::{
     Axis, AxisSource, Event as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
     PointerAxisEvent as _, PointerButtonEvent as _, PointerMotionEvent as _,
@@ -46,7 +46,8 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::input::event::keyboard::KeyboardKeyEvent as LibinputKeyEvent;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource as _};
-use smithay::utils::{IsAlive, Logical, Physical, Point, SERIAL_COUNTER};
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind as PresentKind;
+use smithay::utils::{Clock, IsAlive, Logical, Monotonic, Physical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
@@ -319,6 +320,15 @@ pub(crate) struct State {
     /// clients tag a surface's content type (game / video / photo).
     #[allow(dead_code, reason = "held to keep the wp_content_type_v1 global alive")]
     pub(crate) content_type_state: smithay::wayland::content_type::ContentTypeState,
+    /// `wp_presentation` global. Held so it stays registered; per-frame
+    /// feedback flows through per-surface cached state, not this handle.
+    #[allow(dead_code, reason = "held to keep the wp_presentation global alive")]
+    pub(crate) presentation_state: smithay::wayland::presentation::PresentationState,
+    /// `linux-drm-syncobj-v1` (explicit sync) global. `None` when the DRM
+    /// device lacks `syncobj_eventfd` support (then the protocol isn't
+    /// advertised and clients fall back to implicit sync). Returned to smithay
+    /// via the `DrmSyncobjHandler` impl.
+    pub(crate) drm_syncobj_state: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
     /// Per-surface colour state set via the colour-management protocol,
     /// keyed by `wl_surface` id. Read by the renderer to colour-manage an
     /// HDR output; pruned on surface/object destroy.
@@ -1073,6 +1083,12 @@ impl State {
         self.renderer.refresh_hw_cursor(locked);
         let client_n = captures.len();
         let hdr_surface_ids = self.hdr_surface_ids(&placements);
+        // The smithay `Output` this CRTC drives, for `wp_presentation`
+        // feedback collection (Arc-backed, cheap to clone).
+        let present_output = out_name
+            .as_deref()
+            .and_then(|name| self.outputs.iter().find(|o| o.name() == name))
+            .cloned();
         let followup = match self.renderer.render_for_crtc(
             crtc,
             &placements,
@@ -1082,6 +1098,7 @@ impl State {
             &specs,
             &hdr_surface_ids,
             compose_cursor,
+            present_output.as_ref(),
         ) {
             Ok((mut results, followup)) => {
                 // Trailing results belong to the internal specs.
@@ -3359,6 +3376,26 @@ fn main() -> Result<()> {
         outputs: drm_outputs,
     } = drm_init;
 
+    // Explicit sync (linux-drm-syncobj-v1): advertise it only when this DRM
+    // node supports syncobj eventfds (needed to build the acquire blocker);
+    // otherwise clients use implicit dma-buf sync. The import device is the
+    // single display/render GPU node — clone its fd before it moves into the
+    // renderer. (NVIDIA's syncobj-eventfd support is probed at runtime, not
+    // assumed.)
+    let syncobj_import_fd = drm_fd.clone();
+    let drm_syncobj_state = if smithay::wayland::drm_syncobj::supports_syncobj_eventfd(
+        &syncobj_import_fd,
+    ) {
+        info!("explicit sync: advertising linux-drm-syncobj-v1 (device supports syncobj eventfd)");
+        Some(smithay::wayland::drm_syncobj::DrmSyncobjState::new::<State>(
+            &display.handle(),
+            syncobj_import_fd,
+        ))
+    } else {
+        warn!("explicit sync: device lacks syncobj eventfd; clients use implicit sync only");
+        None
+    };
+
     let mut renderer = render::Renderer::new(
         drm_fd,
         drm_outputs,
@@ -3700,6 +3737,8 @@ fn main() -> Result<()> {
         pointer_gestures_state: wayland_init.pointer_gestures_state,
         color_management: wayland_init.color_management,
         content_type_state: wayland_init.content_type_state,
+        presentation_state: wayland_init.presentation_state,
+        drm_syncobj_state,
         color_surfaces: std::collections::HashMap::new(),
         color_surface_objects: std::collections::HashSet::new(),
         pending_image_info: Vec::new(),
@@ -4006,6 +4045,30 @@ fn drm_card_paths<T>(devices: &[(T, std::path::PathBuf)]) -> Result<Vec<std::pat
     Ok(paths)
 }
 
+/// Resolve a DRM page-flip event's metadata into a `wp_presentation`
+/// presentation time (`CLOCK_MONOTONIC`), page-flip sequence, and base
+/// feedback flags. A kernel-provided monotonic flip timestamp is a true
+/// hardware-clock completion time (`Vsync | HwClock | HwCompletion`); a
+/// realtime or absent timestamp falls back to sampling `CLOCK_MONOTONIC` now,
+/// flagged only `Vsync`.
+fn present_info(meta: Option<&DrmEventMetadata>) -> (std::time::Duration, u32, PresentKind) {
+    match meta {
+        Some(m) => match m.time {
+            DrmEventTime::Monotonic(d) => (
+                d,
+                m.sequence,
+                PresentKind::Vsync | PresentKind::HwClock | PresentKind::HwCompletion,
+            ),
+            DrmEventTime::Realtime(_) => (
+                Clock::<Monotonic>::new().now().into(),
+                m.sequence,
+                PresentKind::Vsync,
+            ),
+        },
+        None => (Clock::<Monotonic>::new().now().into(), 0, PresentKind::Vsync),
+    }
+}
+
 /// Insert the libseat/udev/DRM/libinput event sources into the calloop
 /// handle. Pulled out of `main` so the init flow stays under clippy's
 /// `too_many_lines` threshold without losing per-source visibility.
@@ -4063,11 +4126,16 @@ fn wire_event_sources(
     handle
         .insert_source(
             drm_notifier,
-            |event, _meta, state: &mut State| match event {
+            |event, meta, state: &mut State| match event {
                 smithay::backend::drm::DrmEvent::VBlank(crtc) => {
                     // The flip for this output just completed — ack it so the
-                    // swapchain frees the scanned-out buffer.
-                    state.renderer.frame_submitted(crtc);
+                    // swapchain frees the scanned-out buffer, and feed
+                    // `wp_presentation` the real flip timestamp + sequence.
+                    // A monotonic page-flip timestamp from the kernel is a
+                    // hardware-clock presentation time; otherwise fall back to
+                    // sampling CLOCK_MONOTONIC now (no hw-clock flags then).
+                    let (present_time, seq, base_flags) = present_info(meta.as_ref());
+                    state.renderer.frame_submitted(crtc, present_time, seq, base_flags);
                     // Re-render only if a trigger arrived while the flip was in
                     // flight, or an animation/slide is still running. Otherwise
                     // the output parks until the next trigger queues a redraw.

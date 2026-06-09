@@ -15,7 +15,7 @@
 //! rectangle.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -40,7 +40,13 @@ use smithay::backend::renderer::{
     Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
     Offscreen as _, Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
 };
+use smithay::desktop::utils::{
+    OutputPresentationFeedback, take_presentation_feedback_surface_tree,
+};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
+use smithay::output::Output;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind as PresentKind;
+use smithay::wayland::presentation::Refresh;
 use smithay::reexports::drm::Device as _;
 use smithay::reexports::drm::DriverCapability;
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
@@ -48,7 +54,9 @@ use smithay::reexports::drm::control::{Device as ControlDevice, connector, crtc}
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
-use smithay::utils::{IsAlive as _, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{
+    IsAlive as _, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time, Transform,
+};
 use smithay::wayland::compositor::{
     BufferAssignment, SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
@@ -1051,6 +1059,12 @@ struct OutputRender {
     /// Saturation multiplier applied to SDR content in this output's HDR
     /// encode (1.0 = colorimetrically accurate). Ignored unless `hdr`.
     hdr_saturation: f32,
+    /// `wp_presentation` feedback for the frame currently in flight on this
+    /// output. Collected at queue/flip time, fired with the real vblank
+    /// timestamp in `frame_submitted`. `None` between frames. Only one flip
+    /// is ever in flight per output (the `WaitingForVblank` guard), so a
+    /// single slot suffices.
+    pending_feedback: Option<OutputPresentationFeedback>,
 }
 
 /// Public snapshot of one output's geometry for callers (the screenshot
@@ -1786,6 +1800,7 @@ impl Renderer {
                     .and_then(|c| c.sdr_reference_white)
                     .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
                 hdr_saturation: output_sdr_saturation(output_cfg),
+                pending_feedback: None,
             });
         }
 
@@ -2207,7 +2222,7 @@ impl Renderer {
             // Followup ignored: each output is primed once, then parks until
             // a redraw is queued (a flip is now in flight, acked on vblank).
             let _ = self
-                .render_output(idx, &[], &[], &[], false, &[], &HashSet::new(), false)
+                .render_output(idx, &[], &[], &[], false, &[], &HashSet::new(), false, None)
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -2265,6 +2280,10 @@ impl Renderer {
         clippy::too_many_arguments,
         reason = "thin pass-through to render_output; the per-frame inputs are all distinct"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "per-frame render inputs; threading them through a struct would not simplify"
+    )]
     pub fn render_for_crtc(
         &mut self,
         crtc: crtc::Handle,
@@ -2275,6 +2294,7 @@ impl Renderer {
         captures: &[CaptureSpec],
         hdr_surface_ids: &HashSet<ObjectId>,
         compose_cursor: bool,
+        output: Option<&Output>,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
         let idx = self
             .outputs
@@ -2290,18 +2310,44 @@ impl Renderer {
             captures,
             hdr_surface_ids,
             compose_cursor,
+            output,
         )
     }
 
     /// Ack a completed page-flip for `crtc` so its swapchain frees the
-    /// scanned-out buffer. Called from the vblank handler; lets the
-    /// on-demand driver acknowledge a flip without being forced to render
-    /// the next frame (the free-run loop used to do both at once).
-    pub fn frame_submitted(&mut self, crtc: crtc::Handle) {
-        if let Some(o) = self.outputs.iter_mut().find(|o| o.crtc == crtc)
-            && let Err(err) = o.surface.frame_submitted()
-        {
+    /// scanned-out buffer, and send `wp_presentation` feedback for the frame
+    /// that just hit the screen using the real vblank timestamp/sequence.
+    /// Called from the vblank handler; lets the on-demand driver acknowledge a
+    /// flip without being forced to render the next frame (the free-run loop
+    /// used to do both at once).
+    ///
+    /// `present_time` is a `CLOCK_MONOTONIC` instant, `seq` the page-flip
+    /// sequence, and `base_flags` the presentation kind (vsync, plus hw-clock
+    /// when the timestamp came from the DRM page-flip event). Per-surface
+    /// zero-copy flags were already merged in at collection time.
+    pub fn frame_submitted(
+        &mut self,
+        crtc: crtc::Handle,
+        present_time: Duration,
+        seq: u32,
+        base_flags: PresentKind,
+    ) {
+        let Some(o) = self.outputs.iter_mut().find(|o| o.crtc == crtc) else {
+            return;
+        };
+        if let Err(err) = o.surface.frame_submitted() {
             warn!(error = %err, crtc = ?crtc, "frame_submitted failed");
+        }
+        if let Some(mut feedback) = o.pending_feedback.take() {
+            // refresh_mhz is milli-Hz (144 Hz = 144_000); the frame period is
+            // 1/Hz = 1000/mHz seconds.
+            let period = Duration::from_secs_f64(1000.0 / f64::from(o.refresh_mhz.max(1)));
+            feedback.presented(
+                Time::<Monotonic>::from(present_time),
+                Refresh::fixed(period),
+                u64::from(seq),
+                base_flags,
+            );
         }
     }
 
@@ -2396,6 +2442,7 @@ impl Renderer {
                 .and_then(|c| c.sdr_reference_white)
                 .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
             hdr_saturation: output_sdr_saturation(output_cfg),
+            pending_feedback: None,
         });
         self.blur_scratch.clear();
         Ok(())
@@ -3322,6 +3369,7 @@ impl Renderer {
         captures: &[CaptureSpec],
         hdr_surface_ids: &HashSet<ObjectId>,
         compose_cursor: bool,
+        present_output: Option<&Output>,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
         // Is the cursor already on the hardware plane for this output? If so,
         // skip compositing it (the plane scans it out) — unless this frame
@@ -3424,6 +3472,13 @@ impl Renderer {
                 Ok(true) => {
                     debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
                     self.send_output_frame_callbacks(placements, layers, popups, out_rect);
+                    // Zero-copy presentation: the client's own buffer is on the
+                    // plane, so flag ZeroCopy. Fired on this flip's vblank.
+                    if let Some(out) = present_output {
+                        self.outputs[idx].pending_feedback = Some(collect_presentation_feedback(
+                            out, placements, layers, popups, out_rect, true,
+                        ));
+                    }
                     // No transient state is active (eligibility required it),
                     // so the output parks until the client's next commit.
                     return Ok((Vec::new(), false));
@@ -4571,6 +4626,15 @@ impl Renderer {
         // direct-scanout path).
         self.send_output_frame_callbacks(placements, layers, popups, out_rect);
 
+        // Collect wp_presentation feedback for the surfaces in this composited
+        // frame; fired with the real vblank timestamp in `frame_submitted`.
+        // Not zero-copy (the scene went through the GLES compositor).
+        if let Some(out) = present_output {
+            self.outputs[idx].pending_feedback = Some(collect_presentation_feedback(
+                out, placements, layers, popups, out_rect, false,
+            ));
+        }
+
         // Tell the on-demand driver whether this output still produces
         // frames on its own — an in-flight window/close/open animation, or
         // a visible media wallpaper (which advances every frame). When
@@ -4810,6 +4874,51 @@ fn opaque_region_covers(
                 && r.loc.y + r.size.h >= size.h
         })
     })
+}
+
+/// Collect `wp_presentation` feedback for every surface visible on this output
+/// this frame into an [`OutputPresentationFeedback`], to be fired on the next
+/// vblank. Mirrors [`Renderer::send_output_frame_callbacks`]'s per-output
+/// filtering (windows/layers by overlap, popups unconditionally). `zero_copy`
+/// tags surfaces scanned out directly (no compositing copy).
+fn collect_presentation_feedback(
+    output: &Output,
+    placements: &[Placement],
+    layers: &[LayerPlacement],
+    popups: &[PopupPlacement],
+    out_rect: Rectangle<i32, Physical>,
+    zero_copy: bool,
+) -> OutputPresentationFeedback {
+    let mut feedback = OutputPresentationFeedback::new(output);
+    let flags = if zero_copy {
+        PresentKind::ZeroCopy
+    } else {
+        PresentKind::empty()
+    };
+    {
+        let mut collect = |surface: &WlSurface| {
+            take_presentation_feedback_surface_tree(
+                surface,
+                &mut feedback,
+                |_, _| Some(output.clone()),
+                |_, _| flags,
+            );
+        };
+        for p in placements {
+            if p.cell_rect.overlaps(out_rect) {
+                collect(&p.surface);
+            }
+        }
+        for l in layers {
+            if l.rect.overlaps(out_rect) {
+                collect(&l.surface);
+            }
+        }
+        for p in popups {
+            collect(&p.surface);
+        }
+    }
+    feedback
 }
 
 /// Whether `surface`'s tree is a single node (no subsurfaces). A prerequisite
