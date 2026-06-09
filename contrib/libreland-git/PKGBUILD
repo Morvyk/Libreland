@@ -1,16 +1,15 @@
 # Maintainer: Morvyk <Morvyk@proton.me>
 #
-# Builds Libreland from its latest tagged GitHub release. For a build that
-# tracks the git tip instead, use libreland-git (contrib/libreland-git/).
+# Builds Libreland from the current git tip. For a stable tagged build, use
+# the `libreland` package (contrib/PKGBUILD) instead.
 #
-# Run `makepkg -si` from inside the directory holding this PKGBUILD (it needs
-# libreland.install alongside it). Everything else is fetched from the release
-# tarball — no local checkout required.
+# Run `makepkg -si` from inside this directory (it needs libreland.install
+# alongside it). The source is cloned from GitHub — no local checkout needed.
 
-pkgname=libreland
-pkgver=0.1.0
+pkgname=libreland-git
+pkgver=0.1.0.r0.g0000000
 pkgrel=1
-pkgdesc='A Wayland compositor in pure Rust, configured in Lua'
+pkgdesc='A Wayland compositor in pure Rust, configured in Lua (git)'
 arch=('x86_64')
 url='https://github.com/Morvyk/Libreland'
 license=('MIT')
@@ -32,8 +31,8 @@ depends=(
 )
 # `rust` provides cargo; the project's .cargo/config.toml links through mold.
 # clang (libclang) + pkgconf build the ffmpeg-sys bindings (bindgen +
-# pkg-config against the system ffmpeg).
-makedepends=('rust' 'mold' 'clang' 'pkgconf')
+# pkg-config against the system ffmpeg). git is needed to clone the source.
+makedepends=('rust' 'mold' 'git' 'clang' 'pkgconf')
 optdepends=(
     'xdg-desktop-portal: desktop integration frontend (file dialogs, screen sharing)'
     'xdg-desktop-portal-wlr: screen sharing + screenshots via PipeWire'
@@ -42,24 +41,26 @@ optdepends=(
     'kitty: terminal bound to Super+Return in the default config'
 )
 provides=('libreland')
-conflicts=('libreland-git')
-install="$pkgname.install"
+conflicts=('libreland')
+install='libreland.install'
 # Take full control of the build away from the user's /etc/makepkg.conf:
 #  !lto   — the `release` profile already does fat LTO; makepkg's `lto`
 #           would only inject -flto into the vendored-lua C build (mismatch).
 #  !debug — the binary is built with debug=false + stripped, so there's no
 #           debuginfo to split into a -debug package.
 options=('!lto' '!debug')
-# GitHub source tarball for the v$pkgver tag (extracts to Libreland-$pkgver/).
-# SKIP: GitHub's auto-generated archive tarballs are not guaranteed to be
-# byte-stable (they have changed compression and broken pinned checksums
-# before), so a hardcoded sha256 is a liability, not a safeguard. The tag is
-# the integrity anchor; transport is HTTPS.
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
 
+pkgver() {
+    cd "$srcdir/$pkgname"
+    # Monotonic snapshot version: 0.1.0.r<commit-count>.g<short-hash>, so
+    # each commit yields a higher version makepkg/pacman will upgrade to.
+    printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
 build() {
-    cd "$srcdir/Libreland-$pkgver"
+    cd "$srcdir/$pkgname"
     # makepkg.conf exports RUSTFLAGS (and the encoded variants), which would
     # *replace* — not merge with — the project's `.cargo/config.toml`
     # rustflags (the `-fuse-ld=mold` link arg). Unset them so config.toml +
@@ -73,7 +74,7 @@ build() {
 }
 
 package() {
-    local root="$srcdir/Libreland-$pkgver"
+    local root="$srcdir/$pkgname"
 
     # Binaries.
     install -Dm755 "$root/target/release/libreland" \
@@ -102,6 +103,6 @@ package() {
         "$pkgdir/etc/xdg/xdg-desktop-portal-wlr/libreland"
 
     # License + docs.
-    install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    install -Dm644 "$root/Documentation.md" "$pkgdir/usr/share/doc/$pkgname/Documentation.md"
+    install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/libreland/LICENSE"
+    install -Dm644 "$root/Documentation.md" "$pkgdir/usr/share/doc/libreland/Documentation.md"
 }
