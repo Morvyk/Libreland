@@ -38,7 +38,7 @@ use smithay::backend::renderer::utils::{
 };
 use smithay::backend::renderer::{
     Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
-    Offscreen as _, Renderer as _, Texture as _, TextureFilter, TextureMapping as _,
+    Offscreen as _, Renderer as _, Texture as _, TextureFilter,
 };
 use smithay::desktop::utils::{
     OutputPresentationFeedback, take_presentation_feedback_surface_tree,
@@ -139,22 +139,19 @@ pub struct CaptureSpec {
 /// `y_invert` flag: xdg-desktop-portal-wlr 0.8.2 never implemented
 /// `y_invert` handling and self-destructs on the flag (it hits an
 /// unimplemented stub that frees the cast instance, then double-frees
-/// during teardown → SIGSEGV). `flipped` on `Shm` only tells the writer
-/// whether the read-back rows need reversing into the client buffer.
+/// during teardown → SIGSEGV).
 #[derive(Debug)]
 pub enum CaptureOutcome {
-    /// CPU read-back: a tight buffer (`width * 4` bytes/row). `flipped`
-    /// means the rows are bottom-up (GL origin) and must be reversed
-    /// when written to the client buffer.
+    /// CPU read-back: a tight buffer (`width * 4` bytes/row), rows
+    /// top-down (FBO readbacks are memory-ordered; see `capture_shm`).
     Shm {
         bytes: Vec<u8>,
         width: u32,
         height: u32,
-        flipped: bool,
     },
-    /// The client's dmabuf was filled directly by a GPU blit, already
-    /// upright (the blit copies GL→GL coordinates, so memory-row 0 is
-    /// the top of the image — no `y_invert` needed).
+    /// The client's dmabuf was filled directly by a GPU blit between
+    /// FBO attachments, which is memory-ordered — memory-row 0 stays
+    /// the top of the image, so it's already upright (no `y_invert`).
     Dmabuf,
     /// Capture failed; the caller fails the frame.
     Failed,
@@ -3047,11 +3044,9 @@ impl Renderer {
         let results: Vec<CaptureOutcome> = captures
             .iter()
             .map(|spec| match &spec.target {
-                CaptureTarget::Shm => {
-                    capture_shm(&mut self.gles, &target, spec, mode_size.h, output_name)
-                }
+                CaptureTarget::Shm => capture_shm(&mut self.gles, &target, spec, output_name),
                 CaptureTarget::Dmabuf(client) => {
-                    capture_dmabuf(&mut self.gles, &target, client, spec, mode_size.h, output_name)
+                    capture_dmabuf(&mut self.gles, &target, client, spec, output_name)
                 }
             })
             .collect();
@@ -4544,16 +4539,11 @@ impl Renderer {
                 .iter()
                 .map(|spec| match &spec.target {
                     CaptureTarget::Shm => {
-                        capture_shm(&mut self.gles, &target, spec, mode_size.h, &output_name)
+                        capture_shm(&mut self.gles, &target, spec, &output_name)
                     }
-                    CaptureTarget::Dmabuf(client) => capture_dmabuf(
-                        &mut self.gles,
-                        &target,
-                        client,
-                        spec,
-                        mode_size.h,
-                        &output_name,
-                    ),
+                    CaptureTarget::Dmabuf(client) => {
+                        capture_dmabuf(&mut self.gles, &target, client, spec, &output_name)
+                    }
                 })
                 .collect()
         };
@@ -4938,30 +4928,28 @@ fn surface_is_single_node(surface: &WlSurface) -> bool {
     count == 1
 }
 
-/// Convert a screencopy region (top-left origin) to the bottom-left
-/// origin both `glReadPixels` and `glBlitFramebuffer` read from, so a
-/// partial region (`grim -g`) reads the band the client asked for. A
-/// full-output capture is unchanged (loc.y 0, full height -> 0).
-fn region_gl(spec: &CaptureSpec, fb_height: i32) -> Rectangle<i32, Physical> {
-    let gl_y = fb_height - spec.region.loc.y - spec.region.size.h;
-    Rectangle::new(
-        (spec.region.loc.x, gl_y).into(),
-        (spec.region.size.w, spec.region.size.h).into(),
-    )
-}
-
 /// CPU read-back: copy `spec.region` of `target` into a tight buffer.
+///
+/// Coordinates and rows are memory-ordered, not GL-bottom-left: every
+/// capture target here is an FBO attachment (the scanout dmabuf or an
+/// offscreen texture), and `glReadPixels` on an FBO preserves
+/// texel-row = memory-row order. The rendered framebuffer is top-down
+/// in memory (scanout displays memory-row 0 as the top scanline), so
+/// `spec.region`'s top-left coordinates index it directly and the
+/// read-back rows are already upright. Do NOT consult
+/// `mapping.flipped()`: smithay hard-codes it `true`, which describes
+/// default-framebuffer (`ReadBuffer(BACK)`) readbacks — it does not
+/// apply to FBO reads, and honouring it here delivers vertically
+/// mirrored frames.
 fn capture_shm(
     gles: &mut GlesRenderer,
     target: &GlesTarget<'_>,
     spec: &CaptureSpec,
-    fb_height: i32,
     output_name: &str,
 ) -> CaptureOutcome {
-    let gl = region_gl(spec, fb_height);
     let region = Rectangle::<i32, smithay::utils::Buffer>::new(
-        (gl.loc.x, gl.loc.y).into(),
-        (gl.size.w, gl.size.h).into(),
+        (spec.region.loc.x, spec.region.loc.y).into(),
+        (spec.region.size.w, spec.region.size.h).into(),
     );
     let mapping = match gles.copy_framebuffer(target, region, spec.fourcc) {
         Ok(mapping) => mapping,
@@ -4970,16 +4958,12 @@ fn capture_shm(
             return CaptureOutcome::Failed;
         }
     };
-    // Rows come back bottom-up (GL origin); `write_to_shm` reverses them
-    // into the client buffer so the delivered frame is upright.
-    let flipped = mapping.flipped();
     let (width, height) = (mapping.width(), mapping.height());
     match gles.map_texture(&mapping) {
         Ok(bytes) => CaptureOutcome::Shm {
             bytes: bytes.to_vec(),
             width,
             height,
-            flipped,
         },
         Err(err) => {
             warn!(error = %err, output = %output_name, "screencopy: map_texture failed");
@@ -4989,16 +4973,16 @@ fn capture_shm(
 }
 
 /// Zero-copy GPU path: bind the client's dmabuf as a framebuffer and
-/// blit `spec.region` of the composited output into it. The blit copies
-/// GL→GL coordinates; our output framebuffer and the client's dmabuf
-/// both map GL `(0,0)` to the bottom of the image, so the result lands
-/// upright in memory (row 0 = top) — no `y_invert` flag needed.
+/// blit `spec.region` of the composited output into it. Both src and
+/// dst are FBO attachments, so the blit is memory-ordered (see
+/// `capture_shm`): `spec.region`'s top-left coordinates index the
+/// source directly and the result lands upright in the client's dmabuf
+/// (memory-row 0 = top) — no `y_invert` flag needed.
 fn capture_dmabuf(
     gles: &mut GlesRenderer,
     target: &GlesTarget<'_>,
     client: &Dmabuf,
     spec: &CaptureSpec,
-    fb_height: i32,
     output_name: &str,
 ) -> CaptureOutcome {
     let mut client = client.clone();
@@ -5009,7 +4993,7 @@ fn capture_dmabuf(
             return CaptureOutcome::Failed;
         }
     };
-    let src = region_gl(spec, fb_height);
+    let src = spec.region;
     let dst_rect = Rectangle::<i32, Physical>::from_size(spec.region.size);
     match gles.blit(target, &mut dst, src, dst_rect, TextureFilter::Linear) {
         Ok(()) => CaptureOutcome::Dmabuf,

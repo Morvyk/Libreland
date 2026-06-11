@@ -3176,7 +3176,6 @@ impl State {
             bytes,
             width,
             height,
-            flipped: _,
         } = outcome
         else {
             warn!(output = %cap.output, "screenshot: internal capture failed");

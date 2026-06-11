@@ -330,9 +330,9 @@ fn shm_buffer_valid(buffer: &WlBuffer, region: Rectangle<i32, Physical>) -> bool
 }
 
 /// Finish a serviced capture: for the shm path write the read-back
-/// pixels into the client buffer (reversing rows if they came back
-/// bottom-up); for the dmabuf path the GPU blit already filled it
-/// upright. Then signal `ready`, or `failed` if the capture didn't
+/// pixels (already upright — FBO readbacks are memory-ordered) into
+/// the client buffer; for the dmabuf path the GPU blit already filled
+/// it upright. Then signal `ready`, or `failed` if the capture didn't
 /// happen.
 ///
 /// We always deliver an upright buffer and never set the `y_invert`
@@ -352,9 +352,8 @@ pub fn complete(pending: &PendingCapture, outcome: crate::render::CaptureOutcome
             bytes,
             width,
             height,
-            flipped,
         } => {
-            if !write_to_shm(&pending.buffer, &bytes, width, height, flipped) {
+            if !write_to_shm(&pending.buffer, &bytes, width, height) {
                 pending.frame.failed();
                 return;
             }
@@ -371,18 +370,11 @@ pub fn complete(pending: &PendingCapture, outcome: crate::render::CaptureOutcome
     pending.frame.ready(hi, lo, nsecs);
 }
 
-/// Copy the tight captured pixels (row = `width * 4`) into the client's
-/// shm buffer, honouring its stride. When `flipped` the source rows are
-/// bottom-up (GL origin), so they're written in reverse to hand the
-/// client an upright buffer (we never use the `y_invert` flag — see
+/// Copy the tight captured pixels (row = `width * 4`, rows top-down)
+/// into the client's shm buffer, honouring its stride. The source is
+/// already upright (we never use the `y_invert` flag — see
 /// [`complete`]). Returns whether it fit.
-fn write_to_shm(
-    buffer: &WlBuffer,
-    bytes: &[u8],
-    width: u32,
-    height: u32,
-    flipped: bool,
-) -> bool {
+fn write_to_shm(buffer: &WlBuffer, bytes: &[u8], width: u32, height: u32) -> bool {
     let row = width as usize * 4;
     let rows = height as usize;
     smithay::wayland::shm::with_buffer_contents_mut(buffer, |ptr, len, spec| {
@@ -405,8 +397,7 @@ fn write_to_shm(
         )]
         unsafe {
             for y in 0..rows {
-                let src_y = if flipped { rows - 1 - y } else { y };
-                let src = bytes.as_ptr().add(src_y * row);
+                let src = bytes.as_ptr().add(y * row);
                 let dst = ptr.add(y * dst_stride);
                 std::ptr::copy_nonoverlapping(src, dst, row);
             }
