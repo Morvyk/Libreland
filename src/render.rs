@@ -323,10 +323,15 @@ void main() {
 }
 ";
 
-/// Clips a blurred backdrop tier to the same rounded-rect shape its window or
-/// layer-shell panel uses, so the corners reveal the *sharp* backdrop instead
-/// of a square block of blur poking out past the rounded edge. Same SDF as
-/// [`ROUND_TEX_SHADER`] but with no border ring — it only masks the blur.
+/// Clips a blurred backdrop tier to the same rounded-rect shape its window
+/// uses, so the corners reveal the *sharp* backdrop instead of a square block
+/// of blur poking out past the rounded edge. Same SDF as [`ROUND_TEX_SHADER`]
+/// but with no border ring — it only masks the blur. `v_coords` here samples
+/// the *tier* (the `src` sub-rect normalised over the whole tier texture), so
+/// it is NOT 0..1 across the drawn rect; `local_mul`/`local_add` are a
+/// CPU-computed affine map from `v_coords` back to rect-local pixels for the
+/// SDF (feeding `v_coords * size` in directly only lined up for a rect at the
+/// output's top-left corner — corners anywhere else were never clipped).
 /// Sampled texture (the tier) is already premultiplied; output stays premult
 /// for the `GL_ONE / GL_ONE_MINUS_SRC_ALPHA` blend. With `radius = 0` the SDF
 /// is a plain rectangle, so nothing is clipped (the pre-rounding behaviour).
@@ -344,11 +349,13 @@ uniform sampler2D tex;
 uniform float alpha;
 uniform vec2 size;
 uniform float radius;
+uniform vec2 local_mul;
+uniform vec2 local_add;
 
 varying vec2 v_coords;
 
 void main() {
-    vec2 p = v_coords * size;
+    vec2 p = v_coords * local_mul + local_add;
     vec2 half_size = size * 0.5;
     vec2 d = abs(p - half_size) - (half_size - vec2(radius));
     float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
@@ -490,6 +497,8 @@ uniform sampler2D tex;
 uniform float alpha;
 uniform vec2 size;
 uniform float radius;
+uniform vec2 local_mul;
+uniform vec2 local_add;
 uniform float reference_white;
 uniform float saturation;
 varying vec2 v_coords;
@@ -499,7 +508,7 @@ vec3 srgb_to_linear(vec3 c) {
     return mix(lo, hi, step(vec3(0.04045), c));
 }
 void main() {
-    vec2 p = v_coords * size;
+    vec2 p = v_coords * local_mul + local_add;
     vec2 half_size = size * 0.5;
     vec2 d = abs(p - half_size) - (half_size - vec2(radius));
     float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - radius;
@@ -519,6 +528,82 @@ void main() {
     bt2020 = max(mix(vec3(luma), bt2020, saturation), vec3(0.0));
     float outer = 1.0 - smoothstep(-aa, aa, dist);
     gl_FragColor = vec4(bt2020 * c.a, c.a) * (outer * alpha);
+}
+";
+
+/// Masks a blurred backdrop tier by the *surface's own alpha channel* (its
+/// texture, bound on unit 1), so the frost follows exactly the shape the
+/// client drew — any corner radius, pills, cut-outs — with no compositor-side
+/// radius guess. Used for layer-shell panels (a panel's rounding lives in the
+/// client buffer, which the compositor can't predict); windows keep the SDF
+/// clip ([`ROUND_BLUR_SHADER`]) since the compositor rounds those itself.
+/// `mask_mul`/`mask_add` affinely map `v_coords` (tier UV, see
+/// [`ROUND_BLUR_SHADER`]) into the mask's 0..1 UV space, including a y-flip
+/// when either texture is y-inverted. Both textures are premultiplied; output
+/// stays premult for the `GL_ONE / GL_ONE_MINUS_SRC_ALPHA` blend, so the
+/// backdrop becomes `blur·a + sharp·(1−a)` per pixel before the panel itself
+/// draws over it.
+const MASK_BLUR_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform sampler2D tex;
+uniform sampler2D mask;
+uniform float alpha;
+uniform vec2 mask_mul;
+uniform vec2 mask_add;
+
+varying vec2 v_coords;
+
+void main() {
+    vec4 c = texture2D(tex, v_coords);
+    float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
+    gl_FragColor = c * (m * alpha);
+}
+";
+
+/// HDR variant of [`MASK_BLUR_SHADER`]: alpha-masks the (sRGB) blurred tier,
+/// then decodes to linear BT.2020 for the fp16 scene — same colour math as
+/// [`ROUND_BLUR_SHADER_HDR`], with the SDF coverage replaced by the mask's
+/// alpha.
+const MASK_BLUR_SHADER_HDR: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform sampler2D mask;
+uniform float alpha;
+uniform vec2 mask_mul;
+uniform vec2 mask_add;
+uniform float reference_white;
+uniform float saturation;
+varying vec2 v_coords;
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+void main() {
+    vec4 c = texture2D(tex, v_coords);
+    float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
+    vec3 straight = c.a > 0.0 ? (c.rgb / c.a) : vec3(0.0);
+    vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = bt709_to_bt2020 * lin;
+    float luma = dot(bt2020, vec3(0.2627, 0.6780, 0.0593));
+    bt2020 = max(mix(vec3(luma), bt2020, saturation), vec3(0.0));
+    gl_FragColor = vec4(bt2020 * c.a, c.a) * (m * alpha);
 }
 ";
 
@@ -806,6 +891,10 @@ pub struct Renderer {
     /// rounded-rectangle mask (transparent corners + opaque border ring).
     /// See [`ROUND_TEX_SHADER`]. `Arc`-backed, cheap to clone out per frame.
     round_tex_shader: GlesTexProgram,
+    /// Texture shader that masks a blurred backdrop tier by the surface's
+    /// own alpha channel (bound on unit 1), used for layer-shell panels so
+    /// the frost follows the client's real shape. See [`MASK_BLUR_SHADER`].
+    mask_blur_shader: GlesTexProgram,
     /// Texture shader that clips a blurred backdrop tier to a rounded-rect
     /// shape, so a rounded window / panel's corners reveal the sharp backdrop
     /// rather than a square block of blur. See [`ROUND_BLUR_SHADER`].
@@ -840,6 +929,8 @@ pub struct Renderer {
     round_tex_shader_linear: GlesTexProgram,
     /// HDR variant of `round_blur_shader`. See [`ROUND_BLUR_SHADER_HDR`].
     round_blur_shader_hdr: GlesTexProgram,
+    /// HDR variant of `mask_blur_shader`. See [`MASK_BLUR_SHADER_HDR`].
+    mask_blur_shader_hdr: GlesTexProgram,
     /// Per-output offscreen the HDR scene is composited into before the
     /// PQ-encode pass, keyed by output name. fp16 (linear BT.2020), sized
     /// to the output's mode, rebuilt when the size changes; only for HDR.
@@ -1606,9 +1697,21 @@ impl Renderer {
                 &[
                     UniformName::new("size", UniformType::_2f),
                     UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("local_mul", UniformType::_2f),
+                    UniformName::new("local_add", UniformType::_2f),
                 ],
             )
             .context("rounded-blur mask shader compile failed")?;
+        let mask_blur_shader = gles
+            .compile_custom_texture_shader(
+                MASK_BLUR_SHADER,
+                &[
+                    UniformName::new("mask", UniformType::_1i),
+                    UniformName::new("mask_mul", UniformType::_2f),
+                    UniformName::new("mask_add", UniformType::_2f),
+                ],
+            )
+            .context("alpha-mask blur shader compile failed")?;
 
         info!("phase: compiling HDR colour-pipeline shaders");
         // PQ-only encode: input is already linear BT.2020 (no extra uniforms).
@@ -1673,11 +1776,25 @@ impl Renderer {
                 &[
                     UniformName::new("size", UniformType::_2f),
                     UniformName::new("radius", UniformType::_1f),
+                    UniformName::new("local_mul", UniformType::_2f),
+                    UniformName::new("local_add", UniformType::_2f),
                     UniformName::new("reference_white", UniformType::_1f),
                     UniformName::new("saturation", UniformType::_1f),
                 ],
             )
             .context("HDR rounded-blur mask shader compile failed")?;
+        let mask_blur_shader_hdr = gles
+            .compile_custom_texture_shader(
+                MASK_BLUR_SHADER_HDR,
+                &[
+                    UniformName::new("mask", UniformType::_1i),
+                    UniformName::new("mask_mul", UniformType::_2f),
+                    UniformName::new("mask_add", UniformType::_2f),
+                    UniformName::new("reference_white", UniformType::_1f),
+                    UniformName::new("saturation", UniformType::_1f),
+                ],
+            )
+            .context("HDR alpha-mask blur shader compile failed")?;
 
         info!("phase: creating GBM allocator");
         // Clone the GBM device for cursor-BO allocation before it's moved
@@ -1879,6 +1996,8 @@ impl Renderer {
             closing: Vec::new(),
             blur_down,
             blur_up,
+            mask_blur_shader,
+            mask_blur_shader_hdr,
             round_tex_shader,
             round_blur_shader,
             blur_scratch: HashMap::new(),
@@ -3390,12 +3509,14 @@ impl Renderer {
         let border = self.border.clone();
         let round_tex_shader = self.round_tex_shader.clone();
         let round_blur_shader = self.round_blur_shader.clone();
+        let mask_blur_shader = self.mask_blur_shader.clone();
         let hdr_encode_shader = self.hdr_encode_shader.clone();
         let sdr_decode_shader = self.sdr_decode_shader.clone();
         let hdr_decode_shader = self.hdr_decode_shader.clone();
         let round_tex_shader_hdr = self.round_tex_shader_hdr.clone();
         let round_tex_shader_linear = self.round_tex_shader_linear.clone();
         let round_blur_shader_hdr = self.round_blur_shader_hdr.clone();
+        let mask_blur_shader_hdr = self.mask_blur_shader_hdr.clone();
         let cursor_size = self.cursor_size;
         let window_opacity = self.decoration.window_opacity;
         // The effective cursor this frame: a compositor override (grab /
@@ -3699,6 +3820,21 @@ impl Renderer {
                     (l.layer, elements)
                 })
                 .collect();
+
+        // Each layer surface's imported texture (populated by the
+        // `render_elements_from_surface_tree` import above), used to
+        // alpha-mask that layer's backdrop blur to the shape the client
+        // actually drew. `None` for a layer with no committed buffer.
+        let ctx_id = self.gles.context_id();
+        let layer_masks: Vec<Option<GlesTexture>> = layers
+            .iter()
+            .map(|l| {
+                with_renderer_surface_state(&l.surface, |state| {
+                    state.texture::<GlesTexture>(ctx_id.clone()).cloned()
+                })
+                .flatten()
+            })
+            .collect();
 
         // Popups (menus/submenus): pre-import like layers. Each
         // `buffer_origin` is already absolute compositor px with the
@@ -4162,12 +4298,18 @@ impl Renderer {
             }
             self.blur_scratch.insert(idx, scratch);
         }
-        // Paint a full-res tier's sub-rect (opaque) behind a translucent
-        // surface. The tier texture is 1:1 with the framebuffer, so the
-        // source sub-rect matches the on-screen destination rect.
+        // Paint a full-res tier's sub-rect behind a translucent surface. The
+        // tier texture is 1:1 with the framebuffer, so the source sub-rect
+        // matches the on-screen destination rect. With a `mask` texture
+        // (layer-shell panels) the blur is alpha-masked by the surface's own
+        // buffer, so the frost follows whatever shape the client drew — the
+        // compositor can't know a panel's corner radius. Without one
+        // (windows) an SDF clips the tier to the same rounded rect
+        // `draw_window` composites.
         let blur_rect = |frame: &mut GlesFrame<'_, '_>,
                          tier: &GlesTexture,
-                         dst: Rectangle<i32, Physical>|
+                         dst: Rectangle<i32, Physical>,
+                         mask: Option<&GlesTexture>|
          -> Result<()> {
             let src = Rectangle::<f64, smithay::utils::Buffer>::new(
                 Point::from((f64::from(dst.loc.x), f64::from(dst.loc.y))),
@@ -4179,12 +4321,81 @@ impl Renderer {
             // collapses to a zero-size instance for any offset surface — the
             // whole reason blur only ever showed full-screen.
             let local = [Rectangle::from_size(dst.size)];
-            // Clip the tier to the rounded-rect shape its window / panel uses,
-            // so the corners reveal the sharp backdrop rather than a square
-            // block of blur. Radius matches `draw_window`'s clamp; for a
-            // layer-shell panel it assumes the client rounds to the compositor's
-            // `rounded_corners` (keep the panel's QML `radius` in sync). The
-            // AA edge needs blending, so the opaque-region hint is now empty;
+            // `v_coords` in the blur shaders samples the tier: it spans the
+            // `src` sub-rect normalised over the *whole* tier, not 0..1
+            // across `dst`. Hand the shaders a CPU-computed affine map from
+            // `v_coords` back to rect-local pixels / mask UV instead, flipped
+            // when a texture is y-inverted (create_buffer offscreens are not,
+            // but derive it from the texture rather than assume).
+            let tier_sz = tier.size();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "cell pixel sizes / radius are bounded by the output, exact in f32"
+            )]
+            let (dst_w, dst_h, loc_x, loc_y, tier_w, tier_h) = (
+                dst.size.w as f32,
+                dst.size.h as f32,
+                dst.loc.x as f32,
+                dst.loc.y as f32,
+                tier_sz.w as f32,
+                tier_sz.h as f32,
+            );
+            // v_coords → absolute output px: abs.x = v.x * tier_w,
+            // abs.y = v.y * ay + by.
+            let (ay, by) = if tier.is_y_inverted() {
+                (-tier_h, tier_h)
+            } else {
+                (tier_h, 0.0)
+            };
+
+            if let Some(mask) = mask {
+                // abs px → mask UV: shift by the rect origin, normalise by
+                // the rect size, and flip y again if the client's buffer is
+                // y-inverted.
+                let mut mask_mul = (tier_w / dst_w, ay / dst_h);
+                let mut mask_add = (-loc_x / dst_w, (by - loc_y) / dst_h);
+                if mask.is_y_inverted() {
+                    mask_mul.1 = -mask_mul.1;
+                    mask_add.1 = 1.0 - mask_add.1;
+                }
+                let mut uniforms = vec![
+                    Uniform::new("mask", 1i32),
+                    Uniform::new("mask_mul", mask_mul),
+                    Uniform::new("mask_add", mask_add),
+                ];
+                // The blur pyramid is sRGB; into the linear HDR scene the HDR
+                // variant decodes it to linear BT.2020 (needs reference_white).
+                let program = if hdr {
+                    uniforms.push(Uniform::new("reference_white", ref_white_f32));
+                    uniforms.push(Uniform::new("saturation", hdr_saturation));
+                    &mask_blur_shader_hdr
+                } else {
+                    &mask_blur_shader
+                };
+                // The shader's `mask` sampler reads texture unit 1; smithay's
+                // draw only drives unit 0, so the secondary binding (made and
+                // restored by the vendored helper) survives the call.
+                frame
+                    .with_secondary_texture(mask, |frame| {
+                        frame.render_texture_from_to(
+                            tier,
+                            src,
+                            dst,
+                            &local,
+                            &[],
+                            Transform::Normal,
+                            1.0,
+                            Some(program),
+                            &uniforms,
+                        )
+                    })
+                    .context("blur: alpha-masked backdrop sub-rect")?;
+                return Ok(());
+            }
+
+            // No mask (windows): SDF-clip the tier to the rounded rect the
+            // window composite draws. Radius matches `draw_window`'s clamp.
+            // The AA edge needs blending, so the opaque-region hint is empty;
             // with `radius_comp == 0` the SDF is a plain rect (old behaviour).
             let max_half = (dst.size.w / 2).min(dst.size.h / 2);
             let radius = scale_i(radius_comp, scale).min(max_half).max(0);
@@ -4193,14 +4404,16 @@ impl Renderer {
                 reason = "cell pixel sizes / radius are bounded by the output, exact in f32"
             )]
             let mut uniforms = vec![
-                Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
+                Uniform::new("size", (dst_w, dst_h)),
                 Uniform::new("radius", radius as f32),
+                Uniform::new("local_mul", (tier_w, ay)),
+                Uniform::new("local_add", (-loc_x, by - loc_y)),
             ];
             // The blur pyramid is sRGB; into the linear HDR scene the HDR
             // variant decodes it to linear BT.2020 (needs reference_white).
             let program = if hdr {
                 uniforms.push(Uniform::new("reference_white", ref_white_f32));
-                    uniforms.push(Uniform::new("saturation", hdr_saturation));
+                uniforms.push(Uniform::new("saturation", hdr_saturation));
                 &round_blur_shader_hdr
             } else {
                 &round_blur_shader
@@ -4271,7 +4484,7 @@ impl Renderer {
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
             {
                 if let Some(t) = &tier_tiled {
-                    blur_rect(&mut frame, t, cell_local(wd.effective))?;
+                    blur_rect(&mut frame, t, cell_local(wd.effective), None)?;
                 }
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
             }
@@ -4285,7 +4498,7 @@ impl Renderer {
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
             {
                 if let Some(t) = &tier_float {
-                    blur_rect(&mut frame, t, cell_local(wd.effective))?;
+                    blur_rect(&mut frame, t, cell_local(wd.effective), None)?;
                 }
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
             }
@@ -4305,7 +4518,11 @@ impl Renderer {
             // window (status bar above kitty, but a fullscreen game covers the
             // bar). Blur against the full backdrop (tier 2) so a translucent
             // panel reveals a frosted desktop.
-            for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
+            for ((l, (bucket, elements)), mask) in layers
+                .iter()
+                .zip(layer_groups.iter())
+                .zip(layer_masks.iter())
+            {
                 if !matches!(bucket, LayerBucket::Top) {
                     continue;
                 }
@@ -4319,7 +4536,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst)?;
+                    blur_rect(&mut frame, t, dst, mask.as_ref())?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
                     .context("draw_render_elements (layer top) failed")?;
@@ -4362,7 +4579,11 @@ impl Renderer {
             // Overlay layer surfaces go above everything else below the cursor —
             // above windows AND fullscreen, so a launcher / toast / OSD stays on
             // top of a fullscreen game. Same tier-2 blur as the Top layer.
-            for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
+            for ((l, (bucket, elements)), mask) in layers
+                .iter()
+                .zip(layer_groups.iter())
+                .zip(layer_masks.iter())
+            {
                 if !matches!(bucket, LayerBucket::Overlay) {
                     continue;
                 }
@@ -4376,7 +4597,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst)?;
+                    blur_rect(&mut frame, t, dst, mask.as_ref())?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
                     .context("draw_render_elements (layer overlay) failed")?;

@@ -2002,6 +2002,32 @@ impl GlesFrame<'_, '_> {
     {
         Ok(func(&self.renderer.gl))
     }
+
+    /// Runs `func` with `texture` bound to texture unit 1 (`GL_TEXTURE1`),
+    /// restoring the previous state (unit 1 unbound, unit 0 active) before
+    /// returning.
+    ///
+    /// This renderer only ever drives texture unit 0 itself (each draw
+    /// re-activates `GL_TEXTURE0`), so a custom texture shader (see
+    /// [`GlesRenderer::compile_custom_texture_shader`]) may sample a second
+    /// texture during `func` through a `sampler2D` uniform set to `1i`.
+    pub fn with_secondary_texture<F, R>(&mut self, texture: &GlesTexture, func: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        unsafe {
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE1);
+            self.renderer.gl.BindTexture(ffi::TEXTURE_2D, texture.tex_id());
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+        }
+        let res = func(self);
+        unsafe {
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE1);
+            self.renderer.gl.BindTexture(ffi::TEXTURE_2D, 0);
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+        }
+        res
+    }
 }
 
 impl RendererSuper for GlesRenderer {

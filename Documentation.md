@@ -450,6 +450,14 @@ and each band is blurred at most once, so nothing is ever double-blurred.
 Surface alpha isn't probed, so a mapped opaque panel/window still pays for
 its tier while it's up — the cost is bounded.
 
+**Layer blur follows the panel's real shape.** The blurred backdrop behind
+a layer surface is alpha-masked by the panel's own buffer, so wherever the
+client leaves pixels transparent — rounded corners of any radius, pill
+shapes, cut-outs — the sharp desktop shows instead of a square block of
+frost. Nothing to configure or keep in sync. Blur behind *windows* is
+clipped to the same rounded rect the compositor draws
+(`border.rounded_corners`).
+
 ```lua
 decoration = {
     opacity = 0.9,                    -- windows slightly see-through (1.0 = opaque)
