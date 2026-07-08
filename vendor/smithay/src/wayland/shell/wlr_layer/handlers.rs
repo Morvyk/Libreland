@@ -131,6 +131,16 @@ where
                                 .lock()
                                 .unwrap();
 
+                            // The hook outlives the role object (it is installed once per
+                            // wl_surface and never removed): after zwlr_layer_surface_v1
+                            // .destroy() the client legitimately commits a null buffer to
+                            // unmap, while the cached role state has been reset — without
+                            // this check that commit trips the size validation below and
+                            // kills the client with a spurious protocol error.
+                            if !guard.surface.is_alive() {
+                                return;
+                            }
+
                             let mut cached_guard = states.cached_state.get::<LayerSurfaceCachedState>();
                             let pending = cached_guard.pending();
 
