@@ -657,6 +657,7 @@ the full usage.
 | `focused-window`   | The keyboard-focused window (alias `focused`).                                               |
 | `capture-window <id> [--max N]` | Render a window (any workspace/output) to a PNG thumbnail and print its path. `--max` caps the longest side (default 512). |
 | `binds`            | The configured keybindings.                                                                  |
+| `cursor`           | The pointer position: global logical coordinates, the output under it, and output-local coordinates. |
 
 **Actions** — windows are addressed by the stable **id** from `windows`
 (or the focused window when the id is omitted):

@@ -40,6 +40,11 @@ pub enum Request {
     FocusedWindow,
     /// The configured keybindings.
     Binds,
+    /// The pointer position: global compositor coordinates plus the
+    /// output under it and output-local coordinates. Lets shell widgets
+    /// (popups, context UIs) open at the cursor without guessing from
+    /// enter events.
+    Cursor,
     /// Render a thumbnail of a window (by id) to a PNG and return its path.
     /// Works for any window regardless of workspace or output. `max` caps
     /// the longest side in pixels (downscaled only; default 512).
@@ -167,6 +172,7 @@ pub enum Response {
     Windows(Vec<WindowInfo>),
     FocusedWindow(Option<WindowInfo>),
     Binds(Vec<BindInfo>),
+    Cursor(CursorInfo),
     /// A window thumbnail was written to `path` (a PNG of `width`x`height`).
     WindowCapture {
         path: String,
@@ -182,6 +188,20 @@ pub enum Response {
 pub struct VersionInfo {
     pub name: String,
     pub version: String,
+}
+
+/// The pointer position. `x`/`y` are global compositor (logical)
+/// coordinates; `output` is the connector under the cursor (`None` if
+/// it's outside every output, e.g. mid-hotplug) with `output_x`/
+/// `output_y` local to that output's top-left.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorInfo {
+    pub x: f64,
+    pub y: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    pub output_x: f64,
+    pub output_y: f64,
 }
 
 /// One connected output (monitor).
@@ -297,8 +317,8 @@ mod server {
     use tracing::{info, warn};
 
     use super::{
-        BindInfo, Event, EventKind, LayerInfo, OutputInfo, Reply, Request, Response, VersionInfo,
-        WindowInfo, WorkspaceInfo, WorkspaceTarget,
+        BindInfo, CursorInfo, Event, EventKind, LayerInfo, OutputInfo, Reply, Request, Response,
+        VersionInfo, WindowInfo, WorkspaceInfo, WorkspaceTarget,
     };
     use crate::layout::{FillMode, Layout, WindowEntry};
     use crate::State;
@@ -745,6 +765,7 @@ mod server {
             Request::Windows => Ok(Response::Windows(windows(state))),
             Request::FocusedWindow => Ok(Response::FocusedWindow(focused_window(state))),
             Request::Binds => Ok(Response::Binds(binds(state))),
+            Request::Cursor => cursor(state),
             Request::CaptureWindow { id, max } => capture_window(state, id, max),
             Request::FocusWindow { id } => focus_window(state, id),
             Request::Close { id } => close_window(state, id),
@@ -954,6 +975,38 @@ mod server {
             .ok_or_else(|| "no config path (XDG dirs unset)".to_owned())?;
         state.reload_config(&path);
         Ok(Response::Handled)
+    }
+
+    /// The pointer position, with the containing output resolved so
+    /// clients get output-local coordinates for free.
+    fn cursor(state: &mut State) -> Reply {
+        let Some(pointer) = state.seat.get_pointer() else {
+            return Err("no pointer on the seat".to_owned());
+        };
+        let loc = pointer.current_location();
+        let mut output = None;
+        let (mut output_x, mut output_y) = (loc.x, loc.y);
+        for d in state.renderer.output_descriptors() {
+            let pos = d.compositor_position;
+            let size = d.compositor_size;
+            if loc.x >= f64::from(pos.x)
+                && loc.x < f64::from(pos.x + size.w)
+                && loc.y >= f64::from(pos.y)
+                && loc.y < f64::from(pos.y + size.h)
+            {
+                output_x = loc.x - f64::from(pos.x);
+                output_y = loc.y - f64::from(pos.y);
+                output = Some(d.name);
+                break;
+            }
+        }
+        Ok(Response::Cursor(CursorInfo {
+            x: loc.x,
+            y: loc.y,
+            output,
+            output_x,
+            output_y,
+        }))
     }
 
     fn outputs(state: &mut State) -> Vec<OutputInfo> {
@@ -1318,6 +1371,8 @@ mod client {
         FocusedWindow,
         /// List the configured keybindings.
         Binds,
+        /// Print the pointer position (global + output-local).
+        Cursor,
         /// Render a window (by id) to a PNG thumbnail and print its path.
         /// Works regardless of the window's workspace or output.
         CaptureWindow {
@@ -1377,6 +1432,7 @@ mod client {
                 Command::Windows => Request::Windows,
                 Command::FocusedWindow => Request::FocusedWindow,
                 Command::Binds => Request::Binds,
+                Command::Cursor => Request::Cursor,
                 Command::CaptureWindow { id, max } => Request::CaptureWindow { id: *id, max: *max },
                 Command::FocusWindow { id } => Request::FocusWindow { id: *id },
                 Command::Close { id } => Request::Close { id: *id },
@@ -1553,6 +1609,13 @@ mod client {
                 None => println!("no focused window"),
             },
             Response::Binds(binds) => print_binds(binds),
+            Response::Cursor(c) => match &c.output {
+                Some(name) => println!(
+                    "{:.0},{:.0} (global) — {name} {:.0},{:.0}",
+                    c.x, c.y, c.output_x, c.output_y
+                ),
+                None => println!("{:.0},{:.0} (global) — outside every output", c.x, c.y),
+            },
             Response::WindowCapture { path, width, height } => {
                 println!("{path} ({width}x{height})");
             }
@@ -1716,6 +1779,7 @@ mod tests {
             Request::Windows,
             Request::FocusedWindow,
             Request::Binds,
+            Request::Cursor,
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: Request = serde_json::from_str(&json).unwrap();
