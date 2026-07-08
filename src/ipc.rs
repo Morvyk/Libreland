@@ -279,7 +279,7 @@ pub struct BindInfo {
 // ======================================================================
 
 mod server {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -303,11 +303,60 @@ mod server {
     use crate::layout::{FillMode, Layout, WindowEntry};
     use crate::State;
 
+    /// Cap on one subscriber's pending outgoing bytes. A reader this far
+    /// behind isn't slow, it's stuck — drop it rather than buffer without
+    /// bound.
+    const MAX_SUBSCRIBER_QUEUE: usize = 4 * 1024 * 1024;
+
+    /// Cap on one connection's buffered, un-terminated request line. A
+    /// client that sends this much without a newline is broken or hostile
+    /// — close it rather than buffer its request without bound.
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
     /// One subscribed connection: a write handle to its socket plus the
     /// event kinds it wants (`None` = all).
     struct Subscriber {
         stream: UnixStream,
         kinds: Option<Vec<EventKind>>,
+        /// Bytes accepted but not yet written — the (nonblocking) socket
+        /// was full mid-event. Drained by [`Subscriber::flush`] on the
+        /// next writes / poll ticks; keeping the exact remainder preserves
+        /// line framing across partial writes, so a slow reader never sees
+        /// a truncated event.
+        queue: VecDeque<u8>,
+    }
+
+    impl Subscriber {
+        /// Queue `payload` and write as much pending data as the socket
+        /// accepts. `false` means drop this subscriber: its socket is dead,
+        /// or it is so far behind the queue cap tripped.
+        fn send(&mut self, payload: &[u8]) -> bool {
+            if self.queue.len() + payload.len() > MAX_SUBSCRIBER_QUEUE {
+                return false;
+            }
+            self.queue.extend(payload);
+            self.flush()
+        }
+
+        /// Write queued bytes until done or the socket would block.
+        /// `false` means the connection is dead.
+        fn flush(&mut self) -> bool {
+            while !self.queue.is_empty() {
+                let (front, _) = self.queue.as_slices();
+                match (&self.stream).write(front) {
+                    Ok(0) => return false,
+                    Ok(n) => {
+                        self.queue.drain(..n);
+                    }
+                    // Full socket: the reader is just slow. Keep the
+                    // remainder queued for the next flush.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return false,
+                }
+            }
+            true
+        }
     }
 
     /// Stable window-id registry + event-stream bookkeeping. Lives in
@@ -359,7 +408,14 @@ mod server {
             self.next_conn += 1;
             let id = self.next_conn;
             let kinds = (!events.is_empty()).then_some(events);
-            self.subscribers.insert(id, Subscriber { stream, kinds });
+            self.subscribers.insert(
+                id,
+                Subscriber {
+                    stream,
+                    kinds,
+                    queue: VecDeque::new(),
+                },
+            );
             (id, first)
         }
 
@@ -374,7 +430,9 @@ mod server {
         }
 
         /// Write `event` to every subscriber that wants its kind, dropping
-        /// any whose socket has gone away.
+        /// any whose socket has gone away (or fallen hopelessly behind).
+        /// A merely *slow* reader keeps its subscription: the unwritten
+        /// remainder is queued and flushed on later writes / poll ticks.
         fn broadcast(&mut self, event: &Event) {
             let kind = event.kind();
             let Ok(mut payload) = serde_json::to_vec(event) else {
@@ -382,11 +440,11 @@ mod server {
             };
             payload.push(b'\n');
             let mut dead = Vec::new();
-            for (id, sub) in &self.subscribers {
+            for (id, sub) in &mut self.subscribers {
                 if sub.kinds.as_ref().is_some_and(|k| !k.contains(&kind)) {
                     continue;
                 }
-                if (&sub.stream).write_all(&payload).is_err() {
+                if !sub.send(&payload) {
                     dead.push(*id);
                 }
             }
@@ -397,14 +455,30 @@ mod server {
 
         /// Send one event to a single subscriber (the subscribe snapshot).
         fn send_to(&mut self, id: u64, event: &Event) {
-            let Some(sub) = self.subscribers.get(&id) else {
+            let Some(sub) = self.subscribers.get_mut(&id) else {
                 return;
             };
             let Ok(mut payload) = serde_json::to_vec(event) else {
                 return;
             };
             payload.push(b'\n');
-            if (&sub.stream).write_all(&payload).is_err() {
+            if !sub.send(&payload) {
+                self.subscribers.remove(&id);
+            }
+        }
+
+        /// Retry queued writes for subscribers whose sockets were full.
+        /// Called once per event-loop iteration (from [`poll_events`]), so
+        /// a drained reader catches up within the loop's next wakeup (the
+        /// 1 s redraw heartbeat bounds the worst case).
+        fn flush_subscribers(&mut self) {
+            let mut dead = Vec::new();
+            for (id, sub) in &mut self.subscribers {
+                if !sub.flush() {
+                    dead.push(*id);
+                }
+            }
+            for id in dead {
                 self.subscribers.remove(&id);
             }
         }
@@ -571,6 +645,14 @@ mod server {
                         Err(e) => write_reply(conn, &Err(format!("invalid request: {e}"))),
                     }
                 }
+                if pending.len() > MAX_REQUEST_BYTES {
+                    warn!(
+                        bytes = pending.len(),
+                        "IPC request line exceeds cap; closing connection"
+                    );
+                    write_reply(conn, &Err("request line too large".to_owned()));
+                    closed = true;
+                }
                 if closed {
                     if let Some(id) = subscriber_id.take() {
                         state.ipc.remove_subscriber(id);
@@ -628,6 +710,7 @@ mod server {
         if !state.ipc.has_subscribers() {
             return;
         }
+        state.ipc.flush_subscribers();
         let windows = windows(state);
         let workspaces = workspaces(state);
         let focus = focused_window(state);
@@ -847,7 +930,7 @@ mod server {
         }
     }
 
-    fn spawn(state: &State, command: &[String]) -> Reply {
+    fn spawn(state: &mut State, command: &[String]) -> Reply {
         let Some((program, args)) = command.split_first() else {
             return Err("empty command".to_owned());
         };
@@ -858,6 +941,8 @@ mod server {
         match cmd.spawn() {
             Ok(child) => {
                 info!(pid = child.id(), ?command, "spawned via IPC");
+                // Parked for the reap timer; a dropped handle zombies.
+                state.children.push(child);
                 Ok(Response::Handled)
             }
             Err(e) => Err(format!("spawn failed: {e}")),
@@ -1066,6 +1151,90 @@ mod server {
             Action::Close => "close".to_owned(),
             Action::Spawn(cmd) => format!("spawn {cmd}"),
             Action::Screenshot(_) => "screenshot".to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::net::UnixStream;
+
+        use smithay::reexports::rustix;
+
+        use super::{Event, IpcState};
+
+        /// A subscriber whose socket buffer fills (a slow reader — a bar
+        /// mid-GC, a paused terminal, a busy script) must be kept, not
+        /// silently dropped on the first `WouldBlock`.
+        #[test]
+        fn slow_subscriber_is_kept() {
+            use std::io::Read as _;
+
+            let (writer, mut reader) = UnixStream::pair().expect("socketpair");
+            // Match accept_connection: the subscriber write half is
+            // nonblocking. Shrink the buffer so it fills quickly.
+            writer.set_nonblocking(true).expect("set_nonblocking");
+            rustix::net::sockopt::set_socket_send_buffer_size(&writer, 4096)
+                .expect("shrink send buffer");
+
+            let mut ipc = IpcState::default();
+            ipc.add_subscriber(writer, Vec::new());
+            const EVENTS: usize = 2000;
+            for _ in 0..EVENTS {
+                ipc.broadcast(&Event::WindowClosed { id: 7 });
+            }
+            assert!(
+                ipc.has_subscribers(),
+                "a slow (unread) subscriber was dropped while its socket was alive"
+            );
+
+            // The reader catches up: drain the socket, re-flushing as the
+            // buffer empties. Every event must arrive, and every line must
+            // be complete (no truncation from a partial write).
+            reader.set_nonblocking(true).expect("reader nonblocking");
+            let mut received = Vec::new();
+            let mut idle_rounds = 0;
+            while idle_rounds < 100 {
+                let mut buf = [0u8; 65536];
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        received.extend_from_slice(&buf[..n]);
+                        idle_rounds = 0;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        ipc.flush_subscribers();
+                        idle_rounds += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("reader failed: {e}"),
+                }
+            }
+            assert!(received.ends_with(b"\n"), "stream ends mid-line");
+            let lines: Vec<&[u8]> = received
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(lines.len(), EVENTS, "events were lost");
+            for line in lines {
+                serde_json::from_slice::<serde_json::Value>(line)
+                    .expect("subscriber received a corrupt line");
+            }
+        }
+
+        /// A subscriber whose peer is actually gone must still be dropped.
+        #[test]
+        fn dead_subscriber_is_dropped() {
+            let (writer, reader) = UnixStream::pair().expect("socketpair");
+            writer.set_nonblocking(true).expect("set_nonblocking");
+            let mut ipc = IpcState::default();
+            ipc.add_subscriber(writer, Vec::new());
+            drop(reader);
+            // The first write can still land in the kernel buffer (EPIPE
+            // arrives on a later write), so broadcast a few times.
+            for _ in 0..8 {
+                ipc.broadcast(&Event::WindowClosed { id: 1 });
+            }
+            assert!(!ipc.has_subscribers(), "dead subscriber was not dropped");
         }
     }
 }
