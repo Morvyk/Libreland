@@ -539,10 +539,11 @@ void main() {
 /// clip ([`ROUND_BLUR_SHADER`]) since the compositor rounds those itself.
 /// `mask_mul`/`mask_add` affinely map `v_coords` (tier UV, see
 /// [`ROUND_BLUR_SHADER`]) into the mask's 0..1 UV space, including a y-flip
-/// when either texture is y-inverted. Both textures are premultiplied; output
-/// stays premult for the `GL_ONE / GL_ONE_MINUS_SRC_ALPHA` blend, so the
-/// backdrop becomes `blur·a + sharp·(1−a)` per pixel before the panel itself
-/// draws over it.
+/// when either texture is y-inverted. The mask alpha is treated as
+/// *coverage* (saturated, see the shader body), so a translucent panel body
+/// still gets the full frost and only the shape's AA edge blends out. Both
+/// textures are premultiplied; output stays premult for the
+/// `GL_ONE / GL_ONE_MINUS_SRC_ALPHA` blend.
 const MASK_BLUR_SHADER: &str = r"#version 100
 //_DEFINES_
 #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -562,6 +563,12 @@ varying vec2 v_coords;
 void main() {
     vec4 c = texture2D(tex, v_coords);
     float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
+    // The mask alpha is *coverage*, not frost strength: a translucent panel
+    // body (say 0.75) must still get the full blur behind it — otherwise the
+    // remainder shows the sharp backdrop and the frost reads weak. Saturate
+    // so any pixel the panel meaningfully covers is fully frosted and only
+    // the AA ramp at the shape's edge blends out.
+    m = min(m * 4.0, 1.0);
     gl_FragColor = c * (m * alpha);
 }
 ";
@@ -593,6 +600,8 @@ vec3 srgb_to_linear(vec3 c) {
 void main() {
     vec4 c = texture2D(tex, v_coords);
     float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
+    // Coverage saturation — see MASK_BLUR_SHADER.
+    m = min(m * 4.0, 1.0);
     vec3 straight = c.a > 0.0 ? (c.rgb / c.a) : vec3(0.0);
     vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
     mat3 bt709_to_bt2020 = mat3(

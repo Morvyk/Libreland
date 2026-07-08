@@ -454,8 +454,11 @@ its tier while it's up — the cost is bounded.
 a layer surface is alpha-masked by the panel's own buffer, so wherever the
 client leaves pixels transparent — rounded corners of any radius, pill
 shapes, cut-outs — the sharp desktop shows instead of a square block of
-frost. Nothing to configure or keep in sync. Blur behind *windows* is
-clipped to the same rounded rect the compositor draws
+frost. The mask is treated as *coverage*: a translucent panel body still
+gets the full frost behind it (only near-invisible pixels, alpha < 0.25,
+fade the frost proportionally), and the shape's antialiased edge blends
+out cleanly. Nothing to configure or keep in sync. Blur behind *windows*
+is clipped to the same rounded rect the compositor draws
 (`border.rounded_corners`).
 
 ```lua
