@@ -162,6 +162,11 @@ pub(crate) struct State {
     /// Running `xwayland-satellite` child, if X support is on. Held so a
     /// live `xwayland = false` reload can stop it; `None` when off.
     pub(crate) xwayland_child: Option<std::process::Child>,
+    /// Children spawned at runtime (startup commands, bind/IPC `spawn`,
+    /// the idle lock command). Held so [`State::reap_children`] can
+    /// `try_wait` them — a dropped `Child` handle is never waited on, so
+    /// every exited child would otherwise linger as a zombie.
+    pub(crate) children: Vec<std::process::Child>,
     /// X display the satellite serves (e.g. `":1"`). Exported as
     /// `$DISPLAY` to children we spawn (see [`State::build_command`]) so
     /// X clients connect; `None` when X support is off.
@@ -809,7 +814,10 @@ impl State {
             info!(command = %cmd, "idle: spawning lock command");
             if let Some(mut command) = self.build_command(cmd) {
                 match command.spawn() {
-                    Ok(child) => info!(pid = child.id(), command = %cmd, "idle: lock command spawned"),
+                    Ok(child) => {
+                        info!(pid = child.id(), command = %cmd, "idle: lock command spawned");
+                        self.children.push(child);
+                    }
                     Err(err) => warn!(error = %err, command = %cmd, "idle: lock command failed"),
                 }
             }
@@ -2504,11 +2512,14 @@ impl State {
                     return;
                 };
                 match command.spawn() {
-                    Ok(child) => info!(
-                        pid = child.id(),
-                        command = %cmd,
-                        "spawn action fired"
-                    ),
+                    Ok(child) => {
+                        info!(
+                            pid = child.id(),
+                            command = %cmd,
+                            "spawn action fired"
+                        );
+                        self.children.push(child);
+                    }
                     Err(err) => warn!(
                         error = %err,
                         command = %cmd,
@@ -2607,6 +2618,35 @@ impl State {
                 apply_input_config(device, new_input);
             }
             info!("input: re-applied mouse acceleration to live devices");
+        }
+    }
+
+    /// Reap exited children so they don't accumulate as zombies. Every
+    /// runtime spawn path parks its `Child` handle in `self.children`;
+    /// this sweeps them with `try_wait` (never blocks) on a timer. The
+    /// xwayland satellite is checked too: if it died on its own, clear
+    /// the stale handle *and* `$DISPLAY` so new children don't inherit a
+    /// dead X display.
+    pub(crate) fn reap_children(&mut self) {
+        self.children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(status)) => {
+                debug!(pid = child.id(), %status, "reaped exited child");
+                false
+            }
+            Ok(None) => true,
+            Err(err) => {
+                warn!(pid = child.id(), error = %err, "reaping child failed; dropping the handle");
+                false
+            }
+        });
+        if let Some(child) = &mut self.xwayland_child
+            && !matches!(child.try_wait(), Ok(None))
+        {
+            warn!(
+                "xwayland-satellite exited on its own; X11 support is gone until an `xwayland` toggle or restart"
+            );
+            self.xwayland_child = None;
+            self.xwayland_display = None;
         }
     }
 
@@ -3605,7 +3645,7 @@ fn main() -> Result<()> {
     // set, spawn any configured startup commands. Their stdout /
     // stderr inherit ours (so they share the file log via
     // descriptors, if relevant).
-    wayland::spawn_startup(&config.startup);
+    let startup_children = wayland::spawn_startup(&config.startup);
 
     // Live config reload: poll the config file once a second and
     // re-apply on change. Polling (vs inotify) is dependency-free and
@@ -3703,6 +3743,7 @@ fn main() -> Result<()> {
         config,
         input_devices: Vec::new(),
         xwayland_child,
+        children: startup_children,
         xwayland_display,
         display_handle: wayland_init.display_handle,
         compositor_state: wayland_init.compositor_state,
@@ -4186,6 +4227,20 @@ fn wire_event_sources(
                 TimeoutAction::ToDuration(tick)
             })
             .map_err(|e| anyhow::anyhow!("failed to insert idle timer: {e}"))?;
+    }
+
+    // Reap exited children so zombies don't accumulate: every runtime
+    // spawn path (startup, binds, idle lock, IPC) parks its `Child` in
+    // `state.children`; this sweeps them with `try_wait` (never blocks).
+    {
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        let sweep = std::time::Duration::from_secs(5);
+        handle
+            .insert_source(Timer::from_duration(sweep), move |_, (), state: &mut State| {
+                state.reap_children();
+                TimeoutAction::ToDuration(sweep)
+            })
+            .map_err(|e| anyhow::anyhow!("failed to insert child-reap timer: {e}"))?;
     }
 
     handle

@@ -495,7 +495,11 @@ pub fn init(
 /// the compositor's environment (notably `$WAYLAND_DISPLAY`) so
 /// they connect to *our* socket. A failed spawn is logged and
 /// skipped — one broken command shouldn't crash the compositor.
-pub fn spawn_startup(commands: &[String]) {
+/// The `Child` handles are returned for `State::children`, whose reap
+/// timer `try_wait`s them — a dropped handle is never waited on, so
+/// every exited child would linger as a zombie.
+pub fn spawn_startup(commands: &[String]) -> Vec<std::process::Child> {
+    let mut children = Vec::new();
     for raw in commands {
         let parts: Vec<&str> = raw.split_whitespace().collect();
         let Some((program, args)) = parts.split_first() else {
@@ -503,7 +507,10 @@ pub fn spawn_startup(commands: &[String]) {
             continue;
         };
         match std::process::Command::new(program).args(args).spawn() {
-            Ok(child) => info!(pid = child.id(), command = raw, "spawned startup command"),
+            Ok(child) => {
+                info!(pid = child.id(), command = raw, "spawned startup command");
+                children.push(child);
+            }
             Err(err) => warn!(
                 command = raw,
                 error = %err,
@@ -511,6 +518,7 @@ pub fn spawn_startup(commands: &[String]) {
             ),
         }
     }
+    children
 }
 
 /// Wrap a freshly-accepted client stream into a registered
