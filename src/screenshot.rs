@@ -224,10 +224,62 @@ fn expand(input: &str) -> String {
     out
 }
 
-/// Create `dir` (and parents) and write `bytes` to `dir/filename`.
+/// Create `dir` (and parents) and write `bytes` to `dir/filename`,
+/// never clobbering an existing file: the timestamped name only has
+/// second resolution, so two captures in the same second would
+/// otherwise silently overwrite each other. On a collision a `_N`
+/// counter is inserted before the extension (`create_new` makes the
+/// existence check race-free).
 pub(crate) fn save(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(filename);
-    std::fs::write(&path, bytes)?;
-    Ok(path)
+    let (stem, ext) = filename
+        .rsplit_once('.')
+        .map_or((filename, None), |(s, e)| (s, Some(e)));
+    for n in 0..100u32 {
+        let candidate = match (n, ext) {
+            (0, _) => dir.join(filename),
+            (n, Some(ext)) => dir.join(format!("{stem}_{n}.{ext}")),
+            (n, None) => dir.join(format!("{stem}_{n}")),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "gave up finding a free name for {filename} after 100 collisions"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two captures with the same timestamped filename (same second) must
+    /// both survive — the second gets a `_1` suffix instead of silently
+    /// overwriting the first.
+    #[test]
+    fn save_never_clobbers() {
+        let dir = std::env::temp_dir().join(format!("libreland-save-test-{}", std::process::id()));
+        let a = save(&dir, "Screenshot_20260708_120000.png", b"first").unwrap();
+        let b = save(&dir, "Screenshot_20260708_120000.png", b"second").unwrap();
+        let c = save(&dir, "Screenshot_20260708_120000.png", b"third").unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        assert_eq!(std::fs::read(&c).unwrap(), b"third");
+        assert_eq!(b.file_name().unwrap(), "Screenshot_20260708_120000_1.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
