@@ -68,8 +68,11 @@ build() {
     unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
     # The `release` profile already does fat LTO + symbol stripping; build
     # the whole workspace (compositor + output picker). --locked uses the
-    # committed Cargo.lock so the package is reproducible.
-    cargo build --release --locked
+    # committed Cargo.lock so the package is reproducible. --workspace is
+    # load-bearing: this workspace has a root package, so a bare `cargo
+    # build` compiles only the compositor and package() then fails to
+    # find the output-picker binary.
+    cargo build --release --locked --workspace
 }
 
 package() {
