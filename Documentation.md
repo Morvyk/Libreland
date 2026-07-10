@@ -743,5 +743,5 @@ present and elided here.)
 | `wl_data_device_manager`                                       | Clipboard + drag-and-drop.                                              |
 | `zwp_primary_selection_v1`                                     | Primary (middle-click) selection.                                       |
 | `zwlr_data_control_v1` (v2) + `ext_data_control_v1` (v1)       | Clipboard managers — see [Clipboard & selections](#clipboard--selections). |
-| `ext_session_lock_v1`                                          | Screen lockers (used by the [idle](#idle) locker).                      |
+| `ext_session_lock_v1`                                          | Screen lockers (used by the [idle](#idle) locker). **While a lock is active, all user keybinds are suppressed** — `exit`, `spawn`, and screenshot binds can't fire, so there's no way to bypass the lock from the keyboard; every key forwards to the locker for password entry. |
 | `zwlr_screencopy_v1`                                           | Output capture — screenshots + screen sharing via the portal.           |

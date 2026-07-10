@@ -613,7 +613,13 @@ impl State {
             return;
         }
 
-        let matched_action = if pressed {
+        // While the session is locked (ext-session-lock-v1), NO user bind
+        // may fire — otherwise `exit`, a `spawn`, or a screenshot bind
+        // would be a trivial lock bypass. Every key forwards to the lock
+        // surface (which holds keyboard focus) so the password can be
+        // typed; the compositor enforces this regardless of the user's
+        // configured binds.
+        let matched_action = if pressed && !self.session_locked {
             let normal = self
                 .config
                 .binds
