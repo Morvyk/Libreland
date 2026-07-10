@@ -121,10 +121,17 @@ where
                         if let Some(assignment) = surface_attrs.buffer.as_ref() {
                             match assignment {
                                 BufferAssignment::Removed => {
-                                    attributes.surface.post_error(
-                                        ext_session_lock_surface_v1::Error::NullBuffer,
-                                        "Surface attached a NULL buffer.",
-                                    );
+                                    // A NULL-buffer commit is how a client unmaps its lock
+                                    // surface during teardown (unlock_and_destroy): Qt/quickshell
+                                    // attach(null)+commit before destroying the objects. The spec
+                                    // calls this a protocol error, but treating it as fatal here
+                                    // *disconnects the locker mid-unlock* — which killed quickshell
+                                    // on every unlock and, combined with the desktop being revealed,
+                                    // left the session with no bar (and could strand a lock that
+                                    // recommits). Tolerate it: ignore the unmap rather than kill the
+                                    // client. During an active lock this just means the surface stops
+                                    // updating (the lock stays up); it can never reveal the desktop.
+                                    return;
                                 }
                                 BufferAssignment::NewBuffer(buffer) => {
                                     if let Some(buf_size) = buffer_dimensions(buffer) {
