@@ -291,6 +291,7 @@ pub fn init(
     output_descs: &[OutputDescriptor],
     preferred_scale: f64,
     dmabuf_formats: Vec<Format>,
+    scanout_formats: Vec<Format>,
     render_node: Option<DrmNode>,
 ) -> Result<WaylandInit> {
     let dh = display.handle();
@@ -328,7 +329,35 @@ pub fn init(
     // render node or feedback can't be built.
     let mut dmabuf_state = DmabufState::new();
     let dmabuf_global = if let Some(node) = render_node {
-        match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
+        // Scanout preference tranche: the primary output's plane formats
+        // (∩ renderer-importable), flagged Scanout and targeted at the
+        // *primary* DRM node. Clients that honour it (Vulkan/EGL WSI)
+        // allocate fullscreen swapchains with explicit plane-compatible
+        // modifiers — the difference between direct scanout engaging and
+        // every game frame being compositing-only (an implicit-modifier
+        // buffer can never be latched onto the plane; the Weston rule).
+        let scanout_device = node
+            .node_with_type(smithay::backend::drm::NodeType::Primary)
+            .and_then(Result::ok)
+            .map_or_else(|| node.dev_id(), |primary| primary.dev_id());
+        let mut builder = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone());
+        if scanout_formats.is_empty() {
+            warn!("no scanout-capable formats; dmabuf feedback carries no scanout tranche");
+        } else {
+            info!(
+                count = scanout_formats.len(),
+                "dmabuf feedback: scanout tranche for the primary plane"
+            );
+            builder = builder.add_preference_tranche(
+                scanout_device,
+                Some(
+                    smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server
+                        ::zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                ),
+                scanout_formats,
+            );
+        }
+        match builder.build() {
             Ok(feedback) => {
                 info!(node = ?node, "advertising zwp_linux_dmabuf_v1 with default feedback (v4)");
                 dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback)

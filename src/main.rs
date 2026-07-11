@@ -3581,9 +3581,11 @@ fn main() -> Result<()> {
     let output_descs = renderer.output_descriptors();
     let preferred_scale = renderer.primary_scale();
     let dmabuf_formats = renderer.dmabuf_formats();
+    let scanout_formats = renderer.primary_scanout_formats();
     let render_node = renderer.render_drm_node();
     info!(
         count = dmabuf_formats.len(),
+        scanout = scanout_formats.len(),
         render_node = ?render_node,
         "dmabuf import formats advertised to clients"
     );
@@ -3599,6 +3601,7 @@ fn main() -> Result<()> {
         &output_descs,
         preferred_scale,
         dmabuf_formats,
+        scanout_formats,
         render_node,
     )
     .context("wayland substate init failed")?;
