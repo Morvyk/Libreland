@@ -3444,24 +3444,22 @@ fn main() -> Result<()> {
             info!(name, value, "applying configured env var");
             std::env::set_var(name, value);
         }
-        // Pin $XCURSOR_SIZE (unless the user set one) to the *logical*
-        // cursor size. This env var is inherited by everything —
-        // native Wayland clients AND our own cursor loader
-        // (`cursor::configured_size`) both read it as a logical size
-        // and scale it themselves at draw time, so it must NOT carry a
-        // pre-multiplied physical value (that double-scales every
-        // cursor on a fractional output — real regression). X11 apps
-        // under the native Xwayland integration live in a
-        // physical-sized pixel space (client scale, see
-        // src/xwayland.rs) and want the physical size instead; they
-        // get it via XSETTINGS `Gtk/CursorThemeSize`, which the XWM
-        // publishes at logical × scale and re-publishes on scale
-        // changes. Toolkit-less X apps that only read this env var
-        // will draw a slightly small cursor on fractional outputs —
-        // the correct trade against breaking every native cursor.
-        if std::env::var_os("XCURSOR_SIZE").is_none() {
-            std::env::set_var("XCURSOR_SIZE", crate::cursor::DEFAULT_SIZE.to_string());
-        }
+        // $XCURSOR_SIZE is deliberately NOT exported (unless the user
+        // set it themselves). The env var means a *logical* size to
+        // native Wayland clients and to our own loader
+        // (`cursor::configured_size`), but a *physical* size to X11
+        // apps (their pixel space is physical-sized under the client
+        // scale — see src/xwayland.rs), so no single value fits both.
+        // Leaving it unset gives every consumer its correct source:
+        // native clients fall back to the standard 24-logical default
+        // (identical to what pinning it provided), and libXcursor in X
+        // apps falls through to the `Xcursor.size` root resource — the
+        // XWM publishes the physical size there (and via XSETTINGS for
+        // toolkits), re-published on scale changes. An env value would
+        // shadow that resource in libXcursor's lookup order and break
+        // X cursor sizing on fractional outputs. A user-set value is
+        // respected but skews X apps' cursors on fractional outputs by
+        // the same logic.
     }
 
     // Wayland frontend bootstrap. The calloop loop data type is `State`

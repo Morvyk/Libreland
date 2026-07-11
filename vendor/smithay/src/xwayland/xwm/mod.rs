@@ -1314,6 +1314,23 @@ impl X11Wm {
         Ok(())
     }
 
+    /// Replace the `RESOURCE_MANAGER` property on the root window — the
+    /// xrdb resource database. X clients that don't speak XSETTINGS
+    /// (libXcursor's `Xcursor.size`/`Xcursor.theme`, Xft's `Xft.dpi`)
+    /// read their defaults from here, so a compositor can publish
+    /// cursor/DPI configuration for toolkit-less X11 apps. `resources`
+    /// is the xrdb text format: one `name:\tvalue` entry per line.
+    pub fn set_resource_manager(&self, resources: &str) -> Result<(), ConnectionError> {
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.screen.root,
+            AtomEnum::RESOURCE_MANAGER,
+            AtomEnum::STRING,
+            resources.as_bytes(),
+        )?;
+        self.conn.flush()
+    }
+
     /// Gets the current primary output as advertised by xrandr
     pub fn get_randr_primary_output(&self) -> Result<Option<String>, ReplyError> {
         let current_primary = self

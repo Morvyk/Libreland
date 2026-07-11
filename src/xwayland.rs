@@ -440,12 +440,25 @@ impl State {
     }
 }
 
-/// Publish the XSETTINGS X apps read for scale + cursors:
-/// `Xft/DPI` in 1/1024ths (96 × the output scale — the "144 DPI at
-/// 1.5×" the compositor advertises to fractional-aware Wayland
-/// clients), and the cursor theme/size matching the compositor's own
-/// (`$XCURSOR_THEME` / physical cursor pixels), so X apps request
-/// cursors that render identical to native ones.
+/// Publish the scale + cursor configuration X apps read, through both
+/// channels a rootful X session would provide:
+///
+/// - **XSETTINGS** for toolkit apps (GTK & co): `Xft/DPI` in 1/1024ths
+///   (96 × the output scale — the "144 DPI at 1.5×" the compositor
+///   advertises to fractional-aware Wayland clients) and the cursor
+///   theme/size.
+/// - **`RESOURCE_MANAGER`** (the xrdb database on the root window) for
+///   everyone else: libXcursor reads `Xcursor.size`/`Xcursor.theme`
+///   and Xft reads `Xft.dpi` from here. This is the only channel that
+///   reaches toolkit-less X apps (SDL games, xterm), which is why the
+///   compositor must NOT export `$XCURSOR_SIZE` — libXcursor prefers
+///   the env var over the resource, and the env value is a *logical*
+///   size shared with native Wayland clients, while X apps need the
+///   *physical* one (their pixel space is physical-sized under the
+///   client scale; see the module docs).
+///
+/// The cursor size is `configured_size() × scale` — physical pixels —
+/// so an X cursor renders at exactly the size of a native one.
 fn apply_xsettings(xwm: &mut X11Wm, scale: f64) {
     #[allow(
         clippy::cast_possible_truncation,
@@ -458,15 +471,35 @@ fn apply_xsettings(xwm: &mut X11Wm, scale: f64) {
         reason = "cursor size is a small positive number (theme sizes are tens of pixels)"
     )]
     let cursor_px = (f64::from(crate::cursor::configured_size()) * scale).round() as i32;
+    let theme = std::env::var("XCURSOR_THEME").ok();
+
     let mut settings: Vec<(String, Value)> = vec![
         ("Xft/DPI".to_owned(), Value::Integer(dpi)),
         ("Gtk/CursorThemeSize".to_owned(), Value::Integer(cursor_px)),
     ];
-    if let Ok(theme) = std::env::var("XCURSOR_THEME") {
-        settings.push(("Gtk/CursorThemeName".to_owned(), Value::String(theme)));
+    if let Some(theme) = &theme {
+        settings.push(("Gtk/CursorThemeName".to_owned(), Value::String(theme.clone())));
     }
     if let Err(err) = xwm.set_xsettings(settings.into_iter()) {
         warn!(error = %err, "failed to publish XSETTINGS (X apps fall back to 96 DPI)");
+    }
+
+    // xrdb entries carry plain values (Xft.dpi is the real DPI here,
+    // not the ×1024 XSETTINGS serialization).
+    let theme_line = theme
+        .as_ref()
+        .map(|theme| format!("Xcursor.theme:\t{theme}\n"))
+        .unwrap_or_default();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "96 * scale for sane scales (0.5..4) is far below i32::MAX"
+    )]
+    let resources = format!(
+        "Xft.dpi:\t{}\nXcursor.size:\t{cursor_px}\n{theme_line}",
+        (96.0 * scale).round() as i32,
+    );
+    if let Err(err) = xwm.set_resource_manager(&resources) {
+        warn!(error = %err, "failed to publish RESOURCE_MANAGER (toolkit-less X apps fall back to 96 DPI)");
     }
 }
 
