@@ -2100,6 +2100,39 @@ impl Renderer {
             .is_some_and(|cp| cp.image.is_some() && cp.active_crtc == Some(crtc))
     }
 
+    /// Whether the pointer must be drawn into output `idx`'s *composite*
+    /// this frame — the exact inverse of "the cursor plane shows it, or
+    /// nothing is shown at all". Mirrors the composite path's cursor arm
+    /// (see `render_output`): nothing is drawn when the pointer is
+    /// hidden (`hide_cursor` — a lock or a cursorless capture), when its
+    /// hotspot is on another output, when the status is `Hidden`, or
+    /// when a client cursor surface has no committed buffer (that's how
+    /// some clients hide the pointer); a plane-resident cursor scans out
+    /// beside any frame. Only the remainder — a software cursor, or a
+    /// capture forcing a bake-in — really needs compositing.
+    ///
+    /// Direct scanout keys off this rather than `hw_cursor_active`
+    /// alone: requiring an *active plane* meant a fullscreen game hiding
+    /// or locking the pointer (i.e. every game, all session long) could
+    /// never scan out, and neither could a game on one output while the
+    /// pointer sat on another.
+    fn cursor_needs_composite(&self, idx: usize, hide_cursor: bool, compose_cursor: bool) -> bool {
+        if hide_cursor || self.cursor_output_idx() != Some(idx) {
+            return false;
+        }
+        let status = self.cursor_override.as_ref().unwrap_or(&self.cursor_status);
+        let plane = self.hw_cursor_active(self.outputs[idx].crtc);
+        match status {
+            CursorImageStatus::Hidden => false,
+            CursorImageStatus::Surface(surface) => {
+                let mapped = with_renderer_surface_state(surface, |s| s.buffer().is_some())
+                    .unwrap_or(false);
+                mapped && (compose_cursor || !plane)
+            }
+            CursorImageStatus::Named(_) => compose_cursor || !plane,
+        }
+    }
+
     /// True while a drag-and-drop icon is following the pointer (it's drawn in
     /// the composite, so motion must redraw even with a hardware cursor).
     pub fn has_dnd_icon(&self) -> bool {
@@ -3582,6 +3615,7 @@ impl Renderer {
             placements,
             layers,
             popups,
+            hide_cursor,
             captures,
             hdr_surface_ids,
             compose_cursor,
@@ -4936,11 +4970,11 @@ impl Renderer {
     /// frame must be composited.
     ///
     /// Eligible only when nothing needs compositing on this output: no
-    /// captures, the cursor is on the HW plane, no layer-shell/overlay/popup/
-    /// session-lock/transient surface or running animation, and exactly one
-    /// placement covers the output — a settled, 1:1, opaque `Fullscreen`
-    /// window whose colour mode matches the output (HDR output ⇔ PQ surface),
-    /// backed by a single dmabuf buffer with no transform.
+    /// captures, the cursor either hidden or on the HW plane, no layer-shell/
+    /// overlay/popup/session-lock/transient surface or running animation, and
+    /// exactly one placement covers the output — a settled, 1:1, opaque
+    /// `Fullscreen` window whose colour mode matches the output (HDR output ⇔
+    /// PQ surface), backed by a single dmabuf buffer with no transform.
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors render_output's per-frame inputs; a struct would not simplify"
@@ -4952,6 +4986,7 @@ impl Renderer {
         placements: &[Placement],
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
+        hide_cursor: bool,
         captures: &[CaptureSpec],
         hdr_surface_ids: &HashSet<ObjectId>,
         compose_cursor: bool,
@@ -4959,9 +4994,10 @@ impl Renderer {
         let output = &self.outputs[idx];
         let out_rect = Rectangle::new(output.compositor_position, output.compositor_size);
 
-        // A capture must read a composited framebuffer; the cursor must be on
-        // the HW plane (not composited into the primary), with none baked in.
-        if !captures.is_empty() || compose_cursor || !self.hw_cursor_active(output.crtc) {
+        // A capture must read a composited framebuffer; the cursor must not
+        // need drawing into this output's frame (hidden and off-output
+        // pointers need nothing; a plane-resident one scans out alongside).
+        if !captures.is_empty() || self.cursor_needs_composite(idx, hide_cursor, compose_cursor) {
             return None;
         }
         // Anything that draws above a fullscreen window forces compositing.
@@ -5013,16 +5049,26 @@ impl Renderer {
         }
 
         // Extract a scanout-ready dmabuf + keep-alive from the committed
-        // buffer. Rejects shm buffers, transformed buffers, viewport-cropped/
-        // scaled buffers, non-native buffer scale, buffers whose pixels don't
-        // match the mode 1:1, and buffers we can't prove are opaque.
+        // buffer. Rejects shm buffers, transformed buffers, viewport-cropped
+        // buffers, buffers whose pixels don't match the mode 1:1, and buffers
+        // we can't prove are opaque.
         let mode_size = output.mode_size;
+        let out_size = output.compositor_size;
         with_renderer_surface_state(&p.surface, |state| {
-            // The buffer must map to the plane 1:1: native buffer scale, no
-            // rotation, and no wp_viewport crop/scale. (A fractional-scale
-            // client commits an oversized buffer + viewport to map it down;
-            // that path must composite, not scan out the raw buffer.)
-            if state.buffer_transform() != Transform::Normal || state.buffer_scale() != 1 {
+            // The buffer must land on the plane 1:1: no rotation, no crop
+            // (src covers the whole surface), and a logical destination that
+            // covers exactly this output. dst is compared against the OUTPUT
+            // size, not the buffer: a fractional-aware client (oversized
+            // buffer + viewport) and an Xwayland client under the client
+            // scale (physical-sized buffer that smithay shrinks logically)
+            // both have dst < buffer *by design* while their pixels still
+            // match the mode exactly — `dmabuf.size == mode_size` below is
+            // the pixel-exactness gate. Requiring `dst == buffer` here kept
+            // every such fullscreen game compositing (0 scanned-out frames in
+            // a whole session). `buffer_scale` needs no check of its own —
+            // it's already folded into both src (surface-logical units) and
+            // dst.
+            if state.buffer_transform() != Transform::Normal {
                 return None;
             }
             let buf = state.buffer_size()?;
@@ -5031,7 +5077,8 @@ impl Renderer {
             if src_loc.x != 0
                 || src_loc.y != 0
                 || view.src.size.to_i32_round::<i32>() != buf
-                || view.dst != buf
+                || view.dst.w != out_size.w
+                || view.dst.h != out_size.h
             {
                 return None;
             }
