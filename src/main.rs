@@ -3444,38 +3444,23 @@ fn main() -> Result<()> {
             info!(name, value, "applying configured env var");
             std::env::set_var(name, value);
         }
-        // Pin $XCURSOR_SIZE (unless the user set one) so X apps' cursors
-        // match native Wayland ones. Under the native Xwayland
-        // integration the X pixel space is *physical*-sized (client
-        // scale, see src/xwayland.rs): an X cursor of N px renders as N
-        // physical px, while our themed cursor at logical L renders as
-        // L × scale. So X apps must load cursors at L × primary-scale —
-        // physical pixels. The renderer isn't up yet, so the scale comes
-        // from the primary output's *configured* scale (the renderer
-        // applies the same value); XSETTINGS `Gtk/CursorThemeSize`
-        // repeats it for toolkits that ignore the env var, and tracks
-        // live scale changes where this one-shot env pin can't.
+        // Pin $XCURSOR_SIZE (unless the user set one) to the *logical*
+        // cursor size. This env var is inherited by everything —
+        // native Wayland clients AND our own cursor loader
+        // (`cursor::configured_size`) both read it as a logical size
+        // and scale it themselves at draw time, so it must NOT carry a
+        // pre-multiplied physical value (that double-scales every
+        // cursor on a fractional output — real regression). X11 apps
+        // under the native Xwayland integration live in a
+        // physical-sized pixel space (client scale, see
+        // src/xwayland.rs) and want the physical size instead; they
+        // get it via XSETTINGS `Gtk/CursorThemeSize`, which the XWM
+        // publishes at logical × scale and re-publishes on scale
+        // changes. Toolkit-less X apps that only read this env var
+        // will draw a slightly small cursor on fractional outputs —
+        // the correct trade against breaking every native cursor.
         if std::env::var_os("XCURSOR_SIZE").is_none() {
-            let primary_scale = if let Some(name) = &config.monitors.primary {
-                config.monitors.outputs.get(name).map_or(1.0, |o| o.scale)
-            } else {
-                // Automatic primary: which connector wins isn't known
-                // until the DRM scan. If every configured output shares
-                // one scale (the common case), use it; else assume 1.
-                let mut scales = config.monitors.outputs.values().map(|o| o.scale);
-                let first = scales.next();
-                match first {
-                    Some(s) if scales.all(|t| (t - s).abs() < f64::EPSILON) => s,
-                    _ => 1.0,
-                }
-            };
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "cursor size is a small positive number (theme sizes are tens of pixels)"
-            )]
-            let size = (f64::from(crate::cursor::DEFAULT_SIZE) * primary_scale).round() as u32;
-            std::env::set_var("XCURSOR_SIZE", size.to_string());
+            std::env::set_var("XCURSOR_SIZE", crate::cursor::DEFAULT_SIZE.to_string());
         }
     }
 
