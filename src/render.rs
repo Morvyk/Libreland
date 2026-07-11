@@ -747,6 +747,58 @@ void main() {
 }
 ";
 
+/// Fused SDR decode + PQ encode for the single-pass HDR fast path: one
+/// opaque SDR fullscreen surface covering an HDR output is drawn straight
+/// into the 10-bit scanout — sRGB EOTF → BT.709→BT.2020 → reference-white
+/// scale → saturation → PQ OETF in a single fragment, skipping the fp16
+/// scene buffer and the separate encode pass entirely (two full-output
+/// passes saved per frame, which at 4K/high-Hz is the difference between
+/// a game's frame budget and the compositor eating into it). Alpha is
+/// forced opaque: eligibility proved the surface covers everything.
+const SDR_TO_PQ_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform float reference_white;
+uniform float saturation;
+varying vec2 v_coords;
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+vec3 saturate_bt2020(vec3 c, float s) {
+    float luma = dot(c, vec3(0.2627, 0.6780, 0.0593));
+    return max(mix(vec3(luma), c, s), vec3(0.0));
+}
+vec3 pq_oetf(vec3 l) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 lp = pow(max(l, vec3(0.0)), vec3(m1));
+    return pow((vec3(c1) + vec3(c2) * lp) / (vec3(1.0) + vec3(c3) * lp), vec3(m2));
+}
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 straight = premult.rgb / max(premult.a, 0.001);
+    vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = saturate_bt2020(bt709_to_bt2020 * lin, saturation);
+    gl_FragColor = vec4(pq_oetf(bt2020), 1.0) * alpha;
+}
+";
+
 /// Decode an HDR PQ / BT.2020 source (a colour-managed client's buffer)
 /// into the linear BT.2020 working space. Primaries already match and the
 /// PQ EOTF lands in the 1.0 == 10000 cd/m² domain, so no rescale.
@@ -925,6 +977,10 @@ pub struct Renderer {
     /// space; the scene-frame default override for HDR outputs. See
     /// [`SDR_DECODE_SHADER`].
     sdr_decode_shader: GlesTexProgram,
+    /// Fused SDR decode → PQ encode for the single-pass HDR fast path
+    /// (one opaque SDR fullscreen surface drawn straight into the 10-bit
+    /// scanout). See [`SDR_TO_PQ_SHADER`].
+    sdr_to_pq_shader: GlesTexProgram,
     /// Decodes an HDR (PQ/BT.2020) source into the linear working space;
     /// swapped in around colour-managed surfaces. See [`HDR_DECODE_SHADER`].
     hdr_decode_shader: GlesTexProgram,
@@ -1742,6 +1798,15 @@ impl Renderer {
                 ],
             )
             .context("SDR decode shader compile failed")?;
+        let sdr_to_pq_shader = gles
+            .compile_custom_texture_shader(
+                SDR_TO_PQ_SHADER,
+                &[
+                    UniformName::new("reference_white", UniformType::_1f),
+                    UniformName::new("saturation", UniformType::_1f),
+                ],
+            )
+            .context("fused SDR→PQ shader compile failed")?;
         let hdr_decode_shader = gles
             .compile_custom_texture_shader(HDR_DECODE_SHADER, &[])
             .context("HDR decode shader compile failed")?;
@@ -2013,6 +2078,7 @@ impl Renderer {
             hdr_encode_shader,
             screenshot_tonemap_shader,
             sdr_decode_shader,
+            sdr_to_pq_shader,
             hdr_decode_shader,
             round_tex_shader_hdr,
             round_tex_shader_linear,
@@ -3554,6 +3620,7 @@ impl Renderer {
         let mask_blur_shader = self.mask_blur_shader.clone();
         let hdr_encode_shader = self.hdr_encode_shader.clone();
         let sdr_decode_shader = self.sdr_decode_shader.clone();
+        let sdr_to_pq_shader = self.sdr_to_pq_shader.clone();
         let hdr_decode_shader = self.hdr_decode_shader.clone();
         let round_tex_shader_hdr = self.round_tex_shader_hdr.clone();
         let round_tex_shader_linear = self.round_tex_shader_linear.clone();
@@ -3601,15 +3668,10 @@ impl Renderer {
         )]
         let ref_white_f32 = hdr_reference_white as f32;
 
-        // ── Direct-scanout fast path ──────────────────────────────────
-        // A single settled fullscreen opaque client whose colour mode
-        // matches the output: scan its buffer straight to the primary
-        // plane, skipping ALL compositing (≈ zero GPU for this output).
-        // Anything that needs compositing — overlays, popups, animations,
-        // captures, a non-1:1 buffer, or a buffer the plane rejects —
-        // falls through to the composite path below.
+        // Solo-fullscreen scene test, shared by the two fast paths below
+        // (direct scanout, single-pass HDR) and the wallpaper skip.
         let out_rect = Rectangle::new(compositor_position, compositor_size);
-        if let Some(direct) = self.direct_scanout_inputs(
+        let solo = self.solo_fullscreen_scene(
             idx,
             &win_draws,
             placements,
@@ -3617,9 +3679,17 @@ impl Renderer {
             popups,
             hide_cursor,
             captures,
-            hdr_surface_ids,
             compose_cursor,
-        ) {
+        );
+
+        // ── Direct-scanout fast path ──────────────────────────────────
+        // A single settled fullscreen opaque client whose colour mode
+        // matches the output: scan its buffer straight to the primary
+        // plane, skipping ALL compositing (≈ zero GPU for this output).
+        // Anything that needs compositing — overlays, popups, animations,
+        // captures, a non-1:1 buffer, or a buffer the plane rejects —
+        // falls through to the composite path below.
+        if let Some(direct) = self.direct_scanout_inputs(idx, solo, placements, hdr_surface_ids) {
             // VRR must settle before the flip (it may promote the flip to a
             // modeset); harmlessly re-applied by the composite path on a miss.
             self.apply_vrr(idx, placements);
@@ -3647,6 +3717,33 @@ impl Renderer {
                     warn!(output = %output_name, error = %err, "direct scanout failed; compositing");
                 }
             }
+        }
+
+        // The solo window, when it's additionally a *provably opaque* single
+        // surface: with every output pixel guaranteed overwritten opaquely,
+        // the wallpaper/base pass underneath is pure waste — skip it (any
+        // colour mode; this also trims the composite for SDR outputs when a
+        // game's buffer isn't plane-scannable that frame).
+        let solo_opaque = solo.filter(|&i| {
+            let surface = &placements[i].surface;
+            surface_is_single_node(surface) && surface_provably_opaque(surface)
+        });
+
+        // ── Single-pass HDR fast path ─────────────────────────────────
+        // An SDR game filling an HDR output can't direct-scan (its pixels
+        // need the PQ encode), but it doesn't need the generic HDR pipeline
+        // either — compositing into the fp16 linear scene and PQ-encoding it
+        // in a second pass costs two extra full-output passes per game
+        // frame. Instead render this frame like an SDR output (straight into
+        // the scanout dmabuf, no fp16 scene, no encode pass) with the fused
+        // SDR→PQ program as the frame default, which colour-matches the
+        // generic pipeline exactly (same decode, saturation, and OETF, one
+        // fragment instead of two passes).
+        let single_pass_hdr = hdr
+            && solo_opaque.is_some_and(|i| !hdr_surface_ids.contains(&placements[i].surface.id()));
+        if single_pass_hdr {
+            debug!(output = %output_name, "single-pass HDR: fused SDR→PQ straight to scanout");
+            hdr = false;
         }
 
         // Ensure the fp16 linear scene buffer for HDR outputs *before* the
@@ -4499,10 +4596,21 @@ impl Renderer {
             // HDR output: composite in the linear BT.2020 working space.
             // Default every override-respecting source draw (wallpaper,
             // windows, layers, popups, cursor) to the SDR decode; HDR-tagged
-            // surfaces swap to the PQ decode inside draw_window.
+            // surfaces swap to the PQ decode inside draw_window. The
+            // single-pass fast path (`hdr` demoted to false above) instead
+            // defaults to the fused SDR→PQ program — the only draw in that
+            // frame is the solo SDR window, going straight to the scanout.
             if hdr {
                 frame.override_default_tex_program(
                     sdr_decode_shader.clone(),
+                    vec![
+                        Uniform::new("reference_white", ref_white_f32),
+                        Uniform::new("saturation", hdr_saturation),
+                    ],
+                );
+            } else if single_pass_hdr {
+                frame.override_default_tex_program(
+                    sdr_to_pq_shader.clone(),
                     vec![
                         Uniform::new("reference_white", ref_white_f32),
                         Uniform::new("saturation", hdr_saturation),
@@ -4517,7 +4625,11 @@ impl Renderer {
             // Each window keeps its own `draw_render_elements` call
             // (single-element slice) so smithay's opaque-region culling
             // can't skip floats behind earlier tiles.
-            draw_base(&mut frame, hdr)?;
+            // A provably-opaque solo fullscreen window overwrites every
+            // output pixel, so the base band beneath it is skipped outright.
+            if solo_opaque.is_none() {
+                draw_base(&mut frame, hdr)?;
+            }
             // Tiled windows blur against the base (tier 0).
             for (((p, elements), wd), tex) in placements
                 .iter()
@@ -4969,17 +5081,25 @@ impl Renderer {
     /// returning the buffer keep-alive + dmabuf when so. `None` means the
     /// frame must be composited.
     ///
-    /// Eligible only when nothing needs compositing on this output: no
-    /// captures, the cursor either hidden or on the HW plane, no layer-shell/
-    /// overlay/popup/session-lock/transient surface or running animation, and
-    /// exactly one placement covers the output — a settled, 1:1, opaque
-    /// `Fullscreen` window whose colour mode matches the output (HDR output ⇔
-    /// PQ surface), backed by a single dmabuf buffer with no transform.
+    /// Whether this output's frame is exactly one settled fullscreen
+    /// window and nothing else — the scene precondition shared by direct
+    /// scanout and the single-pass HDR fast path. Returns the covering
+    /// placement's index when: no captures, the cursor needs no
+    /// compositing (hidden / off-output / on the HW plane), no popup or
+    /// layer-shell/session-lock surface overlaps this output, no
+    /// transient overlay or window animation is running, and exactly one
+    /// placement covers the output — `Fullscreen` fill, settled at 1:1
+    /// (`effective == out_rect`), fully visible (`alpha == 1`).
+    ///
+    /// Note the popup check is overlap-based, not `popups.is_empty()`:
+    /// an X11 override-redirect window some client keeps mapped on
+    /// another output (Steam does) must not veto this output's fast
+    /// paths.
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors render_output's per-frame inputs; a struct would not simplify"
     )]
-    fn direct_scanout_inputs(
+    fn solo_fullscreen_scene(
         &self,
         idx: usize,
         win_draws: &[WinDraw],
@@ -4988,9 +5108,8 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
-        hdr_surface_ids: &HashSet<ObjectId>,
         compose_cursor: bool,
-    ) -> Option<DirectInputs> {
+    ) -> Option<usize> {
         let output = &self.outputs[idx];
         let out_rect = Rectangle::new(output.compositor_position, output.compositor_size);
 
@@ -5003,7 +5122,9 @@ impl Renderer {
         // Anything that draws above a fullscreen window forces compositing.
         // `layers` carries real layer-shell surfaces *and* the session-lock
         // surface (injected as an Overlay layer by render_crtc).
-        if !popups.is_empty() || layers.iter().any(|l| l.rect.overlaps(out_rect)) {
+        if popups.iter().any(|pp| pp.rect.overlaps(out_rect))
+            || layers.iter().any(|l| l.rect.overlaps(out_rect))
+        {
             return None;
         }
         // Transient overlays / running window animations (any of which draws
@@ -5031,8 +5152,7 @@ impl Renderer {
             return None;
         }
 
-        // It must be a settled (1:1, fully opaque) fullscreen window whose
-        // colour mode matches the output.
+        // It must be a settled (1:1, fully visible) fullscreen window.
         if p.fill != FillMode::Fullscreen || p.slide_dy != 0 {
             return None;
         }
@@ -5040,6 +5160,27 @@ impl Renderer {
         if draw.effective != out_rect || draw.alpha < 1.0 {
             return None;
         }
+        Some(i)
+    }
+
+    /// Eligible only when the scene is a solo fullscreen window (see
+    /// [`Self::solo_fullscreen_scene`], decided by the caller) whose colour
+    /// mode matches the output (HDR output ⇔ PQ surface), backed by a
+    /// single dmabuf buffer with no transform that is pixel-exact with the
+    /// mode.
+    fn direct_scanout_inputs(
+        &self,
+        idx: usize,
+        solo: Option<usize>,
+        placements: &[Placement],
+        hdr_surface_ids: &HashSet<ObjectId>,
+    ) -> Option<DirectInputs> {
+        let output = &self.outputs[idx];
+        let p = placements.get(solo?)?;
+
+        // The window's colour mode must match the output: an SDR surface on
+        // an HDR output needs the compositor's PQ encode (see the single-pass
+        // fast path), a PQ surface on an SDR output needs a tonemap.
         if output.hdr != hdr_surface_ids.contains(&p.surface.id()) {
             return None;
         }
@@ -5186,6 +5327,25 @@ fn collect_presentation_feedback(
         }
     }
     feedback
+}
+
+/// Whether `surface`'s committed buffer provably covers its whole extent
+/// opaquely, per smithay's computed opaque regions (a no-alpha buffer gets
+/// a full-extent region automatically; an alpha buffer carries the client's
+/// declared region). Checked against both the buffer's logical size and the
+/// surface view's destination — client-declared regions are surface-local
+/// while smithay's auto-region is view-sized, and a full cover in either
+/// unit system is a genuine full-coverage declaration. Used by the
+/// composite fast paths that skip drawing anything underneath the surface.
+fn surface_provably_opaque(surface: &WlSurface) -> bool {
+    with_renderer_surface_state(surface, |state| {
+        let (Some(buf), Some(view)) = (state.buffer_size(), state.view()) else {
+            return false;
+        };
+        opaque_region_covers(state.opaque_regions(), buf)
+            || opaque_region_covers(state.opaque_regions(), view.dst)
+    })
+    .unwrap_or(false)
 }
 
 /// Whether `surface`'s tree is a single node (no subsurfaces). A prerequisite
