@@ -6501,3 +6501,301 @@ fn draw_cursor(
         .context("Frame::draw_solid (cursor) failed")?;
     Ok(())
 }
+
+/// Headless GPU pass benchmark: measures the raw cost of every composite
+/// pass this renderer uses, on a surfaceless EGL context over the render
+/// node — no DRM master, no seat, safe to run inside a live session:
+///
+/// ```text
+/// cargo test gpu_bench -- --ignored --nocapture
+/// ```
+///
+/// What it can measure: per-pass GPU milliseconds at 4K (plain copy, SDR
+/// decode, fused SDR→PQ, HDR encode, the blur pyramid, decoration
+/// offscreens with/without a cached allocation). What it can't: KMS
+/// flips, VRR pacing, real client buffers — those need the live session
+/// (see `RenderProfile`, logged every 5 s). Timing brackets each
+/// iteration with a fence wait, so numbers are slightly pessimistic
+/// (no cross-frame pipelining) but directly comparable to each other.
+#[cfg(test)]
+mod gpu_bench {
+    use super::*;
+    use smithay::backend::allocator::gbm::GbmDevice;
+    use smithay::reexports::drm::node::DrmNode as BenchDrmNode;
+    use smithay::utils::DeviceFd;
+    use std::fs::OpenOptions;
+    use std::os::fd::OwnedFd;
+
+    const W: i32 = 3840;
+    const H: i32 = 2160;
+    const ITERS: u32 = 60;
+
+    fn bench<F: FnMut() -> Result<()>>(name: &str, mut f: F) {
+        // Warmup (shader compile, first-use allocations).
+        for _ in 0..3 {
+            f().expect("bench warmup failed");
+        }
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            f().expect("bench iteration failed");
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERS);
+        println!("{name:<44} {ms:>8.3} ms");
+    }
+
+    #[test]
+    #[ignore = "GPU benchmark; run manually with --ignored --nocapture"]
+    fn gpu_bench() {
+        let _ = BenchDrmNode::from_path("/dev/dri/renderD128");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .expect("open render node");
+        let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+        let gbm = GbmDevice::new(fd).expect("GbmDevice");
+        #[allow(
+            unsafe_code,
+            reason = "same contract as Renderer::new: the Arc-backed GbmDevice clone lives inside EGLDisplay for its full lifetime"
+        )]
+        // SAFETY: see #[allow] above.
+        let display = unsafe { EGLDisplay::new(gbm.clone()) }.expect("EGLDisplay");
+        let context = EGLContext::new(&display).expect("EGLContext");
+        #[allow(
+            unsafe_code,
+            reason = "same contract as Renderer::new: the context is used from this single test thread only"
+        )]
+        // SAFETY: see #[allow] above.
+        let mut gles = unsafe { GlesRenderer::new(context) }.expect("GlesRenderer");
+
+        let uniforms = [
+            UniformName::new("reference_white", UniformType::_1f),
+            UniformName::new("saturation", UniformType::_1f),
+        ];
+        let sdr_decode = gles
+            .compile_custom_texture_shader(SDR_DECODE_SHADER, &uniforms)
+            .expect("sdr decode shader");
+        let sdr_to_pq = gles
+            .compile_custom_texture_shader(SDR_TO_PQ_SHADER, &uniforms)
+            .expect("fused shader");
+        let hdr_encode = gles
+            .compile_custom_texture_shader(HDR_ENCODE_SHADER, &[])
+            .expect("encode shader");
+        let blur_uniforms = [
+            UniformName::new("half_pixel", UniformType::_2f),
+            UniformName::new("radius", UniformType::_1f),
+        ];
+        let blur_down = gles
+            .compile_custom_texture_shader(BLUR_DOWN, &blur_uniforms)
+            .expect("blur down");
+        let blur_up = gles
+            .compile_custom_texture_shader(BLUR_UP, &blur_uniforms)
+            .expect("blur up");
+
+        let size = Size::<i32, smithay::utils::Buffer>::from((W, H));
+        let phys = Size::<i32, Physical>::from((W, H));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let src_rect = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+            f64::from(W),
+            f64::from(H),
+        )));
+        let dst_rect = Rectangle::<i32, Physical>::from_size(phys);
+
+        let source: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr8888, size)
+            .expect("source tex");
+        let source_fp16: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr16161616f, size)
+            .expect("fp16 source");
+        let mut target8: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr8888, size)
+            .expect("8-bit target");
+        let mut target_fp16: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr16161616f, size)
+            .expect("fp16 target");
+        let mut target10: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr2101010, size)
+            .expect("10-bit target");
+
+        // One full-screen textured pass into `target` with `program`.
+        macro_rules! pass {
+            ($target:expr, $tex:expr, $program:expr, $unis:expr) => {{
+                let mut bound = gles.bind($target)?;
+                let mut frame = gles.render(&mut bound, phys, Transform::Normal)?;
+                frame.render_texture_from_to(
+                    $tex,
+                    src_rect,
+                    dst_rect,
+                    &full,
+                    &full,
+                    Transform::Normal,
+                    1.0,
+                    $program,
+                    $unis,
+                )?;
+                let sync = frame.finish()?;
+                drop(bound);
+                sync.wait();
+                Result::<()>::Ok(())
+            }};
+        }
+        let unis = [
+            Uniform::new("reference_white", 400.0_f32),
+            Uniform::new("saturation", 1.0_f32),
+        ];
+
+        println!("\n== libreland GPU pass benchmark: {W}x{H}, {ITERS} iters, fence-bounded ==");
+        bench("copy 8-bit -> 8-bit (default sampler)", || {
+            pass!(&mut target8, &source, None, &[])
+        });
+        bench("SDR decode 8-bit -> fp16 (HDR scene draw)", || {
+            pass!(&mut target_fp16, &source, Some(&sdr_decode), &unis)
+        });
+        bench("PQ encode fp16 -> 10-bit (HDR final pass)", || {
+            pass!(&mut target10, &source_fp16, Some(&hdr_encode), &[])
+        });
+        bench("fused SDR->PQ 8-bit -> 10-bit (single-pass)", || {
+            pass!(&mut target10, &source, Some(&sdr_to_pq), &unis)
+        });
+
+        // Decoration offscreen: fresh allocation + draw each frame (the
+        // old behaviour) vs drawing into a kept allocation (the cache's
+        // stale-content path; a cache HIT costs no GPU work at all).
+        let cell = Size::<i32, smithay::utils::Buffer>::from((1280, 1440));
+        let cell_phys = Size::<i32, Physical>::from((1280, 1440));
+        let cell_full = [Rectangle::<i32, Physical>::from_size(cell_phys)];
+        let cell_src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+            1280.0_f64, 1440.0_f64,
+        )));
+        let cell_dst = Rectangle::<i32, Physical>::from_size(cell_phys);
+        bench("win_tex: alloc + draw (old, per frame)", || {
+            let mut tex: GlesTexture = gles.create_buffer(Fourcc::Abgr8888, cell)?;
+            let mut bound = gles.bind(&mut tex)?;
+            let mut frame = gles.render(&mut bound, cell_phys, Transform::Normal)?;
+            frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &cell_full)?;
+            frame.render_texture_from_to(
+                &source,
+                cell_src,
+                cell_dst,
+                &cell_full,
+                &cell_full,
+                Transform::Normal,
+                1.0,
+                None,
+                &[],
+            )?;
+            let sync = frame.finish()?;
+            drop(bound);
+            sync.wait();
+            Ok(())
+        });
+        let mut kept: GlesTexture = gles.create_buffer(Fourcc::Abgr8888, cell).expect("kept tex");
+        bench("win_tex: draw into kept alloc (stale cache)", || {
+            let mut bound = gles.bind(&mut kept)?;
+            let mut frame = gles.render(&mut bound, cell_phys, Transform::Normal)?;
+            frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &cell_full)?;
+            frame.render_texture_from_to(
+                &source,
+                cell_src,
+                cell_dst,
+                &cell_full,
+                &cell_full,
+                Transform::Normal,
+                1.0,
+                None,
+                &[],
+            )?;
+            let sync = frame.finish()?;
+            drop(bound);
+            sync.wait();
+            Ok(())
+        });
+
+        // Blur pyramid: N down + N up dual-filter passes over halving mips,
+        // the shape of `run_pyramid` (per tier; three tiers can run per
+        // frame). Levels allocated once like BlurScratch.
+        let passes = 6usize;
+        let mut levels: Vec<GlesTexture> = (0..=passes)
+            .map(|k| {
+                let w = (W >> k).max(1);
+                let h = (H >> k).max(1);
+                gles.create_buffer(
+                    Fourcc::Abgr8888,
+                    Size::<i32, smithay::utils::Buffer>::from((w, h)),
+                )
+                .expect("blur level")
+            })
+            .collect();
+        bench("blur pyramid, 6 passes (one tier)", || {
+            for k in 0..passes {
+                let (src_slice, dst_slice) = levels.split_at_mut(k + 1);
+                let s = &src_slice[k];
+                let d = &mut dst_slice[0];
+                let dw = (W >> (k + 1)).max(1);
+                let dh = (H >> (k + 1)).max(1);
+                let dphys = Size::<i32, Physical>::from((dw, dh));
+                let dfull = [Rectangle::<i32, Physical>::from_size(dphys)];
+                let hp = [
+                    Uniform::new("half_pixel", [0.5 / f64::from(dw) as f32, 0.5 / f64::from(dh) as f32]),
+                    Uniform::new("radius", 8.0_f32),
+                ];
+                let mut bound = gles.bind(d)?;
+                let mut frame = gles.render(&mut bound, dphys, Transform::Normal)?;
+                frame.render_texture_from_to(
+                    s,
+                    Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                        f64::from((W >> k).max(1)),
+                        f64::from((H >> k).max(1)),
+                    ))),
+                    Rectangle::<i32, Physical>::from_size(dphys),
+                    &dfull,
+                    &dfull,
+                    Transform::Normal,
+                    1.0,
+                    Some(&blur_down),
+                    &hp,
+                )?;
+                frame.finish()?;
+                drop(bound);
+            }
+            for k in (0..passes).rev() {
+                let (dst_slice, src_slice) = levels.split_at_mut(k + 1);
+                let s = &src_slice[0];
+                let d = &mut dst_slice[k];
+                let dw = (W >> k).max(1);
+                let dh = (H >> k).max(1);
+                let dphys = Size::<i32, Physical>::from((dw, dh));
+                let dfull = [Rectangle::<i32, Physical>::from_size(dphys)];
+                let hp = [
+                    Uniform::new("half_pixel", [0.5 / f64::from(dw) as f32, 0.5 / f64::from(dh) as f32]),
+                    Uniform::new("radius", 8.0_f32),
+                ];
+                let mut bound = gles.bind(d)?;
+                let mut frame = gles.render(&mut bound, dphys, Transform::Normal)?;
+                let sync = frame.render_texture_from_to(
+                    s,
+                    Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                        f64::from((W >> (k + 1)).max(1)),
+                        f64::from((H >> (k + 1)).max(1)),
+                    ))),
+                    Rectangle::<i32, Physical>::from_size(dphys),
+                    &dfull,
+                    &dfull,
+                    Transform::Normal,
+                    1.0,
+                    Some(&blur_up),
+                    &hp,
+                )
+                .map(|()| frame.finish())?;
+                drop(bound);
+                if k == 0 {
+                    sync?.wait();
+                } else {
+                    sync?;
+                }
+            }
+            Ok(())
+        });
+        println!();
+    }
+}
