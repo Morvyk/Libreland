@@ -7014,7 +7014,7 @@ mod gpu_bench {
                 )?;
                 let sync = frame.finish()?;
                 drop(bound);
-                sync.wait();
+                let _ = sync.wait();
                 Result::<()>::Ok(())
             }};
         }
@@ -7060,7 +7060,7 @@ mod gpu_bench {
             )?;
             let sync = frame.finish()?;
             drop(bound);
-            sync.wait();
+            let _ = sync.wait();
             Ok(())
         });
 
@@ -7092,7 +7092,7 @@ mod gpu_bench {
             )?;
             let sync = frame.finish()?;
             drop(bound);
-            sync.wait();
+            let _ = sync.wait();
             Ok(())
         });
         let mut kept: GlesTexture = gles.create_buffer(Fourcc::Abgr8888, cell).expect("kept tex");
@@ -7113,7 +7113,7 @@ mod gpu_bench {
             )?;
             let sync = frame.finish()?;
             drop(bound);
-            sync.wait();
+            let _ = sync.wait();
             Ok(())
         });
 
@@ -7161,7 +7161,7 @@ mod gpu_bench {
                     Some(&blur_down),
                     &hp,
                 )?;
-                frame.finish()?;
+                let _ = frame.finish()?;
                 drop(bound);
             }
             for k in (0..passes).rev() {
@@ -7194,10 +7194,9 @@ mod gpu_bench {
                 )
                 .map(|()| frame.finish())?;
                 drop(bound);
+                let sync = sync?;
                 if k == 0 {
-                    sync?.wait();
-                } else {
-                    sync?;
+                    let _ = sync.wait();
                 }
             }
             Ok(())
