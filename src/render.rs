@@ -34,7 +34,8 @@ use smithay::backend::renderer::gles::{
     UniformType,
 };
 use smithay::backend::renderer::utils::{
-    Buffer as ClientBuffer, draw_render_elements, with_renderer_surface_state,
+    Buffer as ClientBuffer, RendererSurfaceStateUserData, draw_render_elements,
+    with_renderer_surface_state,
 };
 use smithay::backend::renderer::{
     Bind as _, Blit as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
@@ -3719,30 +3720,44 @@ impl Renderer {
             }
         }
 
-        // The solo window, when it's additionally a *provably opaque* single
-        // surface: with every output pixel guaranteed overwritten opaquely,
-        // the wallpaper/base pass underneath is pure waste — skip it (any
-        // colour mode; this also trims the composite for SDR outputs when a
-        // game's buffer isn't plane-scannable that frame).
+        // The solo window, when its visually-topmost mapped node covers the
+        // output *provably opaquely*: with every output pixel guaranteed
+        // overwritten, the wallpaper/base pass underneath is pure waste —
+        // skip it (any colour mode; this also trims the composite for SDR
+        // outputs when a game's buffer isn't plane-scannable that frame).
         let solo_opaque = solo.filter(|&i| {
-            let surface = &placements[i].surface;
-            surface_is_single_node(surface) && surface_provably_opaque(surface)
+            covering_top_node(&placements[i].surface).is_some_and(|(node, rect)| {
+                rect.loc == Point::from((0, 0))
+                    && rect.size.w == compositor_size.w
+                    && rect.size.h == compositor_size.h
+                    && surface_provably_opaque(&node)
+            })
         });
 
         // ── Single-pass HDR fast path ─────────────────────────────────
-        // An SDR game filling an HDR output can't direct-scan (its pixels
-        // need the PQ encode), but it doesn't need the generic HDR pipeline
-        // either — compositing into the fp16 linear scene and PQ-encoding it
-        // in a second pass costs two extra full-output passes per game
-        // frame. Instead render this frame like an SDR output (straight into
-        // the scanout dmabuf, no fp16 scene, no encode pass) with the fused
-        // SDR→PQ program as the frame default, which colour-matches the
-        // generic pipeline exactly (same decode, saturation, and OETF, one
-        // fragment instead of two passes).
-        let single_pass_hdr = hdr
-            && solo_opaque.is_some_and(|i| !hdr_surface_ids.contains(&placements[i].surface.id()));
+        // A solo opaque window filling an HDR output doesn't need the
+        // generic HDR pipeline (composite into the fp16 linear scene +
+        // a second PQ-encode pass = two extra full-output passes per game
+        // frame). Render the frame like an SDR output instead — straight
+        // into the scanout dmabuf, no fp16 scene, no encode pass:
+        //
+        // - an SDR window draws with the fused SDR→PQ program as the frame
+        //   default, which colour-matches the generic pipeline exactly
+        //   (same decode, saturation and OETF maths, one fragment);
+        // - a PQ-tagged window (an HDR game that direct scanout couldn't
+        //   take this frame — e.g. its buffer was rejected by the plane)
+        //   needs NO program at all: on a PQ output, decode→encode is the
+        //   identity, so the default sampler copies its pixels straight
+        //   to the 10-bit scanout.
+        let solo_hdr_surface =
+            solo_opaque.is_some_and(|i| hdr_surface_ids.contains(&placements[i].surface.id()));
+        let single_pass_hdr = hdr && solo_opaque.is_some();
         if single_pass_hdr {
-            debug!(output = %output_name, "single-pass HDR: fused SDR→PQ straight to scanout");
+            debug!(
+                output = %output_name,
+                passthrough = solo_hdr_surface,
+                "single-pass HDR: solo window straight to scanout"
+            );
             hdr = false;
         }
 
@@ -4608,7 +4623,7 @@ impl Renderer {
                         Uniform::new("saturation", hdr_saturation),
                     ],
                 );
-            } else if single_pass_hdr {
+            } else if single_pass_hdr && !solo_hdr_surface {
                 frame.override_default_tex_program(
                     sdr_to_pq_shader.clone(),
                     vec![
@@ -4617,6 +4632,9 @@ impl Renderer {
                     ],
                 );
             }
+            // (single_pass_hdr && solo_hdr_surface: no override — the solo
+            // window's pixels are already PQ/BT.2020, exactly what the
+            // 10-bit scanout wants; the default sampler is the identity.)
 
             // Backdrop bands drawn fresh, interleaving the blurred tiers so
             // each translucent surface reveals a blurred copy of whatever
@@ -5184,31 +5202,39 @@ impl Renderer {
         if output.hdr != hdr_surface_ids.contains(&p.surface.id()) {
             return None;
         }
-        // A toplevel with subsurfaces isn't a single scannable buffer.
-        if !surface_is_single_node(&p.surface) {
+        // The window's visually-topmost mapped node must itself cover the
+        // whole output; that node's buffer is the scanout candidate. (A bare
+        // toplevel is its own top node; Wine Wayland's game swapchain is a
+        // subsurface stacked above the host toplevel's buffer — requiring a
+        // single-node tree here kept every Wine Wayland game compositing.)
+        // Node coordinates are window-buffer-local, and a fullscreen
+        // window's buffer origin sits at the cell origin (= the output
+        // origin), so covering the output means exactly (0,0)..out_size.
+        let out_size = output.compositor_size;
+        let (node, node_rect) = covering_top_node(&p.surface)?;
+        if node_rect.loc != Point::from((0, 0))
+            || node_rect.size.w != out_size.w
+            || node_rect.size.h != out_size.h
+        {
             return None;
         }
 
-        // Extract a scanout-ready dmabuf + keep-alive from the committed
-        // buffer. Rejects shm buffers, transformed buffers, viewport-cropped
-        // buffers, buffers whose pixels don't match the mode 1:1, and buffers
-        // we can't prove are opaque.
+        // Extract a scanout-ready dmabuf + keep-alive from the node's
+        // committed buffer. Rejects shm buffers, transformed buffers,
+        // viewport-cropped buffers, buffers whose pixels don't match the
+        // mode 1:1, and buffers we can't prove are opaque.
         let mode_size = output.mode_size;
-        let out_size = output.compositor_size;
-        with_renderer_surface_state(&p.surface, |state| {
-            // The buffer must land on the plane 1:1: no rotation, no crop
-            // (src covers the whole surface), and a logical destination that
-            // covers exactly this output. dst is compared against the OUTPUT
-            // size, not the buffer: a fractional-aware client (oversized
-            // buffer + viewport) and an Xwayland client under the client
-            // scale (physical-sized buffer that smithay shrinks logically)
-            // both have dst < buffer *by design* while their pixels still
-            // match the mode exactly — `dmabuf.size == mode_size` below is
-            // the pixel-exactness gate. Requiring `dst == buffer` here kept
-            // every such fullscreen game compositing (0 scanned-out frames in
-            // a whole session). `buffer_scale` needs no check of its own —
-            // it's already folded into both src (surface-logical units) and
-            // dst.
+        with_renderer_surface_state(&node, |state| {
+            // The buffer must land on the plane 1:1: no rotation and no crop
+            // (src covers the whole surface). The destination was already
+            // checked above against the OUTPUT size, not the buffer: a
+            // fractional-aware client (oversized buffer + viewport) and an
+            // Xwayland client under the client scale (physical-sized buffer
+            // that smithay shrinks logically) both have dst < buffer *by
+            // design* while their pixels still match the mode exactly —
+            // `dmabuf.size == mode_size` below is the pixel-exactness gate.
+            // `buffer_scale` needs no check of its own — it's already folded
+            // into both src (surface-logical units) and dst.
             if state.buffer_transform() != Transform::Normal {
                 return None;
             }
@@ -5218,8 +5244,6 @@ impl Renderer {
             if src_loc.x != 0
                 || src_loc.y != 0
                 || view.src.size.to_i32_round::<i32>() != buf
-                || view.dst.w != out_size.w
-                || view.dst.h != out_size.h
             {
                 return None;
             }
@@ -5231,14 +5255,19 @@ impl Renderer {
                 return None;
             }
 
-            // Provable opacity. The composite path blends an alpha buffer over
-            // the wallpaper; direct scanout ignores the alpha (nothing is below
-            // the primary plane), so the two only agree when the surface is
-            // actually opaque. A no-alpha format is inherently opaque; an alpha
-            // format must declare a full opaque region. An opaque alpha buffer
-            // is scanned out via the opaque sibling fourcc.
+            // Provable opacity. The composite path blends an alpha buffer
+            // over what's beneath (wallpaper, or lower tree nodes); direct
+            // scanout ignores the alpha (the opaque sibling fourcc), so the
+            // two only agree when the surface is actually opaque. A no-alpha
+            // format is inherently opaque; an 8-bit alpha format must
+            // declare a full opaque region (a translucent fullscreen
+            // terminal must keep compositing); a [`vestigial_alpha`] HDR
+            // swapchain format is accepted as-is.
             let code = dmabuf.format().code;
-            if has_alpha(code) && !opaque_region_covers(state.opaque_regions(), buf) {
+            if has_alpha(code)
+                && !vestigial_alpha(code)
+                && !opaque_region_covers(state.opaque_regions(), buf)
+            {
                 return None;
             }
             let use_opaque = has_alpha(code);
@@ -5329,40 +5358,97 @@ fn collect_presentation_feedback(
     feedback
 }
 
+/// Formats whose alpha channel is vestigial: 2-bit-alpha 10-bit and fp16 —
+/// the HDR swapchain formats. No UI translucency fits in 2 alpha bits,
+/// Vulkan swapchains present opaque frames, and no client declares opaque
+/// regions on them (Wine doesn't) — so the fast paths treat them as opaque
+/// rather than reject every HDR game.
+fn vestigial_alpha(code: Fourcc) -> bool {
+    matches!(
+        code,
+        Fourcc::Argb2101010
+            | Fourcc::Abgr2101010
+            | Fourcc::Rgba1010102
+            | Fourcc::Bgra1010102
+            | Fourcc::Abgr16161616f
+            | Fourcc::Argb16161616f
+    )
+}
+
 /// Whether `surface`'s committed buffer provably covers its whole extent
-/// opaquely, per smithay's computed opaque regions (a no-alpha buffer gets
+/// opaquely: per smithay's computed opaque regions (a no-alpha buffer gets
 /// a full-extent region automatically; an alpha buffer carries the client's
-/// declared region). Checked against both the buffer's logical size and the
-/// surface view's destination — client-declared regions are surface-local
-/// while smithay's auto-region is view-sized, and a full cover in either
-/// unit system is a genuine full-coverage declaration. Used by the
-/// composite fast paths that skip drawing anything underneath the surface.
+/// declared region), or by carrying a [`vestigial_alpha`] format. Regions
+/// are checked against both the buffer's logical size and the surface
+/// view's destination — client-declared regions are surface-local while
+/// smithay's auto-region is view-sized, and a full cover in either unit
+/// system is a genuine full-coverage declaration. Used by the composite
+/// fast paths that skip drawing anything underneath the surface.
 fn surface_provably_opaque(surface: &WlSurface) -> bool {
     with_renderer_surface_state(surface, |state| {
         let (Some(buf), Some(view)) = (state.buffer_size(), state.view()) else {
             return false;
         };
+        if let Some(buffer) = state.buffer()
+            && let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(buffer)
+            && vestigial_alpha(dmabuf.format().code)
+        {
+            return true;
+        }
         opaque_region_covers(state.opaque_regions(), buf)
             || opaque_region_covers(state.opaque_regions(), view.dst)
     })
     .unwrap_or(false)
 }
 
-/// Whether `surface`'s tree is a single node (no subsurfaces). A prerequisite
-/// for direct scanout: subsurfaces would be lost if we latched only the root
-/// buffer onto the plane.
-fn surface_is_single_node(surface: &WlSurface) -> bool {
-    let mut count = 0usize;
+/// The visually-topmost mapped node of `root`'s surface tree — the first
+/// buffer-carrying surface in top-to-bottom traversal — with its view
+/// rect in window-buffer-local coordinates (subsurface offsets folded
+/// in). The scanout / base-skip fast paths need "one buffer visually IS
+/// this window": a plain toplevel is its own top node, while e.g. Wine
+/// Wayland mounts a game's Vulkan swapchain on a subsurface stacked
+/// above the host toplevel's buffer — that subsurface is what's actually
+/// on screen, and when its rect covers the whole output, everything
+/// beneath it in the tree is invisible.
+fn covering_top_node(root: &WlSurface) -> Option<(WlSurface, Rectangle<i32, Logical>)> {
+    use std::cell::RefCell;
+    let found: RefCell<Option<(WlSurface, Rectangle<i32, Logical>)>> = RefCell::new(None);
     with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, &()| TraversalAction::DoChildren(()),
-        |_, _, &()| {
-            count += 1;
+        root,
+        Point::<i32, Logical>::from((0, 0)),
+        |_, states, loc| {
+            if found.borrow().is_some() {
+                return TraversalAction::SkipChildren;
+            }
+            let mut loc = *loc;
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            if let Some(view) = data.and_then(|d| d.lock().unwrap().view()) {
+                loc += view.offset;
+                TraversalAction::DoChildren(loc)
+            } else {
+                // An unmapped parent hides its children too.
+                TraversalAction::SkipChildren
+            }
         },
-        |_, _, &()| true,
+        |surface, states, loc| {
+            if found.borrow().is_some() {
+                return;
+            }
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            let Some(data) = data else { return };
+            let state = data.lock().unwrap();
+            if state.buffer().is_none() {
+                return;
+            }
+            let Some(view) = state.view() else { return };
+            found.replace(Some((
+                surface.clone(),
+                Rectangle::new(*loc + view.offset, view.dst),
+            )));
+        },
+        |_, _, _| true,
     );
-    count == 1
+    found.into_inner()
 }
 
 /// CPU read-back: copy `spec.region` of `target` into a tight buffer.
