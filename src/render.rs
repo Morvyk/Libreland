@@ -5131,11 +5131,31 @@ impl Renderer {
         let output = &self.outputs[idx];
         let out_rect = Rectangle::new(output.compositor_position, output.compositor_size);
 
+        // Every rejection below names itself in the debug log, but only
+        // while a fullscreen window is actually covering this output —
+        // that's the situation where a vetoed fast path costs real frames
+        // and the reason is worth reading back from a session log; on a
+        // plain desktop the veto is the permanent normal case.
+        let fullscreen_covers = placements
+            .iter()
+            .any(|p| p.fill == FillMode::Fullscreen && p.cell_rect.overlaps(out_rect));
+        macro_rules! veto {
+            ($reason:literal) => {{
+                if fullscreen_covers {
+                    debug!(output = %output.name, reason = $reason, "solo-fullscreen fast paths vetoed");
+                }
+                return None;
+            }};
+        }
+
         // A capture must read a composited framebuffer; the cursor must not
         // need drawing into this output's frame (hidden and off-output
         // pointers need nothing; a plane-resident one scans out alongside).
-        if !captures.is_empty() || self.cursor_needs_composite(idx, hide_cursor, compose_cursor) {
-            return None;
+        if !captures.is_empty() {
+            veto!("pending capture");
+        }
+        if self.cursor_needs_composite(idx, hide_cursor, compose_cursor) {
+            veto!("software cursor");
         }
         // Anything that draws ABOVE a fullscreen window forces compositing:
         // popups, and *Overlay* layer surfaces (which include the
@@ -5147,48 +5167,65 @@ impl Renderer {
         // over the whole session (quickshell parks ten such `qs-popup`
         // Overlay surfaces at startup), and a buffer-less surface draws
         // nothing.
-        if popups.iter().any(|pp| pp.rect.overlaps(out_rect))
-            || layers.iter().any(|l| {
-                matches!(l.layer, LayerBucket::Overlay)
-                    && l.rect.overlaps(out_rect)
-                    && with_renderer_surface_state(&l.surface, |state| state.buffer().is_some())
-                        .unwrap_or(false)
-            })
-        {
-            return None;
+        if popups.iter().any(|pp| pp.rect.overlaps(out_rect)) {
+            veto!("popup overlaps");
         }
-        // Transient overlays / running window animations (any of which draws
-        // over, or distorts, the fullscreen window) → composite.
-        if !self.closing.is_empty()
-            || !self.pending_open.is_empty()
-            || self.screenshot_overlay.is_some()
+        if layers.iter().any(|l| {
+            matches!(l.layer, LayerBucket::Overlay)
+                && l.rect.overlaps(out_rect)
+                && with_renderer_surface_state(&l.surface, |state| state.buffer().is_some())
+                    .unwrap_or(false)
+        }) {
+            veto!("mapped overlay layer overlaps");
+        }
+        // Transient overlays that draw ABOVE a fullscreen window →
+        // composite. Scoped to this output where possible: a closing
+        // window's fade-out snapshot draws above fullscreen, so it only
+        // matters when its rect overlaps this output; the screenshot
+        // overlay / DnD icon / frozen backdrop always composite. (Pending
+        // open marks and running move/open animations are checked against
+        // the covering window itself below — on any *other* window they
+        // animate beneath the fullscreen one, invisibly.)
+        if self.closing.iter().any(|c| c.rect.overlaps(out_rect)) {
+            veto!("closing animation overlaps");
+        }
+        if self.screenshot_overlay.is_some()
             || self.dnd_icon.is_some()
             || self.freeze_textures.contains_key(&output.name)
-            || self
-                .win_anims
-                .values()
-                .any(|w| w.move_anim.is_some() || w.open_anim.is_some())
         {
-            return None;
+            veto!("screenshot/DnD overlay active");
         }
 
-        // Exactly one placement may cover the output.
-        let mut covering = placements
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.cell_rect.overlaps(out_rect));
+        // Exactly one *fullscreen* placement may cover the output. Windows
+        // with any other fill draw BENEATH a fullscreen one (tiled →
+        // floating → maximized → Top layers → fullscreen), so tiled and
+        // floating windows sharing the workspace — the Steam client behind
+        // the game it launched — are invisible behind it and don't matter.
+        let mut covering = placements.iter().enumerate().filter(|(_, p)| {
+            p.fill == FillMode::Fullscreen && p.cell_rect.overlaps(out_rect)
+        });
         let (i, p) = covering.next()?;
         if covering.next().is_some() {
-            return None;
+            veto!("two fullscreen windows cover the output");
         }
 
-        // It must be a settled (1:1, fully visible) fullscreen window.
-        if p.fill != FillMode::Fullscreen || p.slide_dy != 0 {
-            return None;
+        // It must be settled: parked at 1:1 over the whole output, fully
+        // visible, mid-workspace-slide excluded, and neither waiting on its
+        // open animation nor animating its rect.
+        if p.slide_dy != 0 {
+            veto!("workspace slide in progress");
         }
         let draw = win_draws.get(i)?;
         if draw.effective != out_rect || draw.alpha < 1.0 {
-            return None;
+            veto!("window not settled at 1:1 opaque");
+        }
+        if self.pending_open.contains(&p.surface.id())
+            || self
+                .win_anims
+                .get(&p.surface.id())
+                .is_some_and(|w| w.move_anim.is_some() || w.open_anim.is_some())
+        {
+            veto!("window open/move animation running");
         }
         Some(i)
     }
@@ -5208,11 +5245,22 @@ impl Renderer {
         let output = &self.outputs[idx];
         let p = placements.get(solo?)?;
 
+        // Every rejection names itself at debug so a session log can say
+        // exactly why a fullscreen game isn't on the plane (the caller
+        // already established the solo-fullscreen scene, so this never
+        // fires for plain desktop use).
+        macro_rules! reject {
+            ($reason:literal) => {{
+                debug!(output = %output.name, reason = $reason, "direct scanout rejected; compositing");
+                return None;
+            }};
+        }
+
         // The window's colour mode must match the output: an SDR surface on
         // an HDR output needs the compositor's PQ encode (see the single-pass
         // fast path), a PQ surface on an SDR output needs a tonemap.
         if output.hdr != hdr_surface_ids.contains(&p.surface.id()) {
-            return None;
+            reject!("surface/output colour mode mismatch (SDR on HDR takes the single-pass path)");
         }
         // The window's visually-topmost mapped node must itself cover the
         // whole output; that node's buffer is the scanout candidate. (A bare
@@ -5223,12 +5271,14 @@ impl Renderer {
         // window's buffer origin sits at the cell origin (= the output
         // origin), so covering the output means exactly (0,0)..out_size.
         let out_size = output.compositor_size;
-        let (node, node_rect) = covering_top_node(&p.surface)?;
+        let Some((node, node_rect)) = covering_top_node(&p.surface) else {
+            reject!("window has no mapped surface node");
+        };
         if node_rect.loc != Point::from((0, 0))
             || node_rect.size.w != out_size.w
             || node_rect.size.h != out_size.h
         {
-            return None;
+            reject!("topmost surface node doesn't cover the output");
         }
 
         // Extract a scanout-ready dmabuf + keep-alive from the node's
@@ -5236,7 +5286,14 @@ impl Renderer {
         // viewport-cropped buffers, buffers whose pixels don't match the
         // mode 1:1, and buffers we can't prove are opaque.
         let mode_size = output.mode_size;
+        let name = &output.name;
         with_renderer_surface_state(&node, |state| {
+            macro_rules! reject {
+                ($reason:literal) => {{
+                    debug!(output = %name, reason = $reason, "direct scanout rejected; compositing");
+                    return None;
+                }};
+            }
             // The buffer must land on the plane 1:1: no rotation and no crop
             // (src covers the whole surface). The destination was already
             // checked above against the OUTPUT size, not the buffer: a
@@ -5248,7 +5305,7 @@ impl Renderer {
             // `buffer_scale` needs no check of its own — it's already folded
             // into both src (surface-logical units) and dst.
             if state.buffer_transform() != Transform::Normal {
-                return None;
+                reject!("buffer is transformed");
             }
             let buf = state.buffer_size()?;
             let view = state.view()?;
@@ -5257,14 +5314,17 @@ impl Renderer {
                 || src_loc.y != 0
                 || view.src.size.to_i32_round::<i32>() != buf
             {
-                return None;
+                reject!("viewport crops the buffer");
             }
 
             let buffer = state.buffer()?.clone();
-            let dmabuf = smithay::wayland::dmabuf::get_dmabuf(&buffer).ok()?.clone();
+            let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(&buffer) else {
+                reject!("buffer is not a dmabuf (shm)");
+            };
+            let dmabuf = dmabuf.clone();
             let size = dmabuf.size();
             if size.w != mode_size.w || size.h != mode_size.h {
-                return None;
+                reject!("buffer pixels don't match the mode 1:1");
             }
 
             // Provable opacity. The composite path blends an alpha buffer
@@ -5280,7 +5340,7 @@ impl Renderer {
                 && !vestigial_alpha(code)
                 && !opaque_region_covers(state.opaque_regions(), buf)
             {
-                return None;
+                reject!("alpha buffer without a covering opaque region");
             }
             let use_opaque = has_alpha(code);
             Some(DirectInputs {
