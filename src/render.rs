@@ -34,7 +34,7 @@ use smithay::backend::renderer::gles::{
     UniformType,
 };
 use smithay::backend::renderer::utils::{
-    Buffer as ClientBuffer, RendererSurfaceStateUserData, draw_render_elements,
+    Buffer as ClientBuffer, CommitCounter, RendererSurfaceStateUserData, draw_render_elements,
     with_renderer_surface_state,
 };
 use smithay::backend::renderer::{
@@ -1001,6 +1001,19 @@ pub struct Renderer {
     /// PQ-encode pass, keyed by output name. fp16 (linear BT.2020), sized
     /// to the output's mode, rebuilt when the size changes; only for HDR.
     hdr_scene: HashMap<String, GlesTexture>,
+    /// Cached decoration offscreens (`win_tex`) per window, re-rendered
+    /// only when the surface tree committed new content or the cell
+    /// resized — previously every decorated window paid a fresh texture
+    /// allocation AND a full redraw every frame, idle or not. Evicted on
+    /// surface destroy ([`Renderer::forget_surface`]) and on size/format
+    /// change. `LIBRELAND_NO_WINTEX_CACHE=1` disables for A/B runs.
+    wintex_cache: HashMap<ObjectId, WinTexCache>,
+    /// `LIBRELAND_NO_OCCLUSION=1`: disable the occluded/off-output window
+    /// prune, for A/B benchmarking against the render-profile log.
+    no_occlusion: bool,
+    /// `LIBRELAND_NO_WINTEX_CACHE=1`: disable the decoration offscreen
+    /// cache, for A/B benchmarking.
+    no_wintex_cache: bool,
     /// Per-output 8-bit `Abgr8888` scratch the HDR scene is tonemapped into
     /// for screenshots / screencopy (the fp16 scanout can't be read back as
     /// 8-bit). Cached + reused so continuous capture (OBS) doesn't re-alloc a
@@ -1219,6 +1232,124 @@ struct OutputRender {
     /// is ever in flight per output (the `WaitingForVblank` guard), so a
     /// single slot suffices.
     pending_feedback: Option<OutputPresentationFeedback>,
+    /// Rolling per-phase frame-cost accumulator, logged + reset every ~5 s
+    /// (see [`RenderProfile`]). Always on: the bookkeeping is a handful of
+    /// `Instant::now()` calls per frame.
+    profile: RenderProfile,
+}
+
+/// One cached decoration offscreen (`win_tex`): the rendered texture plus
+/// the content identity it was rendered from. Valid while the window's
+/// surface tree hasn't committed (fingerprint match) and the cell size /
+/// colour format are unchanged.
+struct WinTexCache {
+    tex: GlesTexture,
+    size: Size<i32, smithay::utils::Buffer>,
+    fmt: Fourcc,
+    /// Per-node commit counters of the window's surface tree at render
+    /// time; a commit anywhere in the tree changes the fingerprint.
+    fingerprint: Vec<(ObjectId, CommitCounter)>,
+}
+
+/// The window tree's content identity — decides whether a cached
+/// decoration offscreen is still current without touching the GPU.
+fn surface_tree_fingerprint(root: &WlSurface) -> Vec<(ObjectId, CommitCounter)> {
+    let mut out = Vec::new();
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, states, &()| {
+            if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                out.push((surface.id(), data.lock().unwrap().current_commit()));
+            }
+        },
+        |_, _, &()| true,
+    );
+    out
+}
+
+/// Rolling accumulator of where a composited frame's CPU/GL-submission
+/// time goes, per output. Phases (all wall-clock around the GL calls, so
+/// stalls — allocations, readbacks — show up even though true GPU
+/// execution is async): element import, decoration offscreens, blur
+/// pyramid, scene draw, HDR encode. Logged at info every ~5 s so a
+/// session log doubles as a benchmark record, then reset.
+#[derive(Debug)]
+struct RenderProfile {
+    since: Instant,
+    frames: u32,
+    total: Duration,
+    max: Duration,
+    import: Duration,
+    wintex: Duration,
+    blur: Duration,
+    scene: Duration,
+    encode: Duration,
+}
+
+impl RenderProfile {
+    fn new() -> Self {
+        RenderProfile {
+            since: Instant::now(),
+            frames: 0,
+            total: Duration::ZERO,
+            max: Duration::ZERO,
+            import: Duration::ZERO,
+            wintex: Duration::ZERO,
+            blur: Duration::ZERO,
+            scene: Duration::ZERO,
+            encode: Duration::ZERO,
+        }
+    }
+
+    /// Fold one frame's phase timings in; every ~5 s emit the averages and
+    /// reset. `ms` values are averages per *composited* frame (direct-scanout
+    /// frames never get here — that path is effectively free by design).
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "microsecond sums over a 5 s window are far below f64's exact-integer range"
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Duration per profiled phase; a struct would restate the same six names"
+    )]
+    fn record(
+        &mut self,
+        name: &str,
+        total: Duration,
+        import: Duration,
+        wintex: Duration,
+        blur: Duration,
+        scene: Duration,
+        encode: Duration,
+    ) {
+        self.frames += 1;
+        self.total += total;
+        self.max = self.max.max(total);
+        self.import += import;
+        self.wintex += wintex;
+        self.blur += blur;
+        self.scene += scene;
+        self.encode += encode;
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let per = |d: Duration| d.as_micros() as f64 / f64::from(self.frames.max(1)) / 1000.0;
+        info!(
+            output = %name,
+            frames = self.frames,
+            avg_ms = format!("{:.2}", per(self.total)),
+            max_ms = format!("{:.2}", self.max.as_secs_f64() * 1000.0),
+            import_ms = format!("{:.2}", per(self.import)),
+            wintex_ms = format!("{:.2}", per(self.wintex)),
+            blur_ms = format!("{:.2}", per(self.blur)),
+            scene_ms = format!("{:.2}", per(self.scene)),
+            encode_ms = format!("{:.2}", per(self.encode)),
+            "render profile (composited frames, 5 s window)"
+        );
+        *self = RenderProfile::new();
+    }
 }
 
 /// Public snapshot of one output's geometry for callers (the screenshot
@@ -1990,6 +2121,7 @@ impl Renderer {
                     .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
                 hdr_saturation: output_sdr_saturation(output_cfg),
                 pending_feedback: None,
+                profile: RenderProfile::new(),
             });
         }
 
@@ -2085,6 +2217,9 @@ impl Renderer {
             round_tex_shader_linear,
             round_blur_shader_hdr,
             hdr_scene: HashMap::new(),
+            wintex_cache: HashMap::new(),
+            no_occlusion: std::env::var_os("LIBRELAND_NO_OCCLUSION").is_some(),
+            no_wintex_cache: std::env::var_os("LIBRELAND_NO_WINTEX_CACHE").is_some(),
             sdr_capture: HashMap::new(),
             cursor_plane,
             hw_named: HashMap::new(),
@@ -2677,6 +2812,7 @@ impl Renderer {
                 .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
             hdr_saturation: output_sdr_saturation(output_cfg),
             pending_feedback: None,
+            profile: RenderProfile::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -3479,6 +3615,13 @@ impl Renderer {
         self.gles.dmabuf_formats().into_iter().collect()
     }
 
+    /// Drop per-surface render caches (the decoration offscreen). Called
+    /// when a surface is destroyed so the cache never accumulates dead
+    /// entries (a `wl_surface` id is not reused after destruction).
+    pub fn forget_surface(&mut self, surface: &WlSurface) {
+        self.wintex_cache.remove(&surface.id());
+    }
+
     /// Scanout-capable `(fourcc, modifier)` pairs: the primary output's
     /// plane formats, intersected with what the renderer can import as a
     /// texture (the composite fallback must be able to draw the very same
@@ -3802,6 +3945,37 @@ impl Renderer {
             hdr = false;
         }
 
+        // Everything below is the composited path — profile it (see
+        // [`RenderProfile`]; direct-scanout frames returned above).
+        let t_frame = Instant::now();
+        let mut t_import = Duration::ZERO;
+        let mut t_wintex = Duration::ZERO;
+        let mut t_blur = Duration::ZERO;
+
+        // Per-placement visibility on THIS output. Two prunes, applied by
+        // every stage below (element import, decoration offscreens, draw
+        // loops): windows fully occluded by a provably-opaque solo
+        // fullscreen window — the Steam client behind the game paid an
+        // offscreen + full draw per game frame — and windows that don't
+        // even touch this output (each output renders its own frame;
+        // drawing another output's windows at out-of-view coordinates was
+        // pure waste). `LIBRELAND_NO_OCCLUSION=1` disables the prune for
+        // A/B measurements against the render-profile log.
+        let visible: Vec<bool> = placements
+            .iter()
+            .zip(win_draws.iter())
+            .enumerate()
+            .map(|(i, (p, wd))| {
+                if self.no_occlusion {
+                    return true;
+                }
+                if solo_opaque.is_some_and(|j| i != j) {
+                    return false;
+                }
+                p.cell_rect.overlaps(out_rect) || wd.effective.overlaps(out_rect)
+            })
+            .collect();
+
         // Ensure the fp16 linear scene buffer for HDR outputs *before* the
         // draw closures capture `hdr` (they read it for shader selection).
         // 8-bit can't hold HDR headroom; if the driver rejects fp16 as a
@@ -3883,11 +4057,18 @@ impl Renderer {
             clippy::type_complexity,
             reason = "one frame's worth of per-window, rescale-wrapped surface elements"
         )]
+        let t = Instant::now();
         let grouped: Vec<Vec<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>> =
             placements
                 .iter()
                 .zip(win_draws.iter())
-                .map(|(p, wd)| {
+                .enumerate()
+                .map(|(i, (p, wd))| {
+                    // Occluded / off-output windows don't get their trees
+                    // walked or their textures touched at all.
+                    if !visible[i] {
+                        return Vec::new();
+                    }
                     // CSD clients pad their buffer with an invisible
                     // drop-shadow margin and report the real window rect
                     // via xdg_surface.set_window_geometry. Shift the
@@ -4056,6 +4237,8 @@ impl Renderer {
             })
             .collect();
 
+        t_import += t.elapsed();
+
         // Drag-and-drop icon: composite the drag surface at the cursor
         // (only on the output the cursor is on). Pre-imported here while we
         // still hold `&mut self.gles`, like the surface groups above.
@@ -4190,13 +4373,15 @@ impl Renderer {
         // straight to the frame. No cross-frame pooling: with on-demand
         // rendering an idle output allocates nothing, and these free at frame
         // end. Mirrors the close-snapshot offscreen above.
+        let t = Instant::now();
         let mut win_tex: Vec<Option<GlesTexture>> = Vec::with_capacity(placements.len());
-        for ((p, elements), wd) in placements
+        for (i, ((p, elements), wd)) in placements
             .iter()
             .zip(grouped.iter())
             .zip(win_draws.iter())
+            .enumerate()
         {
-            if p.fill != FillMode::Normal || !decorated {
+            if p.fill != FillMode::Normal || !decorated || !visible[i] {
                 win_tex.push(None);
                 continue;
             }
@@ -4215,14 +4400,37 @@ impl Renderer {
                 cell.size.w.max(1),
                 cell.size.h.max(1),
             ));
+            // Cached offscreen still current (same content, cell and
+            // format)? Reuse it — an idle window costs a fingerprint walk
+            // instead of an allocation + full redraw. On mismatch, reuse
+            // at least the allocation when the geometry still fits.
+            let fingerprint = surface_tree_fingerprint(&p.surface);
+            let cached = (!self.no_wintex_cache)
+                .then(|| self.wintex_cache.remove(&p.surface.id()))
+                .flatten();
+            let mut reusable = None;
+            if let Some(cached) = cached {
+                if cached.fmt == fmt && cached.size == size && cached.fingerprint == fingerprint {
+                    win_tex.push(Some(cached.tex.clone()));
+                    self.wintex_cache.insert(p.surface.id(), cached);
+                    continue;
+                }
+                // Stale content: still reuse the allocation when it fits.
+                reusable = (cached.fmt == fmt && cached.size == size).then_some(cached.tex);
+            }
             let phys = Size::<i32, Physical>::from((size.w, size.h));
             let full = [Rectangle::<i32, Physical>::from_size(phys)];
             let tex = (|| -> Option<GlesTexture> {
-                let mut tex = self
-                    .gles
-                    .create_buffer(fmt, size)
-                    .inspect_err(|err| warn!(error = %err, "rounded window: offscreen alloc failed"))
-                    .ok()?;
+                let mut tex = match reusable {
+                    Some(tex) => tex,
+                    None => self
+                        .gles
+                        .create_buffer(fmt, size)
+                        .inspect_err(
+                            |err| warn!(error = %err, "rounded window: offscreen alloc failed"),
+                        )
+                        .ok()?,
+                };
                 let mut target = self
                     .gles
                     .bind(&mut tex)
@@ -4251,8 +4459,22 @@ impl Renderer {
                 drop(target);
                 Some(tex)
             })();
+            if let Some(tex) = &tex
+                && !self.no_wintex_cache
+            {
+                self.wintex_cache.insert(
+                    p.surface.id(),
+                    WinTexCache {
+                        tex: tex.clone(),
+                        size,
+                        fmt,
+                        fingerprint,
+                    },
+                );
+            }
             win_tex.push(tex);
         }
+        t_wintex += t.elapsed();
 
         // `linear` is true when drawing into the fp16 linear-BT.2020 HDR
         // scene (vs the sRGB blur pyramid): it selects the HDR shader
@@ -4431,8 +4653,15 @@ impl Renderer {
         // blur drives tier 2. We don't probe per-surface alpha, so a mapped
         // opaque panel/window still pays while it's up; the cost is bounded.
         let blur = self.decoration.blur.clone();
-        let passes_ok = blur.enabled && blur.passes > 0;
-        let any_normal = placements.iter().any(|p| p.fill == FillMode::Normal);
+        // A provably-opaque solo fullscreen window covers everything a blur
+        // tier could ever show through — a blur-opted bar occluded behind a
+        // game kept a full 6-pass pyramid running on every single-pass game
+        // frame. No visible translucency ⇒ no pyramid.
+        let passes_ok = blur.enabled && blur.passes > 0 && solo_opaque.is_none();
+        let any_normal = placements
+            .iter()
+            .enumerate()
+            .any(|(i, p)| visible[i] && p.fill == FillMode::Normal);
         let need_window = passes_ok && blur.windows && any_normal;
         // Layer blur is opt-in per namespace (config `blur.layers`), so a
         // fullscreen always-mapped overlay (e.g. a launcher) doesn't frost the
@@ -4442,6 +4671,7 @@ impl Renderer {
                 matches!(l.layer, LayerBucket::Top | LayerBucket::Overlay)
                     && layer_should_blur(&blur, &l.namespace)
             });
+        let t = Instant::now();
         // Saved per-tier blurred backdrops. Pull the scratch out of the map
         // so the blur helpers borrow only `self.gles`; on any GPU failure
         // we clear the tiers and fall back to sharp rendering. Programs are
@@ -4494,6 +4724,7 @@ impl Renderer {
             }
             self.blur_scratch.insert(idx, scratch);
         }
+        t_blur += t.elapsed();
         // Paint a full-res tier's sub-rect behind a translucent surface. The
         // tier texture is 1:1 with the framebuffer, so the source sub-rect
         // matches the on-screen destination rect. With a `mask` texture
@@ -4630,6 +4861,7 @@ impl Renderer {
             Ok(())
         };
 
+        let t = Instant::now();
         let mut target = if hdr {
             let scene = self
                 .hdr_scene
@@ -4689,13 +4921,19 @@ impl Renderer {
             if solo_opaque.is_none() {
                 draw_base(&mut frame, hdr)?;
             }
-            // Tiled windows blur against the base (tier 0).
-            for (((p, elements), wd), tex) in placements
+            // Tiled windows blur against the base (tier 0). Occluded /
+            // off-output windows (`!visible[i]`) are skipped in every band —
+            // their element vectors are empty anyway, but the skip also
+            // avoids painting backdrop frost behind an invisible window.
+            for (_, (((p, elements), wd), tex)) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
                 .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
+                .enumerate()
+                .filter(|(i, (((p, _), _), _))| {
+                    visible[*i] && p.fill == FillMode::Normal && !p.floating
+                })
             {
                 if let Some(t) = &tier_tiled {
                     blur_rect(&mut frame, t, cell_local(wd.effective), None)?;
@@ -4704,12 +4942,15 @@ impl Renderer {
             }
             // Floating windows draw above tiled and blur against base +
             // tiled (tier 1), so a float reveals the windows beneath it.
-            for (((p, elements), wd), tex) in placements
+            for (_, (((p, elements), wd), tex)) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
                 .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
+                .enumerate()
+                .filter(|(i, (((p, _), _), _))| {
+                    visible[*i] && p.fill == FillMode::Normal && p.floating
+                })
             {
                 if let Some(t) = &tier_float {
                     blur_rect(&mut frame, t, cell_local(wd.effective), None)?;
@@ -4718,12 +4959,13 @@ impl Renderer {
             }
             // Maximized windows: borderless, above normal windows but below
             // Top/Overlay panels. Opaque — no backdrop blur.
-            for (((p, elements), wd), tex) in placements
+            for (_, (((p, elements), wd), tex)) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
                 .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
+                .enumerate()
+                .filter(|(i, (((p, _), _), _))| visible[*i] && p.fill == FillMode::Maximized)
             {
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
             }
@@ -4731,13 +4973,14 @@ impl Renderer {
             // Top layer surfaces go above windows but below a fullscreen
             // window (status bar above kitty, but a fullscreen game covers the
             // bar). Blur against the full backdrop (tier 2) so a translucent
-            // panel reveals a frosted desktop.
+            // panel reveals a frosted desktop. Skipped wholesale under a
+            // provably-opaque solo fullscreen window — the game covers them.
             for ((l, (bucket, elements)), mask) in layers
                 .iter()
                 .zip(layer_groups.iter())
                 .zip(layer_masks.iter())
             {
-                if !matches!(bucket, LayerBucket::Top) {
+                if solo_opaque.is_some() || !matches!(bucket, LayerBucket::Top) {
                     continue;
                 }
                 if let Some(t) = &tier_layer
@@ -4760,10 +5003,11 @@ impl Renderer {
             // Top panels (a fullscreen game/video covers the bar), but BELOW
             // Overlay layers (launcher / toasts / OSDs stay visible) and below
             // popups and the cursor.
-            for (p, elements) in placements
+            for (_, (p, elements)) in placements
                 .iter()
                 .zip(grouped.iter())
-                .filter(|(p, _)| p.fill == FillMode::Fullscreen)
+                .enumerate()
+                .filter(|(i, (p, _))| visible[*i] && p.fill == FillMode::Fullscreen)
             {
                 // Colour-managed (PQ) fullscreen surface (e.g. an HDR game):
                 // swap the frame's decode override to PQ for this draw, then
@@ -4983,6 +5227,7 @@ impl Renderer {
                 .collect()
         };
         drop(target);
+        let t_scene = t.elapsed();
 
         // HDR screenshots: tonemap the linear scene to 8-bit sRGB and read
         // that, so a capture of an HDR output "looks like SDR".
@@ -4994,6 +5239,7 @@ impl Renderer {
         // HDR: encode the composited linear-BT.2020 scene (the fp16 offscreen)
         // to PQ / BT.2020 into the 10-bit scanout dmabuf. SDR keeps the
         // scene's own sync — it composited straight to the dmabuf.
+        let t = Instant::now();
         let sync = if hdr {
             let scene_tex = self
                 .hdr_scene
@@ -5033,6 +5279,17 @@ impl Renderer {
         } else {
             scene_sync
         };
+
+        let t_encode = t.elapsed();
+        self.outputs[idx].profile.record(
+            &output_name,
+            t_frame.elapsed(),
+            t_import,
+            t_wintex,
+            t_blur,
+            t_scene,
+            t_encode,
+        );
 
         // Settle this output's adaptive-sync state for the frame we're
         // about to queue. Must run before `queue_buffer` so the commit it

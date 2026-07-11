@@ -782,6 +782,8 @@ impl CompositorHandler for State {
         self.mapped_toplevels.remove(surface);
         // Same for the sticky scanout-feedback record.
         self.scanout_feedback_given.borrow_mut().remove(&surface.id());
+        // And the renderer's per-surface caches (decoration offscreen).
+        self.renderer.forget_surface(surface);
     }
 }
 
