@@ -15,6 +15,7 @@
 //! rectangle.
 
 use std::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -1014,6 +1015,9 @@ pub struct Renderer {
     /// `LIBRELAND_NO_WINTEX_CACHE=1`: disable the decoration offscreen
     /// cache, for A/B benchmarking.
     no_wintex_cache: bool,
+    /// `LIBRELAND_NO_DAMAGE=1`: paint every frame in full, for A/B
+    /// benchmarking against the render-profile log.
+    no_damage: bool,
     /// Per-output 8-bit `Abgr8888` scratch the HDR scene is tonemapped into
     /// for screenshots / screencopy (the fp16 scanout can't be read back as
     /// 8-bit). Cached + reused so continuous capture (OBS) doesn't re-alloc a
@@ -1236,6 +1240,139 @@ struct OutputRender {
     /// (see [`RenderProfile`]). Always on: the bookkeeping is a handful of
     /// `Instant::now()` calls per frame.
     profile: RenderProfile,
+    /// Per-output damage diffing state (see [`DamageTracker`]).
+    damage_tracker: DamageTracker,
+}
+
+/// What one drawn thing (window / layer / popup) looked like last frame,
+/// for damage diffing: its content identity, where it was drawn, and the
+/// non-content inputs that change its pixels (focus flips the border
+/// colour; alpha animates during open/fade).
+struct DrawnState {
+    fingerprint: Vec<(ObjectId, CommitCounter)>,
+    rect: Rectangle<i32, Physical>,
+    focused: bool,
+    alpha_bits: u32,
+}
+
+/// Per-output damage tracker: diffs each frame's drawn set against the
+/// previous frame to produce the region that actually changed, and keeps
+/// a short history so a swapchain buffer that last presented `age` frames
+/// ago can be repaired by re-drawing the union of the last `age` frames'
+/// damage. `None` anywhere means "full frame" — the tracker falls back to
+/// full liberally (transient overlays, media wallpaper, workspace slides,
+/// composited cursors) because a missed-damage artifact is strictly worse
+/// than a full repaint. `LIBRELAND_NO_DAMAGE=1` forces full frames for
+/// A/B runs against the render-profile log.
+struct DamageTracker {
+    prev: HashMap<ObjectId, DrawnState>,
+    /// Close-animation rects drawn last frame (they fade → damage every
+    /// frame any exist, plus the frame after the last one vanishes).
+    prev_closing: Vec<Rectangle<i32, Physical>>,
+    /// Newest-last per-frame damage, capped at [`DAMAGE_HISTORY`].
+    history: VecDeque<Vec<Rectangle<i32, Physical>>>,
+    /// Frames since the persistent fp16 HDR scene texture was last drawn
+    /// into (1 = last frame). Single-pass frames skip the scene, so its
+    /// staleness is tracked separately from the swapchain's buffer age.
+    scene_age: usize,
+    /// Force a full frame once (config/output change invalidation).
+    force_full: bool,
+}
+
+/// Swapchain depth is 3-4; anything older is repainted in full.
+const DAMAGE_HISTORY: usize = 8;
+
+/// Damage rect-count cap: beyond this the set coalesces to its bounding
+/// box (`FB_DAMAGE_CLIPS` arrays shouldn't grow unbounded, and neither
+/// should per-element intersection work).
+const DAMAGE_MAX_RECTS: usize = 32;
+
+impl DamageTracker {
+    fn new() -> Self {
+        DamageTracker {
+            prev: HashMap::new(),
+            prev_closing: Vec::new(),
+            history: VecDeque::new(),
+            scene_age: usize::MAX,
+            force_full: true,
+        }
+    }
+
+    /// The damage needed to repair a target whose content is `age` frames
+    /// old, given this frame's `current` damage. `None` = repaint in full
+    /// (unknown age, or history too short).
+    fn accumulated(
+        &self,
+        age: usize,
+        current: &[Rectangle<i32, Physical>],
+    ) -> Option<Vec<Rectangle<i32, Physical>>> {
+        if age == 0 || age > self.history.len() + 1 {
+            return None;
+        }
+        let mut out = current.to_vec();
+        for frame in self.history.iter().rev().take(age - 1) {
+            out.extend_from_slice(frame);
+        }
+        Some(coalesce_damage(out))
+    }
+
+    /// Record this frame's damage (`None` = the frame was painted in
+    /// full, which repairs every buffer — recorded as a full-frame rect).
+    fn push(
+        &mut self,
+        current: Option<Vec<Rectangle<i32, Physical>>>,
+        full: Rectangle<i32, Physical>,
+    ) {
+        self.history.push_back(current.unwrap_or_else(|| vec![full]));
+        if self.history.len() > DAMAGE_HISTORY {
+            self.history.pop_front();
+        }
+    }
+}
+
+/// Clamp a damage set's cardinality: past [`DAMAGE_MAX_RECTS`], coalesce
+/// to the single bounding box. (Overlapping rects are fine — GL and KMS
+/// both tolerate them; only unbounded growth isn't.)
+fn coalesce_damage(mut damage: Vec<Rectangle<i32, Physical>>) -> Vec<Rectangle<i32, Physical>> {
+    damage.retain(|r| r.size.w > 0 && r.size.h > 0);
+    if damage.len() > DAMAGE_MAX_RECTS {
+        let bbox = damage
+            .iter()
+            .skip(1)
+            .fold(damage[0], |acc, r| acc.merge(*r));
+        return vec![bbox];
+    }
+    damage
+}
+
+/// Union of the drawn geometries of an element group — the on-screen
+/// bbox the group occupies this frame, in output-local physical pixels.
+fn elements_bbox<E: smithay::backend::renderer::element::Element>(
+    elements: &[E],
+    scale: Scale<f64>,
+) -> Option<Rectangle<i32, Physical>> {
+    let mut it = elements.iter().map(|e| e.geometry(scale));
+    let first = it.next()?;
+    Some(it.fold(first, smithay::utils::Rectangle::merge))
+}
+
+/// Translate frame-absolute damage into `dst`-relative rects (the
+/// convention `render_texture_from_to` expects), dropping the parts
+/// outside `dst`. An empty result means the draw can be skipped.
+fn damage_rel(
+    damage: &[Rectangle<i32, Physical>],
+    dst: Rectangle<i32, Physical>,
+) -> Vec<Rectangle<i32, Physical>> {
+    damage
+        .iter()
+        .filter_map(|d| {
+            d.intersection(dst)
+                .map(|mut r| {
+                    r.loc -= dst.loc;
+                    r
+                })
+        })
+        .collect()
 }
 
 /// One cached decoration offscreen (`win_tex`): the rendered texture plus
@@ -2122,6 +2259,7 @@ impl Renderer {
                 hdr_saturation: output_sdr_saturation(output_cfg),
                 pending_feedback: None,
                 profile: RenderProfile::new(),
+                damage_tracker: DamageTracker::new(),
             });
         }
 
@@ -2220,6 +2358,7 @@ impl Renderer {
             wintex_cache: HashMap::new(),
             no_occlusion: std::env::var_os("LIBRELAND_NO_OCCLUSION").is_some(),
             no_wintex_cache: std::env::var_os("LIBRELAND_NO_WINTEX_CACHE").is_some(),
+            no_damage: std::env::var_os("LIBRELAND_NO_DAMAGE").is_some(),
             sdr_capture: HashMap::new(),
             cursor_plane,
             hw_named: HashMap::new(),
@@ -2813,6 +2952,7 @@ impl Renderer {
             hdr_saturation: output_sdr_saturation(output_cfg),
             pending_feedback: None,
             profile: RenderProfile::new(),
+            damage_tracker: DamageTracker::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -2852,6 +2992,8 @@ impl Renderer {
     /// output, clamps the cursor back inside the new bounds, and returns
     /// fresh [`OutputDescriptor`]s for the Wayland layer to re-advertise.
     pub fn reflow_outputs(&mut self, monitors: &MonitorsConfig) -> Vec<OutputDescriptor> {
+        // Output-local coordinates shift wholesale on a reflow.
+        self.invalidate_damage();
         // Refresh scale + compositor size from config first, then assign
         // non-overlapping positions in a second pass (configured monitors
         // pinned, the rest packed past them — see `place_outputs`).
@@ -3010,6 +3152,7 @@ impl Renderer {
     pub fn set_appearance(&mut self, wallpaper: Fill, border: BorderConfig) {
         self.wallpaper = wallpaper;
         self.border = border;
+        self.invalidate_damage();
     }
 
     /// Set (or clear) the media wallpaper. `Some((rgba, w, h, mode, anim))`
@@ -3130,6 +3273,7 @@ impl Renderer {
     /// reload; read fresh next frame.
     pub fn set_decoration(&mut self, cfg: DecorationConfig) {
         self.decoration = cfg;
+        self.invalidate_damage();
     }
 
     /// Ensure output `idx` has a backdrop-blur scratch chain sized for its
@@ -3622,6 +3766,17 @@ impl Renderer {
         self.wintex_cache.remove(&surface.id());
     }
 
+    /// Repaint every output's next frame in full and restart damage
+    /// diffing from scratch. Called whenever pixels can change without any
+    /// tracked input changing: appearance/decoration reload (border
+    /// colours, opacity), output layout changes, and VT re-activation
+    /// (the kernel may have scribbled over our buffers while away).
+    pub fn invalidate_damage(&mut self) {
+        for o in &mut self.outputs {
+            o.damage_tracker = DamageTracker::new();
+        }
+    }
+
     /// Scanout-capable `(fourcc, modifier)` pairs: the primary output's
     /// plane formats, intersected with what the renderer can import as a
     /// texture (the composite fallback must be able to draw the very same
@@ -4014,7 +4169,7 @@ impl Renderer {
         // The previous frame's flip is acked separately, on its vblank
         // (see `Renderer::frame_submitted`), so the on-demand driver can
         // ack a completed flip without being forced to render another.
-        let (mut dmabuf, _age) = self.outputs[idx]
+        let (mut dmabuf, buffer_age) = self.outputs[idx]
             .surface
             .next_buffer()
             .with_context(|| format!("next_buffer failed for {output_name}"))?;
@@ -4341,15 +4496,20 @@ impl Renderer {
         // blur pyramid): solid fills are then converted to linear BT.2020.
         // The wallpaper *texture* goes through render_texture_from_to(None),
         // so it picks up the frame's decode override regardless.
-        let draw_base = |frame: &mut GlesFrame<'_, '_>, linear: bool| -> Result<()> {
+        let draw_base = |frame: &mut GlesFrame<'_, '_>,
+                         linear: bool,
+                         damage: &[Rectangle<i32, Physical>]|
+         -> Result<()> {
             if let Some(wp) = &wallpaper_media {
+                // Media wallpapers force full-frame damage upstream, so no
+                // damage threading is needed here.
                 draw_wallpaper_texture(frame, wp, mode_size, linear, hdr_reference_white, hdr_saturation)?;
             } else {
-                draw_fill(frame, &wallpaper, mode_size, mode_size, linear, hdr_reference_white, hdr_saturation)?;
+                draw_fill(frame, &wallpaper, mode_size, mode_size, damage, linear, hdr_reference_white, hdr_saturation)?;
             }
             for (bucket, elements) in &layer_groups {
                 if matches!(bucket, LayerBucket::Background | LayerBucket::Bottom) {
-                    draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage)
+                    draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, damage)
                         .context("draw_render_elements (layer bg/bottom) failed")?;
                 }
             }
@@ -4487,7 +4647,8 @@ impl Renderer {
         >],
                            wd: &WinDraw,
                            tex: Option<&GlesTexture>,
-                           linear: bool|
+                           linear: bool,
+                           damage: &[Rectangle<i32, Physical>]|
          -> Result<()> {
             // A colour-managed (PQ) surface in the linear scene is drawn
             // straight (skipping decoration — option A) with the PQ decode,
@@ -4570,12 +4731,16 @@ impl Renderer {
                 } else {
                     &round_tex_shader
                 };
+                let rel = damage_rel(damage, dst);
+                if rel.is_empty() {
+                    return Ok(());
+                }
                 frame
                     .render_texture_from_to(
                         tex,
                         src,
                         dst,
-                        &[Rectangle::from_size(dst.size)],
+                        &rel,
                         &[],
                         Transform::Normal,
                         // Window opacity + animation alpha, applied here (the
@@ -4594,7 +4759,7 @@ impl Renderer {
                     frame.override_default_tex_program(hdr_decode_shader.clone(), Vec::new());
                 }
                 let res =
-                    draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, &full_damage);
+                    draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, damage);
                 if surface_is_hdr {
                     frame.override_default_tex_program(
                         sdr_decode_shader.clone(),
@@ -4618,7 +4783,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
             {
-                draw_window(frame, p, elements, wd, tex.as_ref(), false)?;
+                draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
             Ok(())
         };
@@ -4630,7 +4795,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
             {
-                draw_window(frame, p, elements, wd, tex.as_ref(), false)?;
+                draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
             for (((p, elements), wd), tex) in placements
                 .iter()
@@ -4639,7 +4804,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
             {
-                draw_window(frame, p, elements, wd, tex.as_ref(), false)?;
+                draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
             Ok(())
         };
@@ -4690,7 +4855,7 @@ impl Renderer {
                 .expect("ensure_blur_scratch inserted it");
             let res: Result<()> = (|| {
                 render_scene_stage(&mut self.gles, &mut scratch, mode_size, &|f| {
-                    draw_base(f, false)
+                    draw_base(f, false, &full_damage)
                 })?;
                 if need_window {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 0)?;
@@ -4725,6 +4890,193 @@ impl Renderer {
             self.blur_scratch.insert(idx, scratch);
         }
         t_blur += t.elapsed();
+
+        // ── Damage ────────────────────────────────────────────────────
+        // Diff this frame's drawn set against the previous frame's (see
+        // [`DamageTracker`]); `None` = paint in full. Falls back to full
+        // whenever pixels can change outside the tracked inputs.
+        let current_damage: Option<Vec<Rectangle<i32, Physical>>> = 'damage: {
+            if self.no_damage
+                || self.outputs[idx].damage_tracker.force_full
+                || self.cursor_needs_composite(idx, hide_cursor, compose_cursor)
+                || !dnd_icon_elements.is_empty()
+                || self.screenshot_overlay.is_some()
+                || freeze_texture.is_some()
+                // A media wallpaper's texture is refreshed out-of-band
+                // (refresh_wallpaper) — untracked, so full unless occluded.
+                || (wallpaper_media.is_some() && solo_opaque.is_none())
+                || placements.iter().any(|p| p.slide_dy != 0)
+            {
+                break 'damage None;
+            }
+            let elem_scale = Scale::from(scale);
+            let mut prev = std::mem::take(&mut self.outputs[idx].damage_tracker.prev);
+            let mut new_map: HashMap<ObjectId, DrawnState> = HashMap::with_capacity(prev.len() + 4);
+            let mut damage: Vec<Rectangle<i32, Physical>> = Vec::new();
+            {
+                let mut note = |id: ObjectId,
+                                fingerprint: Vec<(ObjectId, CommitCounter)>,
+                                rect: Rectangle<i32, Physical>,
+                                focused: bool,
+                                alpha: f32,
+                                animating: bool| {
+                    let alpha_bits = alpha.to_bits();
+                    match prev.remove(&id) {
+                        Some(old)
+                            if !animating
+                                && old.rect == rect
+                                && old.focused == focused
+                                && old.alpha_bits == alpha_bits
+                                && old.fingerprint == fingerprint => {}
+                        Some(old) => {
+                            damage.push(old.rect);
+                            damage.push(rect);
+                        }
+                        None => damage.push(rect),
+                    }
+                    new_map.insert(
+                        id,
+                        DrawnState {
+                            fingerprint,
+                            rect,
+                            focused,
+                            alpha_bits,
+                        },
+                    );
+                };
+                // Windows, at their drawn rects: the composite dst for
+                // decorated Normal windows, the element bbox (which
+                // includes CSD shadows) otherwise. Alpha + focus feed the
+                // pixels (opacity, border colour); a running open/move
+                // animation forces per-frame damage (alpha/rect sweep).
+                for (i, (p, wd)) in placements.iter().zip(win_draws.iter()).enumerate() {
+                    if !visible[i] {
+                        continue;
+                    }
+                    let rect = if p.fill == FillMode::Normal && decorated {
+                        cell_local(wd.effective)
+                    } else {
+                        match elements_bbox(&grouped[i], elem_scale) {
+                            Some(r) => r,
+                            None => continue,
+                        }
+                    };
+                    let animating = self
+                        .win_anims
+                        .get(&p.surface.id())
+                        .is_some_and(|w| w.open_anim.is_some() || w.move_anim.is_some());
+                    note(
+                        p.surface.id(),
+                        surface_tree_fingerprint(&p.surface),
+                        rect,
+                        p.focused,
+                        wd.alpha,
+                        animating,
+                    );
+                }
+                // Layer surfaces, only the ones this frame actually draws:
+                // Overlay always; the rest only when the base bands run.
+                for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
+                    let drawn =
+                        matches!(bucket, LayerBucket::Overlay) || solo_opaque.is_none();
+                    if !drawn {
+                        continue;
+                    }
+                    let Some(rect) = elements_bbox(elements, elem_scale) else {
+                        continue;
+                    };
+                    note(
+                        l.surface.id(),
+                        surface_tree_fingerprint(&l.surface),
+                        rect,
+                        false,
+                        1.0,
+                        false,
+                    );
+                }
+                // Popups (always drawn).
+                for (pp, elements) in popups.iter().zip(popup_groups.iter()) {
+                    let Some(rect) = elements_bbox(elements, elem_scale) else {
+                        continue;
+                    };
+                    note(
+                        pp.surface.id(),
+                        surface_tree_fingerprint(&pp.surface),
+                        rect,
+                        false,
+                        1.0,
+                        false,
+                    );
+                }
+            }
+            // Whatever was drawn last frame and isn't this frame exposes
+            // what's beneath it.
+            damage.extend(prev.into_values().map(|s| s.rect));
+            // Close-animation snapshots fade per frame: damage their rects
+            // every frame any exist, plus the frame after the last one.
+            let closing_rects: Vec<Rectangle<i32, Physical>> =
+                closing_draws.iter().map(|(_, dest, _)| *dest).collect();
+            damage.extend_from_slice(&self.outputs[idx].damage_tracker.prev_closing);
+            damage.extend_from_slice(&closing_rects);
+            self.outputs[idx].damage_tracker.prev_closing = closing_rects;
+            // Frosted backdrops sample a neighbourhood of the scene: any
+            // change may alter every frosted rect (the blur spread at 4K
+            // rivals the output), so conservatively re-damage them all.
+            if !damage.is_empty()
+                && (tier_tiled.is_some() || tier_float.is_some() || tier_layer.is_some())
+            {
+                if tier_tiled.is_some() || tier_float.is_some() {
+                    for (i, (p, wd)) in placements.iter().zip(win_draws.iter()).enumerate() {
+                        if visible[i] && p.fill == FillMode::Normal {
+                            damage.push(cell_local(wd.effective));
+                        }
+                    }
+                }
+                if tier_layer.is_some() {
+                    for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
+                        if matches!(bucket, LayerBucket::Top | LayerBucket::Overlay)
+                            && layer_should_blur(&blur, &l.namespace)
+                            && let Some(rect) = elements_bbox(elements, elem_scale)
+                        {
+                            damage.push(rect);
+                        }
+                    }
+                }
+            }
+            self.outputs[idx].damage_tracker.prev = new_map;
+            Some(coalesce_damage(damage))
+        };
+        // Repair damage for each render target from its own staleness:
+        // the swapchain buffer by its age, the persistent fp16 scene by
+        // frames-since-last-scene-draw. History is per-frame damage.
+        let (scene_damage_vec, swap_damage_vec);
+        {
+            let hdr_scene_pass = hdr;
+            let tracker = &mut self.outputs[idx].damage_tracker;
+            tracker.force_full = false;
+            swap_damage_vec = current_damage
+                .as_ref()
+                .and_then(|c| tracker.accumulated(usize::from(buffer_age), c));
+            scene_damage_vec = if hdr_scene_pass {
+                current_damage
+                    .as_ref()
+                    .and_then(|c| tracker.accumulated(tracker.scene_age, c))
+            } else {
+                None
+            };
+            tracker.push(current_damage, full_damage[0]);
+            tracker.scene_age = if hdr_scene_pass {
+                1
+            } else {
+                tracker.scene_age.saturating_add(1)
+            };
+        }
+        // The damage set for the target the scene block draws into.
+        let draw_damage: &[Rectangle<i32, Physical>] = if hdr {
+            scene_damage_vec.as_deref().unwrap_or(&full_damage)
+        } else {
+            swap_damage_vec.as_deref().unwrap_or(&full_damage)
+        };
         // Paint a full-res tier's sub-rect behind a translucent surface. The
         // tier texture is 1:1 with the framebuffer, so the source sub-rect
         // matches the on-screen destination rect. With a `mask` texture
@@ -4736,7 +5088,8 @@ impl Renderer {
         let blur_rect = |frame: &mut GlesFrame<'_, '_>,
                          tier: &GlesTexture,
                          dst: Rectangle<i32, Physical>,
-                         mask: Option<&GlesTexture>|
+                         mask: Option<&GlesTexture>,
+                         damage: &[Rectangle<i32, Physical>]|
          -> Result<()> {
             let src = Rectangle::<f64, smithay::utils::Buffer>::new(
                 Point::from((f64::from(dst.loc.x), f64::from(dst.loc.y))),
@@ -4747,7 +5100,10 @@ impl Renderer {
             // so they must be `(0,0)`-anchored. Passing the absolute `dst`
             // collapses to a zero-size instance for any offset surface — the
             // whole reason blur only ever showed full-screen.
-            let local = [Rectangle::from_size(dst.size)];
+            let local = damage_rel(damage, dst);
+            if local.is_empty() {
+                return Ok(());
+            }
             // `v_coords` in the blur shaders samples the tier: it spans the
             // `src` sub-rect normalised over the *whole* tier, not 0..1
             // across `dst`. Hand the shaders a CPU-computed affine map from
@@ -4919,7 +5275,7 @@ impl Renderer {
             // A provably-opaque solo fullscreen window overwrites every
             // output pixel, so the base band beneath it is skipped outright.
             if solo_opaque.is_none() {
-                draw_base(&mut frame, hdr)?;
+                draw_base(&mut frame, hdr, draw_damage)?;
             }
             // Tiled windows blur against the base (tier 0). Occluded /
             // off-output windows (`!visible[i]`) are skipped in every band —
@@ -4936,9 +5292,9 @@ impl Renderer {
                 })
             {
                 if let Some(t) = &tier_tiled {
-                    blur_rect(&mut frame, t, cell_local(wd.effective), None)?;
+                    blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
                 }
-                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
             }
             // Floating windows draw above tiled and blur against base +
             // tiled (tier 1), so a float reveals the windows beneath it.
@@ -4953,9 +5309,9 @@ impl Renderer {
                 })
             {
                 if let Some(t) = &tier_float {
-                    blur_rect(&mut frame, t, cell_local(wd.effective), None)?;
+                    blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
                 }
-                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
             }
             // Maximized windows: borderless, above normal windows but below
             // Top/Overlay panels. Opaque — no backdrop blur.
@@ -4967,7 +5323,7 @@ impl Renderer {
                 .enumerate()
                 .filter(|(i, (((p, _), _), _))| visible[*i] && p.fill == FillMode::Maximized)
             {
-                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr)?;
+                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
             }
 
             // Top layer surfaces go above windows but below a fullscreen
@@ -4993,9 +5349,9 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst, mask.as_ref())?;
+                    blur_rect(&mut frame, t, dst, mask.as_ref(), draw_damage)?;
                 }
-                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
                     .context("draw_render_elements (layer top) failed")?;
             }
 
@@ -5020,7 +5376,7 @@ impl Renderer {
                     &mut frame,
                     scale,
                     elements,
-                    &full_damage,
+                    draw_damage,
                 );
                 if surface_is_hdr {
                     frame.override_default_tex_program(
@@ -5055,21 +5411,25 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst, mask.as_ref())?;
+                    blur_rect(&mut frame, t, dst, mask.as_ref(), draw_damage)?;
                 }
-                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full_damage)
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
                     .context("draw_render_elements (layer overlay) failed")?;
             }
 
             // Closing windows: the fade/shrink-out snapshot, above the
             // windows reflowing to fill the freed space, below popups.
             for (texture, dest, alpha) in &closing_draws {
+                let rel = damage_rel(draw_damage, *dest);
+                if rel.is_empty() {
+                    continue;
+                }
                 frame
                     .render_texture_from_to(
                         texture,
                         Rectangle::from_size(texture.size()).to_f64(),
                         *dest,
-                        &[Rectangle::from_size(dest.size)],
+                        &rel,
                         &[],
                         Transform::Normal,
                         *alpha,
@@ -5088,7 +5448,7 @@ impl Renderer {
                     &mut frame,
                     scale,
                     elements,
-                    &full_damage,
+                    draw_damage,
                 )
                 .context("draw_render_elements (popup) failed")?;
             }
@@ -5263,7 +5623,9 @@ impl Renderer {
                         scene_tex,
                         src,
                         dst,
-                        &[dst],
+                        // The swapchain target is repaired by its own age
+                        // (dst sits at the origin, so relative == absolute).
+                        swap_damage_vec.as_deref().unwrap_or(&[dst]),
                         &[dst],
                         Transform::Normal,
                         1.0,
@@ -5297,9 +5659,12 @@ impl Renderer {
         // commit to a modeset itself when the toggle demands one).
         self.apply_vrr(idx, placements);
 
+        // Hand KMS the real damage as FB_DAMAGE_CLIPS (None = full frame;
+        // also None when nothing changed — an empty clip array is invalid).
+        let clips = swap_damage_vec.filter(|v| !v.is_empty());
         self.outputs[idx]
             .surface
-            .queue_buffer(Some(sync), None)
+            .queue_buffer(Some(sync), clips)
             .with_context(|| format!("queue_buffer failed for {output_name}"))?;
         debug!(output = %output_name, "frame queued for scanout");
 
@@ -6106,7 +6471,7 @@ fn draw_wallpaper_texture(
             )?;
         }
         ScaleMode::Fit => {
-            draw_fill(frame, &black, output, output, hdr, reference_white, saturation)?;
+            draw_fill(frame, &black, output, output, &[full_dst], hdr, reference_white, saturation)?;
             let scale = (ow / tw).min(oh / th);
             let (dw, dh) = ((tw * scale) as i32, (th * scale) as i32);
             let dst = Rectangle::new(
@@ -6116,7 +6481,7 @@ fn draw_wallpaper_texture(
             draw(frame, buf(0.0, 0.0, tw, th), dst)?;
         }
         ScaleMode::Center => {
-            draw_fill(frame, &black, output, output, hdr, reference_white, saturation)?;
+            draw_fill(frame, &black, output, output, &[full_dst], hdr, reference_white, saturation)?;
             // Native size, centred, cropped to the output.
             let (off_x, off_y) = ((output.w - wp.width) / 2, (output.h - wp.height) / 2);
             let (x0, x1) = (off_x.max(0), (off_x + wp.width).min(output.w));
@@ -6137,11 +6502,16 @@ fn draw_wallpaper_texture(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors draw_fill_rect; the args are the fill's full draw context"
+)]
 fn draw_fill(
     frame: &mut GlesFrame<'_, '_>,
     fill: &Fill,
     rect: Size<i32, Physical>,
     output_size: Size<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
     hdr: bool,
     reference_white: u32,
     saturation: f32,
@@ -6151,17 +6521,23 @@ fn draw_fill(
         fill,
         Rectangle::<i32, Physical>::from_size(rect),
         output_size,
+        damage,
         hdr,
         reference_white,
         saturation,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one value per independent draw input (colour pipeline + damage); a struct would restate the same names"
+)]
 fn draw_fill_rect(
     frame: &mut GlesFrame<'_, '_>,
     fill: &Fill,
     rect: Rectangle<i32, Physical>,
     output_size: Size<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
     hdr: bool,
     reference_white: u32,
     saturation: f32,
@@ -6180,9 +6556,9 @@ fn draw_fill_rect(
     };
     match fill {
         Fill::Solid(rgb) => {
-            let damage = [Rectangle::from_size(rect.size)];
+            let rel = damage_rel(damage, rect);
             frame
-                .draw_solid(rect, &damage, conv(Color32F::new(rgb[0], rgb[1], rgb[2], 1.0)))
+                .draw_solid(rect, &rel, conv(Color32F::new(rgb[0], rgb[1], rgb[2], 1.0)))
                 .context("Frame::draw_solid (fill solid) failed")?;
         }
         Fill::VerticalGradient { top, bottom } => {
@@ -6214,9 +6590,12 @@ fn draw_fill_rect(
                     Point::from((rect.loc.x, clipped_y)),
                     Size::new(rect.size.w, clipped_h),
                 );
-                let damage = [Rectangle::from_size(stripe_dst.size)];
+                let rel = damage_rel(damage, stripe_dst);
+                if rel.is_empty() {
+                    continue;
+                }
                 frame
-                    .draw_solid(stripe_dst, &damage, color)
+                    .draw_solid(stripe_dst, &rel, color)
                     .context("Frame::draw_solid (fill stripe) failed")?;
             }
         }
@@ -6656,6 +7035,33 @@ mod gpu_bench {
         });
         bench("fused SDR->PQ 8-bit -> 10-bit (single-pass)", || {
             pass!(&mut target10, &source, Some(&sdr_to_pq), &unis)
+        });
+
+        // Damage tracking: the same full-screen composite clipped to a
+        // damage region ~5% of the output — what a partial repaint frame
+        // costs vs the full-frame passes above.
+        let small = [Rectangle::<i32, Physical>::new(
+            Point::from((100, 100)),
+            Size::from((860, 540)),
+        )];
+        bench("copy pass clipped to 5% damage", || {
+            let mut bound = gles.bind(&mut target8)?;
+            let mut frame = gles.render(&mut bound, phys, Transform::Normal)?;
+            frame.render_texture_from_to(
+                &source,
+                src_rect,
+                dst_rect,
+                &small,
+                &full,
+                Transform::Normal,
+                1.0,
+                None,
+                &[],
+            )?;
+            let sync = frame.finish()?;
+            drop(bound);
+            sync.wait();
+            Ok(())
         });
 
         // Decoration offscreen: fresh allocation + draw each frame (the

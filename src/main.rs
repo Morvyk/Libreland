@@ -308,6 +308,15 @@ pub(crate) struct State {
     /// missing piece between the single-pass composite and true
     /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
     pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// Bumped on every redraw trigger; versions the pointer hit-test
+    /// snapshot below (a stale epoch means the scene may have changed).
+    pub(crate) scene_epoch: std::cell::Cell<u64>,
+    /// Cached popup-placement snapshot for pointer hit-testing, keyed by
+    /// the epoch it was built at. Every mouse motion used to rebuild the
+    /// full placement + popup snapshot (layout walk + allocations); at
+    /// 1000 Hz polling that's a thousand rebuilds a second for a scene
+    /// that changes at most once per frame.
+    pub(crate) popup_snapshot: std::cell::RefCell<(u64, Vec<render::PopupPlacement>)>,
     /// Surfaces that have ever been handed the scanout feedback variant —
     /// they keep it for life (see `sync_scanout_feedback`; every feedback
     /// change costs the client a swapchain rebuild). `RefCell` because the
@@ -736,6 +745,9 @@ impl State {
     /// animation, …) calls this. Coalescing is automatic — many triggers
     /// between two frames schedule at most one render.
     fn queue_redraw(&mut self, crtc: crtc::Handle) {
+        // Any redraw trigger may mean the scene changed — invalidate the
+        // pointer hit-test snapshot (see popup_at).
+        self.scene_epoch.set(self.scene_epoch.get().wrapping_add(1));
         let schedule = match self.redraw.entry(crtc).or_insert(RedrawState::Idle) {
             slot @ RedrawState::Idle => {
                 *slot = RedrawState::Scheduled;
@@ -2138,11 +2150,19 @@ impl State {
         WlSurface,
         smithay::utils::Point<f64, smithay::utils::Logical>,
     )> {
-        let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
-        let placements = self.layout.placements(focused.as_ref(), None);
-        let layers = self.snapshot_layer_placements();
-        let popups = self.snapshot_popup_placements(&placements, &layers);
-        popups.iter().rev().find_map(|pp| {
+        // Rebuild the snapshot only when the scene may have changed since
+        // it was built (see `scene_epoch`); consecutive motion events —
+        // the hot caller — reuse it.
+        let epoch = self.scene_epoch.get();
+        if self.popup_snapshot.borrow().0 != epoch {
+            let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
+            let placements = self.layout.placements(focused.as_ref(), None);
+            let layers = self.snapshot_layer_placements();
+            let popups = self.snapshot_popup_placements(&placements, &layers);
+            *self.popup_snapshot.borrow_mut() = (epoch, popups);
+        }
+        let snapshot = self.popup_snapshot.borrow();
+        snapshot.1.iter().rev().find_map(|pp| {
             let r = pp.rect;
             let inside = r.size.w > 0
                 && r.size.h > 0
@@ -3978,6 +3998,8 @@ fn main() -> Result<()> {
         dmabuf_global: wayland_init.dmabuf_global,
         dmabuf_default_feedback: wayland_init.dmabuf_default_feedback,
         dmabuf_scanout_feedback: wayland_init.dmabuf_scanout_feedback,
+        scene_epoch: std::cell::Cell::new(1),
+        popup_snapshot: std::cell::RefCell::new((0, Vec::new())),
         scanout_feedback_given: std::cell::RefCell::new(std::collections::HashSet::new()),
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
@@ -4309,6 +4331,9 @@ fn wire_event_sources(
                 // switched VTs away, so its vblank will never arrive. Discard
                 // the stale WaitingForVblank bookkeeping (reset to Idle) and
                 // force a fresh render of every output to restore scanout.
+                // Buffers may have been scribbled over while away — restart
+                // damage diffing with a full repaint.
+                state.renderer.invalidate_damage();
                 for crtc in state.renderer.crtcs() {
                     state.redraw.insert(crtc, RedrawState::Idle);
                 }
