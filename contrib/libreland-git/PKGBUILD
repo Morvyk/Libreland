@@ -7,7 +7,7 @@
 # alongside it). The source is cloned from GitHub — no local checkout needed.
 
 pkgname=libreland-git
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0.r129.g7d50ac1
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua (git)'
 arch=('x86_64')
