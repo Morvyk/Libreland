@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "libreland"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "libreland-output-picker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "font8x8",
  "smithay-client-toolkit",
