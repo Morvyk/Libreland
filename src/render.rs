@@ -2567,9 +2567,20 @@ impl Renderer {
             // refresh_mhz is milli-Hz (144 Hz = 144_000); the frame period is
             // 1/Hz = 1000/mHz seconds.
             let period = Duration::from_secs_f64(1000.0 / f64::from(o.refresh_mhz.max(1)));
+            // With adaptive sync engaged the frame period is NOT the fixed
+            // mode period — flips land whenever the client presents. Report
+            // `Variable` (the mode period as the lower bound) so
+            // present-timing consumers (e.g. Vulkan present-timing through
+            // wp_presentation) don't build schedules on a cadence the
+            // display isn't actually following.
+            let refresh = if o.surface.vrr_enabled() {
+                Refresh::variable(period)
+            } else {
+                Refresh::fixed(period)
+            };
             feedback.presented(
                 Time::<Monotonic>::from(present_time),
-                Refresh::fixed(period),
+                refresh,
                 u64::from(seq),
                 base_flags,
             );
@@ -3725,11 +3736,22 @@ impl Renderer {
                     debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
                     self.send_output_frame_callbacks(placements, layers, popups, out_rect);
                     // Zero-copy presentation: the client's own buffer is on the
-                    // plane, so flag ZeroCopy. Fired on this flip's vblank.
+                    // plane, so flag ZeroCopy. Fired on this flip's vblank. A
+                    // feedback still parked from a frame that never reached
+                    // its flip (mailbox replacement) must be DISCARDED, not
+                    // dropped — per wp_presentation every feedback resolves
+                    // exactly once, and a present-timing consumer (Vulkan
+                    // present timing rides these events) errors out waiting
+                    // on one that never fires.
                     if let Some(out) = present_output {
-                        self.outputs[idx].pending_feedback = Some(collect_presentation_feedback(
-                            out, placements, layers, popups, out_rect, true,
-                        ));
+                        let replaced = self.outputs[idx].pending_feedback.replace(
+                            collect_presentation_feedback(
+                                out, placements, layers, popups, out_rect, true,
+                            ),
+                        );
+                        if let Some(mut old) = replaced {
+                            old.discarded();
+                        }
                     }
                     // No transient state is active (eligibility required it),
                     // so the output parks until the client's next commit.
@@ -5034,11 +5056,18 @@ impl Renderer {
 
         // Collect wp_presentation feedback for the surfaces in this composited
         // frame; fired with the real vblank timestamp in `frame_submitted`.
-        // Not zero-copy (the scene went through the GLES compositor).
+        // Not zero-copy (the scene went through the GLES compositor). A
+        // feedback still parked from a frame that never reached its flip is
+        // discarded, never dropped — see the direct-scanout twin above.
         if let Some(out) = present_output {
-            self.outputs[idx].pending_feedback = Some(collect_presentation_feedback(
-                out, placements, layers, popups, out_rect, false,
-            ));
+            let replaced = self.outputs[idx]
+                .pending_feedback
+                .replace(collect_presentation_feedback(
+                    out, placements, layers, popups, out_rect, false,
+                ));
+            if let Some(mut old) = replaced {
+                old.discarded();
+            }
         }
 
         // Tell the on-demand driver whether this output still produces
