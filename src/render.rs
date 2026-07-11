@@ -5137,11 +5137,23 @@ impl Renderer {
         if !captures.is_empty() || self.cursor_needs_composite(idx, hide_cursor, compose_cursor) {
             return None;
         }
-        // Anything that draws above a fullscreen window forces compositing.
-        // `layers` carries real layer-shell surfaces *and* the session-lock
-        // surface (injected as an Overlay layer by render_crtc).
+        // Anything that draws ABOVE a fullscreen window forces compositing:
+        // popups, and *Overlay* layer surfaces (which include the
+        // session-lock surface, injected as Overlay by render_crtc).
+        // Top/Bottom/Background layers draw BELOW fullscreen windows — a
+        // fullscreen game covers the bar — so a mapped panel must not veto.
+        // And an Overlay only counts when it actually has a committed
+        // buffer: shells pre-create buffer-less popup slots that sit mapped
+        // over the whole session (quickshell parks ten such `qs-popup`
+        // Overlay surfaces at startup), and a buffer-less surface draws
+        // nothing.
         if popups.iter().any(|pp| pp.rect.overlaps(out_rect))
-            || layers.iter().any(|l| l.rect.overlaps(out_rect))
+            || layers.iter().any(|l| {
+                matches!(l.layer, LayerBucket::Overlay)
+                    && l.rect.overlaps(out_rect)
+                    && with_renderer_surface_state(&l.surface, |state| state.buffer().is_some())
+                        .unwrap_or(false)
+            })
         {
             return None;
         }
