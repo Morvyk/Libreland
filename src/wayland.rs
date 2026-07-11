@@ -555,16 +555,32 @@ fn acquire_wait_deadline() -> i64 {
     i64::try_from(now.as_nanos().saturating_add(1_000_000_000)).unwrap_or(i64::MAX)
 }
 
+/// The per-client compositor state for both kinds of client we host:
+/// regular Wayland clients carry our [`ClientState`] (attached in
+/// `new_client_data` when the listening socket accepts them), while the
+/// Xwayland client is inserted by smithay's `XWayland::spawn` with its
+/// own `XWaylandClientData` — which also carries the client-scale
+/// override that drives X11 `HiDPI`, so returning *its* state here is
+/// what makes the scale mapping reach Xwayland's surfaces. `None` means
+/// the client is gone (or was inserted by neither path, which doesn't
+/// happen).
+fn compositor_client_state(client: &Client) -> Option<&CompositorClientState> {
+    if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+        return Some(&data.compositor_state);
+    }
+    client
+        .get_data::<ClientState>()
+        .map(|data| &data.compositor_state)
+}
+
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client
-            .get_data::<ClientState>()
+        compositor_client_state(client)
             .expect("client inserted without ClientState — see wayland::new_client_data")
-            .compositor_state
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
@@ -618,8 +634,12 @@ impl CompositorHandler for State {
                     move |(), _metadata, state: &mut State| {
                         // The client may have disconnected while its fence was
                         // in flight; skip rather than panic in
-                        // `client_compositor_state`'s expect.
-                        if client.get_data::<ClientState>().is_some() {
+                        // `client_compositor_state`'s expect. Checked through
+                        // the same both-kinds helper — Xwayland (DXVK games
+                        // running through it use explicit sync too) has
+                        // XWaylandClientData, not our ClientState, and being
+                        // skipped here would leave its commit blocked forever.
+                        if compositor_client_state(&client).is_some() {
                             let dh = state.display_handle.clone();
                             state
                                 .client_compositor_state(&client)
