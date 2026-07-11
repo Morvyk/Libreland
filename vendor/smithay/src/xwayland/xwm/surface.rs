@@ -931,6 +931,50 @@ impl X11Surface {
         conn.flush()
     }
 
+    /// Perform only the X11 side of giving this window keyboard focus:
+    /// `SetInputFocus` and/or a `WM_TAKE_FOCUS` client message, according
+    /// to the window's ICCCM input mode. Unlike the [`KeyboardTarget`]
+    /// impl, this does **not** forward `wl_keyboard.enter` to the
+    /// associated `wl_surface` — for compositors whose keyboard focus
+    /// type is `WlSurface` (which already delivers wl_keyboard events via
+    /// the surface's own `KeyboardTarget`), using the `KeyboardTarget`
+    /// impl on this type would double-send enter/leave.
+    pub fn x11_take_focus(&self) -> Result<(), ConnectionError> {
+        let (set_input_focus, send_take_focus) = match self.input_mode() {
+            InputMode::None => return Ok(()),
+            InputMode::Passive => (true, false),
+            InputMode::LocallyActive => (true, true),
+            InputMode::GloballyActive => (false, true),
+        };
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        if set_input_focus {
+            conn.set_input_focus(InputFocus::NONE, self.window, x11rb::CURRENT_TIME)?;
+        }
+        if send_take_focus {
+            let event = ClientMessageEvent::new(
+                32,
+                self.window,
+                self.atoms.WM_PROTOCOLS,
+                [self.atoms.WM_TAKE_FOCUS, x11rb::CURRENT_TIME, 0, 0, 0],
+            );
+            conn.send_event(false, self.window, EventMask::NO_EVENT, event)?;
+        }
+        conn.flush()
+    }
+
+    /// Perform only the X11 side of removing keyboard focus from this
+    /// window (`SetInputFocus` to none). Counterpart of
+    /// [`X11Surface::x11_take_focus`]; see there for why this exists
+    /// separately from the [`KeyboardTarget`] impl.
+    pub fn x11_unfocus(&self) -> Result<(), ConnectionError> {
+        if self.input_mode() == InputMode::None {
+            return Ok(());
+        }
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME)?;
+        conn.flush()
+    }
+
     /// Get the client PID associated with the X11 window.
     pub fn get_client_pid(&self) -> Result<u32, Box<dyn std::error::Error>> {
         if let Some(connection) = self.conn.upgrade() {

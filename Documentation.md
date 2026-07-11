@@ -41,7 +41,7 @@ breaks your session. You can also force a reload at any time with
   keymap clients receive and the one hotkeys match against), and the
   `mouse_accel_*` settings (re-applied to the connected pointers).
 - `idle` — the new timeouts/command are picked up on the next idle tick.
-- `xwayland` — toggling it starts or stops `xwayland-satellite`
+- `xwayland` — toggling it starts or stops the Xwayland server
   (stopping it disconnects any running X11 clients).
 - `env` — applies to **children spawned from now on** (`spawn` binds,
   the idle lock command, `libreland msg spawn`). Already-running
@@ -157,8 +157,9 @@ startup = {
     -- "sh -c 'swaybg -i ~/wallpapers/blue.png &'",
 }
 
--- Run xwayland-satellite at startup for X11 app support (default true).
--- Toggling on a live reload starts/stops the satellite.
+-- Run Xwayland at startup for X11 app support (default true).
+-- Native integration: Libreland is the X11 window manager itself.
+-- Toggling on a live reload starts/stops the Xwayland server.
 xwayland = true
 
 -- Built-in idle handling (off by default). Lock the session and/or
@@ -210,16 +211,23 @@ They're also pushed (with `WAYLAND_DISPLAY` / `DISPLAY`) into the D-Bus
 
 | Field      | Default | State | Notes |
 | ---------- | ------- | ----- | ----- |
-| `xwayland` | `true`  | ✅    | Run [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite) at startup so X11 apps work. The compositor picks a free X display (`:0`..`:32`), launches the satellite on it, and exports `$DISPLAY` to children. If the binary isn't installed it's logged and skipped (never fatal). Toggling on a live reload starts or stops the satellite — turning it **off** disconnects any running X11 clients from their server. |
+| `xwayland` | `true`  | ✅    | Run Xwayland at startup so X11 apps work. Libreland spawns a rootless `Xwayland` on a free X display, acts as its **window manager in-process** (native integration, no `xwayland-satellite`), and exports `$DISPLAY` to children. If `Xwayland` isn't installed it's logged and skipped (never fatal). Toggling on a live reload starts or stops the server — turning it **off** disconnects any running X11 clients from their server. |
 
-XWayland runs **rootless** via `xwayland-satellite`: it connects to
-Libreland as an ordinary Wayland client, so X windows arrive as normal
-`xdg_toplevel`s and tile/float like any other window. The satellite
-scales X apps itself through `wp_fractional_scale` + `wp_viewporter`
-(on a mixed-scale multi-monitor setup it uses the *smallest* output's
-scale). Cursors stay consistent because Libreland draws its own pointer
-over every surface and exports `XCURSOR_THEME`/`XCURSOR_SIZE` to the
-satellite. Requires `xwayland-satellite` (and `Xwayland`) installed.
+XWayland runs **rootless** with Libreland as its native X11 window
+manager: X windows enter the same tiling layout as Wayland windows
+(tile, float, fullscreen, workspaces, IPC — all identical), and
+override-redirect windows (menus, tooltips) draw topmost like popups.
+Scaling is native: Xwayland is given a *client scale* equal to the
+primary output's scale, so X windows render their buffers at physical
+resolution (pixel-sharp, no upscale) and X apps are told the matching
+DPI via XSETTINGS `Xft/DPI` (96 × scale — e.g. `144` at 1.5×) plus
+cursor theme/size (`Gtk/CursorThemeName`/`Gtk/CursorThemeSize`).
+Cursors stay consistent because X apps' cursors arrive through the
+normal `wl_pointer` path, the X root cursor is uploaded from
+Libreland's own cursor theme, and `XCURSOR_SIZE` is pinned to the
+physical cursor size. Clipboard and primary selection are bridged both
+directions in-process. Requires `Xwayland` installed (the standalone
+X server, usually packaged as `xorg-xwayland`).
 
 ### idle
 

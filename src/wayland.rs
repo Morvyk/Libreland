@@ -222,6 +222,10 @@ pub struct WaylandInit {
     /// surface's cached state when we want to drive per-content behaviour.
     pub content_type_state: smithay::wayland::content_type::ContentTypeState,
     pub presentation_state: smithay::wayland::presentation::PresentationState,
+    /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
+    /// `wl_surface`s with X11 windows (see `src/xwayland.rs`). Held so
+    /// the global stays alive; only the Xwayland client may bind it.
+    pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     /// Tracks `xdg_popup` parent→child trees (menus / submenus).
     pub popup_manager: PopupManager,
     /// One smithay `Output` per DRM connector. Each carries its
@@ -315,7 +319,7 @@ pub fn init(
     let cursor_shape_state = CursorShapeManagerState::new::<State>(&dh);
     // zwp_linux_dmabuf_v1: advertise the GPU buffer formats our GLES
     // renderer can import, so GPU-composited clients (and Xwayland's
-    // glamor-rendered windows via xwayland-satellite) can present
+    // glamor-rendered windows via our Xwayland) can present
     // dmabuf content instead of rendering blank. We advertise a *v4*
     // global with default feedback (main render device + format
     // table) — modern Xwayland/glamor needs the feedback to pick a
@@ -406,6 +410,11 @@ pub fn init(
     // the clock our DRM page-flip timestamps and feedback use.
     let presentation_state =
         smithay::wayland::presentation::PresentationState::new::<State>(&dh, 1);
+    // xwayland_shell_v1: how Xwayland associates the wl_surface it
+    // creates for each X11 window with that window (a shared serial;
+    // see src/xwayland.rs). smithay only lets Xwayland clients bind it.
+    let xwayland_shell_state =
+        smithay::wayland::xwayland_shell::XWaylandShellState::new::<State>(&dh);
     // xdg_popup tracking (menus / submenus). No global of its own —
     // popups arrive through xdg_wm_base; this just bookkeeps the
     // parent→child trees so we can position + render them.
@@ -483,6 +492,7 @@ pub fn init(
         color_management,
         content_type_state,
         presentation_state,
+        xwayland_shell_state,
         popup_manager,
         outputs,
         output_globals,
@@ -653,9 +663,13 @@ impl CompositorHandler for State {
         // on the next configure (e.g. when the user moves it). The first time a
         // tracked toplevel commits a buffer, re-send its layout configure so it
         // resizes itself with no user interaction.
-        if smithay::wayland::compositor::get_role(surface)
-            == Some(smithay::wayland::shell::xdg::XDG_TOPLEVEL_ROLE)
-            && !self.mapped_toplevels.contains(surface)
+        if matches!(
+            smithay::wayland::compositor::get_role(surface),
+            Some(
+                smithay::wayland::shell::xdg::XDG_TOPLEVEL_ROLE
+                    | smithay::wayland::xwayland_shell::XWAYLAND_SHELL_ROLE
+            )
+        ) && !self.mapped_toplevels.contains(surface)
             && smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
                 s.buffer().is_some()
             })
@@ -807,12 +821,16 @@ impl SeatHandler for State {
         let dh = self.display_handle.clone();
         set_data_device_focus(&dh, seat, client.clone());
         set_primary_focus(&dh, seat, client);
+        // X11 windows additionally need X-side input focus
+        // (SetInputFocus / WM_TAKE_FOCUS) — wl_keyboard events alone
+        // aren't accepted by X clients. No-op for Wayland↔Wayland moves.
+        self.sync_x11_focus(focused);
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // The focused client set its pointer image — a surface
         // (`wl_pointer.set_cursor`, used by toolkits and games incl.
-        // Xwayland via the satellite), a named shape
+        // Xwayland forwarding an X11 cursor), a named shape
         // (`wp_cursor_shape_v1`, which smithay funnels here as
         // `Named`), or `Hidden`. The renderer draws it next frame,
         // unless a compositor grab override is active.
@@ -878,7 +896,8 @@ impl XdgShellHandler for State {
         )]
         let cursor =
             smithay::utils::Point::<i32, smithay::utils::Physical>::from((cx as i32, cy as i32));
-        self.layout.insert(surface.clone(), Some(cursor));
+        self.layout
+            .insert(crate::layout::WindowSurface::Xdg(surface.clone()), Some(cursor));
         // Play the open (fade + scale-in) animation the first frame this
         // toplevel is drawn.
         self.renderer.mark_open(surface.wl_surface());
@@ -1099,7 +1118,19 @@ impl SelectionHandler for State {
         source: Option<SelectionSource>,
         _seat: Seat<State>,
     ) {
-        crate::clipboard::on_new_selection(self, ty, source.map(|s| s.mime_types()));
+        // A Wayland client took (or cleared) the selection, so any X11
+        // ownership is over — Wayland pastes are served from our cache
+        // again, not routed through the XWM.
+        self.x11_owns_selection.set(ty, false);
+        let mimes = source.map(|s| s.mime_types());
+        // Mirror the selection into the X world so X clients can paste
+        // what Wayland clients copy (`None` clears the X-side offer).
+        if let Some(xwm) = &mut self.xwm
+            && let Err(err) = xwm.new_selection(ty, mimes.clone())
+        {
+            warn!(?ty, error = %err, "failed to forward the selection to Xwayland");
+        }
+        crate::clipboard::on_new_selection(self, ty, mimes);
     }
 
     fn send_selection(
@@ -1110,6 +1141,18 @@ impl SelectionHandler for State {
         _seat: Seat<State>,
         _user_data: &(),
     ) {
+        // When an X11 client owns the selection the bytes live on the X
+        // side — have Xwayland fetch and stream them into the paster's
+        // fd. Otherwise serve from the compositor's clipboard cache.
+        if self.x11_owns_selection.owns(ty) {
+            let loop_handle = self.loop_handle.clone();
+            if let Some(xwm) = &mut self.xwm {
+                if let Err(err) = xwm.send_selection(ty, mime_type, fd, loop_handle) {
+                    warn!(?ty, error = %err, "failed to request the selection from Xwayland");
+                }
+                return;
+            }
+        }
         crate::clipboard::on_send_selection(self, ty, &mime_type, fd);
     }
 }
@@ -1218,7 +1261,7 @@ impl XdgActivationHandler for State {
     }
 }
 
-// GPU buffer sharing. When a client (or Xwayland via the satellite)
+// GPU buffer sharing. When a client (or Xwayland)
 // offers a dmabuf, try to import it into the GLES renderer and accept
 // or reject accordingly — a rejected buffer makes the client fall
 // back to another format rather than render blank.

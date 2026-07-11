@@ -867,14 +867,11 @@ mod server {
 
     fn close_window(state: &mut State, id: Option<u64>) -> Reply {
         let surface = resolve(state, id)?;
-        let toplevel = state
-            .xdg_shell_state
-            .toplevel_surfaces()
-            .iter()
-            .find(|t| t.wl_surface() == &surface)
-            .cloned()
+        let handle = state
+            .layout
+            .window_surface(&surface)
             .ok_or_else(|| "target is not a toplevel window".to_owned())?;
-        toplevel.send_close();
+        handle.send_close();
         Ok(Response::Handled)
     }
 
@@ -1105,7 +1102,12 @@ mod server {
         let entries = state.layout.window_entries();
         entries
             .into_iter()
-            .map(|e| window_info(&mut state.ipc, &dh, e, focus.as_ref()))
+            .map(|e| {
+                let x11 = state
+                    .x11_window_for(&e.surface)
+                    .map(|w| (w.class(), w.title()));
+                window_info(&mut state.ipc, &dh, e, focus.as_ref(), x11)
+            })
             .collect()
     }
 
@@ -1117,7 +1119,10 @@ mod server {
             .window_entries()
             .into_iter()
             .find(|e| e.surface == focus)?;
-        Some(window_info(&mut state.ipc, &dh, entry, Some(&focus)))
+        let x11 = state
+            .x11_window_for(&entry.surface)
+            .map(|w| (w.class(), w.title()));
+        Some(window_info(&mut state.ipc, &dh, entry, Some(&focus), x11))
     }
 
     /// Build a [`WindowInfo`] from a layout entry, assigning its stable
@@ -1127,9 +1132,20 @@ mod server {
         dh: &DisplayHandle,
         e: WindowEntry,
         focus: Option<&WlSurface>,
+        x11: Option<(String, String)>,
     ) -> WindowInfo {
         let id = ipc.assign(&e.surface);
-        let (app_id, title) = toplevel_strings(&e.surface);
+        // X11 windows have no xdg role data; their `(class, title)` come
+        // from the XWM (precomputed by the caller, which can see State).
+        let (app_id, title) = x11.map_or_else(
+            || toplevel_strings(&e.surface),
+            |(class, title)| {
+                (
+                    Some(class).filter(|s| !s.is_empty()),
+                    Some(title).filter(|s| !s.is_empty()),
+                )
+            },
+        );
         let focused = focus == Some(&e.surface);
         // Peer pid from the client's socket credentials.
         let pid = e

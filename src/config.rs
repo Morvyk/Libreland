@@ -72,13 +72,15 @@ pub struct Config {
     /// screenshot tool entirely; `Some(list)` installs one bind per
     /// entry. Re-applied on live reload like [`Self::binds`].
     pub screenshot: Option<Vec<ScreenshotBind>>,
-    /// Run `xwayland-satellite` at startup so X11 apps work (rootless
-    /// Xwayland as a normal Wayland client). When `true` (default) and
-    /// the binary is installed, the compositor picks a free X display,
-    /// launches the satellite on it, and exports `$DISPLAY` so X
-    /// clients connect. The satellite scales X apps itself via
-    /// `wp_fractional_scale` + `wp_viewporter`. Toggling needs a
-    /// restart (the satellite is spawned once at launch).
+    /// Run Xwayland at startup so X11 apps work. When `true` (default)
+    /// and `Xwayland` is installed, the compositor spawns a rootless
+    /// Xwayland on a free X display, acts as its window manager
+    /// in-process (native integration — see `src/xwayland.rs`), and
+    /// exports `$DISPLAY` so X clients connect. X11 windows tile like
+    /// native windows and render at physical resolution, with the real
+    /// output scale advertised to X apps via XSETTINGS `Xft/DPI`.
+    /// Toggling live via reload starts/stops the server (stopping
+    /// kills running X clients' server).
     pub xwayland: bool,
     /// Built-in idle handling: lock the session and/or power the screens off
     /// after a period of no input, waking on any input. `None` (the default)

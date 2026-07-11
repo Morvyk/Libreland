@@ -34,8 +34,8 @@ Libreland installed.
   * Pick "Libreland" from your display manager's session list, or run
     `libreland` from a TTY.
   * Control it with `libreland msg ...` (try `libreland msg --help`).
-  * X11 apps work via xwayland-satellite (started automatically; disable
-    with `xwayland = false` in ~/.config/libreland/config.lua).
+  * X11 apps work via native Xwayland integration (started automatically;
+    disable with `xwayland = false` in ~/.config/libreland/config.lua).
 
 Portals (screen sharing, file dialogs) need these — install whichever you
 want and (re)start xdg-desktop-portal:

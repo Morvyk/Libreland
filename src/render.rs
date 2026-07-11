@@ -3362,7 +3362,7 @@ impl Renderer {
 
     /// GPU buffer (dmabuf) formats this renderer can import as
     /// textures — advertised via `zwp_linux_dmabuf_v1` so clients
-    /// (and Xwayland via xwayland-satellite) can hand us
+    /// (and Xwayland) can hand us
     /// GPU-rendered content. Without this, GPU-composited apps (e.g.
     /// the Steam client) commit dmabuf buffers we can't sample and
     /// render blank.

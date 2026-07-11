@@ -62,6 +62,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::{SurfaceCachedState, ToplevelSurface};
+use smithay::xwayland::X11Surface;
+use smithay::xwayland::xwm::WmWindowType;
 use tracing::debug;
 
 use crate::config::AnimSpec;
@@ -82,13 +84,60 @@ pub enum FillMode {
     Fullscreen,
 }
 
+/// The protocol handle behind a managed window: a native Wayland
+/// `xdg_toplevel`, or an Xwayland (X11) window managed via the XWM.
+/// The layout treats both uniformly — everything is keyed by the
+/// window's `wl_surface`, and only the configure push (and the dialog
+/// heuristic) dispatches on the protocol.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowSurface {
+    Xdg(ToplevelSurface),
+    /// An X11 window plus the `wl_surface` Xwayland associated with it.
+    /// The surface is cached here at insert time — a window only enters
+    /// the layout once the xwayland-shell association exists — so
+    /// [`WindowSurface::wl_surface`] stays total (no `Option`), keeping
+    /// every surface-keyed lookup identical for both kinds. Boxed
+    /// because [`X11Surface`] carries the whole XWM atom table inline,
+    /// which would otherwise balloon every layout tree node for the
+    /// common (pure-Wayland) case.
+    X11 {
+        surface: Box<X11Surface>,
+        wl_surface: WlSurface,
+    },
+}
+
+impl WindowSurface {
+    /// The `wl_surface` that renders this window — the universal key
+    /// for layout lookups, focus, and the render placements.
+    pub fn wl_surface(&self) -> &WlSurface {
+        match self {
+            Self::Xdg(toplevel) => toplevel.wl_surface(),
+            Self::X11 { wl_surface, .. } => wl_surface,
+        }
+    }
+
+    /// Politely ask the window to close — `xdg_toplevel.close` or the
+    /// X11 `WM_DELETE_WINDOW` protocol. The client drives its own
+    /// teardown; the destroy/unmap handlers pull it from the layout.
+    pub fn send_close(&self) {
+        match self {
+            Self::Xdg(toplevel) => toplevel.send_close(),
+            Self::X11 { surface, .. } => {
+                if let Err(err) = surface.close() {
+                    debug!(window = surface.window_id(), %err, "X11 close failed");
+                }
+            }
+        }
+    }
+}
+
 /// One window managed by the layout, plus its current placement.
 /// The `rect` is the cell the layout has assigned (refreshed by
 /// every reflow) — clients see the same size via
-/// `xdg_toplevel.configure`.
+/// `xdg_toplevel.configure` (or an X11 `ConfigureWindow`).
 #[derive(Debug, Clone)]
 pub struct Window {
-    pub toplevel: ToplevelSurface,
+    pub toplevel: WindowSurface,
     pub rect: Rectangle<i32, Physical>,
     /// Maximized/fullscreen override: when set, the window fills its
     /// output (ignoring `rect`), drops its border/corners, and draws
@@ -381,7 +430,7 @@ impl Layout {
     /// position known) or doesn't land in any leaf, the new
     /// window splits the deepest leaf as a fallback. The first
     /// window in an empty layout becomes the root, full bounds.
-    pub fn insert(&mut self, toplevel: ToplevelSurface, cursor: Option<Point<i32, Physical>>) {
+    pub fn insert(&mut self, toplevel: WindowSurface, cursor: Option<Point<i32, Physical>>) {
         // Tile the new window on the output under the cursor (else
         // the first output). With no outputs at all there's nowhere
         // to put it — silent no-op.
@@ -1168,6 +1217,30 @@ impl Layout {
     /// maps at a default size and only repaints when a *later* configure
     /// arrives — snaps to its cell when nudged this way (the same thing a
     /// window move does). Returns whether `surface` is a window we track.
+    /// The protocol handle of the window matching `surface`, wherever
+    /// it lives (tree or floating, any workspace). Lets callers act on
+    /// the right protocol — e.g. a close request — without caring
+    /// whether the window is xdg or X11.
+    pub fn window_surface(&self, surface: &WlSurface) -> Option<WindowSurface> {
+        for op in &self.outputs {
+            for ws in &op.workspaces {
+                if let Some(t) = &ws.tree
+                    && let Some(w) = leaf_ref(t, surface)
+                {
+                    return Some(w.toplevel.clone());
+                }
+                if let Some(w) = ws
+                    .floating
+                    .iter()
+                    .find(|w| w.toplevel.wl_surface() == surface)
+                {
+                    return Some(w.toplevel.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub fn reconfigure(&self, surface: &WlSurface) -> bool {
         for op in &self.outputs {
             let area = op.area();
@@ -1852,24 +1925,59 @@ fn collect_filled<'a>(node: &'a Node, out: &mut Vec<&'a Window>) {
 /// a properties or preferences window over its app) or pins a fixed size
 /// (`min_size == max_size`, which only non-tileable windows do). The preferred
 /// size is the client's window geometry, else its fixed size.
-fn dialog_size(toplevel: &ToplevelSurface) -> Option<Size<i32, Physical>> {
-    let has_parent = toplevel.parent().is_some();
-    let (min, max, geo) = with_states(toplevel.wl_surface(), |states| {
-        let mut cached = states.cached_state.get::<SurfaceCachedState>();
-        let cur = cached.current();
-        (cur.min_size, cur.max_size, cur.geometry.map(|g| g.size))
-    });
-    let fixed = min.w > 0 && min.h > 0 && min == max;
-    if !has_parent && !fixed {
-        return None;
+fn dialog_size(toplevel: &WindowSurface) -> Option<Size<i32, Physical>> {
+    match toplevel {
+        WindowSurface::Xdg(toplevel) => {
+            let has_parent = toplevel.parent().is_some();
+            let (min, max, geo) = with_states(toplevel.wl_surface(), |states| {
+                let mut cached = states.cached_state.get::<SurfaceCachedState>();
+                let cur = cached.current();
+                (cur.min_size, cur.max_size, cur.geometry.map(|g| g.size))
+            });
+            let fixed = min.w > 0 && min.h > 0 && min == max;
+            if !has_parent && !fixed {
+                return None;
+            }
+            // Window geometry is the visible size sans shadows; prefer it,
+            // else the pinned size, else leave both axes 0 for the caller
+            // to fill in.
+            let size = geo
+                .filter(|s| s.w > 0 && s.h > 0)
+                .or(fixed.then_some(min))
+                .unwrap_or_default();
+            Some(Size::<i32, Physical>::from((size.w, size.h)))
+        }
+        WindowSurface::X11 { surface, .. } => {
+            // The X11 equivalents of the xdg heuristic: a transient-for
+            // hint is the xdg `parent`, a dialog/utility/splash/toolbar
+            // `NET_WM_WINDOW_TYPE` is an explicit "I'm not a main
+            // window", and pinned WM_NORMAL_HINTS (min == max) marks the
+            // same non-tileable windows it does on Wayland.
+            let has_parent = surface.is_transient_for().is_some();
+            let typed_dialog = matches!(
+                surface.window_type(),
+                Some(
+                    WmWindowType::Dialog
+                        | WmWindowType::Utility
+                        | WmWindowType::Splash
+                        | WmWindowType::Toolbar
+                )
+            );
+            let (min, max) = (surface.min_size(), surface.max_size());
+            let fixed = min.is_some() && min == max;
+            if !has_parent && !typed_dialog && !fixed {
+                return None;
+            }
+            // The window's own geometry is the size the client asked to
+            // map at (Xwayland keeps it current), which is exactly the
+            // dialog's preferred size; fall back to the pinned minimum.
+            let size = Some(surface.geometry().size)
+                .filter(|s| s.w > 0 && s.h > 0)
+                .or(if fixed { min } else { None })
+                .unwrap_or_default();
+            Some(Size::<i32, Physical>::from((size.w, size.h)))
+        }
     }
-    // Window geometry is the visible size sans shadows; prefer it, else the
-    // pinned size, else leave both axes 0 for the caller to fill in.
-    let size = geo
-        .filter(|s| s.w > 0 && s.h > 0)
-        .or(fixed.then_some(min))
-        .unwrap_or_default();
-    Some(Size::<i32, Physical>::from((size.w, size.h)))
 }
 
 /// Find the leaf whose window is `surface` (shared borrow).
@@ -1941,28 +2049,33 @@ fn push_configures_tree(node: &Node, border: i32, area: OutputArea) {
 /// the target. Shared by the tiled and floating paths — fill mode
 /// dominates either home.
 fn push_configure_filled(w: &Window, rect: Rectangle<i32, Physical>) {
-    let size = Size::<i32, Logical>::from((rect.size.w.max(1), rect.size.h.max(1)));
-    w.toplevel.with_pending_state(|state| {
-        state.size = Some(size);
-        state.states.set(xdg_toplevel::State::Activated);
-        state.states.unset(xdg_toplevel::State::TiledLeft);
-        state.states.unset(xdg_toplevel::State::TiledRight);
-        state.states.unset(xdg_toplevel::State::TiledTop);
-        state.states.unset(xdg_toplevel::State::TiledBottom);
-        match w.fill {
-            FillMode::Maximized => {
-                state.states.set(xdg_toplevel::State::Maximized);
-                state.states.unset(xdg_toplevel::State::Fullscreen);
-            }
-            FillMode::Fullscreen => {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.states.unset(xdg_toplevel::State::Maximized);
-            }
-            // Caller only reaches here for non-Normal fills.
-            FillMode::Normal => {}
+    match &w.toplevel {
+        WindowSurface::Xdg(toplevel) => {
+            let size = Size::<i32, Logical>::from((rect.size.w.max(1), rect.size.h.max(1)));
+            toplevel.with_pending_state(|state| {
+                state.size = Some(size);
+                state.states.set(xdg_toplevel::State::Activated);
+                state.states.unset(xdg_toplevel::State::TiledLeft);
+                state.states.unset(xdg_toplevel::State::TiledRight);
+                state.states.unset(xdg_toplevel::State::TiledTop);
+                state.states.unset(xdg_toplevel::State::TiledBottom);
+                match w.fill {
+                    FillMode::Maximized => {
+                        state.states.set(xdg_toplevel::State::Maximized);
+                        state.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
+                    FillMode::Fullscreen => {
+                        state.states.set(xdg_toplevel::State::Fullscreen);
+                        state.states.unset(xdg_toplevel::State::Maximized);
+                    }
+                    // Caller only reaches here for non-Normal fills.
+                    FillMode::Normal => {}
+                }
+            });
+            toplevel.send_configure();
         }
-    });
-    w.toplevel.send_configure();
+        WindowSurface::X11 { surface, .. } => push_x11_configure(surface, rect, w.fill),
+    }
     debug!(
         surface = ?w.toplevel.wl_surface().id(),
         w = rect.size.w,
@@ -1970,6 +2083,47 @@ fn push_configure_filled(w: &Window, rect: Rectangle<i32, Physical>) {
         fill = ?w.fill,
         "layout: fullscreen/maximized configure sent",
     );
+}
+
+/// Configure an X11 window to `rect` (global compositor coordinates —
+/// unlike xdg, X11 configures carry position too, which is what keeps
+/// Xwayland's idea of the window's place in sync for override-redirect
+/// popup positioning) and mirror the fill mode into `NET_WM_STATE` so
+/// the client sees the same maximized/fullscreen state an xdg client
+/// would. smithay translates the rect into the client's coordinate
+/// space per the Xwayland client scale. Errors mean the window (or
+/// Xwayland itself) is going away — nothing sensible to do, so they're
+/// logged and swallowed like a configure to a dying xdg surface.
+fn push_x11_configure(surface: &X11Surface, rect: Rectangle<i32, Physical>, fill: FillMode) {
+    let rect = Rectangle::<i32, Logical>::new(
+        Point::from((rect.loc.x, rect.loc.y)),
+        Size::from((rect.size.w.max(1), rect.size.h.max(1))),
+    );
+    if let Err(err) = surface.configure(rect) {
+        debug!(window = surface.window_id(), %err, "layout: X11 configure failed");
+    }
+    // Only touch NET_WM_STATE on an actual change — this runs on every
+    // reflow, and rewriting the property each time would spam X clients
+    // with PropertyNotify events they may react to.
+    if surface.is_maximized() != (fill == FillMode::Maximized) {
+        let _ = surface.set_maximized(fill == FillMode::Maximized);
+    }
+    if surface.is_fullscreen() != (fill == FillMode::Fullscreen) {
+        let _ = surface.set_fullscreen(fill == FillMode::Fullscreen);
+    }
+}
+
+/// The rect inside `rect`'s border ring: shifted in by `border` on
+/// both axes with the size shrunk to match (clamped like
+/// [`surface_size`]). This is where an X11 window's content goes —
+/// the X11 configure needs the full positioned rect, not just a size.
+fn inside_border(rect: Rectangle<i32, Physical>, border: i32) -> Rectangle<i32, Physical> {
+    let border = border.max(0);
+    let size = surface_size(rect.size, border);
+    Rectangle::new(
+        Point::new(rect.loc.x + border, rect.loc.y + border),
+        Size::from((size.w, size.h)),
+    )
 }
 
 /// Shrink `cell_size` by `2 * border` on each axis (clamped to a
@@ -1996,7 +2150,16 @@ fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
         return;
     }
     let size = surface_size(w.rect.size, border);
-    w.toplevel.with_pending_state(|state| {
+    let toplevel = match &w.toplevel {
+        WindowSurface::Xdg(toplevel) => toplevel,
+        // X11: one call carries position + size (inside the border) and
+        // clears any stale maximized/fullscreen state.
+        WindowSurface::X11 { surface, .. } => {
+            push_x11_configure(surface, inside_border(w.rect, border), FillMode::Normal);
+            return;
+        }
+    };
+    toplevel.with_pending_state(|state| {
         state.size = Some(size);
         state.states.set(xdg_toplevel::State::Activated);
         state.states.set(xdg_toplevel::State::TiledLeft);
@@ -2007,7 +2170,7 @@ fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
         state.states.unset(xdg_toplevel::State::Maximized);
         state.states.unset(xdg_toplevel::State::Fullscreen);
     });
-    w.toplevel.send_configure();
+    toplevel.send_configure();
     debug!(
         surface = ?w.toplevel.wl_surface().id(),
         x = w.rect.loc.x,
@@ -2029,7 +2192,14 @@ fn push_configure_for_floating(w: &Window, border: i32, area: OutputArea) {
         return;
     }
     let size = surface_size(w.rect.size, border);
-    w.toplevel.with_pending_state(|state| {
+    let toplevel = match &w.toplevel {
+        WindowSurface::Xdg(toplevel) => toplevel,
+        WindowSurface::X11 { surface, .. } => {
+            push_x11_configure(surface, inside_border(w.rect, border), FillMode::Normal);
+            return;
+        }
+    };
+    toplevel.with_pending_state(|state| {
         state.size = Some(size);
         state.states.set(xdg_toplevel::State::Activated);
         state.states.unset(xdg_toplevel::State::TiledLeft);
@@ -2040,7 +2210,7 @@ fn push_configure_for_floating(w: &Window, border: i32, area: OutputArea) {
         state.states.unset(xdg_toplevel::State::Maximized);
         state.states.unset(xdg_toplevel::State::Fullscreen);
     });
-    w.toplevel.send_configure();
+    toplevel.send_configure();
     debug!(
         surface = ?w.toplevel.wl_surface().id(),
         x = w.rect.loc.x,

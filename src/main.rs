@@ -78,6 +78,7 @@ mod scanout;
 mod screencopy;
 mod screenshot;
 mod wayland;
+mod xwayland;
 
 /// Walk subsurface parents up to the root surface, so a subsurface commit
 /// resolves to the toplevel (or layer surface) it belongs to.
@@ -159,18 +160,48 @@ pub(crate) struct State {
     /// acceleration to the *live* devices. Updated on
     /// `DeviceAdded`/`DeviceRemoved`.
     pub(crate) input_devices: Vec<smithay::reexports::input::Device>,
-    /// Running `xwayland-satellite` child, if X support is on. Held so a
-    /// live `xwayland = false` reload can stop it; `None` when off.
-    pub(crate) xwayland_child: Option<std::process::Child>,
     /// Children spawned at runtime (startup commands, bind/IPC `spawn`,
     /// the idle lock command). Held so [`State::reap_children`] can
     /// `try_wait` them — a dropped `Child` handle is never waited on, so
     /// every exited child would otherwise linger as a zombie.
     pub(crate) children: Vec<std::process::Child>,
-    /// X display the satellite serves (e.g. `":1"`). Exported as
+    /// X display our Xwayland serves (e.g. `":1"`). Exported as
     /// `$DISPLAY` to children we spawn (see [`State::build_command`]) so
     /// X clients connect; `None` when X support is off.
     pub(crate) xwayland_display: Option<String>,
+    /// The X11 window manager connection to our Xwayland, once it
+    /// reported ready. All XWM callbacks (`XwmHandler`) route through
+    /// this; `None` while Xwayland is off/starting/dead.
+    pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
+    /// Registration of the Xwayland readiness source. Removing it drops
+    /// the [`smithay::xwayland::XWayland`] instance, which disconnects
+    /// and terminates the Xwayland server — that's how a live
+    /// `xwayland = false` reload stops X support.
+    pub(crate) xwayland_source: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Xwayland's Wayland client handle: carries the per-client scale
+    /// override that maps X pixel space to our logical space (see
+    /// `xwayland.rs` module docs). Held to re-apply on scale changes.
+    pub(crate) xwayland_client: Option<smithay::reexports::wayland_server::Client>,
+    /// Managed (layout-resident) X11 windows, paired with the
+    /// `wl_surface` Xwayland associated. The pair is the lookup table in
+    /// both directions: focus sync (wl → X11) and unmap cleanup
+    /// (X11 → wl, whose association Xwayland may already have dropped).
+    pub(crate) x11_windows: Vec<(smithay::xwayland::X11Surface, WlSurface)>,
+    /// Mapped override-redirect X11 windows (menus, tooltips). Never in
+    /// the layout — rendered topmost through the popup path at whatever
+    /// global position the client set.
+    pub(crate) x11_or_windows: Vec<(smithay::xwayland::X11Surface, WlSurface)>,
+    /// The X11 window currently holding X input focus, if keyboard
+    /// focus is on an X11 window. Tracked so focus moves can unfocus
+    /// the previous X window (see `sync_x11_focus`).
+    pub(crate) x11_kbd_focus: Option<smithay::xwayland::X11Surface>,
+    /// Which selections (clipboard / primary) are currently owned by an
+    /// X11 client. Routes Wayland-side paste requests back through the
+    /// XWM instead of the compositor's clipboard cache.
+    pub(crate) x11_owns_selection: crate::xwayland::X11SelectionOwnership,
+    /// `xwayland_shell_v1` global state: how Xwayland associates its
+    /// `wl_surface`s with X11 windows. Held to keep the global alive.
+    pub(crate) xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     /// Cheap-to-clone handle to the Wayland display. Used by handler
     /// impls that need to create new globals or look up clients.
     #[allow(
@@ -2008,8 +2039,8 @@ impl State {
                 let pgeo = popup.geometry();
                 // The popup's window-geometry rect within its buffer
                 // (loc = buffer→visible offset, size = visible extent).
-                // XWayland (xwayland-satellite) menus never call
-                // set_window_geometry, so popup.geometry() is a zero
+                // Some clients never call set_window_geometry on their
+                // popups, so popup.geometry() is a zero
                 // rect there; fall back to the actual committed surface
                 // extent (loc AND size, per xdg-shell: an unset window
                 // geometry is the full surface bounds). Without this the
@@ -2047,6 +2078,28 @@ impl State {
                     rect: Rectangle::new(Point::new(left, top), smithay::utils::Size::new(w, h)),
                 });
             }
+        }
+        // Mapped X11 override-redirect windows (menus, tooltips,
+        // dropdowns) ride the same pipeline: topmost, at the global
+        // position the client chose. X apps position these against
+        // their toplevel's geometry — which our configures keep in
+        // sync — and constrain them on-screen themselves, so unlike
+        // xdg popups there's nothing to clamp or offset (an X window
+        // has no shadow-padded window geometry; buffer (0,0) is the
+        // rect's top-left).
+        for (window, surface) in &self.x11_or_windows {
+            if !window.alive() {
+                continue;
+            }
+            let geo = window.geometry();
+            out.push(render::PopupPlacement {
+                surface: surface.clone(),
+                buffer_origin: Point::new(geo.loc.x, geo.loc.y),
+                rect: Rectangle::new(
+                    Point::new(geo.loc.x, geo.loc.y),
+                    smithay::utils::Size::new(geo.size.w, geo.size.h),
+                ),
+            });
         }
         out
     }
@@ -2490,6 +2543,9 @@ impl State {
         self.sync_output_globals(&descs);
         self.recompute_layer_layout();
         self.preferred_scale = self.renderer.primary_scale();
+        // A hotplug can change which output is primary (and so its
+        // scale) — keep Xwayland's client scale + XSETTINGS DPI in step.
+        self.update_xwayland_scale();
         self.queue_redraw_all();
     }
 
@@ -2557,23 +2613,19 @@ impl State {
                 }
             }
             config::Action::Close => {
-                // Politely ask the focused toplevel to close. Match
-                // the keyboard-focused surface against the live
-                // toplevels and send xdg_toplevel.close; the client
-                // drives its own teardown (which destroys the
-                // surface, and our XdgShellHandler removes it from
-                // the layout). No focus / no matching toplevel (e.g.
-                // a layer surface like rofi is focused) = no-op.
+                // Politely ask the focused window to close — via
+                // xdg_toplevel.close or WM_DELETE_WINDOW, whichever
+                // protocol it speaks; the client drives its own
+                // teardown (which unmaps/destroys the surface, and the
+                // shell handlers remove it from the layout). No focus /
+                // no matching window (e.g. a layer surface like rofi is
+                // focused) = no-op.
                 let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
                 if let Some(surface) = focus
-                    && let Some(toplevel) = self
-                        .xdg_shell_state
-                        .toplevel_surfaces()
-                        .iter()
-                        .find(|t| t.wl_surface() == &surface)
+                    && let Some(handle) = self.layout.window_surface(&surface)
                 {
                     info!(surface = ?surface.id(), "close action fired");
-                    toplevel.send_close();
+                    handle.send_close();
                 }
             }
             config::Action::Spawn(cmd) => {
@@ -2698,10 +2750,9 @@ impl State {
 
     /// Reap exited children so they don't accumulate as zombies. Every
     /// runtime spawn path parks its `Child` handle in `self.children`;
-    /// this sweeps them with `try_wait` (never blocks) on a timer. The
-    /// xwayland satellite is checked too: if it died on its own, clear
-    /// the stale handle *and* `$DISPLAY` so new children don't inherit a
-    /// dead X display.
+    /// this sweeps them with `try_wait` (never blocks) on a timer.
+    /// (Xwayland isn't in this set — smithay owns its child handle, and
+    /// a dying Xwayland surfaces as `XwmHandler::disconnected`.)
     pub(crate) fn reap_children(&mut self) {
         self.children.retain_mut(|child| match child.try_wait() {
             Ok(Some(status)) => {
@@ -2714,41 +2765,31 @@ impl State {
                 false
             }
         });
-        if let Some(child) = &mut self.xwayland_child
-            && !matches!(child.try_wait(), Ok(None))
-        {
-            warn!(
-                "xwayland-satellite exited on its own; X11 support is gone until an `xwayland` toggle or restart"
-            );
-            self.xwayland_child = None;
-            self.xwayland_display = None;
-        }
     }
 
-    /// Start or stop `xwayland-satellite` to match a live `xwayland`
-    /// toggle. Enabling spawns it and records the child + display (which
+    /// Start or stop Xwayland to match a live `xwayland` toggle.
+    /// Enabling spawns a fresh server and records the display (which
     /// [`State::build_command`] exports as `$DISPLAY` to children we
-    /// spawn). Disabling kills the running satellite — any X11 clients
+    /// spawn). Disabling tears the server down — any X11 clients
     /// connected to it lose their server.
     fn apply_xwayland_toggle(&mut self, enable: bool) {
         if enable {
-            if let Some((child, disp)) = start_xwayland_satellite() {
-                self.xwayland_child = Some(child);
-                self.xwayland_display = Some(disp.clone());
+            let dh = self.display_handle.clone();
+            let scale = self.renderer.primary_scale();
+            if let Some(spawned) = crate::xwayland::spawn_xwayland(&self.loop_handle, &dh, scale) {
                 info!(
-                    x_display = %disp,
+                    x_display = %spawned.display,
                     "xwayland enabled; children spawned from now get $DISPLAY"
                 );
+                self.xwayland_source = Some(spawned.source);
+                self.xwayland_client = Some(spawned.client);
+                self.xwayland_display = Some(spawned.display);
             } else {
-                warn!("xwayland enabled but the satellite failed to start");
+                warn!("xwayland enabled but Xwayland failed to start");
             }
         } else {
-            if let Some(mut child) = self.xwayland_child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            self.xwayland_display = None;
-            warn!("xwayland disabled; satellite stopped (running X11 clients lost their server)");
+            self.teardown_xwayland();
+            warn!("xwayland disabled (running X11 clients lost their server)");
         }
     }
 
@@ -2851,10 +2892,14 @@ impl State {
             self.sync_output_globals(&descs);
             self.recompute_layer_layout();
             self.preferred_scale = self.renderer.primary_scale();
+            // Xwayland's client scale + XSETTINGS DPI follow the primary
+            // output's scale; re-publish and re-push X window configures
+            // so X apps re-map into the new pixel space.
+            self.update_xwayland_scale();
             info!("monitor config reloaded (position/scale/primary/vrr/mode/hdr)");
         }
 
-        // ---- XWayland: start or stop the satellite to match the toggle. ----
+        // ---- XWayland: start or stop the server to match the toggle. ----
         if xwayland_changed {
             self.apply_xwayland_toggle(new.xwayland);
         }
@@ -3399,17 +3444,38 @@ fn main() -> Result<()> {
             info!(name, value, "applying configured env var");
             std::env::set_var(name, value);
         }
-        // Pin $XCURSOR_SIZE (unless the user set one) so Xwayland's cursor
-        // matches native Wayland ones. Xwayland renders X11 cursors at
-        // $XCURSOR_SIZE *physical* pixels and xwayland-satellite forwards them
-        // as a buffer_scale-1 surface with no viewport, so we draw them at
-        // size × output_scale — the same as our own themed cursor (loaded at
-        // the same logical size). With $XCURSOR_SIZE unset, libXcursor inside
-        // Xwayland instead picks a HiDPI-derived default (~2× on a 1.5× output),
-        // making the X cursor twice the size of native ones. Mirrors niri's
-        // CursorManager::ensure_env.
+        // Pin $XCURSOR_SIZE (unless the user set one) so X apps' cursors
+        // match native Wayland ones. Under the native Xwayland
+        // integration the X pixel space is *physical*-sized (client
+        // scale, see src/xwayland.rs): an X cursor of N px renders as N
+        // physical px, while our themed cursor at logical L renders as
+        // L × scale. So X apps must load cursors at L × primary-scale —
+        // physical pixels. The renderer isn't up yet, so the scale comes
+        // from the primary output's *configured* scale (the renderer
+        // applies the same value); XSETTINGS `Gtk/CursorThemeSize`
+        // repeats it for toolkits that ignore the env var, and tracks
+        // live scale changes where this one-shot env pin can't.
         if std::env::var_os("XCURSOR_SIZE").is_none() {
-            std::env::set_var("XCURSOR_SIZE", crate::cursor::DEFAULT_SIZE.to_string());
+            let primary_scale = if let Some(name) = &config.monitors.primary {
+                config.monitors.outputs.get(name).map_or(1.0, |o| o.scale)
+            } else {
+                // Automatic primary: which connector wins isn't known
+                // until the DRM scan. If every configured output shares
+                // one scale (the common case), use it; else assume 1.
+                let mut scales = config.monitors.outputs.values().map(|o| o.scale);
+                let first = scales.next();
+                match first {
+                    Some(s) if scales.all(|t| (t - s).abs() < f64::EPSILON) => s,
+                    _ => 1.0,
+                }
+            };
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "cursor size is a small positive number (theme sizes are tens of pixels)"
+            )]
+            let size = (f64::from(crate::cursor::DEFAULT_SIZE) * primary_scale).round() as u32;
+            std::env::set_var("XCURSOR_SIZE", size.to_string());
         }
     }
 
@@ -3618,41 +3684,42 @@ fn main() -> Result<()> {
         warn!("XDG_RUNTIME_DIR unset; control IPC socket disabled");
     }
 
-    // XWayland via xwayland-satellite: a rootless Xwayland that
-    // connects to *our* socket as a normal Wayland client (so X
-    // windows arrive as ordinary xdg_toplevels) and serves X11 on a
-    // display we pick. It must start after WAYLAND_DISPLAY is set (it
-    // inherits it) and before X clients. It scales X *windows* itself via
-    // wp_fractional_scale + wp_viewporter (per-window buffer_scale +
-    // viewport). X *cursors*, though, it forwards verbatim as a surface, which
-    // we display — so they only match native ones because we pinned
-    // $XCURSOR_SIZE to the logical size above (and it inherits $XCURSOR_THEME).
-    // Started here so the satellite inherits the process env (incl.
-    // WAYLAND_DISPLAY). The child + display are stored on `State` so a
-    // live `xwayland` reload can stop/start it; `xwayland_display` is
-    // also what `build_command` exports as `$DISPLAY` to children we
-    // spawn (the process env is only safe to mutate here, pre-threads).
-    let (xwayland_child, xwayland_display) = if config.xwayland {
-        match start_xwayland_satellite() {
-            Some((child, disp)) => {
-                // SAFETY: same single-threaded-init reasoning as the
-                // WAYLAND_DISPLAY set_var above — still pre-event-loop.
-                #[allow(
-                    unsafe_code,
-                    reason = "set_var is unsafe due to multi-threaded env races; called in single-threaded init before the event loop, same as WAYLAND_DISPLAY"
-                )]
-                // SAFETY: see #[allow] above.
-                unsafe {
-                    std::env::set_var("DISPLAY", &disp);
-                }
-                info!(x_display = %disp, "XWayland ready; $DISPLAY exported for X11 clients");
-                (Some(child), Some(disp))
-            }
-            None => (None, None),
+    // Native Xwayland (see src/xwayland.rs): spawn `Xwayland -rootless`
+    // on a display smithay picks, with this compositor acting as its
+    // window manager in-process — X11 windows tile like xdg toplevels,
+    // X cursors ride the normal wl_pointer path, and X apps are told
+    // the real output scale (client-scale mapping + XSETTINGS Xft/DPI).
+    // Xwayland talks to us over a socketpair (no dependency on
+    // WAYLAND_DISPLAY), but it's spawned here, pre-event-loop, so the
+    // `$DISPLAY` export is still single-threaded-safe and the D-Bus
+    // activation env below picks it up. The WM attaches once the loop
+    // runs and Xwayland reports ready; X clients started before that
+    // just block on the X socket until then.
+    let mut xwayland_source = None;
+    let mut xwayland_client = None;
+    let mut xwayland_display = None;
+    if config.xwayland
+        && let Some(spawned) = xwayland::spawn_xwayland(
+            &handle,
+            &wayland_init.display_handle,
+            renderer.primary_scale(),
+        )
+    {
+        // SAFETY: same single-threaded-init reasoning as the
+        // WAYLAND_DISPLAY set_var above — still pre-event-loop.
+        #[allow(
+            unsafe_code,
+            reason = "set_var is unsafe due to multi-threaded env races; called in single-threaded init before the event loop, same as WAYLAND_DISPLAY"
+        )]
+        // SAFETY: see #[allow] above.
+        unsafe {
+            std::env::set_var("DISPLAY", &spawned.display);
         }
-    } else {
-        (None, None)
-    };
+        info!(x_display = %spawned.display, "$DISPLAY exported for X11 clients");
+        xwayland_source = Some(spawned.source);
+        xwayland_client = Some(spawned.client);
+        xwayland_display = Some(spawned.display);
+    }
 
     // D-Bus-activated services (notably xdg-desktop-portal) are spawned
     // by the session bus, not by us, so they don't inherit our process
@@ -3817,9 +3884,16 @@ fn main() -> Result<()> {
         keyboard,
         config,
         input_devices: Vec::new(),
-        xwayland_child,
         children: startup_children,
         xwayland_display,
+        xwm: None,
+        xwayland_source,
+        xwayland_client,
+        x11_windows: Vec::new(),
+        x11_or_windows: Vec::new(),
+        x11_kbd_focus: None,
+        x11_owns_selection: crate::xwayland::X11SelectionOwnership::default(),
+        xwayland_shell_state: wayland_init.xwayland_shell_state,
         display_handle: wayland_init.display_handle,
         compositor_state: wayland_init.compositor_state,
         shm_state: wayland_init.shm_state,
@@ -4088,49 +4162,6 @@ fn export_activation_environment() {
             "could not run dbus-update-activation-environment (is dbus installed?); portals may not see the session env"
         ),
     }
-}
-
-/// Launch `xwayland-satellite` on the first free X display and return
-/// that display (e.g. `":1"`) so the caller can export `$DISPLAY`.
-/// Returns `None` if no display is free or the binary isn't installed
-/// — in both cases X11 support is simply absent (logged), never fatal.
-/// The satellite inherits our environment, so it connects to
-/// `$WAYLAND_DISPLAY` and inherits `$XCURSOR_*` for its cursor theme.
-fn start_xwayland_satellite() -> Option<(std::process::Child, String)> {
-    let Some(n) = first_free_x_display() else {
-        warn!("no free X display in :0..:32; not starting xwayland-satellite");
-        return None;
-    };
-    let disp = format!(":{n}");
-    match std::process::Command::new("xwayland-satellite")
-        .arg(&disp)
-        .spawn()
-    {
-        Ok(child) => {
-            info!(pid = child.id(), x_display = %disp, "spawned xwayland-satellite");
-            // Keep the child so a live `xwayland = false` reload can stop it.
-            Some((child, disp))
-        }
-        Err(err) => {
-            warn!(
-                error = %err,
-                "could not start xwayland-satellite (is it installed?); X11 apps unavailable"
-            );
-            None
-        }
-    }
-}
-
-/// Lowest X display number `N` in `0..=32` whose socket
-/// (`/tmp/.X11-unix/XN`) and lock (`/tmp/.XN-lock`) are both absent,
-/// i.e. free for a new X server. There's a benign TOCTOU window
-/// between this check and the satellite claiming it; on a contended
-/// system the satellite simply fails to bind and logs.
-fn first_free_x_display() -> Option<u32> {
-    (0u32..=32).find(|n| {
-        !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
-            && !std::path::Path::new(&format!("/tmp/.X{n}-lock")).exists()
-    })
 }
 
 /// Pick a `/dev/dri/cardN` node from a udev enumeration — render nodes

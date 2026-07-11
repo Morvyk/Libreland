@@ -16,8 +16,8 @@ license=('MIT')
 # Runtime libraries the binaries actually link (from DT_NEEDED): libgbm
 # (mesa), libseat (seatd), libudev (systemd-libs), libinput, libxkbcommon,
 # and libav* (ffmpeg) for media wallpapers. Lua is statically vendored and
-# Wayland is pure-Rust, so neither is a dep. xwayland-satellite is launched
-# by default (config `xwayland = true`).
+# Wayland is pure-Rust, so neither is a dep. Xwayland is spawned and managed
+# natively by default (config `xwayland = true`).
 depends=(
     'glibc'
     'gcc-libs'
@@ -27,7 +27,7 @@ depends=(
     'seatd'
     'systemd-libs'
     'ffmpeg'
-    'xwayland-satellite'
+    'xorg-xwayland'
 )
 # `rust` provides cargo; the project's .cargo/config.toml links through mold.
 # clang (libclang) + pkgconf build the ffmpeg-sys bindings (bindgen +
