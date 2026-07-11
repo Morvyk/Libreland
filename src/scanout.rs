@@ -294,14 +294,6 @@ impl ScanoutSurface {
         Ok((buffer, swapchain, use_opaque))
     }
 
-    /// The primary plane's supported `(fourcc, modifier)` pairs — the set a
-    /// client buffer must land in to be directly scannable on this output.
-    /// Feeds the dmabuf-feedback scanout tranche (see wayland.rs) so clients
-    /// allocate plane-compatible buffers for their fullscreen swapchains.
-    pub fn plane_formats(&self) -> Vec<Format> {
-        self.drm.plane_info().formats.iter().copied().collect()
-    }
-
     /// Acquire the next composite buffer for the renderer to draw into, plus
     /// its buffer age. Idempotent: returns the same buffer until it is queued.
     pub fn next_buffer(&mut self) -> Result<(Dmabuf, u8)> {
@@ -388,9 +380,7 @@ impl ScanoutSurface {
             return Ok(false);
         }
         // KMS can't safely scan out a buffer allocated with an implicit
-        // (Invalid) modifier — its tiling/layout is unknown (the Weston
-        // rule). Clients allocate explicit scanout-capable modifiers when
-        // they honour the dmabuf-feedback scanout tranche (see wayland.rs).
+        // (Invalid) modifier — its tiling/layout is unknown (the Weston rule).
         if dmabuf.format().modifier == Modifier::Invalid {
             debug!(
                 code = ?dmabuf.format().code,

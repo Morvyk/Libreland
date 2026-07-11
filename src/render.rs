@@ -3470,25 +3470,6 @@ impl Renderer {
         self.gles.dmabuf_formats().into_iter().collect()
     }
 
-    /// Scanout-capable `(fourcc, modifier)` pairs: the primary output's
-    /// plane formats, intersected with what the renderer can import as a
-    /// texture — the composite fallback must be able to draw the very same
-    /// buffers on frames the plane can't take (a menu opens, a capture
-    /// runs). Feeds the dmabuf-feedback *scanout tranche*, which is what
-    /// makes clients allocate explicit, plane-compatible modifiers for
-    /// fullscreen swapchains instead of implicit render-optimal ones (an
-    /// implicit-modifier buffer can never be latched onto the plane).
-    pub fn primary_scanout_formats(&self) -> Vec<Format> {
-        let importable = self.gles.dmabuf_formats();
-        self.outputs
-            .get(self.primary_idx)
-            .map(|o| o.surface.plane_formats())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|f| importable.contains(f))
-            .collect()
-    }
-
     /// Whether the renderer can bind a dmabuf of `format` as a *render
     /// target* (the subset of formats we can draw/blit *into*, which is
     /// smaller than the texture-import set). Screencopy's GPU path
