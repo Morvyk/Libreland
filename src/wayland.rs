@@ -780,6 +780,8 @@ impl CompositorHandler for State {
         // Drop the first-map nudge record so the set doesn't accumulate dead
         // surfaces (a toplevel's wl_surface is never reused once destroyed).
         self.mapped_toplevels.remove(surface);
+        // Same for the sticky scanout-feedback record.
+        self.scanout_feedback_given.borrow_mut().remove(&surface.id());
     }
 }
 

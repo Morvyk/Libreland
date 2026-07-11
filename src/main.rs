@@ -308,6 +308,12 @@ pub(crate) struct State {
     /// missing piece between the single-pass composite and true
     /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
     pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// Surfaces that have ever been handed the scanout feedback variant —
+    /// they keep it for life (see `sync_scanout_feedback`; every feedback
+    /// change costs the client a swapchain rebuild). `RefCell` because the
+    /// per-frame sync runs under `&self` alongside the renderer borrows.
+    pub(crate) scanout_feedback_given:
+        std::cell::RefCell<std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>>,
     /// Fractional scale to send to every new
     /// `wp_fractional_scale` object. Currently the primary
     /// output's configured scale; will become per-surface once
@@ -2792,7 +2798,22 @@ impl State {
             return;
         };
         for p in placements.iter().filter(|p| p.cell_rect.overlaps(rect)) {
-            let feedback = if p.fill == layout::FillMode::Fullscreen {
+            // Sticky: once a window has been given the scanout variant it
+            // keeps it for its lifetime. Every feedback change makes the
+            // client's WSI rebuild its swapchain, and swapchain recreation
+            // is exactly the moment fragile frame-pacing code runs (a Wine
+            // build with a broken present-timing thunk asserts there) — so
+            // never flip back on unfullscreen. Keeping the tranche is
+            // harmless: scanout-capable modifiers render fine windowed.
+            let fullscreen = p.fill == layout::FillMode::Fullscreen;
+            if fullscreen {
+                self.scanout_feedback_given
+                    .borrow_mut()
+                    .insert(p.surface.id());
+            }
+            let feedback = if fullscreen
+                || self.scanout_feedback_given.borrow().contains(&p.surface.id())
+            {
                 scanout_fb
             } else {
                 default_fb
@@ -3957,6 +3978,7 @@ fn main() -> Result<()> {
         dmabuf_global: wayland_init.dmabuf_global,
         dmabuf_default_feedback: wayland_init.dmabuf_default_feedback,
         dmabuf_scanout_feedback: wayland_init.dmabuf_scanout_feedback,
+        scanout_feedback_given: std::cell::RefCell::new(std::collections::HashSet::new()),
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         layer_outputs: std::collections::HashMap::new(),
