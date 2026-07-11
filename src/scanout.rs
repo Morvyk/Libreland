@@ -370,16 +370,9 @@ impl ScanoutSurface {
     /// by the plane) and the caller must fall back to compositing this frame.
     /// `Err` is a real failure (inactive device, flip error).
     ///
-    /// `use_opaque` requests the opaque sibling fourcc for the plane (when the
-    /// client buffer carries an unused alpha channel). On success ownership of
-    /// `buffer` (the `wl_buffer` keep-alive) is taken so `wl_buffer.release`
-    /// is deferred until a later flip replaces it.
-    pub fn try_queue_external(
-        &mut self,
-        buffer: ClientBuffer,
-        dmabuf: &Dmabuf,
-        use_opaque: bool,
-    ) -> Result<bool> {
+    /// On success ownership of `buffer` (the `wl_buffer` keep-alive) is taken
+    /// so `wl_buffer.release` is deferred until a later flip replaces it.
+    pub fn try_queue_external(&mut self, buffer: ClientBuffer, dmabuf: &Dmabuf) -> Result<bool> {
         ensure!(self.drm.is_active(), "DRM device is inactive");
 
         // A legacy (non-atomic) surface can't reliably test a foreign FB.
@@ -396,6 +389,23 @@ impl ScanoutSurface {
             );
             return Ok(false);
         }
+
+        // Prefer the buffer's own fourcc when the plane advertises it with
+        // this modifier: the caller proved the content opaque, and on the
+        // primary plane an unused alpha channel scans out over the CRTC's
+        // black background — indistinguishable. Swap to the opaque sibling
+        // only when the plane lacks the native format. Forcing the sibling
+        // unconditionally broke the import on planes that advertise the
+        // alpha fourcc but not its sibling (NVIDIA lists AB30 but no XB30:
+        // addfb2 failed for every HDR game frame → zero direct scans).
+        let fmt = dmabuf.format();
+        let plane_has_native = self
+            .drm
+            .plane_info()
+            .formats
+            .iter()
+            .any(|f| f.code == fmt.code && f.modifier == fmt.modifier);
+        let use_opaque = !plane_has_native;
 
         let fb = match self.import_client_fb(&buffer, dmabuf, use_opaque) {
             Ok(fb) => fb,

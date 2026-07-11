@@ -1217,6 +1217,31 @@ impl Layout {
     /// maps at a default size and only repaints when a *later* configure
     /// arrives — snaps to its cell when nudged this way (the same thing a
     /// window move does). Returns whether `surface` is a window we track.
+    /// Whether `surface` is a managed window parked on a **non-active**
+    /// workspace — mapped, committing, but invisible, with nothing ever
+    /// presenting its frames. Drives the immediate `discarded` for its
+    /// `wp_presentation` feedback (see the commit handler): parking the
+    /// feedback until the workspace returns starves present-timing
+    /// consumers.
+    pub fn on_inactive_workspace(&self, surface: &WlSurface) -> bool {
+        for op in &self.outputs {
+            for (index, ws) in op.workspaces.iter().enumerate() {
+                if index == op.active {
+                    continue;
+                }
+                if ws
+                    .tree
+                    .as_ref()
+                    .is_some_and(|t| leaf_ref(t, surface).is_some())
+                    || ws.floating.iter().any(|w| w.toplevel.wl_surface() == surface)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The protocol handle of the window matching `surface`, wherever
     /// it lives (tree or floating, any workspace). Lets callers act on
     /// the right protocol — e.g. a close request — without caring

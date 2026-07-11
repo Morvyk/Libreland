@@ -723,6 +723,15 @@ impl CompositorHandler for State {
         // invisible (no texture) even though the client did
         // everything right.
         on_commit_buffer_handler::<State>(surface);
+        // A commit nobody will ever present — the window sits on a
+        // hidden workspace, or the session is locked — gets its
+        // wp_presentation feedback DISCARDED right here. Per the
+        // protocol every feedback resolves exactly once; parking them
+        // until the workspace returns starves present-timing consumers
+        // (wine's vkGetPastPresentationTimingEXT asserts once its
+        // timing queue errors — a game crashed on every workspace
+        // switch this way).
+        discard_hidden_presentation_feedback(self, surface);
         // Some clients ignore the size in the *initial* configure (sent before
         // they map) and render at their own default size, only resizing when a
         // later configure arrives — MPV's idle "Drop files" window is the
@@ -772,6 +781,40 @@ impl CompositorHandler for State {
         // surfaces (a toplevel's wl_surface is never reused once destroyed).
         self.mapped_toplevels.remove(surface);
     }
+}
+
+/// Discard the `wp_presentation` feedback of a commit that nothing will
+/// ever present: the committing window sits on a non-active workspace,
+/// or the session is locked (where only the lock surfaces reach the
+/// screen). Resolved immediately at commit time — the only point where
+/// we reliably see every hidden producer — so a game left running on a
+/// hidden workspace keeps getting `discarded` events instead of an
+/// ever-growing queue of feedback that never fires. Visible surfaces
+/// are untouched; their feedback resolves through the per-frame
+/// collect → vblank `presented` path.
+fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) {
+    use smithay::desktop::utils::SurfacePresentationFeedback;
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+
+    let root = crate::root_surface(surface);
+    let hidden = if state.session_locked {
+        !state
+            .lock_surfaces
+            .values()
+            .any(|lock| lock.wl_surface() == &root)
+    } else {
+        state.layout.on_inactive_workspace(&root)
+    };
+    if !hidden {
+        return;
+    }
+    smithay::wayland::compositor::with_states(surface, |states| {
+        if let Some(mut feedback) =
+            SurfacePresentationFeedback::from_states(states, wp_presentation_feedback::Kind::empty())
+        {
+            feedback.discarded();
+        }
+    });
 }
 
 /// Layer-surface focus + layout reflow happens on commit

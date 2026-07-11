@@ -3727,11 +3727,10 @@ impl Renderer {
             // VRR must settle before the flip (it may promote the flip to a
             // modeset); harmlessly re-applied by the composite path on a miss.
             self.apply_vrr(idx, placements);
-            match self.outputs[idx].surface.try_queue_external(
-                direct.buffer,
-                &direct.dmabuf,
-                direct.use_opaque,
-            ) {
+            match self.outputs[idx]
+                .surface
+                .try_queue_external(direct.buffer, &direct.dmabuf)
+            {
                 Ok(true) => {
                     debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
                     self.send_output_frame_callbacks(placements, layers, popups, out_rect);
@@ -5393,12 +5392,7 @@ impl Renderer {
             {
                 reject!("alpha buffer without a covering opaque region");
             }
-            let use_opaque = has_alpha(code);
-            Some(DirectInputs {
-                buffer,
-                dmabuf,
-                use_opaque,
-            })
+            Some(DirectInputs { buffer, dmabuf })
         })
         .flatten()
     }
@@ -5412,9 +5406,6 @@ struct DirectInputs {
     /// until a later flip replaces this buffer on the plane.
     buffer: ClientBuffer,
     dmabuf: Dmabuf,
-    /// Program the plane with the opaque sibling fourcc (ignore the alpha
-    /// channel) — set when the client buffer's format carries unused alpha.
-    use_opaque: bool,
 }
 
 /// Whether the surface's opaque regions cover the whole surface — i.e. it is

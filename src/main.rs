@@ -82,7 +82,7 @@ mod xwayland;
 
 /// Walk subsurface parents up to the root surface, so a subsurface commit
 /// resolves to the toplevel (or layer surface) it belongs to.
-fn root_surface(surface: &WlSurface) -> WlSurface {
+pub(crate) fn root_surface(surface: &WlSurface) -> WlSurface {
     let mut root = surface.clone();
     while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
         root = parent;
