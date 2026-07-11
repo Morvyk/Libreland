@@ -789,6 +789,11 @@ mod server {
             }
         };
         if mutating {
+            // A mutation can change what's under the stationary cursor —
+            // a workspace switch hides the pointer-focused surface
+            // outright. Re-aim pointer focus so a hidden game's pointer
+            // lock / hidden cursor can't outlive its visibility.
+            state.refresh_pointer_focus();
             state.queue_redraw_all();
         }
         reply

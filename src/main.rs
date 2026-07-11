@@ -789,6 +789,9 @@ impl State {
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
         }
+        // The switch changed what's under the cursor; see the IPC
+        // dispatch — same reasoning (stale pointer lock / hidden cursor).
+        self.refresh_pointer_focus();
         self.queue_redraw_all();
     }
 
@@ -1148,6 +1151,124 @@ impl State {
             .insert(crtc, RedrawState::WaitingForVblank { dirty });
     }
 
+    /// Hit-test the desktop at `cursor_i`: returns the surface that should
+    /// take the *pointer* (with the buffer origin that makes surface-local
+    /// coordinates correct) and the surface that should take the
+    /// *keyboard* in the Hover model. A popup under the cursor wins the
+    /// pointer (menus draw on top of everything), then layer surfaces
+    /// (rofi, panels, OSDs), then the tile / floating layout. The keyboard
+    /// target skips popups — we don't run a popup grab yet, and a menu
+    /// shouldn't pull keyboard focus off its parent toplevel. While the
+    /// session is locked, only the lock surface is reachable — no popups,
+    /// layers, or windows take either focus.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple mirrors smithay's pointer focus type (surface + f64 origin); naming it would add a struct used by exactly two callers"
+    )]
+    fn pointer_hit_test(
+        &self,
+        cursor_i: Point<i32, Physical>,
+    ) -> (
+        Option<(WlSurface, Point<f64, Logical>)>,
+        Option<WlSurface>,
+    ) {
+        let popup_hit = if self.session_locked {
+            None
+        } else {
+            self.popup_at(cursor_i)
+        };
+        let surface_hit = if self.session_locked {
+            self.locked_surface_at(cursor_i)
+        } else {
+            self.layer_at(cursor_i)
+                .map(|(surface, rect)| {
+                    (
+                        surface,
+                        Point::<f64, Logical>::from((f64::from(rect.loc.x), f64::from(rect.loc.y))),
+                    )
+                })
+                .or_else(|| {
+                    self.layout.window_at(cursor_i).map(|(w, rect)| {
+                        // A CSD client pads its buffer with an invisible shadow
+                        // margin and reports the real content rect via
+                        // set_window_geometry; the render path shifts the buffer
+                        // up-left by that offset so the visible content lands at
+                        // the cell origin. The pointer focus origin must use that
+                        // SAME shifted buffer origin — otherwise surface-local
+                        // coordinates are off by the shadow margin and clicks land
+                        // below where the content visually is (the Lutris "+"
+                        // button). The shadow only exists on Normal windows;
+                        // maximized/fullscreen drop it, matching `grouped` in
+                        // render_output.
+                        let (gx, gy) = if w.fill == crate::layout::FillMode::Normal {
+                            crate::render::window_geometry_offset(w.toplevel.wl_surface())
+                        } else {
+                            (0, 0)
+                        };
+                        (
+                            w.toplevel.wl_surface().clone(),
+                            Point::<f64, Logical>::from((
+                                f64::from(rect.loc.x - gx),
+                                f64::from(rect.loc.y - gy),
+                            )),
+                        )
+                    })
+                })
+        };
+        let kbd_target = surface_hit.as_ref().map(|(surface, _)| surface.clone());
+        (popup_hit.or(surface_hit), kbd_target)
+    }
+
+    /// Re-aim pointer focus after a compositor-driven scene change
+    /// (workspace switch, window moved to another workspace, close, …):
+    /// re-hit-test the stationary cursor and, if a different surface is
+    /// now under it, hand pointer focus over with a synthetic motion.
+    ///
+    /// Pointer focus otherwise only updates on physical motion — and the
+    /// motion path can't recover on its own, because its pointer-lock
+    /// check reads the *current* focus: a game that locked the pointer
+    /// (cursor hidden) keeps that focus through a workspace switch, so
+    /// every subsequent motion short-circuits down the locked path and
+    /// the user is stranded on the new workspace with a frozen, invisible
+    /// cursor. Handing focus to the real hit makes smithay's leave /
+    /// replace path deactivate the stale constraint and reset the cursor
+    /// image to the default arrow (`vendor/smithay` `PointerTarget::leave`
+    /// / `replace`).
+    ///
+    /// No-op while a pointer grab, compositor drag, or screenshot session
+    /// owns the pointer (those route by position and must not have focus
+    /// yanked mid-gesture), and when the hit is unchanged — a still
+    /// visible locked surface must not receive a synthetic absolute
+    /// motion (pointer-constraints forbids motion events while locked).
+    pub(crate) fn refresh_pointer_focus(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        if self.drag.is_some() || self.screenshot.is_some() || pointer.is_grabbed() {
+            return;
+        }
+        let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+        )]
+        let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+        let (hit, _) = self.pointer_hit_test(cursor_i);
+        if pointer.current_focus() == hit.as_ref().map(|(surface, _)| surface.clone()) {
+            return;
+        }
+        pointer.motion(
+            self,
+            hit,
+            &MotionEvent {
+                location: Point::<f64, Logical>::from((cx, cy)),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: Clock::<Monotonic>::new().now().as_millis(),
+            },
+        );
+        pointer.frame(self);
+    }
+
     /// Forward the current cursor location to the focused client as
     /// a `wl_pointer.motion` event (smithay generates enter/leave
     /// when the focus surface changes). Hit-tests the layout to
@@ -1313,60 +1434,8 @@ impl State {
 
         // Snapshot the hit surface + its top-left into owned values
         // so the layout borrow ends before the mut-borrow on self
-        // (via kbd.set_focus / pointer.motion). A popup under the
-        // cursor wins the *pointer* (menus draw on top of everything),
-        // then layer surfaces (rofi, panels, OSDs), then the tile /
-        // floating layout.
-        // While locked, only the lock surface is reachable — no popups, layers,
-        // or windows take the pointer.
-        let popup_hit = if self.session_locked {
-            None
-        } else {
-            self.popup_at(cursor_i)
-        };
-        let surface_hit = if self.session_locked {
-            self.locked_surface_at(cursor_i)
-        } else {
-            self.layer_at(cursor_i)
-            .map(|(surface, rect)| {
-                (
-                    surface,
-                    Point::<f64, Logical>::from((f64::from(rect.loc.x), f64::from(rect.loc.y))),
-                )
-            })
-            .or_else(|| {
-                self.layout.window_at(cursor_i).map(|(w, rect)| {
-                    // A CSD client pads its buffer with an invisible shadow
-                    // margin and reports the real content rect via
-                    // set_window_geometry; the render path shifts the buffer
-                    // up-left by that offset so the visible content lands at
-                    // the cell origin. The pointer focus origin must use that
-                    // SAME shifted buffer origin — otherwise surface-local
-                    // coordinates are off by the shadow margin and clicks land
-                    // below where the content visually is (the Lutris "+"
-                    // button). The shadow only exists on Normal windows;
-                    // maximized/fullscreen drop it, matching `grouped` in
-                    // render_output.
-                    let (gx, gy) = if w.fill == crate::layout::FillMode::Normal {
-                        crate::render::window_geometry_offset(w.toplevel.wl_surface())
-                    } else {
-                        (0, 0)
-                    };
-                    (
-                        w.toplevel.wl_surface().clone(),
-                        Point::<f64, Logical>::from((
-                            f64::from(rect.loc.x - gx),
-                            f64::from(rect.loc.y - gy),
-                        )),
-                    )
-                })
-            })
-        };
-        // Keyboard focus follows windows / layers only — never popups.
-        // We don't run a popup grab yet, and a menu shouldn't pull
-        // keyboard focus off its parent toplevel.
-        let kbd_target = surface_hit.as_ref().map(|(surface, _)| surface.clone());
-        let hit = popup_hit.or(surface_hit);
+        // (via kbd.set_focus / pointer.motion).
+        let (hit, kbd_target) = self.pointer_hit_test(cursor_i);
 
         // Relative motion goes to the *pre-move* pointer focus
         // (`pointer.motion` below updates it), matching how

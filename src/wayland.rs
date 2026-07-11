@@ -1030,6 +1030,13 @@ impl XdgShellHandler for State {
                 kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
             }
         }
+        // If the pointer was focused on (and possibly locked to) the
+        // dying window — a game exiting with the cursor hidden — hand
+        // pointer focus to whatever takes its cell, so the constraint
+        // deactivates and the cursor image resets instead of staying
+        // hidden. Safe on a dying surface: the first physical motion
+        // after any close already walks this exact leave/replace path.
+        self.refresh_pointer_focus();
         // Reflow + close animation need to be drawn.
         self.queue_redraw_all();
     }
