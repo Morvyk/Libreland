@@ -25,7 +25,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 # to RGBA frames. `the-third` is the maintained fork tracking the system
 # FFmpeg (8.1); it links the system libraries (no bundled `build` feature).
 ffmpeg-the-third = "5.0.0"
-mlua = { version = "0.11.6", features = ["lua54", "vendored"] }
+mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
 # Pure-Rust PNG encoder for the built-in screenshot tool (no C deps).
 png = "0.18.1"
 # JSON IPC: request/response + event-stream (de)serialization for the
