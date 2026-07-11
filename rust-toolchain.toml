@@ -2,5 +2,5 @@
 # packaged by the distro (e.g. Arch's `rust` package), this file is purely
 # informational — the system rustc is whatever the package provides.
 [toolchain]
-channel    = "1.96.0"
+channel    = "1.97.0"
 components = ["rustfmt", "clippy"]

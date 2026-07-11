@@ -2,7 +2,7 @@
 name = "libreland"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.0"
 authors = ["Morvyk <Morvyk@proton.me>"]
 license = "MIT"
 description = "A Wayland compositor in pure Rust, configured in Lua."
