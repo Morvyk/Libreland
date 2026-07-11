@@ -339,6 +339,12 @@ pub struct InputConfig {
     /// (focus follows the surface under the cursor on every motion
     /// event); [`FocusModel::Click`] only refocuses on press.
     pub focus_model: FocusModel,
+    /// Engage Num Lock automatically at startup (`false` by default —
+    /// the traditional bare-VT state). Applied through the xkb locked-
+    /// modifier state, so clients see the modifier and keyboard LEDs
+    /// light up. A live reload applies a *changed* value in either
+    /// direction.
+    pub numlock: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +524,7 @@ impl Default for Config {
                 mouse_accel_profile: AccelProfile::Flat,
                 mouse_accel_speed: 0.0,
                 focus_model: FocusModel::Hover,
+                numlock: false,
             },
             binds: BindsConfig {
                 // Default bindings. The user's `binds` table is
@@ -809,6 +816,9 @@ fn parse_input(t: &Table, defaults: InputConfig) -> mlua::Result<InputConfig> {
             "click" => FocusModel::Click,
             other => lua_bail!("unknown focus_model {other:?}; expected \"hover\" or \"click\""),
         };
+    }
+    if let Some(numlock) = t.get::<Option<bool>>("numlock")? {
+        cfg.numlock = numlock;
     }
     Ok(cfg)
 }

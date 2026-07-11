@@ -512,6 +512,44 @@ impl XkbContext<'_> {
         *self.leds_changed = self.leds_state.update_with(&xkb.state, self.leds_mapping);
     }
 
+    /// Set or clear a *locked* modifier by xkb name (e.g.
+    /// [`xkb::MOD_NAME_NUM`] / [`xkb::MOD_NAME_CAPS`]), as if the user had
+    /// toggled the corresponding lock key — e.g. to engage Num Lock at
+    /// compositor startup. Modifier broadcast to the focused client and
+    /// LED-state notification follow the usual [`KeyboardHandle::with_xkb_state`]
+    /// flow. Returns `false` when the keymap has no such modifier.
+    pub fn set_lock_modifier(&mut self, name: &str, lock: bool) -> bool {
+        let mut xkb = self.xkb.lock().unwrap();
+        let mod_index = xkb.keymap.mod_get_index(name);
+        if mod_index == xkb::MOD_INVALID {
+            return false;
+        }
+        let mask = 1u32 << mod_index;
+        let locked = if lock {
+            self.mods_state.serialized.locked | mask
+        } else {
+            self.mods_state.serialized.locked & !mask
+        };
+        let layout = xkb.active_layout();
+
+        let state = xkb.state.update_mask(
+            self.mods_state.serialized.depressed,
+            self.mods_state.serialized.latched,
+            locked,
+            0,
+            0,
+            layout.0,
+        );
+
+        if state != 0 {
+            self.mods_state.update_with(&xkb.state);
+            *self.mods_changed = true;
+        }
+
+        *self.leds_changed = self.leds_state.update_with(&xkb.state, self.leds_mapping);
+        true
+    }
+
     /// Switches layout forward cycling when it reaches the end.
     pub fn cycle_next_layout(&mut self) {
         let xkb = self.xkb.lock().unwrap();

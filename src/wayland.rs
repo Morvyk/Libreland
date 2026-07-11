@@ -941,6 +941,18 @@ impl SeatHandler for State {
         self.sync_x11_focus(focused);
     }
 
+    fn led_state_changed(
+        &mut self,
+        _seat: &Seat<Self>,
+        led_state: smithay::input::keyboard::LedState,
+    ) {
+        // xkb tracks the lock-key state, but the physical Caps/Num Lock
+        // lights only change if someone hands that state to libinput —
+        // without this impl (the trait default is a no-op) they never lit.
+        self.keyboard_leds = led_state;
+        self.apply_keyboard_leds();
+    }
+
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // The focused client set its pointer image — a surface
         // (`wl_pointer.set_cursor`, used by toolkits and games incl.

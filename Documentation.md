@@ -82,6 +82,7 @@ input = {
     mouse_accel_profile = "flat",         -- "flat" or "adaptive"
     mouse_accel_speed = 0.0,              -- [-1.0, 1.0]
     focus_model = "hover",                -- "hover" or "click"
+    numlock = false,                      -- engage Num Lock at startup
 }
 
 binds = {
@@ -311,6 +312,7 @@ the runtime today (✅) or just held in `Config` for a later consumer
 | `mouse_accel_profile`  | `"flat"` | ✅ (applied per pointer device)  | `"flat"` (1:1, no ramp) or `"adaptive"` (libinput's curve, system default). Re-applied to every connected pointer on reload. |
 | `mouse_accel_speed`    | `0.0`    | ✅ (applied per pointer device)  | libinput speed in `[-1.0, 1.0]`. `0.0` is neutral; with `"flat"` this is "no extra sensitivity". Re-applied live on reload. |
 | `focus_model`          | `"hover"`| ✅                               | `"hover"`: keyboard focus follows the surface under the cursor on every motion event. `"click"`: focus only changes on a pointer-button press. New windows take focus on map either way. |
+| `numlock`              | `false`  | ✅                               | Engage Num Lock automatically at startup, through the xkb locked-modifier state — clients see the modifier and the keyboard's Num Lock LED lights up. A live-reload *change* applies in either direction; an unchanged value never fights your own toggling. |
 
 ### binds
 

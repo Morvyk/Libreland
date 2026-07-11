@@ -308,6 +308,11 @@ pub(crate) struct State {
     /// missing piece between the single-pass composite and true
     /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
     pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// Last known lock-key LED state (num/caps/scroll) from xkb, pushed
+    /// to every keyboard by [`State::apply_keyboard_leds`]. Kept so a
+    /// hot-plugged keyboard (which arrives LEDs-off) can be synced to the
+    /// session's actual lock state.
+    pub(crate) keyboard_leds: smithay::input::keyboard::LedState,
     /// Bumped on every redraw trigger; versions the pointer hit-test
     /// snapshot below (a stale epoch means the scene may have changed).
     pub(crate) scene_epoch: std::cell::Cell<u64>,
@@ -2742,6 +2747,36 @@ impl State {
     /// Apply changed input settings on reload: key repeat rate/delay,
     /// keyboard layout (both the seat keymap clients receive and our own
     /// hotkey-matching xkb state), and mouse acceleration (re-applied to
+    /// Push the current lock-key LED state to every keyboard device.
+    /// Called when xkb lock state changes (`led_state_changed`) and for
+    /// hot-plugged keyboards. Without this the physical Caps/Num Lock
+    /// lights never change — xkb tracks the state, but something must
+    /// hand it to libinput.
+    pub(crate) fn apply_keyboard_leds(&mut self) {
+        for device in &mut self.input_devices {
+            if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard) {
+                device.led_update(self.keyboard_leds.into());
+            }
+        }
+    }
+
+    /// Set (or clear) the xkb *locked* Num Lock modifier — the
+    /// `input.numlock` option. Locked-modifier state means clients see
+    /// the modifier and the LED path above lights the keyboards.
+    fn set_numlock(&mut self, engage: bool) {
+        let Some(kbd) = self.seat.get_keyboard() else {
+            return;
+        };
+        let applied = kbd.with_xkb_state(self, |mut ctx| {
+            ctx.set_lock_modifier(xkbcommon::xkb::MOD_NAME_NUM, engage)
+        });
+        if applied {
+            info!(engage, "input: numlock lock state applied");
+        } else {
+            warn!("input: keymap has no Num Lock modifier; numlock option ignored");
+        }
+    }
+
     /// every live libinput device). The `*_changed` flags are computed by
     /// the caller against the old config before it's swapped.
     fn apply_input_reload(
@@ -2971,6 +3006,7 @@ impl State {
         )]
         let accel_changed = new.input.mouse_accel_profile != self.config.input.mouse_accel_profile
             || new.input.mouse_accel_speed != self.config.input.mouse_accel_speed;
+        let numlock_changed = new.input.numlock != self.config.input.numlock;
         let xwayland_changed = new.xwayland != self.config.xwayland;
         if new.env != self.config.env {
             info!("env changed; applies to children spawned from now on (restart for XCURSOR_* etc.)");
@@ -2981,6 +3017,11 @@ impl State {
 
         // ---- Input: key repeat, keymap, mouse acceleration. ----
         self.apply_input_reload(&new.input, repeat_changed, layout_changed, accel_changed);
+        // A *changed* numlock option applies in either direction (an
+        // unchanged one never fights the user's own toggling).
+        if numlock_changed {
+            self.set_numlock(new.input.numlock);
+        }
 
         // ---- Monitors: modeset changed modes, then reflow the rest. ----
         if monitors_changed {
@@ -3998,6 +4039,7 @@ fn main() -> Result<()> {
         dmabuf_global: wayland_init.dmabuf_global,
         dmabuf_default_feedback: wayland_init.dmabuf_default_feedback,
         dmabuf_scanout_feedback: wayland_init.dmabuf_scanout_feedback,
+        keyboard_leds: smithay::input::keyboard::LedState::default(),
         scene_epoch: std::cell::Cell::new(1),
         popup_snapshot: std::cell::RefCell::new((0, Vec::new())),
         scanout_feedback_given: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -4046,6 +4088,13 @@ fn main() -> Result<()> {
         screenshot_clipboard_tx,
         ipc: ipc::IpcState::default(),
     };
+    // Engage Num Lock at startup when configured. Goes through the xkb
+    // locked-modifier state, so clients see the modifier and the LED sync
+    // lights the keyboards (once libinput reports them).
+    if state.config.input.numlock {
+        state.set_numlock(true);
+    }
+
     info!("entering event loop — type to generate events, super+shift+e to exit");
     event_loop
         .run(None, &mut state, |state| {
@@ -4499,6 +4548,12 @@ fn wire_event_sources(
                 }
                 InputEvent::DeviceAdded { mut device } => {
                     apply_input_config(&mut device, &state.config.input);
+                    // A fresh keyboard arrives with its LEDs dark no matter
+                    // the session's lock state — sync it immediately.
+                    if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard)
+                    {
+                        device.led_update(state.keyboard_leds.into());
+                    }
                     // Keep the handle so a config reload can re-apply
                     // mouse-accel settings to this live device.
                     state.input_devices.push(device);
