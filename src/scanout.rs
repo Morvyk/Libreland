@@ -410,7 +410,13 @@ impl ScanoutSurface {
         let fb = match self.import_client_fb(&buffer, dmabuf, use_opaque) {
             Ok(fb) => fb,
             Err(err) => {
-                debug!(error = %err, "client buffer not importable for scanout; compositing");
+                debug!(
+                    error = %err,
+                    code = ?fmt.code,
+                    modifier = ?fmt.modifier,
+                    use_opaque,
+                    "client buffer not importable for scanout; compositing"
+                );
                 return Ok(false);
             }
         };

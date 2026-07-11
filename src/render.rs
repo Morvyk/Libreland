@@ -2567,20 +2567,18 @@ impl Renderer {
             // refresh_mhz is milli-Hz (144 Hz = 144_000); the frame period is
             // 1/Hz = 1000/mHz seconds.
             let period = Duration::from_secs_f64(1000.0 / f64::from(o.refresh_mhz.max(1)));
-            // With adaptive sync engaged the frame period is NOT the fixed
-            // mode period — flips land whenever the client presents. Report
-            // `Variable` (the mode period as the lower bound) so
-            // present-timing consumers (e.g. Vulkan present-timing through
-            // wp_presentation) don't build schedules on a cadence the
-            // display isn't actually following.
-            let refresh = if o.surface.vrr_enabled() {
-                Refresh::variable(period)
-            } else {
-                Refresh::fixed(period)
-            };
+            // Deliberately Fixed even while adaptive sync is engaged.
+            // `Refresh::Variable` would be the honest answer under VRR,
+            // but Wine's Vulkan present-timing (winevulkan asserts on any
+            // driver error) falls over the moment presented events stop
+            // carrying a fixed cadence — an HDR game crashed within
+            // seconds of gameplay on Variable, and ran for hours on
+            // Fixed. The mode period is what every other consumer
+            // (frame schedulers, video players) expects as an upper
+            // bound, so Fixed is also the safer lie.
             feedback.presented(
                 Time::<Monotonic>::from(present_time),
-                refresh,
+                Refresh::fixed(period),
                 u64::from(seq),
                 base_flags,
             );
