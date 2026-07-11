@@ -294,6 +294,14 @@ impl ScanoutSurface {
         Ok((buffer, swapchain, use_opaque))
     }
 
+    /// The primary plane's supported `(fourcc, modifier)` pairs — the set a
+    /// client buffer must land in to be directly scannable on this output.
+    /// Feeds the per-surface dmabuf-feedback scanout tranche (see
+    /// wayland.rs) so fullscreen clients allocate plane-compatible buffers.
+    pub fn plane_formats(&self) -> Vec<Format> {
+        self.drm.plane_info().formats.iter().copied().collect()
+    }
+
     /// Acquire the next composite buffer for the renderer to draw into, plus
     /// its buffer age. Idempotent: returns the same buffer until it is queued.
     pub fn next_buffer(&mut self) -> Result<(Dmabuf, u8)> {

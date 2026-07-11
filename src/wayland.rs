@@ -177,6 +177,16 @@ pub struct WaylandInit {
     /// show anything; without it their surfaces render blank.
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
+    /// The v4 default dmabuf feedback (render device + import formats),
+    /// re-sent per-surface when a window leaves fullscreen. `None` when
+    /// only a v3 global could be advertised.
+    pub dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// The default feedback plus a Scanout-flagged tranche of the primary
+    /// plane's explicit modifiers. Sent per-surface to fullscreen windows
+    /// only (see `State::sync_scanout_feedback`) so their swapchains
+    /// re-allocate into plane-scannable buffers; never the default —
+    /// see the comment at its construction site.
+    pub dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// `wp_viewporter` global. Fractional-scale-aware clients render
     /// an oversized buffer and use `wp_viewport` to map it down to
     /// the logical surface rect; without this global they can't, and
@@ -291,6 +301,7 @@ pub fn init(
     output_descs: &[OutputDescriptor],
     preferred_scale: f64,
     dmabuf_formats: Vec<Format>,
+    scanout_formats: Vec<Format>,
     render_node: Option<DrmNode>,
 ) -> Result<WaylandInit> {
     let dh = display.handle();
@@ -327,11 +338,45 @@ pub fn init(
     // apps (the Steam client) blank. Falls back to v3 only if the
     // render node or feedback can't be built.
     let mut dmabuf_state = DmabufState::new();
+    let mut dmabuf_default_feedback = None;
+    let mut dmabuf_scanout_feedback = None;
     let dmabuf_global = if let Some(node) = render_node {
         match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
             Ok(feedback) => {
                 info!(node = ?node, "advertising zwp_linux_dmabuf_v1 with default feedback (v4)");
-                dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback)
+                let global =
+                    dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback);
+                // A second feedback variant carrying a Scanout-flagged
+                // preference tranche (the primary plane's explicit
+                // modifiers). Sent ONLY per-surface, to fullscreen windows
+                // (`State::sync_scanout_feedback`) — putting the tranche in
+                // the *default* feedback broke every GPU client's EGL init
+                // wholesale (see the revert of fe142c7). The tranche's
+                // target is the render node — the device clients already
+                // open; the primary card node may not be openable from
+                // inside a session while the compositor holds the seat.
+                if !scanout_formats.is_empty() {
+                    let builder = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone())
+                        .add_preference_tranche(
+                            node.dev_id(),
+                            Some(
+                                smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1
+                                    ::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                            ),
+                            scanout_formats,
+                        );
+                    match builder.build() {
+                        Ok(scanout) => {
+                            info!("built per-surface scanout dmabuf feedback (fullscreen windows)");
+                            dmabuf_scanout_feedback = Some(scanout);
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "scanout dmabuf feedback build failed; fullscreen windows keep the default");
+                        }
+                    }
+                }
+                dmabuf_default_feedback = Some(feedback);
+                global
             }
             Err(err) => {
                 warn!(error = %err, "dmabuf feedback build failed; advertising v3 dmabuf global");
@@ -478,6 +523,8 @@ pub fn init(
         data_device_state,
         dmabuf_state,
         dmabuf_global,
+        dmabuf_default_feedback,
+        dmabuf_scanout_feedback,
         viewporter_state,
         layer_shell_state,
         relative_pointer_state,

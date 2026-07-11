@@ -299,6 +299,15 @@ pub(crate) struct State {
         reason = "held to keep the zwp_linux_dmabuf_v1 global alive for the compositor's lifetime"
     )]
     pub(crate) dmabuf_global: smithay::wayland::dmabuf::DmabufGlobal,
+    /// The v4 default dmabuf feedback, re-sent per-surface when a window
+    /// leaves fullscreen; `None` on a v3-only global.
+    pub(crate) dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// Default feedback + a Scanout-flagged tranche of the primary
+    /// plane's explicit modifiers, sent per-surface to fullscreen windows
+    /// so their swapchains re-allocate into plane-scannable buffers (the
+    /// missing piece between the single-pass composite and true
+    /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
+    pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// Fractional scale to send to every new
     /// `wp_fractional_scale` object. Currently the primary
     /// output's configured scale; will become per-surface once
@@ -1063,6 +1072,11 @@ impl State {
         // Drain pending captures for the output this CRTC drives so the
         // renderer can read them off this frame's framebuffer.
         let out_name = self.renderer.output_name_for_crtc(crtc);
+
+        // Point each visible window's per-surface dmabuf feedback at the
+        // right variant (scanout tranche ⇔ fullscreen). Deduped inside
+        // smithay, so calling per frame only costs a short tree walk.
+        self.sync_scanout_feedback(&placements, out_name.as_deref());
 
         // Session locked: blank everything and draw only this output's lock
         // surface, full-size, as an Overlay (above all windows/layers). Reusing
@@ -2748,6 +2762,50 @@ impl State {
         }
     }
 
+    /// Point per-surface dmabuf feedback at the right variant for every
+    /// window visible on `out_name`: fullscreen windows get the scanout
+    /// feedback (a Scanout-flagged tranche of the primary plane's explicit
+    /// modifiers — what makes a Vulkan/EGL swapchain re-allocate into
+    /// plane-scannable buffers instead of implicit render-optimal ones),
+    /// everything else the default. This is the per-surface half of the
+    /// dmabuf-feedback protocol: it only reaches clients that called
+    /// `get_surface_feedback` (game WSIs do; plain EGL toolkits use the
+    /// default feedback and never see a tranche — putting it in the
+    /// default broke them, see the revert of fe142c7).
+    ///
+    /// Keyed off the *fill mode*, not per-frame scanout eligibility, so a
+    /// menu opening over the game doesn't flap the feedback and force
+    /// swapchain rebuilds. smithay dedupes internally (`set_feedback`
+    /// no-ops when unchanged), so per-frame calls cost a short tree walk.
+    fn sync_scanout_feedback(&self, placements: &[layout::Placement], out_name: Option<&str>) {
+        let (Some(default_fb), Some(scanout_fb)) = (
+            self.dmabuf_default_feedback.as_ref(),
+            self.dmabuf_scanout_feedback.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(name) = out_name else { return };
+        let Some(output) = self.outputs.iter().find(|o| o.name() == name) else {
+            return;
+        };
+        let Some(rect) = self.renderer.output_rect(name) else {
+            return;
+        };
+        for p in placements.iter().filter(|p| p.cell_rect.overlaps(rect)) {
+            let feedback = if p.fill == layout::FillMode::Fullscreen {
+                scanout_fb
+            } else {
+                default_fb
+            };
+            smithay::desktop::utils::send_dmabuf_feedback_surface_tree(
+                &p.surface,
+                output,
+                |_, _| Some(output.clone()),
+                |_, _| feedback,
+            );
+        }
+    }
+
     /// Reap exited children so they don't accumulate as zombies. Every
     /// runtime spawn path parks its `Child` handle in `self.children`;
     /// this sweeps them with `try_wait` (never blocks) on a timer.
@@ -3581,9 +3639,11 @@ fn main() -> Result<()> {
     let output_descs = renderer.output_descriptors();
     let preferred_scale = renderer.primary_scale();
     let dmabuf_formats = renderer.dmabuf_formats();
+    let scanout_formats = renderer.primary_scanout_formats();
     let render_node = renderer.render_drm_node();
     info!(
         count = dmabuf_formats.len(),
+        scanout = scanout_formats.len(),
         render_node = ?render_node,
         "dmabuf import formats advertised to clients"
     );
@@ -3599,6 +3659,7 @@ fn main() -> Result<()> {
         &output_descs,
         preferred_scale,
         dmabuf_formats,
+        scanout_formats,
         render_node,
     )
     .context("wayland substate init failed")?;
@@ -3894,6 +3955,8 @@ fn main() -> Result<()> {
         data_device_state: wayland_init.data_device_state,
         dmabuf_state: wayland_init.dmabuf_state,
         dmabuf_global: wayland_init.dmabuf_global,
+        dmabuf_default_feedback: wayland_init.dmabuf_default_feedback,
+        dmabuf_scanout_feedback: wayland_init.dmabuf_scanout_feedback,
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         layer_outputs: std::collections::HashMap::new(),

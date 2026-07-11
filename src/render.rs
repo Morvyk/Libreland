@@ -3470,6 +3470,28 @@ impl Renderer {
         self.gles.dmabuf_formats().into_iter().collect()
     }
 
+    /// Scanout-capable `(fourcc, modifier)` pairs: the primary output's
+    /// plane formats, intersected with what the renderer can import as a
+    /// texture (the composite fallback must be able to draw the very same
+    /// buffers on frames the plane can't take), with implicit modifiers
+    /// dropped — the whole point is steering clients toward *explicit*
+    /// plane-compatible modifiers; an Invalid entry would invite the
+    /// implicit allocations that can never be latched. Feeds the
+    /// per-surface dmabuf-feedback scanout tranche (see wayland.rs).
+    pub fn primary_scanout_formats(&self) -> Vec<Format> {
+        let importable = self.gles.dmabuf_formats();
+        self.outputs
+            .get(self.primary_idx)
+            .map(|o| o.surface.plane_formats())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| {
+                f.modifier != smithay::backend::allocator::Modifier::Invalid
+                    && importable.contains(f)
+            })
+            .collect()
+    }
+
     /// Whether the renderer can bind a dmabuf of `format` as a *render
     /// target* (the subset of formats we can draw/blit *into*, which is
     /// smaller than the texture-import set). Screencopy's GPU path
