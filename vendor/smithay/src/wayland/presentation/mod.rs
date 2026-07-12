@@ -331,6 +331,13 @@ impl Cacheable for PresentationFeedbackCachedState {
         // discard unprocessed callbacks as defined by the spec
         // ...the user did not see the content update because it was superseded...
         for callback in std::mem::replace(&mut into.callbacks, std::mem::take(&mut self.callbacks)) {
+            // Libreland patch: name the discard in the log — present-timing
+            // consumers (Wine / NVIDIA HDR WSI) react badly to discards, so
+            // a session log must show who received one and why.
+            tracing::debug!(
+                surface = ?callback.surface.upgrade().ok().map(|s| s.id()),
+                "wp_presentation: feedback discarded (commit superseded before render)"
+            );
             callback.discarded();
         }
     }
@@ -341,6 +348,11 @@ impl Drop for PresentationFeedbackCachedState {
         // discard unprocessed callbacks as defined by the spec
         // ...the user did not see the content update because it was superseded or its surface destroyed...
         for callback in self.callbacks.drain(..) {
+            // Libreland patch: see merge_into above.
+            tracing::debug!(
+                surface = ?callback.surface.upgrade().ok().map(|s| s.id()),
+                "wp_presentation: feedback discarded (state dropped)"
+            );
             callback.discarded();
         }
     }

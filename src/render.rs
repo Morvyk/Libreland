@@ -4068,6 +4068,7 @@ impl Renderer {
                             ),
                         );
                         if let Some(mut old) = replaced {
+                            debug!(output = %output_name, "wp_presentation: feedback discarded (flip replaced, direct scanout)");
                             old.discarded();
                         }
                     }
@@ -5707,6 +5708,7 @@ impl Renderer {
                     out, placements, layers, popups, out_rect, false,
                 ));
             if let Some(mut old) = replaced {
+                debug!(output = %output_name, "wp_presentation: feedback discarded (flip replaced, composite)");
                 old.discarded();
             }
         }

@@ -1566,8 +1566,10 @@ impl State {
 
         // Activate a not-yet-active constraint once the pointer enters
         // its surface (and region, if any) — covers a lock requested
-        // while the surface was unfocused.
-        if let Some((surface, origin)) = hit.as_ref() {
+        // while the surface was unfocused. Not during a screenshot
+        // session: its selection cursor must stay free even over a
+        // surface whose lock we broke at session start.
+        if self.screenshot.is_none() && let Some((surface, origin)) = hit.as_ref() {
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "surface-local coords are bounded by the output rect (i32)"
@@ -2856,6 +2858,17 @@ impl State {
     /// swapchain rebuilds. smithay dedupes internally (`set_feedback`
     /// no-ops when unchanged), so per-frame calls cost a short tree walk.
     fn sync_scanout_feedback(&self, placements: &[layout::Placement], out_name: Option<&str>) {
+        // `LIBRELAND_NO_SCANOUT_FEEDBACK=1`: never hand out the scanout
+        // tranche, for A/B-testing whether a client's WSI is stuck
+        // rebuilding its swapchain trying to satisfy scanout with
+        // buffers the plane rejects (NVIDIA HDR10 allocates the opaque
+        // XB30 fourcc; the plane only takes AB30).
+        static NO_SCANOUT_FB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_SCANOUT_FB
+            .get_or_init(|| std::env::var_os("LIBRELAND_NO_SCANOUT_FEEDBACK").is_some())
+        {
+            return;
+        }
         let (Some(default_fb), Some(scanout_fb)) = (
             self.dmabuf_default_feedback.as_ref(),
             self.dmabuf_scanout_feedback.as_ref(),
@@ -2938,6 +2951,7 @@ impl State {
                 if prev.as_deref() == Some(out.as_str()) {
                     continue;
                 }
+                debug!(surface = ?surface.id(), output = %out, moved_from = ?prev, "wl_surface enter");
                 if let Some(prev) = prev
                     && let Some(po) = self.outputs.iter().find(|o| o.name() == prev)
                 {
@@ -3278,6 +3292,23 @@ impl State {
                 }
             }
             config::ScreenshotMode::Region | config::ScreenshotMode::Window => {
+                // A game may hold the pointer locked (cursor frozen and
+                // hidden — `hide_cursor` keys off the lock); selection
+                // needs a visible, movable cursor. Break the constraint
+                // for the session: reactivation-on-motion is gated while
+                // a session runs, and the next motion over the surface
+                // after the session re-activates the client's lock.
+                if let Some(pointer) = self.seat.get_pointer()
+                    && let Some(surface) = pointer.current_focus()
+                {
+                    with_pointer_constraint(&surface, &pointer, |constraint| {
+                        if let Some(c) = constraint
+                            && c.is_active()
+                        {
+                            c.deactivate();
+                        }
+                    });
+                }
                 self.screenshot = Some(ScreenshotState {
                     bind: bind.clone(),
                     anchor: None,
