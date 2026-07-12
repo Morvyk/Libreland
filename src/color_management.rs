@@ -46,8 +46,15 @@ use tracing::debug;
 
 use crate::State;
 
-/// Protocol version we advertise. v1 is the broad-compatibility baseline.
-const MANAGER_VERSION: u32 = 1;
+/// Protocol version we advertise. v3 brings the `windows_scrgb` /
+/// `windows_bt2100` pre-defined descriptions, which are what Wine/Proton's
+/// winewayland keys its whole HDR support on: with them (plus
+/// `extended_target_volume`) advertised, Wine reports the display's real
+/// HDR capabilities to the game, maps HDR10/scRGB swapchains to
+/// `PASS_THROUGH` on the host driver, and attaches the description itself —
+/// once. Without them the NVIDIA WSI runs its own color-management path,
+/// which rebuilds the swapchain every present on this compositor.
+const MANAGER_VERSION: u32 = 3;
 
 /// Default SDR reference white, BT.2408 (cd/m²). Overridable per-output
 /// via config; used when building an output's image description.
@@ -100,9 +107,53 @@ impl ImageDescription {
         }
     }
 
+    /// The protocol's pre-defined Windows-BT.2100 description: BT.2020
+    /// primaries, PQ transfer, reference white assumed 203 cd/m² (ITU-R
+    /// BT.2408-7), PQ system peak 10000 cd/m². Field-identical to the
+    /// parametric PQ description HDR10 clients used to build by hand, so
+    /// the renderer's existing PQ path applies unchanged.
+    pub fn windows_bt2100() -> Self {
+        Self {
+            primaries: Primaries::Bt2020,
+            tf: TransferFunction::St2084Pq,
+            min_lum: 0,
+            max_lum: 10_000,
+            reference_lum: 203,
+            max_cll: None,
+            max_fall: None,
+        }
+    }
+
+    /// The protocol's pre-defined Windows-scRGB description: sRGB
+    /// primaries, extended-linear transfer where R=G=B=1.0 is 80 cd/m²
+    /// (so 125.0 is the 10k cd/m² PQ peak), reference white assumed
+    /// 203 cd/m² (R=G=B=2.5375).
+    pub fn windows_scrgb() -> Self {
+        Self {
+            primaries: Primaries::Srgb,
+            tf: TransferFunction::ExtLinear,
+            min_lum: 0,
+            max_lum: 10_000,
+            reference_lum: 203,
+            max_cll: None,
+            max_fall: None,
+        }
+    }
+
     /// Whether this description denotes HDR (an HDR transfer function).
     pub fn is_hdr(&self) -> bool {
         matches!(self.tf, TransferFunction::St2084Pq | TransferFunction::Hlg)
+    }
+}
+
+/// Send `ready` in the version-appropriate shape: `ready2` (64-bit
+/// identity split) replaces `ready` from v2 on. Our identities are
+/// 32-bit, so the high word is always zero.
+fn send_ready(obj: &WpImageDescriptionV1, identity: u32) {
+    if obj.version() >= 2 {
+        obj.ready2(0, identity);
+    } else {
+        obj.ready(identity);
     }
 }
 
@@ -131,6 +182,10 @@ impl IdentityRegistry {
 #[derive(Debug, Clone, Copy)]
 pub struct ImageDescriptionData {
     desc: ImageDescription,
+    /// Whether `get_information` is allowed on this object. The
+    /// pre-defined Windows descriptions forbid it per spec ("does not
+    /// allow `get_information` request").
+    allow_info: bool,
 }
 
 /// A `get_information` request whose info events are sent *after* the
@@ -247,29 +302,46 @@ impl GlobalDispatch<WpColorManagerV1, ()> for State {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let manager = data_init.init(resource, ());
-        debug!("wp_color_manager_v1: client bound the manager");
+        let version = manager.version();
+        debug!(version, "wp_color_manager_v1: client bound the manager");
 
         // Advertise capabilities (each as its own event), then `done`.
         for intent in [RenderIntent::Perceptual, RenderIntent::Relative] {
             manager.supported_intent(intent);
         }
-        for feature in [
+        // The Windows pre-defined descriptions plus extended target
+        // volume are the trio Wine/Proton gates its HDR reporting on.
+        // `windows_bt2100` (the `create_windows_bt2100` request) only
+        // exists from v3.
+        let mut features = vec![
             Feature::Parametric,
             Feature::SetPrimaries,
             Feature::SetTfPower,
             Feature::SetLuminances,
             Feature::SetMasteringDisplayPrimaries,
-        ] {
+            Feature::ExtendedTargetVolume,
+            Feature::WindowsScrgb,
+        ];
+        if version >= 3 {
+            features.push(Feature::WindowsBt2100);
+        }
+        for feature in features {
             manager.supported_feature(feature);
         }
-        for tf in [
-            TransferFunction::Srgb,
+        // `srgb` (the pure-power approximation) is deprecated-since v2 —
+        // a compositor must not advertise deprecated transfer functions
+        // to clients binding at that version or newer.
+        let mut tfs = vec![
             TransferFunction::Bt1886,
             TransferFunction::Gamma22,
             TransferFunction::ExtLinear,
             TransferFunction::St2084Pq,
             TransferFunction::Hlg,
-        ] {
+        ];
+        if version < 2 {
+            tfs.push(TransferFunction::Srgb);
+        }
+        for tf in tfs {
             manager.supported_tf_named(tf);
         }
         for primaries in [Primaries::Srgb, Primaries::Bt2020, Primaries::DisplayP3] {
@@ -319,10 +391,58 @@ impl Dispatch<WpColorManagerV1, ()> for State {
                     preferred_tf = ?desc.tf,
                     "wp_color_manager_v1: get_surface_feedback (reported preferred description)"
                 );
-                feedback.preferred_changed(identity);
+                if feedback.version() >= 2 {
+                    feedback.preferred_changed2(0, identity);
+                } else {
+                    feedback.preferred_changed(identity);
+                }
             }
             wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
                 data_init.init(obj, ParamsBuilder::default());
+            }
+            wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
+                let desc = ImageDescription::windows_scrgb();
+                let identity = state.color_management.identity_for(&desc);
+                debug!(identity, "wp_color_manager_v1: create_windows_scrgb");
+                let img = data_init.init(
+                    image_description,
+                    ImageDescriptionData {
+                        desc,
+                        allow_info: false,
+                    },
+                );
+                send_ready(&img, identity);
+            }
+            wp_color_manager_v1::Request::CreateWindowsBt2100 { image_description } => {
+                let desc = ImageDescription::windows_bt2100();
+                let identity = state.color_management.identity_for(&desc);
+                debug!(identity, "wp_color_manager_v1: create_windows_bt2100");
+                let img = data_init.init(
+                    image_description,
+                    ImageDescriptionData {
+                        desc,
+                        allow_info: false,
+                    },
+                );
+                send_ready(&img, identity);
+            }
+            wp_color_manager_v1::Request::GetImageDescription {
+                image_description, ..
+            } => {
+                // References are minted by *other* protocols; we implement
+                // none that do, so no valid reference object can reach us.
+                // Consume the new_id (mandatory) and fail it gracefully.
+                let img = data_init.init(
+                    image_description,
+                    ImageDescriptionData {
+                        desc: state.preferred_image_description(),
+                        allow_info: false,
+                    },
+                );
+                img.failed(
+                    wp_image_description_v1::Cause::Unsupported,
+                    "image description references are not supported".to_owned(),
+                );
             }
             wp_color_manager_v1::Request::CreateIccCreator { obj } => {
                 // We don't advertise the icc_v2_v4 feature.
@@ -367,9 +487,10 @@ impl Dispatch<WpColorManagementOutputV1, WlOutput> for State {
                 image_description,
                 ImageDescriptionData {
                     desc,
+                    allow_info: true,
                 },
             );
-            obj.ready(identity);
+            send_ready(&obj, identity);
         }
     }
 }
@@ -426,6 +547,12 @@ impl Dispatch<WpColorManagementSurfaceV1, WlSurface> for State {
                     max_lum = data.desc.max_lum,
                     "surface image description set"
                 );
+                if data.desc.tf == TransferFunction::ExtLinear {
+                    tracing::warn!(
+                        surface = ?surface.id(),
+                        "scRGB (extended-linear) surface attached; composited as SDR — scRGB decode is not implemented yet"
+                    );
+                }
             }
             wp_color_management_surface_v1::Request::UnsetImageDescription => {
                 state.color_surfaces.remove(&surface.id());
@@ -462,9 +589,10 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, WlSurface> for State {
                 image_description,
                 ImageDescriptionData {
                     desc,
+                    allow_info: true,
                 },
             );
-            obj.ready(identity);
+            send_ready(&obj, identity);
         }
     }
 }
@@ -584,9 +712,10 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsBuilder> for State {
                     image_description,
                     ImageDescriptionData {
                         desc,
+                        allow_info: true,
                     },
                 );
-                img.ready(identity);
+                send_ready(&img, identity);
             }
             // set_mastering_display_primaries / set_mastering_luminance are
             // accepted and ignored for now (we don't yet model the target
@@ -619,13 +748,24 @@ impl Dispatch<WpImageDescriptionV1, ImageDescriptionData> for State {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _obj: &WpImageDescriptionV1,
+        obj: &WpImageDescriptionV1,
         request: wp_image_description_v1::Request,
         data: &ImageDescriptionData,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
         if let wp_image_description_v1::Request::GetInformation { information } = request {
+            // The pre-defined Windows descriptions forbid get_information
+            // (spec: "does not allow get_information request").
+            if !data.allow_info {
+                obj.post_error(
+                    wp_image_description_v1::Error::NoInformation,
+                    "get_information is not allowed on this image description",
+                );
+                // Still must consume the new_id.
+                data_init.init(information, ());
+                return;
+            }
             // Init the info object, but DEFER its events: send_information
             // ends with `done`, a destructor that would destroy this
             // just-created object before the wayland backend assigns its
@@ -679,6 +819,11 @@ fn send_information(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
     info.primaries_named(desc.primaries);
     info.tf_named(desc.tf);
     info.luminances(desc.min_lum, desc.max_lum, desc.reference_lum);
+    // Target color volume luminance. For an output description this is
+    // the display's real range — Wine gates its whole HDR reporting on
+    // `max_target_lum > ref_lum`, and DXGI's MaxLuminance (what games
+    // tonemap to) comes from here.
+    info.target_luminance(desc.min_lum, desc.max_lum);
     if let Some(max_cll) = desc.max_cll {
         info.target_max_cll(max_cll);
     }

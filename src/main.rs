@@ -2930,9 +2930,25 @@ impl State {
             .into_iter()
             .map(|e| (e.surface, e.output))
             .collect();
-        if let Some(name) = out_name {
-            roots.extend(layers.iter().map(|l| (l.surface.clone(), name.to_owned())));
-            roots.extend(popups.iter().map(|p| (p.surface.clone(), name.to_owned())));
+        // Layer/popup lists reach every output's render; claim a surface
+        // for this output only when its rect actually overlaps it, or the
+        // last-rendered output would steal every layer each frame
+        // (enter/leave flapping — swapchain-rebuild bait, see above).
+        if let Some(name) = out_name
+            && let Some(rect) = self.renderer.output_rect(name)
+        {
+            roots.extend(
+                layers
+                    .iter()
+                    .filter(|l| l.rect.overlaps(rect))
+                    .map(|l| (l.surface.clone(), name.to_owned())),
+            );
+            roots.extend(
+                popups
+                    .iter()
+                    .filter(|p| p.rect.overlaps(rect))
+                    .map(|p| (p.surface.clone(), name.to_owned())),
+            );
         }
         for (root, out) in roots {
             let Some(output) = self.outputs.iter().find(|o| o.name() == out).cloned() else {
