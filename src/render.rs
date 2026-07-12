@@ -1236,6 +1236,15 @@ struct OutputRender {
     /// is ever in flight per output (the `WaitingForVblank` guard), so a
     /// single slot suffices.
     pending_feedback: Option<OutputPresentationFeedback>,
+    /// Root surfaces of everything drawn into the frame currently in
+    /// flight, for `wl_callback.done` at vblank. Firing frame callbacks
+    /// when the flip *completes* (not when it's queued) paces clients to
+    /// the display: a queue-time callback lets a fast client commit a
+    /// second frame inside the same refresh period, which supersedes the
+    /// first and forces its `wp_presentation` feedback to be discarded —
+    /// present-timing consumers (Wine/NVIDIA HDR swapchains) treat those
+    /// discards as "frame never shown" and rebuild their swapchain.
+    pending_frame_roots: Vec<WlSurface>,
     /// Rolling per-phase frame-cost accumulator, logged + reset every ~5 s
     /// (see [`RenderProfile`]). Always on: the bookkeeping is a handful of
     /// `Instant::now()` calls per frame.
@@ -2258,6 +2267,7 @@ impl Renderer {
                     .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
                 hdr_saturation: output_sdr_saturation(output_cfg),
                 pending_feedback: None,
+                pending_frame_roots: Vec::new(),
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
             });
@@ -2837,6 +2847,10 @@ impl Renderer {
         if let Err(err) = o.surface.frame_submitted() {
             warn!(error = %err, crtc = ?crtc, "frame_submitted failed");
         }
+        // Fire the frame callbacks queued when this flip was submitted —
+        // at the actual vblank, so clients are paced to real presents
+        // (see `pending_frame_roots` for why queue-time firing is wrong).
+        let roots = std::mem::take(&mut o.pending_frame_roots);
         if let Some(mut feedback) = o.pending_feedback.take() {
             // refresh_mhz is milli-Hz (144 Hz = 144_000); the frame period is
             // 1/Hz = 1000/mHz seconds.
@@ -2856,6 +2870,14 @@ impl Renderer {
                 u64::from(seq),
                 base_flags,
             );
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
+        )]
+        let elapsed_ms = self.start.elapsed().as_millis() as u32;
+        for surface in &roots {
+            send_frame_callbacks(surface, elapsed_ms);
         }
     }
 
@@ -2951,6 +2973,7 @@ impl Renderer {
                 .unwrap_or(crate::color_management::DEFAULT_SDR_REFERENCE_WHITE),
             hdr_saturation: output_sdr_saturation(output_cfg),
             pending_feedback: None,
+            pending_frame_roots: Vec::new(),
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
         });
@@ -4029,7 +4052,7 @@ impl Renderer {
             {
                 Ok(true) => {
                     debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
-                    self.send_output_frame_callbacks(placements, layers, popups, out_rect);
+                    self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
                     // Zero-copy presentation: the client's own buffer is on the
                     // plane, so flag ZeroCopy. Fired on this flip's vblank. A
                     // feedback still parked from a frame that never reached
@@ -5668,10 +5691,9 @@ impl Renderer {
             .with_context(|| format!("queue_buffer failed for {output_name}"))?;
         debug!(output = %output_name, "frame queued for scanout");
 
-        // Fire wl_callback.done on every surface we rendered, per-output
-        // filtered (see `send_output_frame_callbacks` — shared with the
-        // direct-scanout path).
-        self.send_output_frame_callbacks(placements, layers, popups, out_rect);
+        // Queue wl_callback.done for every surface in this frame; fired at
+        // vblank by `frame_submitted` (shared with the direct-scanout path).
+        self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
 
         // Collect wp_presentation feedback for the surfaces in this composited
         // frame; fired with the real vblank timestamp in `frame_submitted`.
@@ -5735,32 +5757,30 @@ impl Renderer {
     /// from driving clients on other outputs and pegging them to its refresh
     /// rate — preserving VRR isolation. Shared by the composite and
     /// direct-scanout paths.
-    fn send_output_frame_callbacks(
-        &self,
+    fn queue_output_frame_callbacks(
+        &mut self,
+        idx: usize,
         placements: &[Placement],
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
         out_rect: Rectangle<i32, Physical>,
     ) {
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
-        )]
-        let elapsed_ms = self.start.elapsed().as_millis() as u32;
+        let roots = &mut self.outputs[idx].pending_frame_roots;
+        roots.clear();
         for p in placements {
             if p.cell_rect.overlaps(out_rect) {
-                send_frame_callbacks(&p.surface, elapsed_ms);
+                roots.push(p.surface.clone());
             }
         }
         for l in layers {
             if l.rect.overlaps(out_rect) {
-                send_frame_callbacks(&l.surface, elapsed_ms);
+                roots.push(l.surface.clone());
             }
         }
         // Popups are tiny, transient, and tied to a parent already covered
         // above; fire unconditionally rather than track their output.
         for p in popups {
-            send_frame_callbacks(&p.surface, elapsed_ms);
+            roots.push(p.surface.clone());
         }
     }
 

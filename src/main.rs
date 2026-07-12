@@ -328,6 +328,18 @@ pub(crate) struct State {
     /// per-frame sync runs under `&self` alongside the renderer borrows.
     pub(crate) scanout_feedback_given:
         std::cell::RefCell<std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>>,
+    /// Which output each client surface was last told it is on via
+    /// `wl_surface.enter` (keyed by surface id, holding the surface so a
+    /// later move can `leave` it). Membership is *sticky*: a window on a
+    /// hidden workspace stays entered on its output — flapping
+    /// enter/leave makes color-managed Vulkan swapchains (NVIDIA WSI
+    /// under Wine HDR) rebuild themselves, and rebuilds are where Wine's
+    /// fragile present thunks assert. A surface only `leave`s when it
+    /// actually shows up on a different output.
+    pub(crate) surface_outputs: std::collections::HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        (String, WlSurface),
+    >,
     /// Fractional scale to send to every new
     /// `wp_fractional_scale` object. Currently the primary
     /// output's configured scale; will become per-surface once
@@ -1120,6 +1132,11 @@ impl State {
         } else {
             (placements, layer_placements, popup_placements)
         };
+        // Tell every surface which output it lives on (`wl_surface.enter`).
+        // Color-managed Vulkan swapchains need this to bind their surface
+        // to an output's refresh/description; without it NVIDIA's WSI
+        // stalls or endlessly rebuilds HDR swapchains.
+        self.sync_surface_outputs(&layer_placements, &popup_placements, out_name.as_deref());
         let mut captures: Vec<screencopy::PendingCapture> = Vec::new();
         let mut internal: Vec<InternalCapture> = Vec::new();
         if let Some(name) = out_name.as_deref() {
@@ -2882,6 +2899,59 @@ impl State {
         }
     }
 
+    /// Keep `wl_surface.enter`/`leave` in sync with where surfaces live.
+    /// Windows come from the layout (every workspace, hidden included —
+    /// membership is sticky, see [`State::surface_outputs`]); layer and
+    /// popup surfaces from the lists rendered on this output. Idempotent
+    /// per frame: smithay's `Output::enter` no-ops for already-entered
+    /// surfaces, and unchanged windows never re-send.
+    fn sync_surface_outputs(
+        &mut self,
+        layers: &[render::LayerPlacement],
+        popups: &[render::PopupPlacement],
+        out_name: Option<&str>,
+    ) {
+        let mut roots: Vec<(WlSurface, String)> = self
+            .layout
+            .window_entries()
+            .into_iter()
+            .map(|e| (e.surface, e.output))
+            .collect();
+        if let Some(name) = out_name {
+            roots.extend(layers.iter().map(|l| (l.surface.clone(), name.to_owned())));
+            roots.extend(popups.iter().map(|p| (p.surface.clone(), name.to_owned())));
+        }
+        for (root, out) in roots {
+            let Some(output) = self.outputs.iter().find(|o| o.name() == out).cloned() else {
+                continue;
+            };
+            let mut tree: Vec<WlSurface> = Vec::new();
+            smithay::wayland::compositor::with_surface_tree_downward(
+                &root,
+                (),
+                |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+                |surface, _, ()| tree.push(surface.clone()),
+                |_, _, ()| true,
+            );
+            for surface in tree {
+                let prev = self.surface_outputs.get(&surface.id()).map(|(n, _)| n.clone());
+                if prev.as_deref() == Some(out.as_str()) {
+                    continue;
+                }
+                if let Some(prev) = prev
+                    && let Some(po) = self.outputs.iter().find(|o| o.name() == prev)
+                {
+                    po.leave(&surface);
+                }
+                output.enter(&surface);
+                self.surface_outputs
+                    .insert(surface.id(), (out.clone(), surface));
+            }
+        }
+        // Sweep dead surfaces so the map tracks only live clients.
+        self.surface_outputs.retain(|_, (_, s)| s.alive());
+    }
+
     /// Reap exited children so they don't accumulate as zombies. Every
     /// runtime spawn path parks its `Child` handle in `self.children`;
     /// this sweeps them with `try_wait` (never blocks) on a timer.
@@ -4043,6 +4113,7 @@ fn main() -> Result<()> {
         scene_epoch: std::cell::Cell::new(1),
         popup_snapshot: std::cell::RefCell::new((0, Vec::new())),
         scanout_feedback_given: std::cell::RefCell::new(std::collections::HashSet::new()),
+        surface_outputs: std::collections::HashMap::new(),
         preferred_scale: wayland_init.preferred_scale,
         layer_shell_state: wayland_init.layer_shell_state,
         layer_outputs: std::collections::HashMap::new(),
