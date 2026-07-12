@@ -37,7 +37,7 @@ Most of the important Wayland protocols are supported:
 - **primary-selection** — middle-click paste
 - **ext-session-lock** — screen lockers
 - **idle-inhibit** + **ext-idle-notify** — idle handling
-- **XWayland** (via xwayland-satellite) — X11 apps
+- **XWayland** — X11 apps
 
 …plus the core globals. The full list with notes lives in
 [Documentation.md](Documentation.md#wayland-protocols).
