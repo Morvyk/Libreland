@@ -232,6 +232,21 @@ pub struct WaylandInit {
     /// surface's cached state when we want to drive per-content behaviour.
     pub content_type_state: smithay::wayland::content_type::ContentTypeState,
     pub presentation_state: smithay::wayland::presentation::PresentationState,
+    /// `wp_fifo_manager_v1` — FIFO (vsync) present-mode barriers. Managed:
+    /// smithay blocks a `wait_barrier` commit until we clear the barrier
+    /// (at vblank, see [`signal_fifo_barriers`]). NVIDIA's Vulkan Wayland
+    /// WSI requires this global to enable `VK_EXT_present_timing`; without
+    /// it a Proton/DXVK HDR game asserts in `vkGetPastPresentationTimingEXT`.
+    #[allow(dead_code, reason = "held so the wp_fifo global stays alive; delegate_fifo! routes through it")]
+    pub fifo_manager_state: smithay::wayland::fifo::FifoManagerState,
+    /// `wp_commit_timing_manager_v1` — targeted present timestamps. The
+    /// other half NVIDIA's WSI needs for `VK_EXT_present_timing`. Created
+    /// *unmanaged*: we advertise the protocol (so present-timing enables)
+    /// but don't hold commits to their target time — a vsync'd fullscreen
+    /// game presents at vblank regardless, and unmanaged mode can never
+    /// leave a commit blocked (no hangs).
+    #[allow(dead_code, reason = "held so the wp_commit_timing global stays alive; delegate_commit_timing! routes through it")]
+    pub commit_timing_manager_state: smithay::wayland::commit_timing::CommitTimingManagerState,
     /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
     /// `wl_surface`s with X11 windows (see `src/xwayland.rs`). Held so
     /// the global stays alive; only the Xwayland client may bind it.
@@ -455,6 +470,23 @@ pub fn init(
     // the clock our DRM page-flip timestamps and feedback use.
     let presentation_state =
         smithay::wayland::presentation::PresentationState::new::<State>(&dh, 1);
+    // wp_fifo_manager_v1 + wp_commit_timing_manager_v1: NVIDIA's Vulkan
+    // Wayland WSI binds both (alongside the wp_presentation clock id) to
+    // enable VK_EXT_present_timing. Missing them, a Proton/DXVK HDR game
+    // asserts in vkGetPastPresentationTimingEXT (which KDE, advertising
+    // both, never hits). fifo is managed (real vsync pacing); commit
+    // timing is unmanaged (advertise only — never blocks, so never hangs).
+    // `LIBRELAND_NO_FIFO_BLOCK=1` drops fifo to unmanaged too — advertised
+    // but never blocking — as a recovery valve: still enables NVIDIA
+    // present timing, just without enforced FIFO pacing, should managed
+    // blocking ever wedge a client.
+    let fifo_manager_state = if std::env::var_os("LIBRELAND_NO_FIFO_BLOCK").is_some() {
+        smithay::wayland::fifo::FifoManagerState::unmanaged::<State>(&dh)
+    } else {
+        smithay::wayland::fifo::FifoManagerState::new::<State>(&dh)
+    };
+    let commit_timing_manager_state =
+        smithay::wayland::commit_timing::CommitTimingManagerState::unmanaged::<State>(&dh);
     // xwayland_shell_v1: how Xwayland associates the wl_surface it
     // creates for each X11 window with that window (a shared serial;
     // see src/xwayland.rs). smithay only lets Xwayland clients bind it.
@@ -539,6 +571,8 @@ pub fn init(
         color_management,
         content_type_state,
         presentation_state,
+        fifo_manager_state,
+        commit_timing_manager_state,
         xwayland_shell_state,
         popup_manager,
         outputs,
@@ -812,6 +846,9 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
     if !hidden {
         return;
     }
+    // Same rationale, fifo edge: an inactive-workspace surface is never
+    // presented, so release its fifo barrier here or its next frame hangs.
+    signal_hidden_fifo_barrier(&root);
     smithay::wayland::compositor::with_states(surface, |states| {
         if let Some(mut feedback) =
             SurfacePresentationFeedback::from_states(states, wp_presentation_feedback::Kind::empty())
@@ -819,6 +856,91 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
             feedback.discarded();
         }
     });
+}
+
+/// Clear the `wp_fifo` barriers set by these root surfaces' latest
+/// applied commit, then re-drive each affected client so a commit it
+/// held waiting on the barrier can proceed.
+///
+/// The fifo protocol says a `set_barrier` condition clears "immediately
+/// after the following latching deadline" — i.e. once the frame carrying
+/// it has been latched for the coming refresh. That deadline is exactly
+/// the vblank we call this from, so a client in FIFO present mode (a
+/// vsync'd game) is paced to one frame in flight: its next `wait_barrier`
+/// commit stays blocked until here. Signalling the [`Barrier`] alone
+/// isn't enough — smithay only re-evaluates a held commit's blockers on
+/// [`CompositorClientState::blocker_cleared`], so we prod each client
+/// whose surface actually had a barrier.
+///
+/// [`Barrier`]: smithay::wayland::compositor::Barrier
+pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
+    use smithay::wayland::fifo::FifoBarrierCachedState;
+    if roots.is_empty() {
+        return;
+    }
+    let mut clients = Vec::new();
+    for root in roots {
+        let mut had_barrier = false;
+        smithay::wayland::compositor::with_surface_tree_downward(
+            root,
+            (),
+            |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+            |_surface, states, ()| {
+                if let Some(barrier) = states
+                    .cached_state
+                    .get::<FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .take()
+                {
+                    barrier.signal();
+                    had_barrier = true;
+                }
+            },
+            |_, _, ()| true,
+        );
+        if had_barrier && let Some(client) = root.client() {
+            clients.push(client);
+        }
+    }
+    let dh = state.display_handle.clone();
+    for client in clients {
+        // Xwayland clients don't carry our ClientState; skip (their
+        // blocker bookkeeping lives elsewhere), matching the explicit-sync
+        // blocker path.
+        if compositor_client_state(&client).is_some() {
+            state.client_compositor_state(&client).blocker_cleared(state, &dh);
+        }
+    }
+}
+
+/// Signal a hidden surface's `wp_fifo` barrier at commit time so a FIFO
+/// client on an inactive workspace keeps making forward progress. Such a
+/// surface is never presented, so [`signal_fifo_barriers`]' vblank path
+/// never fires for it, and its next `wait_barrier` commit would block
+/// forever. The spec explicitly lets the compositor clear the condition
+/// for a surface it isn't updating. No `blocker_cleared` here: this runs
+/// inside commit handling, and pre-signalling means the *next* commit
+/// simply won't be blocked (smithay skips an already-signalled barrier).
+fn signal_hidden_fifo_barrier(surface: &WlSurface) {
+    use smithay::wayland::fifo::FifoBarrierCachedState;
+    smithay::wayland::compositor::with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+        |_surface, states, ()| {
+            if let Some(barrier) = states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take()
+            {
+                barrier.signal();
+            }
+        },
+        |_, _, ()| true,
+    );
 }
 
 /// Layer-surface focus + layout reflow happens on commit
@@ -1599,6 +1721,8 @@ delegate_content_type!(State);
 smithay::delegate_session_lock!(State);
 smithay::delegate_presentation!(State);
 smithay::delegate_drm_syncobj!(State);
+smithay::delegate_fifo!(State);
+smithay::delegate_commit_timing!(State);
 
 impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
     fn drm_syncobj_state(

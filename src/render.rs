@@ -2834,15 +2834,20 @@ impl Renderer {
     /// sequence, and `base_flags` the presentation kind (vsync, plus hw-clock
     /// when the timestamp came from the DRM page-flip event). Per-surface
     /// zero-copy flags were already merged in at collection time.
+    ///
+    /// Returns the root surfaces whose frame was just presented, so the
+    /// caller (which holds `State`) can signal their `wp_fifo` barriers —
+    /// FIFO's "the barrier clears one refresh after the frame latched"
+    /// contract, which paces the next frame.
     pub fn frame_submitted(
         &mut self,
         crtc: crtc::Handle,
         present_time: Duration,
         seq: u32,
         base_flags: PresentKind,
-    ) {
+    ) -> Vec<WlSurface> {
         let Some(o) = self.outputs.iter_mut().find(|o| o.crtc == crtc) else {
-            return;
+            return Vec::new();
         };
         if let Err(err) = o.surface.frame_submitted() {
             warn!(error = %err, crtc = ?crtc, "frame_submitted failed");
@@ -2879,6 +2884,7 @@ impl Renderer {
         for surface in &roots {
             send_frame_callbacks(surface, elapsed_ms);
         }
+        roots
     }
 
     /// Every output's CRTC, for the driver to iterate when scheduling

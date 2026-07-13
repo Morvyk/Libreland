@@ -4541,7 +4541,12 @@ fn wire_event_sources(
                     // hardware-clock presentation time; otherwise fall back to
                     // sampling CLOCK_MONOTONIC now (no hw-clock flags then).
                     let (present_time, seq, base_flags) = present_info(meta.as_ref());
-                    state.renderer.frame_submitted(crtc, present_time, seq, base_flags);
+                    let presented =
+                        state.renderer.frame_submitted(crtc, present_time, seq, base_flags);
+                    // FIFO pacing: the frame just latched, so clear the fifo
+                    // barrier its commit set — the next frame that waited on it
+                    // may now proceed (see `signal_fifo_barriers`).
+                    crate::wayland::signal_fifo_barriers(state, &presented);
                     // Re-render only if a trigger arrived while the flip was in
                     // flight, or an animation/slide is still running. Otherwise
                     // the output parks until the next trigger queues a redraw.
