@@ -234,19 +234,18 @@ pub struct WaylandInit {
     pub presentation_state: smithay::wayland::presentation::PresentationState,
     /// `wp_fifo_manager_v1` — FIFO (vsync) present-mode barriers. Managed:
     /// smithay blocks a `wait_barrier` commit until we clear the barrier
-    /// (at vblank, see [`signal_fifo_barriers`]). NVIDIA's Vulkan Wayland
-    /// WSI requires this global to enable `VK_EXT_present_timing`; without
-    /// it a Proton/DXVK HDR game asserts in `vkGetPastPresentationTimingEXT`.
+    /// (at vblank, see [`signal_fifo_barriers`]).
+    ///
+    /// This is advertised but `wp_commit_timing_manager_v1` deliberately is
+    /// NOT — matching KWin, the config where NVIDIA's Vulkan Wayland WSI
+    /// runs `VK_EXT_present_timing` cleanly. Advertising commit-timing makes
+    /// the NVIDIA WSI take its absolute-time present path, whose per-present
+    /// stage-timing buffer it never allocates for our surface — it then
+    /// writes timing results through a NULL pointer (SIGSEGV, caught by
+    /// Wine as the `vkGetPastPresentationTimingEXT` assert). See the git
+    /// history around this line for the full Ghidra/Mesa/KWin analysis.
     #[allow(dead_code, reason = "held so the wp_fifo global stays alive; delegate_fifo! routes through it")]
     pub fifo_manager_state: smithay::wayland::fifo::FifoManagerState,
-    /// `wp_commit_timing_manager_v1` — targeted present timestamps. The
-    /// other half NVIDIA's WSI needs for `VK_EXT_present_timing`. Managed:
-    /// smithay consumes the per-commit timestamp (required — unmanaged
-    /// leaves it set and the next frame's `set_timestamp` fatally errors
-    /// `TimestampExists`) and blocks the commit; [`State::drive_commit_timers`]
-    /// releases those barriers present-ASAP.
-    #[allow(dead_code, reason = "held so the wp_commit_timing global stays alive; delegate_commit_timing! routes through it")]
-    pub commit_timing_manager_state: smithay::wayland::commit_timing::CommitTimingManagerState,
     /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
     /// `wl_surface`s with X11 windows (see `src/xwayland.rs`). Held so
     /// the global stays alive; only the Xwayland client may bind it.
@@ -470,18 +469,14 @@ pub fn init(
     // the clock our DRM page-flip timestamps and feedback use.
     let presentation_state =
         smithay::wayland::presentation::PresentationState::new::<State>(&dh, 1);
-    // wp_fifo_manager_v1 + wp_commit_timing_manager_v1: NVIDIA's Vulkan
-    // Wayland WSI binds both (alongside the wp_presentation clock id) to
-    // enable VK_EXT_present_timing. Missing them, a Proton/DXVK HDR game
-    // asserts in vkGetPastPresentationTimingEXT (which KDE, advertising
-    // both, never hits). Both are MANAGED: unmanaged commit-timing never
-    // consumes the per-commit timestamp, so a client that sets one every
-    // frame (NVIDIA's WSI does) trips `TimestampExists` on the second
-    // frame — a fatal protocol error that kills the connection (proven:
-    // the game's vkGetPastPresentationTimingEXT assert). Managed mode
-    // consumes it via a pre-commit hook; we release the barriers it adds
-    // in `drive_commit_timers` (present-ASAP, so no hang, no pacing loss —
-    // fifo does the pacing).
+    // wp_fifo_manager_v1: advertised (with the wp_presentation clock id)
+    // so NVIDIA's Vulkan Wayland WSI runs VK_EXT_present_timing — the
+    // KWin-parity config a Proton/DXVK HDR game needs. We deliberately do
+    // NOT advertise wp_commit_timing_manager_v1: doing so flips the NVIDIA
+    // WSI onto its absolute-time present path, which writes stage-timing
+    // through an unallocated (NULL) buffer and SIGSEGVs — surfacing as the
+    // vkGetPastPresentationTimingEXT assert. KWin ships fifo without
+    // commit-timing and works; we match it.
     // `LIBRELAND_NO_FIFO_BLOCK=1` drops fifo to unmanaged (advertised but
     // never blocking) as a recovery valve.
     let fifo_manager_state = if std::env::var_os("LIBRELAND_NO_FIFO_BLOCK").is_some() {
@@ -489,8 +484,6 @@ pub fn init(
     } else {
         smithay::wayland::fifo::FifoManagerState::new::<State>(&dh)
     };
-    let commit_timing_manager_state =
-        smithay::wayland::commit_timing::CommitTimingManagerState::new::<State>(&dh);
     // xwayland_shell_v1: how Xwayland associates the wl_surface it
     // creates for each X11 window with that window (a shared serial;
     // see src/xwayland.rs). smithay only lets Xwayland clients bind it.
@@ -576,7 +569,6 @@ pub fn init(
         content_type_state,
         presentation_state,
         fifo_manager_state,
-        commit_timing_manager_state,
         xwayland_shell_state,
         popup_manager,
         outputs,
@@ -670,30 +662,6 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         info!(surface = ?surface.id(), "wayland: new surface");
-        // Commit-timing anti-deadlock. Managed commit-timing blocks a
-        // commit that carries a target timestamp until we release its
-        // barrier (`drive_commit_timers`, at vblank). But a held commit
-        // never reaches `commit()` and, if it's the only pending work, the
-        // output parks with no vblank to drive the release. This hook runs
-        // on every commit *before* smithay's commit-timing hook consumes
-        // the timestamp (hooks fire in add order; this one is registered at
-        // surface creation, smithay's at `get_timer`), so peeking a pending
-        // timestamp here lets us schedule an immediate wake that drains the
-        // barrier. No timestamp → no work.
-        smithay::wayland::compositor::add_pre_commit_hook::<State, _>(
-            surface,
-            |state, _dh, surface| {
-                let has_ts = smithay::wayland::compositor::with_states(surface, |states| {
-                    states
-                        .data_map
-                        .get::<smithay::wayland::commit_timing::CommitTimerStateUserData>()
-                        .is_some_and(|s| s.borrow().timestamp.is_some())
-                });
-                if has_ts {
-                    state.schedule_commit_timer_drain();
-                }
-            },
-        );
         // Explicit sync (linux-drm-syncobj-v1): gate this surface's commits on
         // its acquire fence. When a client (e.g. Proton/DXVK) commits a buffer
         // with an acquire timeline point, the GPU hasn't finished rendering it
@@ -936,72 +904,6 @@ pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
         // Xwayland clients don't carry our ClientState; skip (their
         // blocker bookkeeping lives elsewhere), matching the explicit-sync
         // blocker path.
-        if compositor_client_state(&client).is_some() {
-            state.client_compositor_state(&client).blocker_cleared(state, &dh);
-        }
-    }
-}
-
-impl State {
-    /// Schedule a one-shot drain of pending commit-timing barriers on the
-    /// next event-loop iteration. Called from the commit-timing pre-commit
-    /// hook when a commit carries a target timestamp: a held commit never
-    /// reaches `commit()` and, if it's the only pending work, would leave
-    /// its output parked with no vblank to drive the release — this wakes
-    /// the loop to release it.
-    pub(crate) fn schedule_commit_timer_drain(&mut self) {
-        self.loop_handle.insert_idle(|state| drive_commit_timers(state, &[]));
-    }
-}
-
-/// Release `wp_commit_timing` barriers on `roots` plus every mapped window
-/// and layer surface, then re-drive each affected client. Managed
-/// commit-timing blocks a commit until its target present time; we do not
-/// hold to that time — fifo already paces the client, and honouring an
-/// exact future timestamp risks parking the output past it — so we release
-/// every barrier due within the next second (any sane near-future target)
-/// present-ASAP. Signalling alone isn't enough: smithay only re-checks a
-/// held commit's blockers on [`CompositorClientState::blocker_cleared`].
-pub(crate) fn drive_commit_timers(state: &mut State, roots: &[WlSurface]) {
-    use smithay::utils::{Clock, Monotonic};
-    use smithay::wayland::commit_timing::{CommitTimerBarrierStateUserData, Timestamp};
-    use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
-
-    let deadline: Timestamp =
-        (Clock::<Monotonic>::new().now() + std::time::Duration::from_secs(1)).into();
-    // Presented roots + every mapped window + every layer surface: a
-    // held commit-timing commit isn't presented, so it won't be in `roots`;
-    // its surface is still a live window/layer we can find here.
-    let mut candidates: Vec<WlSurface> = roots.to_vec();
-    candidates.extend(state.layout.window_entries().into_iter().map(|e| e.surface));
-    candidates.extend(
-        state
-            .layer_shell_state
-            .layer_surfaces()
-            .map(|l| l.wl_surface().clone()),
-    );
-    let mut clients = Vec::new();
-    for root in candidates {
-        let mut released = false;
-        with_surface_tree_downward(
-            &root,
-            (),
-            |_, _, ()| TraversalAction::DoChildren(()),
-            |_surface, states, ()| {
-                if let Some(bs) = states.data_map.get::<CommitTimerBarrierStateUserData>()
-                    && bs.lock().unwrap().signal_until(deadline)
-                {
-                    released = true;
-                }
-            },
-            |_, _, ()| true,
-        );
-        if released && let Some(client) = root.client() {
-            clients.push(client);
-        }
-    }
-    let dh = state.display_handle.clone();
-    for client in clients {
         if compositor_client_state(&client).is_some() {
             state.client_compositor_state(&client).blocker_cleared(state, &dh);
         }
@@ -1816,7 +1718,6 @@ smithay::delegate_session_lock!(State);
 smithay::delegate_presentation!(State);
 smithay::delegate_drm_syncobj!(State);
 smithay::delegate_fifo!(State);
-smithay::delegate_commit_timing!(State);
 
 impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
     fn drm_syncobj_state(
