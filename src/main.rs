@@ -4547,6 +4547,9 @@ fn wire_event_sources(
                     // barrier its commit set — the next frame that waited on it
                     // may now proceed (see `signal_fifo_barriers`).
                     crate::wayland::signal_fifo_barriers(state, &presented);
+                    // Release any commit-timing barrier on the presented
+                    // surfaces (present-ASAP; see `drive_commit_timers`).
+                    crate::wayland::drive_commit_timers(state, &presented);
                     // Re-render only if a trigger arrived while the flip was in
                     // flight, or an animation/slide is still running. Otherwise
                     // the output parks until the next trigger queues a redraw.
