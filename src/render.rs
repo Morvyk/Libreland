@@ -5370,8 +5370,18 @@ impl Renderer {
                     continue;
                 }
                 if let Some(t) = &tier_layer
+                    && let Some(mask) = mask
                     && layer_should_blur(&blur, &l.namespace)
                 {
+                    // A layer surface is always alpha-masked by its own
+                    // buffer — the maskless (`else`) path in `blur_rect`
+                    // frosts the *whole* rect and is only correct for
+                    // windows. A qs-popup is a full-output but transparent
+                    // surface, so on any frame it is mapped (rect known)
+                    // without its buffer imported yet, an unmasked blur
+                    // would flash the entire screen until the card lands.
+                    // Skip until the mask exists: nothing is drawn behind
+                    // an absent buffer, so there is nothing to frost.
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -5379,7 +5389,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst, mask.as_ref(), draw_damage)?;
+                    blur_rect(&mut frame, t, dst, Some(mask), draw_damage)?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
                     .context("draw_render_elements (layer top) failed")?;
@@ -5432,8 +5442,18 @@ impl Renderer {
                     continue;
                 }
                 if let Some(t) = &tier_layer
+                    && let Some(mask) = mask
                     && layer_should_blur(&blur, &l.namespace)
                 {
+                    // A layer surface is always alpha-masked by its own
+                    // buffer — the maskless (`else`) path in `blur_rect`
+                    // frosts the *whole* rect and is only correct for
+                    // windows. A qs-popup is a full-output but transparent
+                    // surface, so on any frame it is mapped (rect known)
+                    // without its buffer imported yet, an unmasked blur
+                    // would flash the entire screen until the card lands.
+                    // Skip until the mask exists: nothing is drawn behind
+                    // an absent buffer, so there is nothing to frost.
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -5441,7 +5461,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst, mask.as_ref(), draw_damage)?;
+                    blur_rect(&mut frame, t, dst, Some(mask), draw_damage)?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
                     .context("draw_render_elements (layer overlay) failed")?;

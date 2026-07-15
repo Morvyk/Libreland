@@ -237,7 +237,7 @@ pub struct WaylandInit {
     /// (at vblank, see [`signal_fifo_barriers`]).
     ///
     /// This is advertised but `wp_commit_timing_manager_v1` deliberately is
-    /// NOT — matching KWin, the config where NVIDIA's Vulkan Wayland WSI
+    /// NOT — matching `KWin`, the config where NVIDIA's Vulkan Wayland WSI
     /// runs `VK_EXT_present_timing` cleanly. Advertising commit-timing makes
     /// the NVIDIA WSI take its absolute-time present path, whose per-present
     /// stage-timing buffer it never allocates for our surface — it then
