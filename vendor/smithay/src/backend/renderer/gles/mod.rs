@@ -2028,6 +2028,50 @@ impl GlesFrame<'_, '_> {
         }
         res
     }
+
+    /// Like [`with_secondary_texture`](Self::with_secondary_texture) but for
+    /// texture units 1 **and** 2 at once, so a custom shader may sample two
+    /// extra textures (`sampler2D` uniforms set to `1i`/`2i`) during `func`.
+    /// Libreland uses this for temporally-stable backdrop-blur masking
+    /// (current + previous surface alpha on units 1 and 2). Restores both
+    /// units and re-activates unit 0 before returning.
+    pub fn with_secondary_textures<F, R>(
+        &mut self,
+        texture1: &GlesTexture,
+        texture2: &GlesTexture,
+        func: F,
+    ) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        unsafe {
+            for (unit, tex) in [(ffi::TEXTURE1, texture1), (ffi::TEXTURE2, texture2)] {
+                self.renderer.gl.ActiveTexture(unit);
+                self.renderer.gl.BindTexture(ffi::TEXTURE_2D, tex.tex_id());
+                // Ensure the texture is sampleable regardless of the filter it
+                // was imported with — the default MIN filter needs mipmaps,
+                // which these single-level textures do not have (an incomplete
+                // sampler would read (0,0,0,1)). render_texture only sets the
+                // filter on the primary (unit 0), so do it here for 1 and 2.
+                self.renderer
+                    .gl
+                    .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                self.renderer
+                    .gl
+                    .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            }
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+        }
+        let res = func(self);
+        unsafe {
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE1);
+            self.renderer.gl.BindTexture(ffi::TEXTURE_2D, 0);
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE2);
+            self.renderer.gl.BindTexture(ffi::TEXTURE_2D, 0);
+            self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+        }
+        res
+    }
 }
 
 impl RendererSuper for GlesRenderer {

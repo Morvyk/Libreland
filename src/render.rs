@@ -556,6 +556,7 @@ precision mediump float;
 
 uniform sampler2D tex;
 uniform sampler2D mask;
+uniform sampler2D mask_prev;
 uniform float alpha;
 uniform vec2 mask_mul;
 uniform vec2 mask_add;
@@ -564,18 +565,21 @@ varying vec2 v_coords;
 
 void main() {
     vec4 c = texture2D(tex, v_coords);
-    float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
-    // The mask alpha is *coverage*: a translucent panel body (the quickshell
-    // popups sit at ~0.76-0.79) must get the full blur behind it, otherwise
-    // its transparency shows the sharp backdrop and the frost reads weak. So
-    // remap coverage to frost strength — but only *substantial* coverage is a
-    // panel. A naive `min(m*4, 1)` frosts anything past 0.25 alpha, which
-    // turns the faint full-surface alpha a client leaves on a transient
-    // frame (e.g. a popup's first settling frames) into a full-screen frost
-    // flash. `smoothstep(0.6, 0.74, m)` keeps real panel bodies fully frosted
-    // (>=0.76 -> 1.0) while faint residue (<0.6) contributes nothing, and the
-    // shape's AA edge still ramps cleanly.
-    m = smoothstep(0.6, 0.74, m);
+    vec2 muv = v_coords * mask_mul + mask_add;
+    // Temporal coverage: a real panel (the bar, a popup's card) covers the
+    // same pixels frame after frame; a client's transient full-surface frame
+    // (Qt paints one panel-coloured frame across the whole popup surface when
+    // it maps, before its content settles to just the card) covers a pixel on
+    // *one* frame only. Take the min of this frame's and last frame's surface
+    // alpha, so newly-covered pixels get no frost until they persist — that
+    // one bad frame can no longer flash the whole screen, and it needs no
+    // guess about the alpha (the flash is the same 0.79 as the real card).
+    float m = min(texture2D(mask, muv).a, texture2D(mask_prev, muv).a);
+    // Coverage -> frost strength: a translucent panel body (~0.76-0.79) must
+    // still get the full blur behind it, else its transparency shows the
+    // sharp backdrop. Saturate so any meaningfully-covered pixel is fully
+    // frosted and only the shape's AA edge blends out.
+    m = min(m * 4.0, 1.0);
     gl_FragColor = c * (m * alpha);
 }
 ";
@@ -593,6 +597,7 @@ precision mediump float;
 #endif
 uniform sampler2D tex;
 uniform sampler2D mask;
+uniform sampler2D mask_prev;
 uniform float alpha;
 uniform vec2 mask_mul;
 uniform vec2 mask_add;
@@ -606,9 +611,10 @@ vec3 srgb_to_linear(vec3 c) {
 }
 void main() {
     vec4 c = texture2D(tex, v_coords);
-    float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
-    // Coverage → frost strength — see MASK_BLUR_SHADER.
-    m = smoothstep(0.6, 0.74, m);
+    vec2 muv = v_coords * mask_mul + mask_add;
+    // Temporal coverage min + saturation — see MASK_BLUR_SHADER.
+    float m = min(texture2D(mask, muv).a, texture2D(mask_prev, muv).a);
+    m = min(m * 4.0, 1.0);
     vec3 straight = c.a > 0.0 ? (c.rgb / c.a) : vec3(0.0);
     vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
     mat3 bt709_to_bt2020 = mat3(
@@ -1256,6 +1262,14 @@ struct OutputRender {
     profile: RenderProfile,
     /// Per-output damage diffing state (see [`DamageTracker`]).
     damage_tracker: DamageTracker,
+    /// Last frame's imported surface-alpha texture per blur-eligible layer
+    /// surface (by id), for the backdrop blur's temporal coverage min (see
+    /// `MASK_BLUR_SHADER`). A surface absent here has no history yet — its
+    /// blur is skipped for one frame rather than trusting a single frame's
+    /// alpha, which is what lets a client's transient full-surface frame not
+    /// flash. `GlesTexture` is `Arc`-backed, so holding last frame's handle
+    /// is cheap and keeps that buffer's texture alive until the next frame.
+    prev_layer_masks: HashMap<ObjectId, GlesTexture>,
 }
 
 /// What one drawn thing (window / layer / popup) looked like last frame,
@@ -2055,6 +2069,7 @@ impl Renderer {
                 MASK_BLUR_SHADER,
                 &[
                     UniformName::new("mask", UniformType::_1i),
+                    UniformName::new("mask_prev", UniformType::_1i),
                     UniformName::new("mask_mul", UniformType::_2f),
                     UniformName::new("mask_add", UniformType::_2f),
                 ],
@@ -2145,6 +2160,7 @@ impl Renderer {
                 MASK_BLUR_SHADER_HDR,
                 &[
                     UniformName::new("mask", UniformType::_1i),
+                    UniformName::new("mask_prev", UniformType::_1i),
                     UniformName::new("mask_mul", UniformType::_2f),
                     UniformName::new("mask_add", UniformType::_2f),
                     UniformName::new("reference_white", UniformType::_1f),
@@ -2275,6 +2291,7 @@ impl Renderer {
                 pending_frame_roots: Vec::new(),
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
+                prev_layer_masks: HashMap::new(),
             });
         }
 
@@ -2987,6 +3004,7 @@ impl Renderer {
             pending_frame_roots: Vec::new(),
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
+            prev_layer_masks: HashMap::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -4853,6 +4871,31 @@ impl Renderer {
         // blur drives tier 2. We don't probe per-surface alpha, so a mapped
         // opaque panel/window still pays while it's up; the cost is bounded.
         let blur = self.decoration.blur.clone();
+        // Temporal blur masking (see MASK_BLUR_SHADER + `prev_layer_masks`):
+        // for each blur-eligible layer, fetch last frame's surface-alpha
+        // texture so the blur can mask by the *min* of this and last frame's
+        // coverage — a client's transient full-surface frame then frosts
+        // nothing new. A surface with no stored previous mask (its first
+        // frame) has its blur skipped this frame. Computed here, a clean
+        // borrow point before the frame binds `self.gles`; the store is then
+        // replaced with this frame's masks for next time.
+        let prev_masks_now: Vec<Option<GlesTexture>> = layers
+            .iter()
+            .zip(layer_masks.iter())
+            .map(|(l, cur)| {
+                if cur.is_some() && layer_should_blur(&blur, &l.namespace) {
+                    self.outputs[idx].prev_layer_masks.get(&l.surface.id()).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.outputs[idx].prev_layer_masks = layers
+            .iter()
+            .zip(layer_masks.iter())
+            .filter(|(l, _)| layer_should_blur(&blur, &l.namespace))
+            .filter_map(|(l, cur)| cur.clone().map(|t| (l.surface.id(), t)))
+            .collect();
         // A provably-opaque solo fullscreen window covers everything a blur
         // tier could ever show through — a blur-opted bar occluded behind a
         // game kept a full 6-pass pyramid running on every single-pass game
@@ -5120,10 +5163,13 @@ impl Renderer {
         // compositor can't know a panel's corner radius. Without one
         // (windows) an SDF clips the tier to the same rounded rect
         // `draw_window` composites.
+        // `mask`, when present, is `(current, previous)` surface-alpha
+        // textures — the blur is masked by their temporal minimum (see
+        // MASK_BLUR_SHADER). `None` is the window path (SDF-clipped).
         let blur_rect = |frame: &mut GlesFrame<'_, '_>,
                          tier: &GlesTexture,
                          dst: Rectangle<i32, Physical>,
-                         mask: Option<&GlesTexture>,
+                         mask: Option<(&GlesTexture, &GlesTexture)>,
                          damage: &[Rectangle<i32, Physical>]|
          -> Result<()> {
             let src = Rectangle::<f64, smithay::utils::Buffer>::new(
@@ -5166,10 +5212,12 @@ impl Renderer {
                 (tier_h, 0.0)
             };
 
-            if let Some(mask) = mask {
+            if let Some((mask, mask_prev)) = mask {
                 // abs px → mask UV: shift by the rect origin, normalise by
                 // the rect size, and flip y again if the client's buffer is
-                // y-inverted.
+                // y-inverted. Current and previous masks are the same
+                // surface's buffers (same size, position, inversion), so one
+                // mapping serves both.
                 let mut mask_mul = (tier_w / dst_w, ay / dst_h);
                 let mut mask_add = (-loc_x / dst_w, (by - loc_y) / dst_h);
                 if mask.is_y_inverted() {
@@ -5178,6 +5226,7 @@ impl Renderer {
                 }
                 let mut uniforms = vec![
                     Uniform::new("mask", 1i32),
+                    Uniform::new("mask_prev", 2i32),
                     Uniform::new("mask_mul", mask_mul),
                     Uniform::new("mask_add", mask_add),
                 ];
@@ -5190,11 +5239,11 @@ impl Renderer {
                 } else {
                     &mask_blur_shader
                 };
-                // The shader's `mask` sampler reads texture unit 1; smithay's
-                // draw only drives unit 0, so the secondary binding (made and
-                // restored by the vendored helper) survives the call.
+                // The shader's `mask`/`mask_prev` samplers read texture units
+                // 1 and 2; smithay's draw only drives unit 0, so the bindings
+                // (made and restored by the vendored helper) survive the call.
                 frame
-                    .with_secondary_texture(mask, |frame| {
+                    .with_secondary_textures(mask, mask_prev, |frame| {
                         frame.render_texture_from_to(
                             tier,
                             src,
@@ -5366,21 +5415,26 @@ impl Renderer {
             // bar). Blur against the full backdrop (tier 2) so a translucent
             // panel reveals a frosted desktop. Skipped wholesale under a
             // provably-opaque solo fullscreen window — the game covers them.
-            for ((l, (bucket, elements)), mask) in layers
+            for (((l, (bucket, elements)), mask), mask_prev) in layers
                 .iter()
                 .zip(layer_groups.iter())
                 .zip(layer_masks.iter())
+                .zip(prev_masks_now.iter())
             {
                 if solo_opaque.is_some() || !matches!(bucket, LayerBucket::Top) {
                     continue;
                 }
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
+                    && let Some(mask_prev) = mask_prev
                     && layer_should_blur(&blur, &l.namespace)
                 {
-                    // A layer surface is always alpha-masked by its own buffer;
-                    // skip when the buffer is absent (a maskless layer would
-                    // take blur_rect's window fallback and frost the whole rect).
+                    // A layer's blur is masked by the temporal min of its
+                    // current + previous surface alpha. Both `let Some`s gate
+                    // it: no current buffer would take blur_rect's window
+                    // fallback (whole-rect frost); no previous mask means the
+                    // surface just appeared, so skip one frame rather than
+                    // trust a lone frame's alpha (that is the flash guard).
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -5388,7 +5442,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst, Some(mask), draw_damage)?;
+                    blur_rect(&mut frame, t, dst, Some((mask, mask_prev)), draw_damage)?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
                     .context("draw_render_elements (layer top) failed")?;
@@ -5432,21 +5486,23 @@ impl Renderer {
             // Overlay layer surfaces go above everything else below the cursor —
             // above windows AND fullscreen, so a launcher / toast / OSD stays on
             // top of a fullscreen game. Same tier-2 blur as the Top layer.
-            for ((l, (bucket, elements)), mask) in layers
+            for (((l, (bucket, elements)), mask), mask_prev) in layers
                 .iter()
                 .zip(layer_groups.iter())
                 .zip(layer_masks.iter())
+                .zip(prev_masks_now.iter())
             {
                 if !matches!(bucket, LayerBucket::Overlay) {
                     continue;
                 }
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
+                    && let Some(mask_prev) = mask_prev
                     && layer_should_blur(&blur, &l.namespace)
                 {
-                    // A layer surface is always alpha-masked by its own buffer;
-                    // skip when the buffer is absent (a maskless layer would
-                    // take blur_rect's window fallback and frost the whole rect).
+                    // Temporal-min masked blur; both `let Some`s gate it (no
+                    // buffer → window-fallback whole-rect frost; no previous
+                    // mask → skip one frame). See the Top-layer loop above.
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -5454,7 +5510,7 @@ impl Renderer {
                         ),
                         Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
                     );
-                    blur_rect(&mut frame, t, dst, Some(mask), draw_damage)?;
+                    blur_rect(&mut frame, t, dst, Some((mask, mask_prev)), draw_damage)?;
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
                     .context("draw_render_elements (layer overlay) failed")?;
@@ -7243,5 +7299,122 @@ mod gpu_bench {
             Ok(())
         });
         println!();
+    }
+
+    /// Verifies the temporal-min masking of the layer backdrop blur (the fix
+    /// for the popup-open fullscreen frost flash): with the *same* current
+    /// coverage, whether a pixel gets frosted depends on whether it was also
+    /// covered last frame. A full-surface frame that was not covered before
+    /// (the client's transient map frame) frosts nothing; a stably-covered
+    /// pixel (a real panel body) frosts fully. This is what no alpha threshold
+    /// could achieve, since the flash is the same 0.79 alpha as the real card.
+    #[test]
+    #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    fn temporal_mask_blur_confines_frost() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .expect("open render node");
+        let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+        let gbm = GbmDevice::new(fd).expect("GbmDevice");
+        #[allow(unsafe_code, reason = "test-only surfaceless EGL, single thread")]
+        // SAFETY: GbmDevice clone lives in the EGLDisplay for its lifetime.
+        let display = unsafe { EGLDisplay::new(gbm.clone()) }.expect("EGLDisplay");
+        let context = EGLContext::new(&display).expect("EGLContext");
+        #[allow(unsafe_code, reason = "test-only single-thread renderer")]
+        // SAFETY: used only from this test thread.
+        let mut gles = unsafe { GlesRenderer::new(context) }.expect("GlesRenderer");
+
+        let shader = gles
+            .compile_custom_texture_shader(
+                MASK_BLUR_SHADER,
+                &[
+                    UniformName::new("mask", UniformType::_1i),
+                    UniformName::new("mask_prev", UniformType::_1i),
+                    UniformName::new("mask_mul", UniformType::_2f),
+                    UniformName::new("mask_add", UniformType::_2f),
+                ],
+            )
+            .expect("compile mask blur shader");
+
+        let size = Size::<i32, smithay::utils::Buffer>::from((64, 64));
+        let phys = Size::<i32, Physical>::from((64, 64));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((64.0, 64.0)));
+        let dst = Rectangle::<i32, Physical>::from_size(phys);
+
+        // Uniform-colour textures via import_memory — imported textures have
+        // sampler filters set (create_buffer ones don't, so they'd sample as
+        // incomplete). Uniform content makes the mask UV mapping irrelevant.
+        // Tier (blurred backdrop) is white/opaque so a frosted pixel reads white.
+        let white: Vec<u8> = [255u8; 4].iter().copied().cycle().take(64 * 64 * 4).collect();
+        let tier = gles
+            .import_memory(&white, Fourcc::Abgr8888, size, false)
+            .expect("import tier");
+        let mut mk = |alpha: u8| -> GlesTexture {
+            let data: Vec<u8> = [0u8, 0u8, 0u8, alpha]
+                .iter()
+                .copied()
+                .cycle()
+                .take(64 * 64 * 4)
+                .collect();
+            gles
+                .import_memory(&data, Fourcc::Abgr8888, size, false)
+                .expect("import mask")
+        };
+        let cur = mk(201); // panel material everywhere (0.79) — the flash
+        let prev_none = mk(0); // not covered last frame
+        let prev_full = mk(201); // stably covered
+
+        // Render one masked blur over a red backdrop; return the centre texel.
+        let unis = [
+            Uniform::new("mask", 1i32),
+            Uniform::new("mask_prev", 2i32),
+            Uniform::new("mask_mul", (1.0f32, 1.0f32)),
+            Uniform::new("mask_add", (0.0f32, 0.0f32)),
+        ];
+        let mut run = |prev: &GlesTexture| -> [u8; 4] {
+            let mut target: GlesTexture =
+                gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
+            {
+                let mut b = gles.bind(&mut target).expect("bind target");
+                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
+                f.clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full).expect("clear red");
+                f.with_secondary_textures(&cur, prev, |f| {
+                    f.render_texture_from_to(
+                        &tier, src, dst, &full, &[], Transform::Normal, 1.0, Some(&shader), &unis,
+                    )
+                })
+                .expect("masked blur draw");
+                let s = f.finish().expect("finish");
+                drop(b);
+                let _ = s.wait();
+            }
+            let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((64, 64)));
+            let bound = gles.bind(&mut target).expect("rebind");
+            let mapping = gles
+                .copy_framebuffer(&bound, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let bytes = gles.map_texture(&mapping).expect("map").to_vec();
+            let c = (32 * 64 + 32) * 4; // centre pixel
+            [bytes[c], bytes[c + 1], bytes[c + 2], bytes[c + 3]]
+        };
+
+        let no_history = run(&prev_none);
+        let stable = run(&prev_full);
+        let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+        println!("no-history centre = {no_history:?} (sum {})", sum(no_history));
+        println!("stable     centre = {stable:?} (sum {})", sum(stable));
+        // Not covered last frame -> min coverage 0 -> no frost -> stays red backdrop.
+        assert!(
+            sum(no_history) < 400,
+            "a full-surface frame with no prior coverage must NOT frost (got {no_history:?})"
+        );
+        // Covered both frames -> full frost -> becomes the white tier.
+        assert!(
+            sum(stable) > 600,
+            "a stably-covered pixel must frost fully (got {stable:?})"
+        );
     }
 }
