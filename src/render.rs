@@ -199,6 +199,10 @@ pub struct OutputDescriptor {
 /// is a right-triangle with apex at the hotspot, so this is also
 /// the bounding-box width and height.
 const CURSOR_SIZE: i32 = 24;
+/// Number of a layer surface's initial blur-eligible frames to leave
+/// un-frosted, so a quickshell popup's transient full-surface settling
+/// frames don't flash the whole screen. See [`OutputRender::blur_warmup`].
+const BLUR_WARMUP_FRAMES: u32 = 4;
 
 /// Kawase *dual-filter* blur — downsample half. One bilinear tap at the
 /// centre (weighted ×4) plus four diagonal taps, averaged. Run once per
@@ -1251,15 +1255,14 @@ struct OutputRender {
     profile: RenderProfile,
     /// Per-output damage diffing state (see [`DamageTracker`]).
     damage_tracker: DamageTracker,
-    /// Layer surfaces (by id) that have already had at least one
-    /// blur-eligible frame on this output. A quickshell popup renders a
-    /// single transient full-surface frame the moment its layer surface
-    /// maps — before its transparent content settles — which, blurred,
-    /// frosts the whole screen for that one frame (a visible flash). We
-    /// therefore skip a layer's backdrop blur on its *first* eligible
-    /// frame and blur from the next one; membership here is what marks a
-    /// surface as past that first frame.
-    blur_warmup: HashSet<ObjectId>,
+    /// How many blur-eligible frames each layer surface (by id) has had on
+    /// this output. A quickshell popup renders a few transient full-surface
+    /// frames the moment its layer surface maps — before its content
+    /// settles to just its card — which, blurred, frost the whole screen
+    /// (a visible flash). We skip a layer's backdrop blur for its first
+    /// several eligible frames (`BLUR_WARMUP_FRAMES`) so that settling
+    /// window can't flash; the count here tracks that warmup.
+    blur_warmup: HashMap<ObjectId, u32>,
 }
 
 /// What one drawn thing (window / layer / popup) looked like last frame,
@@ -2279,7 +2282,7 @@ impl Renderer {
                 pending_frame_roots: Vec::new(),
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
-                blur_warmup: HashSet::new(),
+                blur_warmup: HashMap::new(),
             });
         }
 
@@ -2992,7 +2995,7 @@ impl Renderer {
             pending_frame_roots: Vec::new(),
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
-            blur_warmup: HashSet::new(),
+            blur_warmup: HashMap::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -4873,14 +4876,20 @@ impl Renderer {
             .map(|(l, _)| l.surface.id())
             .collect();
         let blur_skip: HashSet<ObjectId> = {
-            let warmup = &self.outputs[idx].blur_warmup;
-            blur_eligible_now
-                .iter()
-                .filter(|id| !warmup.contains(id))
-                .cloned()
-                .collect()
+            let warmup = &mut self.outputs[idx].blur_warmup;
+            // Drop surfaces that are no longer eligible so a re-created
+            // popup (new id) starts its warmup fresh.
+            warmup.retain(|id, _| blur_eligible_now.contains(id));
+            let mut skip = HashSet::new();
+            for id in &blur_eligible_now {
+                let count = warmup.entry(id.clone()).or_insert(0);
+                if *count < BLUR_WARMUP_FRAMES {
+                    skip.insert(id.clone());
+                }
+                *count = count.saturating_add(1);
+            }
+            skip
         };
-        self.outputs[idx].blur_warmup = blur_eligible_now;
         // A provably-opaque solo fullscreen window covers everything a blur
         // tier could ever show through — a blur-opted bar occluded behind a
         // game kept a full 6-pass pyramid running on every single-pass game
@@ -5167,6 +5176,16 @@ impl Renderer {
             if local.is_empty() {
                 return Ok(());
             }
+            // DIAGNOSTIC (temporary): log every backdrop blur that actually
+            // draws, so the popup-open flash frame reveals what is frosted
+            // full-screen. `masked` = layer (true) vs window (false).
+            debug!(
+                x = dst.loc.x, y = dst.loc.y, w = dst.size.w, h = dst.size.h,
+                masked = mask.is_some(),
+                mask_sz = ?mask.map(|m| { let s = m.size(); (s.w, s.h) }),
+                damage_rects = local.len(),
+                "BLURDRAW"
+            );
             // `v_coords` in the blur shaders samples the tier: it spans the
             // `src` sub-rect normalised over the *whole* tier, not 0..1
             // across `dst`. Hand the shaders a CPU-computed affine map from
