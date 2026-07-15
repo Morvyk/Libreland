@@ -199,10 +199,6 @@ pub struct OutputDescriptor {
 /// is a right-triangle with apex at the hotspot, so this is also
 /// the bounding-box width and height.
 const CURSOR_SIZE: i32 = 24;
-/// Number of a layer surface's initial blur-eligible frames to leave
-/// un-frosted, so a quickshell popup's transient full-surface settling
-/// frames don't flash the whole screen. See [`OutputRender::blur_warmup`].
-const BLUR_WARMUP_FRAMES: u32 = 4;
 
 /// Kawase *dual-filter* blur — downsample half. One bilinear tap at the
 /// centre (weighted ×4) plus four diagonal taps, averaged. Run once per
@@ -569,12 +565,17 @@ varying vec2 v_coords;
 void main() {
     vec4 c = texture2D(tex, v_coords);
     float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
-    // The mask alpha is *coverage*, not frost strength: a translucent panel
-    // body (say 0.75) must still get the full blur behind it — otherwise the
-    // remainder shows the sharp backdrop and the frost reads weak. Saturate
-    // so any pixel the panel meaningfully covers is fully frosted and only
-    // the AA ramp at the shape's edge blends out.
-    m = min(m * 4.0, 1.0);
+    // The mask alpha is *coverage*: a translucent panel body (the quickshell
+    // popups sit at ~0.76-0.79) must get the full blur behind it, otherwise
+    // its transparency shows the sharp backdrop and the frost reads weak. So
+    // remap coverage to frost strength — but only *substantial* coverage is a
+    // panel. A naive `min(m*4, 1)` frosts anything past 0.25 alpha, which
+    // turns the faint full-surface alpha a client leaves on a transient
+    // frame (e.g. a popup's first settling frames) into a full-screen frost
+    // flash. `smoothstep(0.6, 0.74, m)` keeps real panel bodies fully frosted
+    // (>=0.76 -> 1.0) while faint residue (<0.6) contributes nothing, and the
+    // shape's AA edge still ramps cleanly.
+    m = smoothstep(0.6, 0.74, m);
     gl_FragColor = c * (m * alpha);
 }
 ";
@@ -606,8 +607,8 @@ vec3 srgb_to_linear(vec3 c) {
 void main() {
     vec4 c = texture2D(tex, v_coords);
     float m = texture2D(mask, v_coords * mask_mul + mask_add).a;
-    // Coverage saturation — see MASK_BLUR_SHADER.
-    m = min(m * 4.0, 1.0);
+    // Coverage → frost strength — see MASK_BLUR_SHADER.
+    m = smoothstep(0.6, 0.74, m);
     vec3 straight = c.a > 0.0 ? (c.rgb / c.a) : vec3(0.0);
     vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
     mat3 bt709_to_bt2020 = mat3(
@@ -1255,14 +1256,6 @@ struct OutputRender {
     profile: RenderProfile,
     /// Per-output damage diffing state (see [`DamageTracker`]).
     damage_tracker: DamageTracker,
-    /// How many blur-eligible frames each layer surface (by id) has had on
-    /// this output. A quickshell popup renders a few transient full-surface
-    /// frames the moment its layer surface maps — before its content
-    /// settles to just its card — which, blurred, frost the whole screen
-    /// (a visible flash). We skip a layer's backdrop blur for its first
-    /// several eligible frames (`BLUR_WARMUP_FRAMES`) so that settling
-    /// window can't flash; the count here tracks that warmup.
-    blur_warmup: HashMap<ObjectId, u32>,
 }
 
 /// What one drawn thing (window / layer / popup) looked like last frame,
@@ -2282,7 +2275,6 @@ impl Renderer {
                 pending_frame_roots: Vec::new(),
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
-                blur_warmup: HashMap::new(),
             });
         }
 
@@ -2995,7 +2987,6 @@ impl Renderer {
             pending_frame_roots: Vec::new(),
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
-            blur_warmup: HashMap::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -4862,34 +4853,6 @@ impl Renderer {
         // blur drives tier 2. We don't probe per-surface alpha, so a mapped
         // opaque panel/window still pays while it's up; the cost is bounded.
         let blur = self.decoration.blur.clone();
-        // First-frame blur suppression (see `OutputRender::blur_warmup`):
-        // a layer surface's backdrop blur is skipped on the first frame it
-        // appears with a buffer, so a quickshell popup's transient
-        // full-surface map frame doesn't frost the whole screen. Compute
-        // the skip set from the *previous* warmup, then record this frame's
-        // blur-eligible layers as the new warmup. Done here (a clean borrow
-        // point, before the frame binds `self.gles`).
-        let blur_eligible_now: HashSet<ObjectId> = layers
-            .iter()
-            .zip(layer_masks.iter())
-            .filter(|(l, mask)| mask.is_some() && layer_should_blur(&blur, &l.namespace))
-            .map(|(l, _)| l.surface.id())
-            .collect();
-        let blur_skip: HashSet<ObjectId> = {
-            let warmup = &mut self.outputs[idx].blur_warmup;
-            // Drop surfaces that are no longer eligible so a re-created
-            // popup (new id) starts its warmup fresh.
-            warmup.retain(|id, _| blur_eligible_now.contains(id));
-            let mut skip = HashSet::new();
-            for id in &blur_eligible_now {
-                let count = warmup.entry(id.clone()).or_insert(0);
-                if *count < BLUR_WARMUP_FRAMES {
-                    skip.insert(id.clone());
-                }
-                *count = count.saturating_add(1);
-            }
-            skip
-        };
         // A provably-opaque solo fullscreen window covers everything a blur
         // tier could ever show through — a blur-opted bar occluded behind a
         // game kept a full 6-pass pyramid running on every single-pass game
@@ -5176,16 +5139,6 @@ impl Renderer {
             if local.is_empty() {
                 return Ok(());
             }
-            // DIAGNOSTIC (temporary): log every backdrop blur that actually
-            // draws, so the popup-open flash frame reveals what is frosted
-            // full-screen. `masked` = layer (true) vs window (false).
-            debug!(
-                x = dst.loc.x, y = dst.loc.y, w = dst.size.w, h = dst.size.h,
-                masked = mask.is_some(),
-                mask_sz = ?mask.map(|m| { let s = m.size(); (s.w, s.h) }),
-                damage_rects = local.len(),
-                "BLURDRAW"
-            );
             // `v_coords` in the blur shaders samples the tier: it spans the
             // `src` sub-rect normalised over the *whole* tier, not 0..1
             // across `dst`. Hand the shaders a CPU-computed affine map from
@@ -5424,14 +5377,10 @@ impl Renderer {
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
                     && layer_should_blur(&blur, &l.namespace)
-                    && !blur_skip.contains(&l.surface.id())
                 {
-                    // A layer surface is always alpha-masked by its own buffer.
-                    // Two skips guard the popup flash: no mask (buffer absent)
-                    // would take blur_rect's window fallback and frost the whole
-                    // rect; and `blur_skip` drops the surface's first buffered
-                    // frame, the transient full-surface frame a quickshell popup
-                    // renders on map before its content is transparent.
+                    // A layer surface is always alpha-masked by its own buffer;
+                    // skip when the buffer is absent (a maskless layer would
+                    // take blur_rect's window fallback and frost the whole rect).
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -5494,14 +5443,10 @@ impl Renderer {
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
                     && layer_should_blur(&blur, &l.namespace)
-                    && !blur_skip.contains(&l.surface.id())
                 {
-                    // A layer surface is always alpha-masked by its own buffer.
-                    // Two skips guard the popup flash: no mask (buffer absent)
-                    // would take blur_rect's window fallback and frost the whole
-                    // rect; and `blur_skip` drops the surface's first buffered
-                    // frame, the transient full-surface frame a quickshell popup
-                    // renders on map before its content is transparent.
+                    // A layer surface is always alpha-masked by its own buffer;
+                    // skip when the buffer is absent (a maskless layer would
+                    // take blur_rect's window fallback and frost the whole rect).
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
