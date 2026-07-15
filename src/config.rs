@@ -458,6 +458,11 @@ pub struct MiscConfig {
     /// solid/gradient fill, or a media file (image/gif/video) decoded by
     /// libav and drawn per the chosen scaling mode.
     pub wallpaper: Wallpaper,
+    /// Autostart the bundled polkit authentication agent
+    /// (`libreland-polkit-agent`) so GUI programs and `pkexec` get a
+    /// password prompt. `true` by default; set `false` to run your own
+    /// agent instead. Applied at launch only (needs a restart).
+    pub polkit_agent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -561,6 +566,7 @@ impl Default for Config {
                     top: [0.40, 0.60, 0.90],    // light sky blue
                     bottom: [0.10, 0.20, 0.50], // deep navy
                 }),
+                polkit_agent: true,
             },
             layout: LayoutConfig {
                 gaps_outer: 8,
@@ -978,6 +984,9 @@ fn parse_misc(t: &Table, defaults: MiscConfig) -> mlua::Result<MiscConfig> {
     let mut cfg = defaults;
     if let Some(w) = t.get::<Option<Table>>("wallpaper")? {
         cfg.wallpaper = parse_wallpaper(&w).context("wallpaper")?;
+    }
+    if let Some(v) = t.get::<Option<bool>>("polkit_agent")? {
+        cfg.polkit_agent = v;
     }
     Ok(cfg)
 }

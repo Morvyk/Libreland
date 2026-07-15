@@ -4030,7 +4030,15 @@ fn main() -> Result<()> {
     // set, spawn any configured startup commands. Their stdout /
     // stderr inherit ours (so they share the file log via
     // descriptors, if relevant).
-    let startup_children = wayland::spawn_startup(&config.startup);
+    let mut startup_children = wayland::spawn_startup(&config.startup);
+
+    // Bring up the bundled polkit agent (unless the user opted out) so GUI
+    // privilege prompts and `pkexec` work in the session.
+    if config.misc.polkit_agent
+        && let Some(agent) = wayland::spawn_polkit_agent()
+    {
+        startup_children.push(agent);
+    }
 
     // Live config reload: poll the config file once a second and
     // re-apply on change. Polling (vs inotify) is dependency-free and

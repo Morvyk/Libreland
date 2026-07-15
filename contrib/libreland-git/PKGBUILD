@@ -7,7 +7,7 @@
 # alongside it). The source is cloned from GitHub — no local checkout needed.
 
 pkgname=libreland-git
-pkgver=0.1.0.r129.g7d50ac1
+pkgver=0.1.0.r162.g8cd7475
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua (git)'
 arch=('x86_64')
@@ -28,11 +28,15 @@ depends=(
     'systemd-libs'
     'ffmpeg'
     'xorg-xwayland'
+    # polkitd + polkit-agent-helper-1, driven by the bundled polkit agent
+    # (libreland-polkit-agent) for GUI privilege prompts / pkexec.
+    'polkit'
 )
 # `rust` provides cargo; the project's .cargo/config.toml links through mold.
 # clang (libclang) + pkgconf build the ffmpeg-sys bindings (bindgen +
 # pkg-config against the system ffmpeg). git is needed to clone the source.
-makedepends=('rust' 'mold' 'git' 'clang' 'pkgconf')
+# `vulkan-headers` builds the tiny no-present-timing Vulkan layer (C).
+makedepends=('rust' 'mold' 'git' 'clang' 'pkgconf' 'vulkan-headers')
 optdepends=(
     'xdg-desktop-portal: desktop integration frontend (file dialogs, screen sharing)'
     'xdg-desktop-portal-wlr: screen sharing + screenshots via PipeWire'
@@ -74,6 +78,14 @@ build() {
     # build` compiles only the compositor and package() then fails to
     # find the output-picker binary.
     cargo build --release --locked --workspace
+
+    # Vulkan implicit layer (plain C) that hides VK_EXT_present_timing, to
+    # work around an NVIDIA Wayland WSI null-deref that crashes Proton/DXVK
+    # HDR games (SIGSEGV surfaced by Wine as a vkGetPastPresentationTimingEXT
+    # assert). See contrib/no-present-timing-layer/no_present_timing.c.
+    gcc -shared -fPIC -O2 -Wall \
+        contrib/no-present-timing-layer/no_present_timing.c \
+        -o "$srcdir/libVkLayer_libreland_no_present_timing.so" -lpthread
 }
 
 package() {
@@ -84,6 +96,11 @@ package() {
         "$pkgdir/usr/bin/libreland"
     install -Dm755 "$root/target/release/libreland-output-picker" \
         "$pkgdir/usr/bin/libreland-output-picker"
+    # PolicyKit authentication agent: registers with polkitd and drives the
+    # themed quickshell password dialog, so GUI privilege prompts and pkexec
+    # work. Autostarted by the compositor (config `misc.polkit_agent`).
+    install -Dm755 "$root/target/release/libreland-polkit-agent" \
+        "$pkgdir/usr/bin/libreland-polkit-agent"
 
     # Wayland session entry so display managers (SDDM/GDM/greetd/…) list
     # "Libreland". Exec is the bare compositor; it sets up its own session
@@ -104,6 +121,14 @@ package() {
     # the chooser at the libreland-output-picker installed above.
     install -Dm644 "$root/contrib/xdg-desktop-portal-wlr.config" \
         "$pkgdir/etc/xdg/xdg-desktop-portal-wlr/libreland"
+
+    # Vulkan implicit layer + manifest: hides VK_EXT_present_timing to work
+    # around an NVIDIA Wayland WSI null-deref (see the layer source). Always
+    # on; disable per-app with DISABLE_LIBRELAND_NO_PRESENT_TIMING=1.
+    install -Dm755 "$srcdir/libVkLayer_libreland_no_present_timing.so" \
+        "$pkgdir/usr/lib/libVkLayer_libreland_no_present_timing.so"
+    install -Dm644 "$root/contrib/no-present-timing-layer/VkLayer_libreland_no_present_timing.json" \
+        "$pkgdir/usr/share/vulkan/implicit_layer.d/VkLayer_libreland_no_present_timing.json"
 
     # License + docs.
     install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/libreland/LICENSE"

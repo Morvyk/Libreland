@@ -338,9 +338,18 @@ Available actions today: `exit`, `togglefloating`, `togglefullscreen`,
 
 ### misc
 
-| Field        | Default            | State | Notes                                                       |
-| ------------ | ------------------ | ----- | ----------------------------------------------------------- |
-| `wallpaper`  | vertical gradient  | ✅    | A flat fill, or a media file (image/gif/video). See below.  |
+| Field          | Default            | State | Notes                                                       |
+| -------------- | ------------------ | ----- | ----------------------------------------------------------- |
+| `wallpaper`    | vertical gradient  | ✅    | A flat fill, or a media file (image/gif/video). See below.  |
+| `polkit_agent` | `true`             | ✅    | Autostart the bundled PolicyKit agent. Launch-only.         |
+
+`misc.polkit_agent` (default `true`) autostarts `libreland-polkit-agent`, the
+bundled PolicyKit authentication agent, so GUI programs that need elevated
+privileges — and `pkexec` — get a password prompt (a themed quickshell dialog
+driving polkit's own `polkit-agent-helper-1`). Set it `false` to run your own
+agent instead (e.g. `lxqt-policykit`, `mate-polkit`). Applied at launch only —
+changing it needs a restart. Needs the **`polkit`** package at runtime.
+
 
 `misc.wallpaper` is a table whose `type` selects the kind:
 

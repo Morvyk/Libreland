@@ -15,7 +15,7 @@ publish = false
 # lint policy below.
 [workspace]
 resolver = "3"
-members = ["output-picker"]
+members = ["output-picker", "polkit-agent"]
 
 [dependencies]
 anyhow = "1.0.102"

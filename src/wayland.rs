@@ -585,6 +585,25 @@ pub fn init(
 /// The `Child` handles are returned for `State::children`, whose reap
 /// timer `try_wait`s them — a dropped handle is never waited on, so
 /// every exited child would linger as a zombie.
+/// Autostart the bundled polkit authentication agent so GUI programs (and
+/// `pkexec`) get a password prompt. It's a normal per-session process — a
+/// sibling binary installed alongside the compositor — that registers with
+/// polkitd and drives the themed quickshell dialog. Failure is non-fatal (the
+/// desktop just won't have polkit prompts); the returned child is reaped like
+/// any other startup process.
+pub fn spawn_polkit_agent() -> Option<std::process::Child> {
+    match std::process::Command::new("libreland-polkit-agent").spawn() {
+        Ok(child) => {
+            info!(pid = child.id(), "spawned polkit authentication agent");
+            Some(child)
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to spawn libreland-polkit-agent (GUI polkit prompts won't work)");
+            None
+        }
+    }
+}
+
 pub fn spawn_startup(commands: &[String]) -> Vec<std::process::Child> {
     let mut children = Vec::new();
     for raw in commands {
