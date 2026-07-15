@@ -1251,6 +1251,15 @@ struct OutputRender {
     profile: RenderProfile,
     /// Per-output damage diffing state (see [`DamageTracker`]).
     damage_tracker: DamageTracker,
+    /// Layer surfaces (by id) that have already had at least one
+    /// blur-eligible frame on this output. A quickshell popup renders a
+    /// single transient full-surface frame the moment its layer surface
+    /// maps — before its transparent content settles — which, blurred,
+    /// frosts the whole screen for that one frame (a visible flash). We
+    /// therefore skip a layer's backdrop blur on its *first* eligible
+    /// frame and blur from the next one; membership here is what marks a
+    /// surface as past that first frame.
+    blur_warmup: HashSet<ObjectId>,
 }
 
 /// What one drawn thing (window / layer / popup) looked like last frame,
@@ -2270,6 +2279,7 @@ impl Renderer {
                 pending_frame_roots: Vec::new(),
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
+                blur_warmup: HashSet::new(),
             });
         }
 
@@ -2982,6 +2992,7 @@ impl Renderer {
             pending_frame_roots: Vec::new(),
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
+            blur_warmup: HashSet::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -4848,6 +4859,28 @@ impl Renderer {
         // blur drives tier 2. We don't probe per-surface alpha, so a mapped
         // opaque panel/window still pays while it's up; the cost is bounded.
         let blur = self.decoration.blur.clone();
+        // First-frame blur suppression (see `OutputRender::blur_warmup`):
+        // a layer surface's backdrop blur is skipped on the first frame it
+        // appears with a buffer, so a quickshell popup's transient
+        // full-surface map frame doesn't frost the whole screen. Compute
+        // the skip set from the *previous* warmup, then record this frame's
+        // blur-eligible layers as the new warmup. Done here (a clean borrow
+        // point, before the frame binds `self.gles`).
+        let blur_eligible_now: HashSet<ObjectId> = layers
+            .iter()
+            .zip(layer_masks.iter())
+            .filter(|(l, mask)| mask.is_some() && layer_should_blur(&blur, &l.namespace))
+            .map(|(l, _)| l.surface.id())
+            .collect();
+        let blur_skip: HashSet<ObjectId> = {
+            let warmup = &self.outputs[idx].blur_warmup;
+            blur_eligible_now
+                .iter()
+                .filter(|id| !warmup.contains(id))
+                .cloned()
+                .collect()
+        };
+        self.outputs[idx].blur_warmup = blur_eligible_now;
         // A provably-opaque solo fullscreen window covers everything a blur
         // tier could ever show through — a blur-opted bar occluded behind a
         // game kept a full 6-pass pyramid running on every single-pass game
@@ -5372,16 +5405,14 @@ impl Renderer {
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
                     && layer_should_blur(&blur, &l.namespace)
+                    && !blur_skip.contains(&l.surface.id())
                 {
-                    // A layer surface is always alpha-masked by its own
-                    // buffer — the maskless (`else`) path in `blur_rect`
-                    // frosts the *whole* rect and is only correct for
-                    // windows. A qs-popup is a full-output but transparent
-                    // surface, so on any frame it is mapped (rect known)
-                    // without its buffer imported yet, an unmasked blur
-                    // would flash the entire screen until the card lands.
-                    // Skip until the mask exists: nothing is drawn behind
-                    // an absent buffer, so there is nothing to frost.
+                    // A layer surface is always alpha-masked by its own buffer.
+                    // Two skips guard the popup flash: no mask (buffer absent)
+                    // would take blur_rect's window fallback and frost the whole
+                    // rect; and `blur_skip` drops the surface's first buffered
+                    // frame, the transient full-surface frame a quickshell popup
+                    // renders on map before its content is transparent.
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
@@ -5444,16 +5475,14 @@ impl Renderer {
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
                     && layer_should_blur(&blur, &l.namespace)
+                    && !blur_skip.contains(&l.surface.id())
                 {
-                    // A layer surface is always alpha-masked by its own
-                    // buffer — the maskless (`else`) path in `blur_rect`
-                    // frosts the *whole* rect and is only correct for
-                    // windows. A qs-popup is a full-output but transparent
-                    // surface, so on any frame it is mapped (rect known)
-                    // without its buffer imported yet, an unmasked blur
-                    // would flash the entire screen until the card lands.
-                    // Skip until the mask exists: nothing is drawn behind
-                    // an absent buffer, so there is nothing to frost.
+                    // A layer surface is always alpha-masked by its own buffer.
+                    // Two skips guard the popup flash: no mask (buffer absent)
+                    // would take blur_rect's window fallback and frost the whole
+                    // rect; and `blur_skip` drops the surface's first buffered
+                    // frame, the transient full-surface frame a quickshell popup
+                    // renders on map before its content is transparent.
                     let dst = Rectangle::<i32, Physical>::new(
                         Point::new(
                             scale_i(l.rect.loc.x - compositor_position.x, scale),
