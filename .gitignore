@@ -6,3 +6,11 @@
 /contrib/pkg/
 /contrib/*.pkg.tar.*
 /contrib/*.log
+
+# Same for the standalone contrib sub-packages that carry their own PKGBUILD.
+/contrib/*/src/
+/contrib/*/pkg/
+/contrib/*/*.pkg.tar.*
+/contrib/*/*.log
+# Compiled Vulkan layer object (built by its Makefile / PKGBUILD)
+/contrib/no-present-timing-layer/*.so

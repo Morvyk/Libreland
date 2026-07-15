@@ -1,0 +1,42 @@
+# Maintainer: Morvyk <Morvyk@proton.me>
+#
+# A Vulkan implicit layer that hides VK_EXT_present_timing from applications,
+# working around an NVIDIA Wayland WSI null-deref (driver 610.x) that surfaces
+# under Wine/Proton as the fatal `vkGetPastPresentationTimingEXT` assert. See
+# no_present_timing.c for the full diagnosis.
+#
+# This is independent of the compositor — it helps any Vulkan client on the
+# affected driver — but is shipped alongside Libreland because that is where
+# HDR games hit the crash. Build in place:  makepkg -si
+#
+# Once installed the layer is implicit + always-on. Disable it per-process with
+#   DISABLE_LIBRELAND_NO_PRESENT_TIMING=1
+# or uninstall the package. Remove it altogether once the NVIDIA driver ships
+# a fix for the WSI present-timing null-deref.
+
+pkgname=libreland-no-present-timing-layer
+pkgver=1
+pkgrel=1
+pkgdesc='Vulkan implicit layer hiding VK_EXT_present_timing (NVIDIA WSI null-deref workaround)'
+arch=('x86_64')
+url='https://github.com/Morvyk/Libreland'
+license=('MIT')
+depends=('vulkan-icd-loader')
+makedepends=('gcc' 'vulkan-headers')
+# The Vulkan loader picks this up implicitly; no explicit enable needed.
+source=(
+    'no_present_timing.c'
+    'VkLayer_libreland_no_present_timing.json'
+    'Makefile'
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+build() {
+    cd "$srcdir"
+    make
+}
+
+package() {
+    cd "$srcdir"
+    make install DESTDIR="$pkgdir" PREFIX=/usr
+}

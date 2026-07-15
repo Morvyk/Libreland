@@ -1,0 +1,15 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_libreland_no_present_timing",
+        "type": "GLOBAL",
+        "library_path": "/usr/lib/libVkLayer_libreland_no_present_timing.so",
+        "api_version": "1.4.313",
+        "implementation_version": "1",
+        "description": "Hide VK_EXT_present_timing — works around an NVIDIA Wayland WSI null-deref (see the layer source). Implicit + always-on; unset by exporting DISABLE_LIBRELAND_NO_PRESENT_TIMING=1.",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        },
+        "disable_environment": { "DISABLE_LIBRELAND_NO_PRESENT_TIMING": "1" }
+    }
+}
