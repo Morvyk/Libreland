@@ -140,10 +140,43 @@ impl ImageDescription {
         }
     }
 
-    /// Whether this description denotes HDR (an HDR transfer function).
-    pub fn is_hdr(&self) -> bool {
-        matches!(self.tf, TransferFunction::St2084Pq | TransferFunction::Hlg)
+    /// Which decode a surface tagged with this description needs.
+    pub fn encoding(&self) -> Encoding {
+        match self.tf {
+            TransferFunction::St2084Pq | TransferFunction::Hlg => Encoding::Pq,
+            // Extended-linear is Windows-scRGB in practice: the pre-defined
+            // description is the only way clients reach it (Wine's
+            // `create_windows_scrgb`), and it fixes BT.709 primaries with the
+            // 1.0 == 80 cd/m² anchor the scRGB decode assumes.
+            TransferFunction::ExtLinear => Encoding::Scrgb,
+            _ => Encoding::Sdr,
+        }
     }
+
+    /// Whether this description denotes HDR content. scRGB counts: its
+    /// extended-linear range reaches 10000 cd/m² at 125.0 — it is just
+    /// carried on a linear rather than a PQ curve.
+    pub fn is_hdr(&self) -> bool {
+        !matches!(self.encoding(), Encoding::Sdr)
+    }
+}
+
+/// How a colour-managed surface's pixels are encoded — this is what picks
+/// the renderer's decode. Deliberately distinct from "is it HDR": scRGB and
+/// PQ are both HDR but need completely different maths, and only PQ is
+/// passthrough-compatible with a PQ-signalled output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    /// sRGB / BT.709, gamma-encoded SDR. The renderer's default.
+    Sdr,
+    /// PQ (or HLG) on BT.2100. Already what a PQ output wants, so these
+    /// surfaces stay eligible for direct scanout / single-pass passthrough.
+    Pq,
+    /// Windows-scRGB: extended *linear* light on BT.709 primaries, where
+    /// 1.0 == 80 cd/m² and 125.0 == 10000 cd/m², and channels may be
+    /// negative to escape the sRGB gamut. Must be converted to PQ by a
+    /// shader — never passed through.
+    Scrgb,
 }
 
 /// Send `ready` in the version-appropriate shape: `ready2` (64-bit

@@ -812,6 +812,86 @@ void main() {
 }
 ";
 
+/// Decode a Windows-scRGB source (Wine/Proton tags a game's scRGB swapchain
+/// with the protocol's pre-defined `windows_scrgb` description and passes the
+/// pixels through untouched) into the linear BT.2020 working space.
+///
+/// Per the protocol: scRGB is **already linear light** on BT.709 primaries,
+/// R=G=B=1.0 is 80 cd/m² and R=G=B=125.0 is the 10000 cd/m² PQ peak. The
+/// working space is linear BT.2020 normalised to 1.0 == 10000 cd/m², so the
+/// whole luminance mapping is exactly `/125`. Critically there is **no EOTF**
+/// (the data is not gamma-encoded) and **no reference-white scaling** (scRGB
+/// carries its own 80 cd/m² anchor) — running scRGB through the SDR decode
+/// instead applies an sRGB curve to linear data, anchors it at the wrong
+/// luminance, and NaNs every negative channel (`pow()` of a negative is
+/// undefined, and `mix(lo, hi, 0.0)` still yields NaN because `0 * NaN =
+/// NaN`) — which is what made id Tech (DOOM) titles render wrong.
+const SCRGB_DECODE_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+varying vec2 v_coords;
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 straight = premult.rgb / max(premult.a, 0.001);
+    vec3 lin = straight / 125.0;
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    // Negative channels are scRGB escaping the sRGB gamut. The matrix maps
+    // them into BT.2020, where most land back in range; clamp only AFTER it,
+    // so wide-gamut colour survives instead of being crushed at the source.
+    vec3 bt2020 = max(bt709_to_bt2020 * lin, vec3(0.0));
+    gl_FragColor = vec4(bt2020 * premult.a, premult.a) * alpha;
+}
+";
+
+/// The scRGB counterpart of [`SDR_TO_PQ_SHADER`]: decode → BT.2020 → PQ OETF
+/// in one fragment for the single-pass fast path, so a solo fullscreen scRGB
+/// game (DOOM et al) costs exactly what it did before — one full-output pass,
+/// no fp16 scene buffer — just with the correct maths. scRGB can never take
+/// direct scanout (its pixels are linear, the display wants PQ), so this
+/// fused program is that path's floor.
+const SCRGB_TO_PQ_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+varying vec2 v_coords;
+vec3 pq_oetf(vec3 l) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 lp = pow(max(l, vec3(0.0)), vec3(m1));
+    return pow((vec3(c1) + vec3(c2) * lp) / (vec3(1.0) + vec3(c3) * lp), vec3(m2));
+}
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 straight = premult.rgb / max(premult.a, 0.001);
+    vec3 lin = straight / 125.0;
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = max(bt709_to_bt2020 * lin, vec3(0.0));
+    gl_FragColor = vec4(pq_oetf(bt2020), 1.0) * alpha;
+}
+";
+
 /// Decode an HDR PQ / BT.2020 source (a colour-managed client's buffer)
 /// into the linear BT.2020 working space. Primaries already match and the
 /// PQ EOTF lands in the 1.0 == 10000 cd/m² domain, so no rescale.
@@ -841,6 +921,29 @@ void main() {
     gl_FragColor = vec4(lin * premult.a, premult.a) * alpha;
 }
 ";
+
+/// Which decode each colour-managed surface needs this frame. A surface in
+/// neither set is plain SDR and takes the renderer's default path.
+///
+/// Split rather than a single "is HDR" flag because the two HDR encodings are
+/// not interchangeable: PQ pixels are already what a PQ output wants (so they
+/// stay eligible for direct scanout and the single-pass passthrough), while
+/// scRGB is linear light that *must* be converted by a shader first.
+#[derive(Debug, Default)]
+pub struct SurfaceEncodings {
+    /// PQ / BT.2100-tagged surfaces. Passthrough-compatible on a PQ output.
+    pub pq: HashSet<ObjectId>,
+    /// Windows-scRGB-tagged surfaces. Never passthrough, never scanout.
+    pub scrgb: HashSet<ObjectId>,
+}
+
+impl SurfaceEncodings {
+    /// Any colour-managed tag — i.e. needs the linear/fp16 treatment rather
+    /// than the sRGB default.
+    pub fn is_managed(&self, id: &ObjectId) -> bool {
+        self.pq.contains(id) || self.scrgb.contains(id)
+    }
+}
 
 /// Renderer for every connected output on a single GPU.
 pub struct Renderer {
@@ -997,6 +1100,12 @@ pub struct Renderer {
     /// Decodes an HDR (PQ/BT.2020) source into the linear working space;
     /// swapped in around colour-managed surfaces. See [`HDR_DECODE_SHADER`].
     hdr_decode_shader: GlesTexProgram,
+    /// Decodes a Windows-scRGB source into the linear working space; swapped
+    /// in around scRGB-tagged surfaces. See [`SCRGB_DECODE_SHADER`].
+    scrgb_decode_shader: GlesTexProgram,
+    /// Fused scRGB decode → PQ encode for the single-pass fast path (a solo
+    /// fullscreen scRGB game). See [`SCRGB_TO_PQ_SHADER`].
+    scrgb_to_pq_shader: GlesTexProgram,
     /// HDR variant of `round_tex_shader` for SDR windows on an HDR output
     /// (decodes their sRGB offscreen → linear BT.2020). See
     /// [`ROUND_TEX_SHADER_HDR`].
@@ -2108,6 +2217,15 @@ impl Renderer {
         let hdr_decode_shader = gles
             .compile_custom_texture_shader(HDR_DECODE_SHADER, &[])
             .context("HDR decode shader compile failed")?;
+        // scRGB carries its own 80 cd/m² anchor and is HDR content, so neither
+        // variant takes `reference_white` or `saturation` (both are SDR-only
+        // knobs).
+        let scrgb_decode_shader = gles
+            .compile_custom_texture_shader(SCRGB_DECODE_SHADER, &[])
+            .context("scRGB decode shader compile failed")?;
+        let scrgb_to_pq_shader = gles
+            .compile_custom_texture_shader(SCRGB_TO_PQ_SHADER, &[])
+            .context("fused scRGB→PQ shader compile failed")?;
         // Rounded-corner / blur HDR variants: same uniforms as their SDR
         // counterparts plus `reference_white`.
         let round_tex_shader_hdr = gles
@@ -2383,6 +2501,8 @@ impl Renderer {
             sdr_decode_shader,
             sdr_to_pq_shader,
             hdr_decode_shader,
+            scrgb_decode_shader,
+            scrgb_to_pq_shader,
             round_tex_shader_hdr,
             round_tex_shader_linear,
             round_blur_shader_hdr,
@@ -2753,7 +2873,7 @@ impl Renderer {
             // Followup ignored: each output is primed once, then parks until
             // a redraw is queued (a flip is now in flight, acked on vblank).
             let _ = self
-                .render_output(idx, &[], &[], &[], false, &[], &HashSet::new(), false, None)
+                .render_output(idx, &[], &[], &[], false, &[], &SurfaceEncodings::default(), false, None)
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -2823,7 +2943,7 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
-        hdr_surface_ids: &HashSet<ObjectId>,
+        enc: &SurfaceEncodings,
         compose_cursor: bool,
         output: Option<&Output>,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
@@ -2839,7 +2959,7 @@ impl Renderer {
             popups,
             hide_cursor,
             captures,
-            hdr_surface_ids,
+            enc,
             compose_cursor,
             output,
         )
@@ -3971,7 +4091,7 @@ impl Renderer {
         popups: &[PopupPlacement],
         hide_cursor: bool,
         captures: &[CaptureSpec],
-        hdr_surface_ids: &HashSet<ObjectId>,
+        enc: &SurfaceEncodings,
         compose_cursor: bool,
         present_output: Option<&Output>,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
@@ -4004,6 +4124,8 @@ impl Renderer {
         let sdr_decode_shader = self.sdr_decode_shader.clone();
         let sdr_to_pq_shader = self.sdr_to_pq_shader.clone();
         let hdr_decode_shader = self.hdr_decode_shader.clone();
+        let scrgb_decode_shader = self.scrgb_decode_shader.clone();
+        let scrgb_to_pq_shader = self.scrgb_to_pq_shader.clone();
         let round_tex_shader_hdr = self.round_tex_shader_hdr.clone();
         let round_tex_shader_linear = self.round_tex_shader_linear.clone();
         let round_blur_shader_hdr = self.round_blur_shader_hdr.clone();
@@ -4071,7 +4193,7 @@ impl Renderer {
         // Anything that needs compositing — overlays, popups, animations,
         // captures, a non-1:1 buffer, or a buffer the plane rejects —
         // falls through to the composite path below.
-        if let Some(direct) = self.direct_scanout_inputs(idx, solo, placements, hdr_surface_ids) {
+        if let Some(direct) = self.direct_scanout_inputs(idx, solo, placements, enc) {
             // VRR must settle before the flip (it may promote the flip to a
             // modeset); harmlessly re-applied by the composite path on a miss.
             self.apply_vrr(idx, placements);
@@ -4142,12 +4264,20 @@ impl Renderer {
         //   identity, so the default sampler copies its pixels straight
         //   to the 10-bit scanout.
         let solo_hdr_surface =
-            solo_opaque.is_some_and(|i| hdr_surface_ids.contains(&placements[i].surface.id()));
+            solo_opaque.is_some_and(|i| enc.pq.contains(&placements[i].surface.id()));
+        // A solo scRGB game (id Tech / DOOM): same single-pass shape as an SDR
+        // solo window — one full-output draw straight to the 10-bit scanout —
+        // but through the fused scRGB→PQ program instead of the SDR one. It
+        // can never be `solo_hdr_surface` (a surface carries one encoding), so
+        // the passthrough branch below stays PQ-only.
+        let solo_scrgb_surface =
+            solo_opaque.is_some_and(|i| enc.scrgb.contains(&placements[i].surface.id()));
         let single_pass_hdr = hdr && solo_opaque.is_some();
         if single_pass_hdr {
             debug!(
                 output = %output_name,
                 passthrough = solo_hdr_surface,
+                scrgb = solo_scrgb_surface,
                 "single-pass HDR: solo window straight to scanout"
             );
             hdr = false;
@@ -4598,11 +4728,12 @@ impl Renderer {
                 win_tex.push(None);
                 continue;
             }
-            // An HDR window's offscreen is fp16 and holds *linear BT.2020*
-            // (the surface is PQ-decoded into it here), so its decoration can
-            // be composited in linear by `ROUND_TEX_SHADER_LINEAR`. SDR windows
-            // keep the 8-bit sRGB offscreen the SDR/HDR-decode composite expects.
-            let win_is_hdr = hdr && hdr_surface_ids.contains(&p.surface.id());
+            // A colour-managed window's offscreen is fp16 and holds *linear
+            // BT.2020* (the surface is PQ- or scRGB-decoded into it here), so
+            // its decoration can be composited in linear by
+            // `ROUND_TEX_SHADER_LINEAR`. SDR windows keep the 8-bit sRGB
+            // offscreen the SDR/HDR-decode composite expects.
+            let win_is_hdr = hdr && enc.is_managed(&p.surface.id());
             let fmt = if win_is_hdr {
                 Fourcc::Abgr16161616f
             } else {
@@ -4655,10 +4786,16 @@ impl Renderer {
                     .inspect_err(|err| warn!(error = %err, "rounded window: render failed"))
                     .ok()?;
                 let _ = frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full);
-                // HDR window: decode its PQ surface to linear BT.2020 as it's
-                // drawn into the fp16 offscreen (the composite then stays linear).
+                // Colour-managed window: decode its surface to linear BT.2020
+                // as it's drawn into the fp16 offscreen (the composite then
+                // stays linear), picking the decode its encoding calls for.
                 if win_is_hdr {
-                    frame.override_default_tex_program(hdr_decode_shader.clone(), Vec::new());
+                    let decode = if enc.scrgb.contains(&p.surface.id()) {
+                        scrgb_decode_shader.clone()
+                    } else {
+                        hdr_decode_shader.clone()
+                    };
+                    frame.override_default_tex_program(decode, Vec::new());
                 }
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full)
                     .inspect_err(|err| warn!(error = %err, "rounded window: draw failed"))
@@ -4703,14 +4840,14 @@ impl Renderer {
                            linear: bool,
                            damage: &[Rectangle<i32, Physical>]|
          -> Result<()> {
-            // A colour-managed (PQ) surface in the linear scene is drawn
-            // straight (skipping decoration — option A) with the PQ decode,
-            // so its content isn't mis-decoded as SDR.
-            let surface_is_hdr = linear && hdr_surface_ids.contains(&p.surface.id());
+            // A colour-managed (PQ or scRGB) surface in the linear scene is
+            // drawn straight (skipping decoration — option A) with its own
+            // decode, so its content isn't mis-decoded as SDR.
+            let surface_is_hdr = linear && enc.is_managed(&p.surface.id());
             // Whether THIS window's offscreen is the fp16 *linear* one built in
             // Phase A — format-based, so independent of `linear` (which is
             // false during the sRGB blur replay).
-            let win_is_hdr = hdr && hdr_surface_ids.contains(&p.surface.id());
+            let win_is_hdr = hdr && enc.is_managed(&p.surface.id());
             if p.fill == FillMode::Normal && decorated {
                 // An HDR window's fp16-linear offscreen can't composite into the
                 // sRGB blur pyramid, so skip it during the blur replay; it still
@@ -4804,12 +4941,18 @@ impl Renderer {
                     )
                     .context("rounded window composite failed")?;
             } else {
-                // Plain rectangle (fullscreen / maximized / undecorated, or an
-                // HDR-tagged surface): draw the surface straight to the frame.
-                // For HDR content swap the frame's decode override to PQ for
-                // this draw, then restore the scene's SDR default.
+                // Plain rectangle (fullscreen / maximized / undecorated, or a
+                // colour-managed surface): draw the surface straight to the
+                // frame. For colour-managed content swap the frame's decode
+                // override to that encoding's decode for this draw, then
+                // restore the scene's SDR default.
                 if surface_is_hdr {
-                    frame.override_default_tex_program(hdr_decode_shader.clone(), Vec::new());
+                    let decode = if enc.scrgb.contains(&p.surface.id()) {
+                        scrgb_decode_shader.clone()
+                    } else {
+                        hdr_decode_shader.clone()
+                    };
+                    frame.override_default_tex_program(decode, Vec::new());
                 }
                 let res =
                     draw_render_elements::<GlesRenderer, _, _>(frame, scale, elements, damage);
@@ -5336,6 +5479,11 @@ impl Renderer {
                         Uniform::new("saturation", hdr_saturation),
                     ],
                 );
+            } else if single_pass_hdr && solo_scrgb_surface {
+                // Solo scRGB game: fused scRGB→PQ. No reference_white /
+                // saturation — scRGB anchors itself at 80 cd/m² and both knobs
+                // are SDR-only.
+                frame.override_default_tex_program(scrgb_to_pq_shader.clone(), Vec::new());
             } else if single_pass_hdr && !solo_hdr_surface {
                 frame.override_default_tex_program(
                     sdr_to_pq_shader.clone(),
@@ -5458,12 +5606,17 @@ impl Renderer {
                 .enumerate()
                 .filter(|(i, (p, _))| visible[*i] && p.fill == FillMode::Fullscreen)
             {
-                // Colour-managed (PQ) fullscreen surface (e.g. an HDR game):
-                // swap the frame's decode override to PQ for this draw, then
-                // restore the scene's SDR default.
-                let surface_is_hdr = hdr && hdr_surface_ids.contains(&p.surface.id());
+                // Colour-managed fullscreen surface (an HDR game): swap the
+                // frame's decode override to its encoding's decode for this
+                // draw, then restore the scene's SDR default.
+                let surface_is_hdr = hdr && enc.is_managed(&p.surface.id());
                 if surface_is_hdr {
-                    frame.override_default_tex_program(hdr_decode_shader.clone(), Vec::new());
+                    let decode = if enc.scrgb.contains(&p.surface.id()) {
+                        scrgb_decode_shader.clone()
+                    } else {
+                        hdr_decode_shader.clone()
+                    };
+                    frame.override_default_tex_program(decode, Vec::new());
                 }
                 let res = draw_render_elements::<GlesRenderer, _, _>(
                     &mut frame,
@@ -6007,7 +6160,7 @@ impl Renderer {
         idx: usize,
         solo: Option<usize>,
         placements: &[Placement],
-        hdr_surface_ids: &HashSet<ObjectId>,
+        enc: &SurfaceEncodings,
     ) -> Option<DirectInputs> {
         let output = &self.outputs[idx];
         let p = placements.get(solo?)?;
@@ -6026,7 +6179,15 @@ impl Renderer {
         // The window's colour mode must match the output: an SDR surface on
         // an HDR output needs the compositor's PQ encode (see the single-pass
         // fast path), a PQ surface on an SDR output needs a tonemap.
-        if output.hdr != hdr_surface_ids.contains(&p.surface.id()) {
+        // scRGB is linear light: the display expects PQ and no plane can
+        // convert, so a scRGB surface is never scanout-eligible — it has to go
+        // through the fused scRGB→PQ program. (On an HDR output the PQ check
+        // below already excludes it; this also covers an SDR output, where
+        // both sides would otherwise be `false` and match.)
+        if enc.scrgb.contains(&p.surface.id()) {
+            return None;
+        }
+        if output.hdr != enc.pq.contains(&p.surface.id()) {
             reject!("surface/output colour mode mismatch (SDR on HDR takes the single-pass path)");
         }
         // The window's visually-topmost mapped node must itself cover the
@@ -7415,6 +7576,163 @@ mod gpu_bench {
         assert!(
             sum(stable) > 600,
             "a stably-covered pixel must frost fully (got {stable:?})"
+        );
+    }
+
+    /// Windows-scRGB must be decoded on its own terms — extended *linear*
+    /// light where 1.0 is 80 cd/m² — and not as sRGB-gamma SDR anchored at
+    /// `reference_white`.
+    ///
+    /// Wine/Proton tags a game's scRGB swapchain with the protocol's
+    /// pre-defined `windows_scrgb` description and sets the Vulkan colour
+    /// space to PASS_THROUGH, i.e. it hands the pixels over untouched and the
+    /// compositor owns the entire conversion. Sending them through the SDR
+    /// decode instead applies a gamma curve to linear data and anchors it at
+    /// 203 rather than 80 cd/m² — which is what mis-rendered id Tech (DOOM)
+    /// titles, the classic scRGB users, while HDR10/PQ games looked fine.
+    ///
+    /// Checks the fused single-pass program (the path a solo fullscreen game
+    /// takes) against the PQ code the protocol's definition demands, and
+    /// pins that the SDR program really does disagree.
+    #[test]
+    #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    fn scrgb_decodes_as_linear_80_nits() {
+        /// Reference PQ OETF (ST.2084), 1.0 == 10000 cd/m².
+        fn pq_oetf(l: f64) -> f64 {
+            const M1: f64 = 0.1593017578125;
+            const M2: f64 = 78.84375;
+            const C1: f64 = 0.8359375;
+            const C2: f64 = 18.8515625;
+            const C3: f64 = 18.6875;
+            let lp = l.max(0.0).powf(M1);
+            ((C1 + C2 * lp) / (1.0 + C3 * lp)).powf(M2)
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .expect("open render node");
+        let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+        let gbm = GbmDevice::new(fd).expect("GbmDevice");
+        #[allow(unsafe_code, reason = "test-only surfaceless EGL, single thread")]
+        // SAFETY: GbmDevice clone lives in the EGLDisplay for its lifetime.
+        let display = unsafe { EGLDisplay::new(gbm.clone()) }.expect("EGLDisplay");
+        let context = EGLContext::new(&display).expect("EGLContext");
+        #[allow(unsafe_code, reason = "test-only single-thread renderer")]
+        // SAFETY: used only from this test thread.
+        let mut gles = unsafe { GlesRenderer::new(context) }.expect("GlesRenderer");
+
+        let scrgb_shader = gles
+            .compile_custom_texture_shader(SCRGB_TO_PQ_SHADER, &[])
+            .expect("compile fused scRGB→PQ");
+        let sdr_shader = gles
+            .compile_custom_texture_shader(
+                SDR_TO_PQ_SHADER,
+                &[
+                    UniformName::new("reference_white", UniformType::_1f),
+                    UniformName::new("saturation", UniformType::_1f),
+                ],
+            )
+            .expect("compile fused SDR→PQ");
+
+        let size = Size::<i32, smithay::utils::Buffer>::from((64, 64));
+        let phys = Size::<i32, Physical>::from((64, 64));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((64.0, 64.0)));
+        let dst = Rectangle::<i32, Physical>::from_size(phys);
+
+        // Opaque grey source textures. Grey keeps the BT.709→BT.2020 matrix a
+        // no-op (its rows sum to 1), so the readback isolates the transfer
+        // maths. import_memory (not create_buffer) so sampler filters are set.
+        let mut mk = |v: u8| -> GlesTexture {
+            let data: Vec<u8> = [v, v, v, 255u8]
+                .iter()
+                .copied()
+                .cycle()
+                .take(64 * 64 * 4)
+                .collect();
+            gles
+                .import_memory(&data, Fourcc::Abgr8888, size, false)
+                .expect("import source")
+        };
+        let white = mk(255);
+        let quarter = mk(64);
+        drop(mk);
+
+        let mut run = |tex: &GlesTexture,
+                       shader: &GlesTexProgram,
+                       unis: &[Uniform<'_>]|
+         -> [u8; 4] {
+            let mut target: GlesTexture =
+                gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
+            {
+                let mut b = gles.bind(&mut target).expect("bind target");
+                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
+                f.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &full).expect("clear");
+                f.render_texture_from_to(
+                    tex,
+                    src,
+                    dst,
+                    &full,
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                    Some(shader),
+                    unis,
+                )
+                .expect("draw");
+                let s = f.finish().expect("finish");
+                drop(b);
+                let _ = s.wait();
+            }
+            let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((64, 64)));
+            let bound = gles.bind(&mut target).expect("rebind");
+            let mapping = gles
+                .copy_framebuffer(&bound, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let bytes = gles.map_texture(&mapping).expect("map").to_vec();
+            let c = (32 * 64 + 32) * 4;
+            [bytes[c], bytes[c + 1], bytes[c + 2], bytes[c + 3]]
+        };
+
+        // scRGB 1.0 == 80 cd/m² and 0.25 == 20 cd/m², linearly — so the fused
+        // program must emit exactly PQ(value / 125).
+        for (tex, value, label) in [(&white, 1.0_f64, "1.0"), (&quarter, 64.0 / 255.0, "0.25")] {
+            let got = run(tex, &scrgb_shader, &[]);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "PQ code in [0,1] scaled to a byte"
+            )]
+            let want = (pq_oetf(value / 125.0) * 255.0).round() as i32;
+            println!(
+                "scRGB {label} -> {got:?} (want ~{want}, i.e. {:.1} cd/m²)",
+                value * 80.0
+            );
+            assert!(
+                (i32::from(got[0]) - want).abs() <= 2,
+                "scRGB {label} must decode to PQ({value}/125) ≈ {want}, got {got:?}"
+            );
+        }
+
+        // And pin the bug this fixes: the SDR program (gamma + 203 cd/m²
+        // anchor) genuinely disagrees, so routing scRGB through it was not a
+        // harmless approximation.
+        let sdr_white = run(
+            &white,
+            &sdr_shader,
+            &[
+                Uniform::new("reference_white", 203.0_f32),
+                Uniform::new("saturation", 1.0_f32),
+            ],
+        );
+        let scrgb_white = run(&white, &scrgb_shader, &[]);
+        println!("white: scRGB decode {scrgb_white:?} vs SDR decode {sdr_white:?}");
+        assert!(
+            i32::from(sdr_white[0]) - i32::from(scrgb_white[0]) > 10,
+            "the SDR decode must visibly differ from the scRGB decode \
+             (scRGB {scrgb_white:?}, SDR {sdr_white:?})"
         );
     }
 }

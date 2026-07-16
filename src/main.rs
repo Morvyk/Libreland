@@ -1047,43 +1047,54 @@ impl State {
     /// while a window animation or workspace slide is still running. This is
     /// the old free-run vblank body, now driven on demand by
     /// [`Self::queue_redraw`] and re-driven by the vblank handler.
-    /// Toplevel placement surfaces whose window should be HDR-decoded. A
-    /// client may tag a *subsurface* (e.g. a Proton/Wine game's swapchain)
-    /// rather than its toplevel, and the renderer keys on the toplevel
-    /// placement surface — so a window counts as HDR if its toplevel OR any
-    /// surface in its tree carries an HDR (PQ/HLG) image description.
-    fn hdr_surface_ids(
-        &self,
-        placements: &[layout::Placement],
-    ) -> std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId> {
-        let tagged: std::collections::HashSet<_> = self
-            .color_surfaces
-            .iter()
-            .filter(|(_, c)| c.image_description.is_hdr())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut out = std::collections::HashSet::new();
-        if tagged.is_empty() {
+    /// Which decode each toplevel placement surface's window needs. A client
+    /// may tag a *subsurface* (e.g. a Proton/Wine game's swapchain) rather
+    /// than its toplevel, and the renderer keys on the toplevel placement
+    /// surface — so a window takes an encoding if its toplevel OR any surface
+    /// in its tree carries an image description with it.
+    ///
+    /// PQ and scRGB are kept apart because they are not interchangeable: PQ
+    /// pixels can be passed through to a PQ output untouched (direct scanout /
+    /// single-pass), while scRGB is linear light that must be converted first.
+    fn surface_encodings(&self, placements: &[layout::Placement]) -> render::SurfaceEncodings {
+        use crate::color_management::Encoding;
+
+        let mut pq_tagged = std::collections::HashSet::new();
+        let mut scrgb_tagged = std::collections::HashSet::new();
+        for (id, c) in &self.color_surfaces {
+            match c.image_description.encoding() {
+                Encoding::Pq => drop(pq_tagged.insert(id.clone())),
+                Encoding::Scrgb => drop(scrgb_tagged.insert(id.clone())),
+                Encoding::Sdr => {}
+            }
+        }
+        let mut out = render::SurfaceEncodings::default();
+        if pq_tagged.is_empty() && scrgb_tagged.is_empty() {
             return out;
         }
-        // A window counts as HDR if any surface in its tree (toplevel or a
-        // subsurface — e.g. a game's swapchain child) carries an HDR-tagged
-        // image description.
         for p in placements {
-            let mut hit = false;
+            let mut hit_pq = false;
+            let mut hit_scrgb = false;
             smithay::wayland::compositor::with_surface_tree_downward(
                 &p.surface,
                 (),
                 |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
                 |s, _, ()| {
-                    if tagged.contains(&s.id()) {
-                        hit = true;
+                    if pq_tagged.contains(&s.id()) {
+                        hit_pq = true;
+                    }
+                    if scrgb_tagged.contains(&s.id()) {
+                        hit_scrgb = true;
                     }
                 },
                 |_, _, ()| true,
             );
-            if hit {
-                out.insert(p.surface.id());
+            // A tree mixing both is pathological; prefer PQ, which is the
+            // passthrough-safe reading.
+            if hit_pq {
+                out.pq.insert(p.surface.id());
+            } else if hit_scrgb {
+                out.scrgb.insert(p.surface.id());
             }
         }
         out
@@ -1184,7 +1195,7 @@ impl State {
         // (cheap + idempotent; programs it on the output under the pointer).
         self.renderer.refresh_hw_cursor(locked);
         let client_n = captures.len();
-        let hdr_surface_ids = self.hdr_surface_ids(&placements);
+        let surface_encodings = self.surface_encodings(&placements);
         // The smithay `Output` this CRTC drives, for `wp_presentation`
         // feedback collection (Arc-backed, cheap to clone).
         let present_output = out_name
@@ -1198,7 +1209,7 @@ impl State {
             &popup_placements,
             hide_cursor,
             &specs,
-            &hdr_surface_ids,
+            &surface_encodings,
             compose_cursor,
             present_output.as_ref(),
         ) {
