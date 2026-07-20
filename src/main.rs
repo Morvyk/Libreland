@@ -1270,14 +1270,20 @@ impl State {
 
     /// Hit-test the desktop at `cursor_i`: returns the surface that should
     /// take the *pointer* (with the buffer origin that makes surface-local
-    /// coordinates correct) and the surface that should take the
-    /// *keyboard* in the Hover model. A popup under the cursor wins the
-    /// pointer (menus draw on top of everything), then layer surfaces
-    /// (rofi, panels, OSDs), then the tile / floating layout. The keyboard
-    /// target skips popups — we don't run a popup grab yet, and a menu
-    /// shouldn't pull keyboard focus off its parent toplevel. While the
-    /// session is locked, only the lock surface is reachable — no popups,
-    /// layers, or windows take either focus.
+    /// coordinates correct), the surface that would take the *keyboard* in
+    /// the Hover model, and whether the pointer hit landed on a popup. A
+    /// popup under the cursor wins the pointer (menus draw on top of
+    /// everything), then layer surfaces (rofi, panels, OSDs), then the
+    /// tile / floating layout. The keyboard target is always the
+    /// window/layer *under* the cursor — over a popup that's whatever the
+    /// popup covers, which where a menu overhangs its parent's edge is a
+    /// DIFFERENT toplevel; re-homing focus there makes the parent dismiss
+    /// its own menu. The `over_popup` flag exists so the hover path can
+    /// freeze keyboard focus instead — for every popup kind, including
+    /// X11 override-redirect menus and non-grabbing xdg popups, which
+    /// never set `popup_grab`. While the session is locked, only the lock
+    /// surface is reachable — no popups, layers, or windows take either
+    /// focus.
     #[allow(
         clippy::type_complexity,
         reason = "the tuple mirrors smithay's pointer focus type (surface + f64 origin); naming it would add a struct used by exactly two callers"
@@ -1288,6 +1294,7 @@ impl State {
     ) -> (
         Option<(WlSurface, Point<f64, Logical>)>,
         Option<WlSurface>,
+        bool,
     ) {
         let popup_hit = if self.session_locked {
             None
@@ -1333,7 +1340,8 @@ impl State {
                 })
         };
         let kbd_target = surface_hit.as_ref().map(|(surface, _)| surface.clone());
-        (popup_hit.or(surface_hit), kbd_target)
+        let over_popup = popup_hit.is_some();
+        (popup_hit.or(surface_hit), kbd_target, over_popup)
     }
 
     /// Re-aim pointer focus after a compositor-driven scene change
@@ -1370,7 +1378,7 @@ impl State {
             reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
         )]
         let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
-        let (hit, _) = self.pointer_hit_test(cursor_i);
+        let (hit, _, _) = self.pointer_hit_test(cursor_i);
         if pointer.current_focus() == hit.as_ref().map(|(surface, _)| surface.clone()) {
             return;
         }
@@ -1552,7 +1560,7 @@ impl State {
         // Snapshot the hit surface + its top-left into owned values
         // so the layout borrow ends before the mut-borrow on self
         // (via kbd.set_focus / pointer.motion).
-        let (hit, kbd_target) = self.pointer_hit_test(cursor_i);
+        let (hit, kbd_target, over_popup) = self.pointer_hit_test(cursor_i);
 
         // Relative motion goes to the *pre-move* pointer focus
         // (`pointer.motion` below updates it), matching how
@@ -1573,11 +1581,18 @@ impl State {
         // so hover can't move focus away — otherwise the client sees its
         // toplevel lose focus and dismisses the menu. Expire the grab
         // first so focus resumes the instant the chain closes.
+        // `over_popup` freezes focus for the popup kinds the grab marker
+        // can't cover — X11 override-redirect menus and non-grabbing xdg
+        // popups: where a menu overhangs its parent window's edge,
+        // `kbd_target` is the OTHER toplevel underneath, and re-homing
+        // focus there makes the parent dismiss the menu the user is
+        // navigating.
         self.refresh_popup_grab();
         if matches!(self.config.input.focus_model, config::FocusModel::Hover)
             && !pointer.is_grabbed()
             && !self.focus_locked_by_layer()
             && self.popup_grab.is_none()
+            && !over_popup
             && let Some(kbd) = self.seat.get_keyboard()
             && kbd.current_focus() != kbd_target
         {
