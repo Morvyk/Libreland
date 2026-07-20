@@ -3231,6 +3231,11 @@ impl Renderer {
         let idx = self.outputs.iter().position(|o| o.crtc == crtc)?;
         let removed = self.outputs.remove(idx);
         self.freeze_textures.remove(&removed.name);
+        // The name-keyed offscreens too — an HDR scene buffer is a
+        // full-resolution fp16 texture; leaving it behind on unplug
+        // parks tens of MB of GPU memory for the session.
+        self.hdr_scene.remove(&removed.name);
+        self.sdr_capture.remove(&removed.name);
         self.blur_scratch.clear();
         Some(removed.name)
     }
@@ -4028,6 +4033,9 @@ impl Renderer {
     /// entries (a `wl_surface` id is not reused after destruction).
     pub fn forget_surface(&mut self, surface: &WlSurface) {
         self.wintex_cache.remove(&surface.id());
+        // A surface that was marked for an open animation but destroyed
+        // before ever being placed would otherwise pin its id here forever.
+        self.pending_open.remove(&surface.id());
     }
 
     /// Repaint every output's next frame in full and restart damage
@@ -5582,10 +5590,10 @@ impl Renderer {
                 // Solo scRGB game: fused scRGB→PQ. No reference_white /
                 // saturation — scRGB anchors itself at 80 cd/m² and both knobs
                 // are SDR-only.
-                frame.override_default_tex_program(scrgb_to_pq_shader.clone(), Vec::new());
+                frame.override_default_tex_program(scrgb_to_pq_shader, Vec::new());
             } else if single_pass_hdr && !solo_hdr_surface {
                 frame.override_default_tex_program(
-                    sdr_to_pq_shader.clone(),
+                    sdr_to_pq_shader,
                     vec![
                         Uniform::new("reference_white", ref_white_f32),
                         Uniform::new("saturation", hdr_saturation),
@@ -5600,10 +5608,7 @@ impl Renderer {
                 // Solo PQ game whose buffer is XRGB-order (NVIDIA HDR10
                 // allocates XR30): the pixels are right, the sampled channel
                 // order isn't — identity copy with R↔B restored.
-                frame.override_default_tex_program(
-                    pq_passthrough_swizzle_shader.clone(),
-                    Vec::new(),
-                );
+                frame.override_default_tex_program(pq_passthrough_swizzle_shader, Vec::new());
             }
             // (single_pass_hdr && solo_hdr_surface with an RGBA-order buffer:
             // no override — the solo window's pixels are already PQ/BT.2020,

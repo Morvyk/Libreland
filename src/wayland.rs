@@ -379,7 +379,7 @@ pub fn init(
                 // open; the primary card node may not be openable from
                 // inside a session while the compositor holds the seat.
                 if !scanout_formats.is_empty() {
-                    let builder = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone())
+                    let builder = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
                         .add_preference_tranche(
                             node.dev_id(),
                             Some(
@@ -892,6 +892,11 @@ impl CompositorHandler for State {
         self.fifo_barrier_watch.remove(&surface.id());
         // Same for the sticky scanout-feedback record.
         self.scanout_feedback_given.borrow_mut().remove(&surface.id());
+        // Color-management records are otherwise only removed by explicit
+        // client requests — a client that crashes without sending destroy
+        // (a Proton game, say) would leak its entries.
+        self.color_surfaces.remove(&surface.id());
+        self.color_surface_objects.remove(&surface.id());
         // And the renderer's per-surface caches (decoration offscreen).
         self.renderer.forget_surface(surface);
     }
@@ -935,7 +940,7 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
 }
 
 /// Whether a toplevel-shaped ROOT surface is committing from *outside the
-/// rendered scene*: an xdg toplevel or XWayland surface that is in no
+/// rendered scene*: an xdg toplevel or `XWayland` surface that is in no
 /// workspace (`window_surface` finds nothing anywhere) and isn't a tracked
 /// override-redirect window. Two ways to get here: the map→manage gap (an
 /// X11 window's first commits land BEFORE `try_manage_x11` places it — seen
@@ -946,12 +951,12 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
 /// vblank-driven for scene surfaces only) — and a starved surface is not a
 /// cosmetic problem: Xwayland falls back to ~1 Hz present completions when
 /// frame callbacks stop, and games freeze on that PERMANENTLY, staying
-/// frozen even after callbacks resume (KWin documents this exact failure
-/// and ships a heartbeat timer for it; see X11Window::wantsFrameCallbackHeartbeat).
+/// frozen even after callbacks resume (`KWin` documents this exact failure
+/// and ships a heartbeat timer for it; see `X11Window::wantsFrameCallbackHeartbeat`).
 /// The commit handler therefore completes pacing for these surfaces
 /// immediately (the "offscreen heartbeat").
 ///
-/// Only toplevel-ish roles qualify: layers, popups, cursors, DnD icons and
+/// Only toplevel-ish roles qualify: layers, popups, cursors, `DnD` icons and
 /// lock surfaces all have their own render-path pacing.
 fn root_offscreen(state: &State, root: &WlSurface) -> bool {
     if !matches!(
@@ -1040,7 +1045,7 @@ pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
 /// they will ever commit again — idTech games rebuild their swapchain
 /// constantly, so hold-until-replaced deadlocks them at a
 /// timing-dependent rebuild (games froze after 1/12/38/99 frames; the
-/// WAYLAND_DEBUG trace showed the wedge with no successor commit ever
+/// `WAYLAND_DEBUG` trace showed the wedge with no successor commit ever
 /// coming). After a composited flip the displayed image is the
 /// compositor's own framebuffer, not the client buffer, so releasing is
 /// safe; the one caveat is a later damage-repaint re-sampling a released

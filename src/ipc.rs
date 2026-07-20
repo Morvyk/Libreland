@@ -649,15 +649,28 @@ mod server {
                         // `subscribe` turns this connection into an event
                         // stream: clone the write half for the broadcaster,
                         // then push the current snapshot. No request/reply.
-                        Ok(Request::Subscribe { events }) => match conn.try_clone() {
-                            Ok(write_half) => {
-                                let (id, first) =
-                                    state.ipc.add_subscriber(write_half, events);
-                                subscriber_id = Some(id);
-                                on_subscribe(state, id, first);
+                        Ok(Request::Subscribe { events }) => {
+                            // A repeat `subscribe` on an already-streaming
+                            // connection would orphan the first subscriber
+                            // entry (duplicate delivery until a dead write
+                            // reaps it) — ignore it.
+                            if subscriber_id.is_some() {
+                                warn!("IPC: repeat subscribe on a streaming connection ignored");
+                            } else {
+                                match conn.try_clone() {
+                                    Ok(write_half) => {
+                                        let (id, first) =
+                                            state.ipc.add_subscriber(write_half, events);
+                                        subscriber_id = Some(id);
+                                        on_subscribe(state, id, first);
+                                    }
+                                    Err(e) => write_reply(
+                                        conn,
+                                        &Err(format!("subscribe failed: {e}")),
+                                    ),
+                                }
                             }
-                            Err(e) => write_reply(conn, &Err(format!("subscribe failed: {e}"))),
-                        },
+                        }
                         Ok(req) => {
                             let reply = dispatch(state, req);
                             write_reply(conn, &reply);
@@ -810,7 +823,7 @@ mod server {
             .ok_or_else(|| format!("no window with id {id}"))?;
         let (w, h, rgba) = state
             .renderer
-            .capture_window(&surface, max.unwrap_or(512))
+            .capture_window(&surface, max.unwrap_or(512).clamp(16, 8192))
             .map_err(|e| format!("capture failed: {e}"))?;
         let png = crate::screenshot::encode_rgba(&rgba, w, h)
             .map_err(|e| format!("png encode failed: {e}"))?;

@@ -2612,6 +2612,16 @@ impl State {
             self.outputs.retain(|o| o.name() != *name);
             self.lock_surfaces.remove(name);
             self.layer_outputs.retain(|_, v| v != name);
+            // Captures aimed at this output can never render now — fail
+            // them so the client isn't left waiting on a frame forever.
+            self.screencopy_pending.retain(|p| {
+                if p.output == *name {
+                    p.frame.failed();
+                    false
+                } else {
+                    true
+                }
+            });
             info!(output = %name, "output disconnected");
         }
 
@@ -2889,6 +2899,10 @@ impl State {
     /// menu opening over the game doesn't flap the feedback and force
     /// swapchain rebuilds. smithay dedupes internally (`set_feedback`
     /// no-ops when unchanged), so per-frame calls cost a short tree walk.
+    #[allow(
+        clippy::unused_self,
+        reason = "kept as a method: the from-birth feedback redesign will need State again"
+    )]
     fn sync_scanout_feedback(&self, placements: &[layout::Placement], out_name: Option<&str>) {
         // PERMANENTLY DISABLED — the per-surface feedback SWITCH was the
         // swapchain-rebuild storm that black-screened idTech games. Measured

@@ -1445,6 +1445,11 @@ impl Layout {
     /// scroll gesture ([`Self::switch`]) and the IPC
     /// [`Self::switch_workspace_to`]. Returns whether `active` changed.
     fn switch_to_index(&mut self, oi: usize, target: usize) -> bool {
+        // `target` arrives unchecked from IPC (`focus-workspace {index}`);
+        // growing is only ever meant to open ONE fresh workspace past the
+        // end, so clamp before the loop — an arbitrary index must not
+        // drive an allocation storm.
+        let target = target.min(self.outputs[oi].workspaces.len());
         while target >= self.outputs[oi].workspaces.len() {
             self.outputs[oi].workspaces.push(Workspace::default());
         }
@@ -1545,6 +1550,9 @@ impl Layout {
     /// then follow it (the destination becomes active). Returns whether a
     /// move happened (`false` if `dst` is already the active workspace).
     fn relocate(&mut self, surface: &WlSurface, oi: usize, is_floating: bool, dst: usize) -> bool {
+        // Same clamp as `switch_to_index`: `dst` is IPC-controlled
+        // (`move-to-workspace {index}`), grow by at most one.
+        let dst = dst.min(self.outputs[oi].workspaces.len());
         while dst >= self.outputs[oi].workspaces.len() {
             self.outputs[oi].workspaces.push(Workspace::default());
         }
