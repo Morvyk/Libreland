@@ -54,7 +54,7 @@ use std::process::Stdio;
 
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
+use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Size};
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::{

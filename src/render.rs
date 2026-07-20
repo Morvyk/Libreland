@@ -895,6 +895,60 @@ void main() {
 /// Decode an HDR PQ / BT.2020 source (a colour-managed client's buffer)
 /// into the linear BT.2020 working space. Primaries already match and the
 /// PQ EOTF lands in the 1.0 == 10000 cd/m² domain, so no rescale.
+/// R↔B-swizzling variant of [`HDR_DECODE_SHADER`], for PQ client buffers in
+/// the XRGB/ARGB channel order (XR30/AR30 and fp16 ARGB). NVIDIA's Wayland
+/// HDR10 swapchains allocate XR30, and its EGL dmabuf import hands GLES the
+/// components in buffer order rather than swizzling to RGBA — sampled
+/// naively, red and blue trade places and the Slayer's green armour turns
+/// turquoise. The plane consumes these buffers natively (fourcc-aware), so
+/// only the GL-sampled paths need this.
+const HDR_DECODE_SWIZZLE_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+varying vec2 v_coords;
+vec3 pq_eotf(vec3 e) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    vec3 ep = pow(e, vec3(1.0 / m2));
+    return pow(max(ep - vec3(c1), vec3(0.0)) / (vec3(c2) - vec3(c3) * ep), vec3(1.0 / m1));
+}
+void main() {
+    vec4 premult = texture2D(tex, v_coords);
+    vec3 straight = premult.bgr / max(premult.a, 0.001);
+    vec3 lin = pq_eotf(straight);
+    gl_FragColor = vec4(lin * premult.a, premult.a) * alpha;
+}
+";
+
+/// R↔B-swizzling identity copy for the single-pass PQ passthrough (see
+/// [`HDR_DECODE_SWIZZLE_SHADER`] for why): the solo fullscreen HDR game's
+/// pixels are already exactly what the PQ scanout wants, except sampled in
+/// buffer order — reorder the channels, touch nothing else.
+const PQ_PASSTHROUGH_SWIZZLE_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+varying vec2 v_coords;
+void main() {
+    vec4 c = texture2D(tex, v_coords);
+    gl_FragColor = vec4(c.b, c.g, c.r, c.a) * alpha;
+}
+";
+
 const HDR_DECODE_SHADER: &str = r"#version 100
 //_DEFINES_
 #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -1100,6 +1154,11 @@ pub struct Renderer {
     /// Decodes an HDR (PQ/BT.2020) source into the linear working space;
     /// swapped in around colour-managed surfaces. See [`HDR_DECODE_SHADER`].
     hdr_decode_shader: GlesTexProgram,
+    /// [`HDR_DECODE_SWIZZLE_SHADER`] — PQ decode for XRGB-order buffers.
+    hdr_decode_swizzle_shader: GlesTexProgram,
+    /// [`PQ_PASSTHROUGH_SWIZZLE_SHADER`] — identity + R↔B for the
+    /// single-pass passthrough of XRGB-order PQ buffers.
+    pq_passthrough_swizzle_shader: GlesTexProgram,
     /// Decodes a Windows-scRGB source into the linear working space; swapped
     /// in around scRGB-tagged surfaces. See [`SCRGB_DECODE_SHADER`].
     scrgb_decode_shader: GlesTexProgram,
@@ -2222,6 +2281,12 @@ impl Renderer {
         let hdr_decode_shader = gles
             .compile_custom_texture_shader(HDR_DECODE_SHADER, &[])
             .context("HDR decode shader compile failed")?;
+        let hdr_decode_swizzle_shader = gles
+            .compile_custom_texture_shader(HDR_DECODE_SWIZZLE_SHADER, &[])
+            .context("HDR decode swizzle shader compile failed")?;
+        let pq_passthrough_swizzle_shader = gles
+            .compile_custom_texture_shader(PQ_PASSTHROUGH_SWIZZLE_SHADER, &[])
+            .context("PQ passthrough swizzle shader compile failed")?;
         // scRGB carries its own 80 cd/m² anchor and is HDR content, so neither
         // variant takes `reference_white` or `saturation` (both are SDR-only
         // knobs).
@@ -2507,6 +2572,8 @@ impl Renderer {
             sdr_decode_shader,
             sdr_to_pq_shader,
             hdr_decode_shader,
+            hdr_decode_swizzle_shader,
+            pq_passthrough_swizzle_shader,
             scrgb_decode_shader,
             scrgb_to_pq_shader,
             round_tex_shader_hdr,
@@ -4149,6 +4216,8 @@ impl Renderer {
         let sdr_decode_shader = self.sdr_decode_shader.clone();
         let sdr_to_pq_shader = self.sdr_to_pq_shader.clone();
         let hdr_decode_shader = self.hdr_decode_shader.clone();
+        let hdr_decode_swizzle_shader = self.hdr_decode_swizzle_shader.clone();
+        let pq_passthrough_swizzle_shader = self.pq_passthrough_swizzle_shader.clone();
         let scrgb_decode_shader = self.scrgb_decode_shader.clone();
         let scrgb_to_pq_shader = self.scrgb_to_pq_shader.clone();
         let round_tex_shader_hdr = self.round_tex_shader_hdr.clone();
@@ -4818,6 +4887,8 @@ impl Renderer {
                 if win_is_hdr {
                     let decode = if enc.scrgb.contains(&p.surface.id()) {
                         scrgb_decode_shader.clone()
+                    } else if window_buffer_rb_swapped(&p.surface) {
+                        hdr_decode_swizzle_shader.clone()
                     } else {
                         hdr_decode_shader.clone()
                     };
@@ -4975,6 +5046,8 @@ impl Renderer {
                 if surface_is_hdr {
                     let decode = if enc.scrgb.contains(&p.surface.id()) {
                         scrgb_decode_shader.clone()
+                    } else if window_buffer_rb_swapped(&p.surface) {
+                        hdr_decode_swizzle_shader.clone()
                     } else {
                         hdr_decode_shader.clone()
                     };
@@ -5518,10 +5591,24 @@ impl Renderer {
                         Uniform::new("saturation", hdr_saturation),
                     ],
                 );
+            } else if single_pass_hdr
+                && solo_hdr_surface
+                && solo_opaque
+                    .and_then(|i| placements.get(i))
+                    .is_some_and(|p| window_buffer_rb_swapped(&p.surface))
+            {
+                // Solo PQ game whose buffer is XRGB-order (NVIDIA HDR10
+                // allocates XR30): the pixels are right, the sampled channel
+                // order isn't — identity copy with R↔B restored.
+                frame.override_default_tex_program(
+                    pq_passthrough_swizzle_shader.clone(),
+                    Vec::new(),
+                );
             }
-            // (single_pass_hdr && solo_hdr_surface: no override — the solo
-            // window's pixels are already PQ/BT.2020, exactly what the
-            // 10-bit scanout wants; the default sampler is the identity.)
+            // (single_pass_hdr && solo_hdr_surface with an RGBA-order buffer:
+            // no override — the solo window's pixels are already PQ/BT.2020,
+            // exactly what the 10-bit scanout wants; the default sampler is
+            // the identity.)
 
             // Backdrop bands drawn fresh, interleaving the blurred tiers so
             // each translucent surface reveals a blurred copy of whatever
@@ -5639,6 +5726,8 @@ impl Renderer {
                 if surface_is_hdr {
                     let decode = if enc.scrgb.contains(&p.surface.id()) {
                         scrgb_decode_shader.clone()
+                    } else if window_buffer_rb_swapped(&p.surface) {
+                        hdr_decode_swizzle_shader.clone()
                     } else {
                         hdr_decode_shader.clone()
                     };
@@ -6417,6 +6506,30 @@ fn surface_provably_opaque(surface: &WlSurface) -> bool {
         opaque_region_covers(state.opaque_regions(), buf)
             || opaque_region_covers(state.opaque_regions(), view.dst)
     })
+    .unwrap_or(false)
+}
+
+/// Whether `root`'s visually-topmost buffer (the game's swapchain content —
+/// see [`covering_top_node`]) is a dmabuf in the XRGB/ARGB channel order
+/// whose GL sampling arrives R↔B swapped (see [`HDR_DECODE_SWIZZLE_SHADER`]).
+fn window_buffer_rb_swapped(root: &WlSurface) -> bool {
+    let Some((node, _)) = covering_top_node(root) else {
+        return false;
+    };
+    with_renderer_surface_state(&node, |state| {
+        state.buffer().and_then(|buffer| {
+            smithay::wayland::dmabuf::get_dmabuf(buffer).ok().map(|d| {
+                matches!(
+                    d.format().code,
+                    Fourcc::Argb2101010
+                        | Fourcc::Xrgb2101010
+                        | Fourcc::Argb16161616f
+                        | Fourcc::Xrgb16161616f
+                )
+            })
+        })
+    })
+    .flatten()
     .unwrap_or(false)
 }
 

@@ -301,12 +301,14 @@ pub(crate) struct State {
     pub(crate) dmabuf_global: smithay::wayland::dmabuf::DmabufGlobal,
     /// The v4 default dmabuf feedback, re-sent per-surface when a window
     /// leaves fullscreen; `None` on a v3-only global.
+    #[allow(dead_code, reason = "kept for the from-birth scanout-feedback redesign; see sync_scanout_feedback")]
     pub(crate) dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// Default feedback + a Scanout-flagged tranche of the primary
     /// plane's explicit modifiers, sent per-surface to fullscreen windows
     /// so their swapchains re-allocate into plane-scannable buffers (the
     /// missing piece between the single-pass composite and true
     /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
+    #[allow(dead_code, reason = "kept for the from-birth scanout-feedback redesign; see sync_scanout_feedback")]
     pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// Last known lock-key LED state (num/caps/scroll) from xkb, pushed
     /// to every keyboard by [`State::apply_keyboard_leds`]. Kept so a
