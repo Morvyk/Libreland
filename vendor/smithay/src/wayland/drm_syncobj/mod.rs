@@ -393,6 +393,30 @@ where
                                 tracing::error!("Failed to signal syncobj release point: {}", err);
                             }
                         }
+                        // Libreland patch: ALSO signal the COMMITTED (current)
+                        // release point. A Vulkan client destroys this object
+                        // while rebuilding its swapchain (idTech does so
+                        // constantly) and then WAITS for every image's release
+                        // point before it can present again — but upstream's
+                        // "still be used" model only signals the current point
+                        // when a FUTURE buffer commit merges over it, which
+                        // never happens for a client blocked in teardown:
+                        // deadlock (games froze after a variable number of
+                        // frames; a WAYLAND_DEBUG trace showed 55 rebuilds with
+                        // the freeze at one of them). Mirrors what
+                        // `destruction_hook` already does on full surface
+                        // destruction. The last frozen frame may be re-sampled
+                        // after release for a few ms until the client's next
+                        // commit lands — bounded, and strictly better than a
+                        // permanent freeze.
+                        if let Some(release_point) = cached.current().release_point.take() {
+                            tracing::debug!(
+                                "syncobj surface destroyed: signalling committed release point (swapchain-rebuild deadlock guard)"
+                            );
+                            if let Err(err) = release_point.signal() {
+                                tracing::error!("Failed to signal syncobj release point: {}", err);
+                            }
+                        }
                     });
                 }
             }
