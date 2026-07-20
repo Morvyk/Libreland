@@ -244,6 +244,15 @@ pub struct WaylandInit {
     /// writes timing results through a NULL pointer (SIGSEGV, caught by
     /// Wine as the `vkGetPastPresentationTimingEXT` assert). See the git
     /// history around this line for the full Ghidra/Mesa/KWin analysis.
+    ///
+    /// History: the same SIGSEGV once fired even WITHOUT commit-timing, which
+    /// is why a `no-present-timing` Vulkan layer used to ship in contrib. It
+    /// stopped reproducing after the present-pipeline overhaul (dmabuf
+    /// feedback stability, colour-management v2/KWin parity, pacing/release
+    /// fixes — the "fix Proton/Vulkan games" series), verified across native
+    /// VK and D3D-translated titles with the layer disabled, so the layer
+    /// was removed. If a present-timing SIGSEGV ever returns, that layer
+    /// (git history: contrib/no-present-timing-layer) is the known shield.
     #[allow(dead_code, reason = "held so the wp_fifo global stays alive; delegate_fifo! routes through it")]
     pub fifo_manager_state: Option<smithay::wayland::fifo::FifoManagerState>,
     /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
