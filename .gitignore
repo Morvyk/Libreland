@@ -14,3 +14,5 @@
 /contrib/*/*.log
 # Compiled Vulkan layer object (built by its Makefile / PKGBUILD)
 /contrib/no-present-timing-layer/*.so
+# makepkg VCS clone dir for the -git package
+/contrib/libreland-git/libreland-git/

@@ -8,7 +8,7 @@
 # tarball — no local checkout required.
 
 pkgname=libreland
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua'
 arch=('x86_64')
@@ -29,6 +29,9 @@ depends=(
     'systemd-libs'
     'ffmpeg'
     'xorg-xwayland'
+    # polkitd + polkit-agent-helper-1, driven by the bundled polkit agent
+    # (libreland-polkit-agent) for GUI privilege prompts / pkexec.
+    'polkit'
 )
 # `rust` provides cargo; the project's .cargo/config.toml links through mold.
 # clang (libclang) + pkgconf build the ffmpeg-sys bindings (bindgen +
@@ -83,6 +86,11 @@ package() {
         "$pkgdir/usr/bin/libreland"
     install -Dm755 "$root/target/release/libreland-output-picker" \
         "$pkgdir/usr/bin/libreland-output-picker"
+    # PolicyKit authentication agent: registers with polkitd and drives the
+    # themed quickshell password dialog, so GUI privilege prompts and pkexec
+    # work. Autostarted by the compositor (config `misc.polkit_agent`).
+    install -Dm755 "$root/target/release/libreland-polkit-agent" \
+        "$pkgdir/usr/bin/libreland-polkit-agent"
 
     # Wayland session entry so display managers (SDDM/GDM/greetd/…) list
     # "Libreland". Exec is the bare compositor; it sets up its own session
