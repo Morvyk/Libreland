@@ -365,6 +365,25 @@ pub(crate) struct State {
     /// initial configure and only resize on a later one, so we nudge each
     /// exactly once on first map — this set stops it firing every frame.
     pub(crate) mapped_toplevels: std::collections::HashSet<WlSurface>,
+    /// Offscreen-heartbeat throttle (see `wayland::root_offscreen`): last
+    /// heartbeat frame-callback time per out-of-scene root surface, so a
+    /// commit→callback→commit loop can't spin faster than a fast display.
+    /// Entries are dropped when the surface is destroyed.
+    pub(crate) offscreen_frame_ts: std::collections::HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        std::time::Instant,
+    >,
+    /// Surfaces whose latest applied commit set a `wp_fifo` barrier, with
+    /// the time it was first seen (see `wayland::fifo_fallback_tick`). The
+    /// vblank path clears barriers for rendered scene surfaces; this watch
+    /// list backs the KWin-style fallback that clears any barrier left
+    /// standing longer than a few frames, so a fifo client can never wedge
+    /// when nothing is driving vblanks for it (NVIDIA's Wayland WSI uses
+    /// fifo-v1 and its games froze after a swapchain of frames without this).
+    pub(crate) fifo_barrier_watch: std::collections::HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        (WlSurface, std::time::Instant),
+    >,
     /// Built-in idle handling (`config.idle`). `idle_last_input` is bumped on
     /// every input event; the idle timer compares its age to the configured
     /// thresholds. `idle_screen_off` tracks whether the panels are DPMS-off so
@@ -2869,58 +2888,25 @@ impl State {
     /// swapchain rebuilds. smithay dedupes internally (`set_feedback`
     /// no-ops when unchanged), so per-frame calls cost a short tree walk.
     fn sync_scanout_feedback(&self, placements: &[layout::Placement], out_name: Option<&str>) {
-        // `LIBRELAND_NO_SCANOUT_FEEDBACK=1`: never hand out the scanout
-        // tranche, for A/B-testing whether a client's WSI is stuck
-        // rebuilding its swapchain trying to satisfy scanout with
-        // buffers the plane rejects (NVIDIA HDR10 allocates the opaque
-        // XB30 fourcc; the plane only takes AB30).
-        static NO_SCANOUT_FB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *NO_SCANOUT_FB
-            .get_or_init(|| std::env::var_os("LIBRELAND_NO_SCANOUT_FEEDBACK").is_some())
-        {
-            return;
-        }
-        let (Some(default_fb), Some(scanout_fb)) = (
-            self.dmabuf_default_feedback.as_ref(),
-            self.dmabuf_scanout_feedback.as_ref(),
-        ) else {
-            return;
-        };
-        let Some(name) = out_name else { return };
-        let Some(output) = self.outputs.iter().find(|o| o.name() == name) else {
-            return;
-        };
-        let Some(rect) = self.renderer.output_rect(name) else {
-            return;
-        };
-        for p in placements.iter().filter(|p| p.cell_rect.overlaps(rect)) {
-            // Sticky: once a window has been given the scanout variant it
-            // keeps it for its lifetime. Every feedback change makes the
-            // client's WSI rebuild its swapchain, and swapchain recreation
-            // is exactly the moment fragile frame-pacing code runs (a Wine
-            // build with a broken present-timing thunk asserts there) — so
-            // never flip back on unfullscreen. Keeping the tranche is
-            // harmless: scanout-capable modifiers render fine windowed.
-            let fullscreen = p.fill == layout::FillMode::Fullscreen;
-            if fullscreen {
-                self.scanout_feedback_given
-                    .borrow_mut()
-                    .insert(p.surface.id());
-            }
-            let feedback = if fullscreen
-                || self.scanout_feedback_given.borrow().contains(&p.surface.id())
-            {
-                scanout_fb
-            } else {
-                default_fb
-            };
-            smithay::desktop::utils::send_dmabuf_feedback_surface_tree(
-                &p.surface,
-                output,
-                |_, _| Some(output.clone()),
-                |_, _| feedback,
-            );
-        }
+        // PERMANENTLY DISABLED — the per-surface feedback SWITCH was the
+        // swapchain-rebuild storm that black-screened idTech games. Measured
+        // with WAYLAND_DEBUG on DOOM Eternal (Wine-Wayland): all 76 of 76
+        // swapchain teardowns were immediately preceded by a dmabuf-feedback
+        // delivery. The chain: a NEW feedback object always receives the
+        // DEFAULT feedback as its initial state (smithay hands out the stored
+        // per-surface state, which starts as the default — nothing sent later
+        // changes what a fresh object sees first); this sync then switched the
+        // surface to the Scanout variant; the WSI treats that change as
+        // "reallocate" → VK_SUBOPTIMAL → idTech recreates its VkSurface → new
+        // surface → same switch again → ~1 rebuild/second forever, each
+        // boundary risking a permanent present-wedge. KWin and cosmic-comp
+        // never switch per-surface feedback; the same game rebuilds exactly
+        // TWICE there. On NVIDIA the scanout tranche never bought zero-copy
+        // anyway (the primary plane rejects the allocated modifiers on nearly
+        // every frame). If zero-copy matters later (AMD), the tranche must be
+        // present in a surface's feedback FROM ITS FIRST DELIVERY — never as
+        // a mid-life switch.
+        let _ = (placements, out_name);
     }
 
     /// Keep `wl_surface.enter`/`leave` in sync with where surfaces live.
@@ -4185,6 +4171,8 @@ fn main() -> Result<()> {
         layer_outputs: std::collections::HashMap::new(),
         layer_namespaces: std::collections::HashMap::new(),
         mapped_toplevels: std::collections::HashSet::new(),
+        offscreen_frame_ts: std::collections::HashMap::new(),
+        fifo_barrier_watch: std::collections::HashMap::new(),
         idle_last_input: std::time::Instant::now(),
         idle_screen_off: false,
         idle_lock_spawned: false,
@@ -4560,12 +4548,22 @@ fn wire_event_sources(
                     // hardware-clock presentation time; otherwise fall back to
                     // sampling CLOCK_MONOTONIC now (no hw-clock flags then).
                     let (present_time, seq, base_flags) = present_info(meta.as_ref());
-                    let presented =
+                    let (presented, direct) =
                         state.renderer.frame_submitted(crtc, present_time, seq, base_flags);
                     // FIFO pacing: the frame just latched, so clear the fifo
                     // barrier its commit set — the next frame that waited on it
                     // may now proceed (see `signal_fifo_barriers`).
                     crate::wayland::signal_fifo_barriers(state, &presented);
+                    // Explicit-sync buffer return: the COMPOSITED frame that
+                    // sampled these clients' buffers has flipped, so their
+                    // release points can signal — clients (idTech swapchain
+                    // teardown, Xwayland PresentIdle) wait on these BEFORE
+                    // committing again, so hold-until-replaced deadlocks them.
+                    // Never for direct-scanout frames: there the client buffer
+                    // IS the displayed image.
+                    if !direct {
+                        crate::wayland::signal_release_points(&presented);
+                    }
                     // Re-render only if a trigger arrived while the flip was in
                     // flight, or an animation/slide is still running. Otherwise
                     // the output parks until the next trigger queues a redraw.
@@ -4602,6 +4600,20 @@ fn wire_event_sources(
                 TimeoutAction::ToDuration(beat)
             })
             .map_err(|e| anyhow::anyhow!("failed to insert redraw heartbeat: {e}"))?;
+    }
+
+    // Fifo fallback: clear wp_fifo barriers the vblank path missed (see
+    // `wayland::fifo_fallback_tick`). 25 ms tick, no-ops while no client
+    // has a standing barrier.
+    {
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        let tick = std::time::Duration::from_millis(25);
+        handle
+            .insert_source(Timer::from_duration(tick), move |_, (), state: &mut State| {
+                crate::wayland::fifo_fallback_tick(state);
+                TimeoutAction::ToDuration(tick)
+            })
+            .map_err(|e| anyhow::anyhow!("failed to insert fifo fallback timer: {e}"))?;
     }
 
     // Built-in idle handling: a low-frequency tick that locks / powers off the

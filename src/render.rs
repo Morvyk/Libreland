@@ -1365,6 +1365,11 @@ struct OutputRender {
     /// present-timing consumers (Wine/NVIDIA HDR swapchains) treat those
     /// discards as "frame never shown" and rebuild their swapchain.
     pending_frame_roots: Vec<WlSurface>,
+    /// Whether the frame currently in flight is a DIRECT-SCANOUT frame (the
+    /// client's own buffer on the plane). The vblank release-point signaling
+    /// must skip those: the client buffer is literally what's on screen, so
+    /// releasing it would let the client overwrite the displayed image.
+    pending_direct: bool,
     /// Rolling per-phase frame-cost accumulator, logged + reset every ~5 s
     /// (see [`RenderProfile`]). Always on: the bookkeeping is a handful of
     /// `Instant::now()` calls per frame.
@@ -2407,6 +2412,7 @@ impl Renderer {
                 hdr_saturation: output_sdr_saturation(output_cfg),
                 pending_feedback: None,
                 pending_frame_roots: Vec::new(),
+                pending_direct: false,
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
                 prev_layer_masks: HashMap::new(),
@@ -2977,19 +2983,20 @@ impl Renderer {
     /// when the timestamp came from the DRM page-flip event). Per-surface
     /// zero-copy flags were already merged in at collection time.
     ///
-    /// Returns the root surfaces whose frame was just presented, so the
-    /// caller (which holds `State`) can signal their `wp_fifo` barriers —
-    /// FIFO's "the barrier clears one refresh after the frame latched"
-    /// contract, which paces the next frame.
+    /// Returns the root surfaces whose frame was just presented — so the
+    /// caller (which holds `State`) can signal their `wp_fifo` barriers and
+    /// explicit-sync release points — plus whether that frame was
+    /// DIRECT-SCANOUT (client buffer on the plane: release points must NOT
+    /// be signalled for it, the buffer is what's on screen).
     pub fn frame_submitted(
         &mut self,
         crtc: crtc::Handle,
         present_time: Duration,
         seq: u32,
         base_flags: PresentKind,
-    ) -> Vec<WlSurface> {
+    ) -> (Vec<WlSurface>, bool) {
         let Some(o) = self.outputs.iter_mut().find(|o| o.crtc == crtc) else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         if let Err(err) = o.surface.frame_submitted() {
             warn!(error = %err, crtc = ?crtc, "frame_submitted failed");
@@ -3026,11 +3033,28 @@ impl Renderer {
         for surface in &roots {
             send_frame_callbacks(surface, elapsed_ms);
         }
-        roots
+        let direct = self
+            .outputs
+            .iter()
+            .find(|o| o.crtc == crtc)
+            .is_some_and(|o| o.pending_direct);
+        (roots, direct)
     }
 
     /// Every output's CRTC, for the driver to iterate when scheduling
     /// redraws across all outputs.
+    /// Monotonic milliseconds since renderer start — the same clock the
+    /// vblank path stamps `wl_callback.done` with, so offscreen-heartbeat
+    /// callbacks (see `wayland::commit`) tick the same timeline clients
+    /// already observe.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "wl_callback.done takes u32 ms which the spec expects to wrap freely (~50d period)"
+    )]
+    pub fn frame_time_ms(&self) -> u32 {
+        self.start.elapsed().as_millis() as u32
+    }
+
     pub fn crtcs(&self) -> Vec<crtc::Handle> {
         self.outputs.iter().map(|o| o.crtc).collect()
     }
@@ -3122,6 +3146,7 @@ impl Renderer {
             hdr_saturation: output_sdr_saturation(output_cfg),
             pending_feedback: None,
             pending_frame_roots: Vec::new(),
+            pending_direct: false,
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
             prev_layer_masks: HashMap::new(),
@@ -4204,6 +4229,7 @@ impl Renderer {
                 Ok(true) => {
                     debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
                     self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
+                    self.outputs[idx].pending_direct = true;
                     // Zero-copy presentation: the client's own buffer is on the
                     // plane, so flag ZeroCopy. Fired on this flip's vblank. A
                     // feedback still parked from a frame that never reached
@@ -5923,6 +5949,7 @@ impl Renderer {
         // Queue wl_callback.done for every surface in this frame; fired at
         // vblank by `frame_submitted` (shared with the direct-scanout path).
         self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
+        self.outputs[idx].pending_direct = false;
 
         // Collect wp_presentation feedback for the surfaces in this composited
         // frame; fired with the real vblank timestamp in `frame_submitted`.
@@ -6960,7 +6987,7 @@ fn draw_screenshot_overlay(
 /// which presuppose a `Space<Window>` we don't have yet (4d); this
 /// minimal version is enough for 4b — every visible surface gets a
 /// callback per vblank cycle.
-fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
+pub(crate) fn send_frame_callbacks(surface: &WlSurface, time_ms: u32) {
     with_surface_tree_downward(
         surface,
         (),

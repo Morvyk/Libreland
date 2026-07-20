@@ -245,7 +245,7 @@ pub struct WaylandInit {
     /// Wine as the `vkGetPastPresentationTimingEXT` assert). See the git
     /// history around this line for the full Ghidra/Mesa/KWin analysis.
     #[allow(dead_code, reason = "held so the wp_fifo global stays alive; delegate_fifo! routes through it")]
-    pub fifo_manager_state: smithay::wayland::fifo::FifoManagerState,
+    pub fifo_manager_state: Option<smithay::wayland::fifo::FifoManagerState>,
     /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
     /// `wl_surface`s with X11 windows (see `src/xwayland.rs`). Held so
     /// the global stays alive; only the Xwayland client may bind it.
@@ -458,6 +458,10 @@ pub fn init(
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
     // wp_color_management_v1: clients detect output HDR + tag surface
     // colour spaces (Proton/mpv use this to enable HDR).
+    // Re-enabled at KWin parity (v2, matching feature set) after the bisect
+    // proved our v3 + scRGB/BT2100 advertisement drove Wine's untested code
+    // paths into a swapchain-rebuild storm — see MANAGER_VERSION in
+    // color_management.rs for the measured evidence.
     let color_management = crate::color_management::ColorManagementState::new(&dh);
     // wp_content_type_v1: clients tag a surface's content type (game / video /
     // photo). Advertised now so clients can hint; read from cached state when
@@ -479,11 +483,13 @@ pub fn init(
     // commit-timing and works; we match it.
     // `LIBRELAND_NO_FIFO_BLOCK=1` drops fifo to unmanaged (advertised but
     // never blocking) as a recovery valve.
-    let fifo_manager_state = if std::env::var_os("LIBRELAND_NO_FIFO_BLOCK").is_some() {
+    // (Bisect result: advertising fifo or not made NO difference to the
+    // idTech freeze — fifo is exonerated and stays enabled.)
+    let fifo_manager_state = Some(if std::env::var_os("LIBRELAND_NO_FIFO_BLOCK").is_some() {
         smithay::wayland::fifo::FifoManagerState::unmanaged::<State>(&dh)
     } else {
         smithay::wayland::fifo::FifoManagerState::new::<State>(&dh)
-    };
+    });
     // xwayland_shell_v1: how Xwayland associates the wl_surface it
     // creates for each X11 window with that window (a shared serial;
     // see src/xwayland.rs). smithay only lets Xwayland clients bind it.
@@ -781,6 +787,31 @@ impl CompositorHandler for State {
         // timing queue errors — a game crashed on every workspace
         // switch this way).
         discard_hidden_presentation_feedback(self, surface);
+        // Offscreen heartbeat (see [`root_offscreen`]): a toplevel-shaped
+        // surface committing from outside the scene must still have its
+        // pacing completed — fifo barrier + feedback are handled by the
+        // discard call above; fire its frame callbacks here, throttled to
+        // roughly a fast display's refresh so a misbehaving client can't
+        // spin the compositor with commit→callback→commit loops. Without
+        // this, an X11 game whose first commits land in the map→manage gap
+        // starves, Xwayland drops to ~1 Hz present completions, and the
+        // game freezes for good (black window, GPU busy).
+        {
+            let root = crate::root_surface(surface);
+            if root_offscreen(self, &root) {
+                let now = std::time::Instant::now();
+                let due = self
+                    .offscreen_frame_ts
+                    .get(&root.id())
+                    .is_none_or(|last| now.duration_since(*last) >= std::time::Duration::from_millis(3));
+                if due {
+                    if self.offscreen_frame_ts.insert(root.id(), now).is_none() {
+                        debug!(root = ?root.id(), "offscreen heartbeat engaged (out-of-scene surface committing)");
+                    }
+                    crate::render::send_frame_callbacks(&root, self.renderer.frame_time_ms());
+                }
+            }
+        }
         // Some clients ignore the size in the *initial* configure (sent before
         // they map) and render at their own default size, only resizing when a
         // later configure arrives — MPV's idle "Drop files" window is the
@@ -810,6 +841,24 @@ impl CompositorHandler for State {
                 self.layout.reconfigure(surface);
             }
         }
+        // Track fifo-barrier surfaces for the fallback clearer (see
+        // [`fifo_fallback_tick`]). Only NVIDIA's Wayland WSI (and other
+        // fifo-v1 clients) ever set barriers, so the map stays tiny.
+        {
+            let has_barrier = smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<smithay::wayland::fifo::FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .is_some()
+            });
+            if has_barrier {
+                self.fifo_barrier_watch
+                    .entry(surface.id())
+                    .or_insert_with(|| (surface.clone(), std::time::Instant::now()));
+            }
+        }
         maybe_handle_layer_commit(self, surface);
         // Promote a freshly-mapped popup into its parent's tree (and
         // let smithay send its initial configure if needed), then reap
@@ -829,6 +878,9 @@ impl CompositorHandler for State {
         // Drop the first-map nudge record so the set doesn't accumulate dead
         // surfaces (a toplevel's wl_surface is never reused once destroyed).
         self.mapped_toplevels.remove(surface);
+        // And the offscreen-heartbeat throttle entry + fifo watch entry.
+        self.offscreen_frame_ts.remove(&surface.id());
+        self.fifo_barrier_watch.remove(&surface.id());
         // Same for the sticky scanout-feedback record.
         self.scanout_feedback_given.borrow_mut().remove(&surface.id());
         // And the renderer's per-surface caches (decoration offscreen).
@@ -856,7 +908,7 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
             .values()
             .any(|lock| lock.wl_surface() == &root)
     } else {
-        state.layout.on_inactive_workspace(&root)
+        state.layout.on_inactive_workspace(&root) || root_offscreen(state, &root)
     };
     if !hidden {
         return;
@@ -871,6 +923,39 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
             feedback.discarded();
         }
     });
+}
+
+/// Whether a toplevel-shaped ROOT surface is committing from *outside the
+/// rendered scene*: an xdg toplevel or XWayland surface that is in no
+/// workspace (`window_surface` finds nothing anywhere) and isn't a tracked
+/// override-redirect window. Two ways to get here: the map→manage gap (an
+/// X11 window's first commits land BEFORE `try_manage_x11` places it — seen
+/// in every game trace), and windows the WM never places at all.
+///
+/// Such a surface gets none of the per-frame pacing the render loop
+/// provides (frame callbacks / fifo barriers / presentation feedback are
+/// vblank-driven for scene surfaces only) — and a starved surface is not a
+/// cosmetic problem: Xwayland falls back to ~1 Hz present completions when
+/// frame callbacks stop, and games freeze on that PERMANENTLY, staying
+/// frozen even after callbacks resume (KWin documents this exact failure
+/// and ships a heartbeat timer for it; see X11Window::wantsFrameCallbackHeartbeat).
+/// The commit handler therefore completes pacing for these surfaces
+/// immediately (the "offscreen heartbeat").
+///
+/// Only toplevel-ish roles qualify: layers, popups, cursors, DnD icons and
+/// lock surfaces all have their own render-path pacing.
+fn root_offscreen(state: &State, root: &WlSurface) -> bool {
+    if !matches!(
+        smithay::wayland::compositor::get_role(root),
+        Some(
+            smithay::wayland::shell::xdg::XDG_TOPLEVEL_ROLE
+                | smithay::wayland::xwayland_shell::XWAYLAND_SHELL_ROLE
+        )
+    ) {
+        return false;
+    }
+    state.layout.window_surface(root).is_none()
+        && !state.x11_or_windows.iter().any(|(_, s)| s == root)
 }
 
 /// Clear the `wp_fifo` barriers set by these root surfaces' latest
@@ -894,13 +979,14 @@ pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
         return;
     }
     let mut clients = Vec::new();
+    let mut cleared_ids = Vec::new();
     for root in roots {
         let mut had_barrier = false;
         smithay::wayland::compositor::with_surface_tree_downward(
             root,
             (),
             |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
-            |_surface, states, ()| {
+            |surface, states, ()| {
                 if let Some(barrier) = states
                     .cached_state
                     .get::<FifoBarrierCachedState>()
@@ -910,6 +996,7 @@ pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
                 {
                     barrier.signal();
                     had_barrier = true;
+                    cleared_ids.push(surface.id());
                 }
             },
             |_, _, ()| true,
@@ -918,11 +1005,121 @@ pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
             clients.push(client);
         }
     }
+    // A vblank-cleared surface leaves the fallback watch; its next
+    // barrier-setting commit re-enters it with a fresh timestamp, so the
+    // fallback only ever sees barriers that vblank clearing MISSED.
+    for id in cleared_ids {
+        state.fifo_barrier_watch.remove(&id);
+    }
     let dh = state.display_handle.clone();
     for client in clients {
         // Xwayland clients don't carry our ClientState; skip (their
         // blocker bookkeeping lives elsewhere), matching the explicit-sync
         // blocker path.
+        if compositor_client_state(&client).is_some() {
+            state.client_compositor_state(&client).blocker_cleared(state, &dh);
+        }
+    }
+}
+
+/// Signal the explicit-sync RELEASE points of these roots' current
+/// (displayed) buffers — called at vblank for COMPOSITED frames only.
+///
+/// smithay's stock model signals a buffer's release point when the NEXT
+/// buffer commit merges over it (hold-until-replaced). Vulkan clients
+/// tearing down a swapchain wait for every image's release point BEFORE
+/// they will ever commit again — idTech games rebuild their swapchain
+/// constantly, so hold-until-replaced deadlocks them at a
+/// timing-dependent rebuild (games froze after 1/12/38/99 frames; the
+/// WAYLAND_DEBUG trace showed the wedge with no successor commit ever
+/// coming). After a composited flip the displayed image is the
+/// compositor's own framebuffer, not the client buffer, so releasing is
+/// safe; the one caveat is a later damage-repaint re-sampling a released
+/// buffer the client has begun reusing — a transient artifact at worst,
+/// against a guaranteed permanent freeze. The point is `take()`n so
+/// `merge_into` can't double-signal.
+pub(crate) fn signal_release_points(roots: &[WlSurface]) {
+    use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
+    for root in roots {
+        smithay::wayland::compositor::with_surface_tree_downward(
+            root,
+            (),
+            |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+            |_s, states, ()| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                if let Some(release_point) = cached.current().release_point.take()
+                    && let Err(err) = release_point.signal()
+                {
+                    warn!(error = %err, "explicit sync: release-point signal failed");
+                }
+            },
+            |_, _, ()| true,
+        );
+    }
+}
+
+/// KWin-style fifo fallback (its `fifoFallbackTimer`): force-clear any
+/// `wp_fifo` barrier that has stood longer than a few frames, then re-drive
+/// the owning client. The vblank path above only clears barriers for
+/// surfaces of RENDERED frames — a fifo client whose next commit is the
+/// only thing that would trigger a render deadlocks with it (blocked
+/// commit → no damage → no render → no vblank → barrier never cleared),
+/// and NVIDIA's Wayland WSI games froze after exactly a swapchain of
+/// frames this way. The fifo spec explicitly permits clearing early "to
+/// ensure client forward progress". Runs from a 25 ms timer; 60 ms of age
+/// means several missed vblanks even at 60 Hz, so healthy vblank-paced
+/// clients never hit it.
+pub(crate) fn fifo_fallback_tick(state: &mut State) {
+    use smithay::wayland::fifo::FifoBarrierCachedState;
+    if state.fifo_barrier_watch.is_empty() {
+        return;
+    }
+    let stale_after = std::time::Duration::from_millis(60);
+    let now = std::time::Instant::now();
+    let mut clients = Vec::new();
+    let mut drop_ids = Vec::new();
+    for (id, (surface, since)) in &state.fifo_barrier_watch {
+        if !surface.is_alive() {
+            drop_ids.push(id.clone());
+            continue;
+        }
+        let cleared_elsewhere = smithay::wayland::compositor::with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .is_none()
+        });
+        if cleared_elsewhere {
+            drop_ids.push(id.clone());
+            continue;
+        }
+        if now.duration_since(*since) < stale_after {
+            continue;
+        }
+        smithay::wayland::compositor::with_states(surface, |states| {
+            if let Some(barrier) = states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take()
+            {
+                barrier.signal();
+            }
+        });
+        debug!(surface = ?id, "fifo fallback: cleared stale barrier (no vblank was coming)");
+        if let Some(client) = surface.client() {
+            clients.push(client);
+        }
+        drop_ids.push(id.clone());
+    }
+    for id in drop_ids {
+        state.fifo_barrier_watch.remove(&id);
+    }
+    let dh = state.display_handle.clone();
+    for client in clients {
         if compositor_client_state(&client).is_some() {
             state.client_compositor_state(&client).blocker_cleared(state, &dh);
         }

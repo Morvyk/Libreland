@@ -577,6 +577,15 @@ impl Layout {
     /// window rule: it has an xdg `parent`, or it pins itself to a fixed
     /// size (`min_size == max_size`), which only non-tileable windows do.
     pub fn float_if_dialog(&mut self, surface: &WlSurface) -> bool {
+        // A "dialog" the size of a display is a game, not a dialog: games pin
+        // min == max to their resolution, which is exactly the fixed-size
+        // heuristic below. Floating one — worse, RESETTING ITS FILL — yanks a
+        // freshly-fullscreened game back to a float, and the resulting
+        // fullscreen↔floating configure ping-pong makes the client rebuild
+        // its swapchain per flip until it gives up (DOOM under Wine-Wayland
+        // rebuilt 40 times, then quit to black).
+        let full_sizes: Vec<Size<i32, Physical>> =
+            self.outputs.iter().map(|op| op.full.size).collect();
         for oi in 0..self.outputs.len() {
             let area = self.outputs[oi].area();
             let work = area.work;
@@ -586,8 +595,16 @@ impl Layout {
             };
             // Decide before disturbing the tree: only float genuine dialogs,
             // and put the untouched tree back if this isn't one (or the
-            // surface lives on another output's active workspace).
-            let Some(pref) = leaf_ref(&root, surface).and_then(|w| dialog_size(&w.toplevel)) else {
+            // surface lives on another output's active workspace). A window
+            // already filled (fullscreen/maximized) is never a dialog — the
+            // user/client explicitly asked for that state.
+            let Some(pref) = leaf_ref(&root, surface).and_then(|w| {
+                if w.fill != FillMode::Normal {
+                    return None;
+                }
+                dialog_size(&w.toplevel)
+                    .filter(|s| !(s.w > 0 && full_sizes.contains(s)))
+            }) else {
                 ws.tree = Some(root);
                 continue;
             };
@@ -1097,6 +1114,17 @@ impl Layout {
     /// whether it floats, plus which output/workspace holds it. The
     /// transient in-transit drag window is omitted (it has no settled
     /// home until release).
+    /// Whether `w × h` (compositor px) exactly matches some output's full
+    /// rect. Wine/Proton games present through a borderless window sized
+    /// to the display; the X11 manage path fullscreens such windows
+    /// instead of tiling them (tiling triggers Wine's destroy/recreate
+    /// churn — xwayland-satellite ships this same size heuristic).
+    pub fn any_output_full_size(&self, w: i32, h: i32) -> bool {
+        self.outputs
+            .iter()
+            .any(|op| op.full.size.w == w && op.full.size.h == h)
+    }
+
     pub fn window_entries(&self) -> Vec<WindowEntry> {
         let mut out = Vec::new();
         for op in &self.outputs {

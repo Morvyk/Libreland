@@ -54,7 +54,17 @@ use crate::State;
 /// `PASS_THROUGH` on the host driver, and attaches the description itself —
 /// once. Without them the NVIDIA WSI runs its own color-management path,
 /// which rebuilds the swapchain every present on this compositor.
-const MANAGER_VERSION: u32 = 3;
+// Pinned to 2 at KWin parity — measured, not guessed: a WAYLAND_DEBUG trace
+// of DOOM Eternal (Wine-Wayland) on KWin shows wp_color_manager_v1 VERSION 2
+// with features {icc, parametric, set_tf_power, set_luminances,
+// set_mastering_display_primaries, extended_target_volume} and the game
+// rebuilding its swapchain exactly TWICE; the same game against our v3 +
+// windows_scrgb/windows_bt2100 advertisement rebuilt 55 TIMES and froze at a
+// rebuild boundary. Wine's scRGB/BT2100 paths are exercised by no shipping
+// compositor (KWin doesn't offer them) and misbehave; advertising v2 without
+// them steers Wine onto the parametric path it is actually tested on.
+// The scRGB/BT2100 machinery below stays for when Wine's v3 path matures.
+const MANAGER_VERSION: u32 = 2;
 
 /// Default SDR reference white, BT.2408 (cd/m²). Overridable per-output
 /// via config; used when building an output's image description.
@@ -346,16 +356,22 @@ impl GlobalDispatch<WpColorManagerV1, ()> for State {
         // volume are the trio Wine/Proton gates its HDR reporting on.
         // `windows_bt2100` (the `create_windows_bt2100` request) only
         // exists from v3.
+        // KWin-parity feature set (see MANAGER_VERSION comment): no
+        // SetPrimaries, no WindowsScrgb, no WindowsBt2100 — Wine takes its
+        // battle-tested parametric path when those are absent, exactly as it
+        // does on KWin, instead of the scRGB/BT2100 paths that drove idTech
+        // games into a swapchain-rebuild storm here.
         let mut features = vec![
             Feature::Parametric,
-            Feature::SetPrimaries,
             Feature::SetTfPower,
             Feature::SetLuminances,
             Feature::SetMasteringDisplayPrimaries,
             Feature::ExtendedTargetVolume,
-            Feature::WindowsScrgb,
         ];
         if version >= 3 {
+            // Not reached at MANAGER_VERSION 2; kept for the eventual v3
+            // re-enable so the gate stays in one place.
+            features.push(Feature::WindowsScrgb);
             features.push(Feature::WindowsBt2100);
         }
         for feature in features {

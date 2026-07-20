@@ -54,7 +54,7 @@ use std::process::Stdio;
 
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, DisplayHandle};
+use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource};
 use smithay::utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Size};
 use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::{
@@ -324,8 +324,23 @@ impl State {
         );
         // A window that asked for fullscreen before mapping (games
         // setting a mode) gets it immediately, through the same layout
-        // path an xdg fullscreen request takes.
-        if window.is_fullscreen() {
+        // path an xdg fullscreen request takes. An OUTPUT-SIZED window is
+        // fullscreened too: Wine/Proton games present through a borderless
+        // window sized exactly to the display, without _NET_WM_STATE_FULLSCREEN
+        // — tiling it makes Wine destroy and recreate the window in a loop
+        // (swapchain-invalidating resize), so the game never stays visible.
+        // xwayland-satellite ships this same size heuristic.
+        let geo = window.geometry();
+        let output_sized = self.layout.any_output_full_size(geo.size.w, geo.size.h);
+        if window.is_fullscreen() || output_sized {
+            if output_sized && !window.is_fullscreen() {
+                info!(
+                    window = window.window_id(),
+                    w = geo.size.w,
+                    h = geo.size.h,
+                    "xwayland: output-sized window → fullscreen (game render window)"
+                );
+            }
             self.layout.toggle_fullscreen(&wl_surface);
         }
         self.renderer.mark_open(&wl_surface);
