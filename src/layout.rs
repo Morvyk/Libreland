@@ -353,6 +353,41 @@ enum Node {
     },
 }
 
+/// Which edges an interactive resize moves, picked from the half of the
+/// window the press landed in (the *nearer* edge on each axis).
+///
+/// A tiled window can only move an edge that has a split divider on it,
+/// and the right-most / bottom-most cells have none on those sides —
+/// their outer edges are the workspace boundary. Choosing by press
+/// position means every window is resizable from somewhere: grab a
+/// right-most cell's left half and you drag the divider it shares with
+/// its neighbour. Floating windows get the same rule, so one gesture
+/// behaves identically everywhere and any corner works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeEdges {
+    /// Move the right edge (else the left one).
+    pub right: bool,
+    /// Move the bottom edge (else the top one).
+    pub bottom: bool,
+}
+
+impl ResizeEdges {
+    /// Pick the edges from where `cursor` sits inside `rect`.
+    pub fn from_press(rect: Rectangle<i32, Physical>, cursor: Point<i32, Physical>) -> Self {
+        Self {
+            right: cursor.x >= rect.loc.x + rect.size.w / 2,
+            bottom: cursor.y >= rect.loc.y + rect.size.h / 2,
+        }
+    }
+}
+
+/// Smallest a cell may be squeezed to by an interactive tiled resize,
+/// so a drag can't collapse a neighbour to nothing (or hand its client
+/// a degenerate size).
+const MIN_TILE_W: i32 = 120;
+/// Vertical counterpart of [`MIN_TILE_W`].
+const MIN_TILE_H: i32 = 80;
+
 #[derive(Debug, Clone, Copy)]
 enum SplitAxis {
     /// Cells positioned left-right; the split divider is vertical.
@@ -692,22 +727,89 @@ impl Layout {
         None
     }
 
-    /// Start an interactive *resize* drag. Only floating windows
-    /// can be drag-resized today; resize on a tile is rejected so
-    /// the caller can log + swallow the press. Returns the rect
-    /// to use as the drag's start rect, or `None`.
+    /// Start an interactive *resize* drag. Floating and tiled windows
+    /// both qualify — a tile resizes by moving the split dividers on its
+    /// edges (see [`Self::apply_resize`]). Returns the rect to use as
+    /// the drag's start rect, or `None` if the window can't be resized.
+    ///
+    /// A maximized or fullscreen window is refused: it owns its whole
+    /// output, so there is no divider to move and a free resize would
+    /// desync its filled configure. Un-fill it first.
     pub fn start_resize_drag(&self, surface: &WlSurface) -> Option<Rectangle<i32, Physical>> {
-        // Can't drag-resize a window that's pinned to fill its output.
         if self.is_filled(surface) {
             return None;
         }
+        // Only a visible window can be under the press, so the active
+        // workspaces are the whole search space.
         self.outputs.iter().find_map(|op| {
+            let ws = &op.workspaces[op.active];
+            ws.floating
+                .iter()
+                .find(|w| w.toplevel.wl_surface() == surface)
+                .or_else(|| ws.tree.as_ref().and_then(|t| tree_leaf(t, surface)))
+                .map(|w| w.rect)
+        })
+    }
+
+    /// Apply an interactive resize: move the window's `edges` so they
+    /// land on `target`'s corresponding sides.
+    ///
+    /// A floating window simply takes the rect. A **tiled** one has no
+    /// rect of its own — its cell is derived from the split ratios — so
+    /// the moved edges are translated into new ratios on the ancestor
+    /// splits that own them and the workspace reflows around it. The
+    /// neighbouring cells give up exactly the space the window gains,
+    /// which is what makes the drag read as moving a shared divider.
+    ///
+    /// Silent no-op for an untracked surface, and per-edge for one whose
+    /// moved edge is the workspace boundary (no divider there to move).
+    pub fn apply_resize(
+        &mut self,
+        surface: &WlSurface,
+        target: Rectangle<i32, Physical>,
+        edges: ResizeEdges,
+    ) {
+        let floating = self.outputs.iter().any(|op| {
             op.workspaces[op.active]
                 .floating
                 .iter()
-                .find(|w| w.toplevel.wl_surface() == surface)
-                .map(|w| w.rect)
-        })
+                .any(|w| w.toplevel.wl_surface() == surface)
+        });
+        if floating {
+            // A float's rect *is* its state.
+            self.set_floating_rect(surface, target);
+            return;
+        }
+        let (inner, outer, border) = (self.gaps.inner, self.gaps.outer, self.border_width);
+        for op in &mut self.outputs {
+            let tile_bounds = shrink_for_outer(op.bounds, outer);
+            let area = op.area();
+            let active = op.active;
+            let Some(tree) = op.workspaces[active].tree.as_mut() else {
+                continue;
+            };
+            if !tree_contains(tree, surface) {
+                continue;
+            }
+            let (mut done_h, mut done_v) = (false, false);
+            resize_leaf(
+                tree,
+                tile_bounds,
+                inner,
+                surface,
+                target,
+                edges,
+                &mut done_h,
+                &mut done_v,
+            );
+            // Reflow and configure just this workspace: a drag ships one
+            // of these per motion event, so walking every other
+            // workspace's clients (what `recompute_and_push` does) would
+            // be pure waste.
+            assign_rects(tree, tile_bounds, inner);
+            push_configures_tree(tree, border, area);
+            return;
+        }
     }
 
     /// Update the `in_transit` window's rect during a move drag
@@ -2092,6 +2194,129 @@ fn tree_fullscreen(node: &Node) -> Option<&Window> {
 /// Bottom}` so that clients (notably kitty) treat the cell as a
 /// hard size to fill, without leaving margins for their own
 /// resize handles or rounding to a font grid.
+/// The leaf holding `surface`, anywhere in this tree.
+fn tree_leaf<'a>(node: &'a Node, surface: &WlSurface) -> Option<&'a Window> {
+    match node {
+        Node::Leaf(w) => (w.toplevel.wl_surface() == surface).then_some(w),
+        Node::Split { first, second, .. } => {
+            tree_leaf(first, surface).or_else(|| tree_leaf(second, surface))
+        }
+    }
+}
+
+/// Retarget the split ratios that own `surface`'s moving edges so those
+/// edges land on `target`. Returns whether this subtree contains it.
+///
+/// The divider that owns an edge is the *nearest* ancestor split on that
+/// axis with the leaf on the matching side: for a `LeftRight` split the
+/// divider is the leaf's right edge when the leaf sits in `first`, and
+/// its left edge when it sits in `second` (`TopBottom` likewise for
+/// bottom/top). Walking back up post-order, the first such ancestor wins
+/// and the `done` flags keep any higher one from moving the same edge
+/// again. An edge with no owning ancestor is the workspace boundary and
+/// simply doesn't move.
+///
+/// The two axes never interfere: a `LeftRight` ratio only shifts its
+/// children's x/width and a `TopBottom` ratio only their y/height, so
+/// retargeting one axis can't invalidate the bounds the other was
+/// computed from — which is why one pass gets both edges exactly right.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one recursive walk carrying the bounds, the target, and the per-axis done flags; bundling them into a struct would only rename the same state"
+)]
+fn resize_leaf(
+    node: &mut Node,
+    bounds: Rectangle<i32, Physical>,
+    inner: i32,
+    surface: &WlSurface,
+    target: Rectangle<i32, Physical>,
+    edges: ResizeEdges,
+    done_h: &mut bool,
+    done_v: &mut bool,
+) -> bool {
+    match node {
+        Node::Leaf(w) => w.toplevel.wl_surface() == surface,
+        Node::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let (b1, b2) = split_bounds(bounds, *axis, *ratio, inner);
+            let in_first = resize_leaf(first, b1, inner, surface, target, edges, done_h, done_v);
+            let in_second = !in_first
+                && resize_leaf(second, b2, inner, surface, target, edges, done_h, done_v);
+            if !in_first && !in_second {
+                return false;
+            }
+            let gap = inner.max(0);
+            let (half_a, half_b) = (gap / 2, gap - gap / 2);
+            // Where this split's divider would have to sit for the edge
+            // it owns to land on the target. Per `split_bounds`, `first`
+            // ends at `split - half_a` and `second` starts at
+            // `split + half_b`.
+            let (want, span, origin, min) = match axis {
+                SplitAxis::LeftRight => (
+                    if *done_h {
+                        None
+                    } else if in_first && edges.right {
+                        Some(target.loc.x + target.size.w + half_a)
+                    } else if in_second && !edges.right {
+                        Some(target.loc.x - half_b)
+                    } else {
+                        None
+                    },
+                    bounds.size.w,
+                    bounds.loc.x,
+                    MIN_TILE_W,
+                ),
+                SplitAxis::TopBottom => (
+                    if *done_v {
+                        None
+                    } else if in_first && edges.bottom {
+                        Some(target.loc.y + target.size.h + half_a)
+                    } else if in_second && !edges.bottom {
+                        Some(target.loc.y - half_b)
+                    } else {
+                        None
+                    },
+                    bounds.size.h,
+                    bounds.loc.y,
+                    MIN_TILE_H,
+                ),
+            };
+            if let Some(split) = want {
+                *ratio = ratio_for_divider(span, origin, split, min);
+                match axis {
+                    SplitAxis::LeftRight => *done_h = true,
+                    SplitAxis::TopBottom => *done_v = true,
+                }
+            }
+            true
+        }
+    }
+}
+
+/// The ratio that puts a split's divider at the absolute coordinate
+/// `split_px`, within a cell starting at `origin` and `span` px long.
+/// Clamped so neither side falls below `min` px.
+///
+/// Pure geometry, split out from [`resize_leaf`] because the clamp is
+/// the fiddly part: `lo`/`hi` stay ordered even when the span is
+/// narrower than two minimums (a very small cell), so `clamp` can never
+/// see `min > max` — which would panic.
+fn ratio_for_divider(span: i32, origin: i32, split_px: i32, min: i32) -> f32 {
+    let lo = min.min(span / 2);
+    let hi = (span - min).max(lo);
+    let split = (split_px - origin).clamp(lo, hi);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "both are output-bounded pixel counts; f32 is exact well past any real display size"
+    )]
+    let ratio = split as f32 / span.max(1) as f32;
+    ratio
+}
+
 fn push_configures_tree(node: &Node, border: i32, area: OutputArea) {
     match node {
         Node::Leaf(w) => push_configure_for_tile(w, border, area),
@@ -2364,4 +2589,79 @@ fn rect_contains(r: Rectangle<i32, Physical>, p: Point<i32, Physical>) -> bool {
         && p.x < r.loc.x + r.size.w
         && p.y >= r.loc.y
         && p.y < r.loc.y + r.size.h
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::{MIN_TILE_H, MIN_TILE_W, Point, Rectangle, ResizeEdges, Size, ratio_for_divider};
+
+    /// A divider dropped at the middle of a cell is a 0.5 ratio, and the
+    /// cell's absolute position is subtracted out (a second monitor's
+    /// tiles start at a large x).
+    #[test]
+    fn divider_maps_to_ratio_relative_to_the_cell() {
+        assert!((ratio_for_divider(1000, 0, 500, MIN_TILE_W) - 0.5).abs() < f32::EPSILON);
+        assert!((ratio_for_divider(1000, 1920, 2420, MIN_TILE_W) - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// Dragging a divider past either end leaves both cells at least the
+    /// minimum wide, so a neighbour can't be squeezed out of existence.
+    #[test]
+    fn divider_is_clamped_to_keep_both_cells_usable() {
+        let squashed_left = ratio_for_divider(1000, 0, -400, MIN_TILE_W);
+        let squashed_right = ratio_for_divider(1000, 0, 9999, MIN_TILE_W);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "test constants, far inside f32's exact-integer range"
+        )]
+        let min_ratio = MIN_TILE_W as f32 / 1000.0;
+        assert!((squashed_left - min_ratio).abs() < f32::EPSILON);
+        assert!((squashed_right - (1.0 - min_ratio)).abs() < f32::EPSILON);
+    }
+
+    /// A cell too narrow to hold two minimums must still produce a sane
+    /// ratio rather than panicking on an inverted clamp range.
+    #[test]
+    fn degenerate_cell_does_not_panic() {
+        let r = ratio_for_divider(100, 0, 9999, MIN_TILE_W);
+        assert!((0.0..=1.0).contains(&r), "ratio out of range: {r}");
+        let r = ratio_for_divider(1, 0, 0, MIN_TILE_H);
+        assert!((0.0..=1.0).contains(&r), "ratio out of range: {r}");
+    }
+
+    /// The press half picks the edge: the drag moves whichever edge the
+    /// cursor started nearest, so every tile is resizable from somewhere.
+    #[test]
+    fn press_half_picks_the_near_edge() {
+        let rect = Rectangle::new(Point::<i32, _>::new(100, 100), Size::new(400, 200));
+        let edges = |x, y| ResizeEdges::from_press(rect, Point::new(x, y));
+        assert_eq!(
+            edges(450, 250),
+            ResizeEdges {
+                right: true,
+                bottom: true
+            }
+        );
+        assert_eq!(
+            edges(150, 150),
+            ResizeEdges {
+                right: false,
+                bottom: false
+            }
+        );
+        assert_eq!(
+            edges(450, 150),
+            ResizeEdges {
+                right: true,
+                bottom: false
+            }
+        );
+        assert_eq!(
+            edges(150, 250),
+            ResizeEdges {
+                right: false,
+                bottom: true
+            }
+        );
+    }
 }

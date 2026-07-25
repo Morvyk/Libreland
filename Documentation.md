@@ -506,9 +506,17 @@ in `src/main.rs`.
 | `Super+F11`     | Toggle fullscreen on the focused window.             |
 | `Super+C`       | Close the focused window (`xdg_toplevel.close`).    |
 | `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled; drop on another monitor to move it there). |
-| `Super+RMB`-drag | Interactively resize the window under the cursor from its bottom-right corner (auto-floats it if tiled). |
+| `Super+RMB`-drag | Interactively resize the window under the cursor. Works on tiled and floating windows alike; the edges that follow the cursor are the ones nearest where you pressed, so press the right half to drag the right edge, the top-left quadrant to drag that corner, and so on. Not available on maximized/fullscreen windows (they own the whole output — un-fill first). |
 | `Super`+scroll down / up | Switch to the next / previous workspace on the output **under the cursor**. |
 | `Super+Shift`+scroll down / up | Move the focused window to the next / previous workspace on **its** output and follow it there. |
+
+Resizing a **tiled** window moves the split dividers on the edges you drag:
+the neighbouring cells give up exactly the space it gains, and the new
+proportions stick — they survive later reflows, so opening or closing another
+window keeps the ratio you set. An edge that has no divider (the outer edge of
+the last cell, which is the screen edge) simply doesn't move; grab the window's
+opposite half to drag the divider it *does* share with a neighbour. Resizing a
+**floating** window just moves its own edges.
 
 Workspaces are per-output and dynamic (niri-style): each output starts with
 one, scrolling down materializes a fresh empty workspace to move into, and

@@ -1000,6 +1000,32 @@ impl SurfaceEncodings {
 }
 
 /// Renderer for every connected output on a single GPU.
+/// Which windows skip the move animation while an interactive drag is
+/// in flight. A dragged window's rect changes every frame to track the
+/// cursor, so it must draw 1:1 or it visibly trails the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoAnim {
+    /// No drag: everything animates normally.
+    None,
+    /// A move drag — only the dragged window snaps; anything the layout
+    /// reflows around it should still animate.
+    One(ObjectId),
+    /// A resize drag — the dragged window *and* every neighbour it
+    /// reflows must snap, or the edge they share trails the divider.
+    All,
+}
+
+impl NoAnim {
+    /// Whether the window with this id must draw at its target rect now.
+    fn covers(&self, id: &ObjectId) -> bool {
+        match self {
+            Self::None => false,
+            Self::One(dragged) => dragged == id,
+            Self::All => true,
+        }
+    }
+}
+
 pub struct Renderer {
     /// Shared GLES2 renderer; owns the EGL context.
     gles: GlesRenderer,
@@ -1104,11 +1130,10 @@ pub struct Renderer {
     /// placements. Keyed separately from `win_anims` so a workspace switch
     /// (which surfaces a window without a fresh map) never triggers it.
     pending_open: HashSet<ObjectId>,
-    /// Surface currently under an interactive move/resize drag, if any.
-    /// Its rect changes every frame to track the cursor, so it must draw
-    /// 1:1 (no move animation) — otherwise it visibly trails the pointer.
-    /// Cleared on drop, which lets the window animate into its final tile.
-    no_anim_move: Option<ObjectId>,
+    /// Which windows skip the move animation while an interactive drag
+    /// is in flight (see [`NoAnim`]). Cleared on drop, which lets them
+    /// animate into their final tiles again.
+    no_anim: NoAnim,
     /// Windows mid close-animation: a snapshot texture taken the moment
     /// the toplevel was destroyed, fading + shrinking out where the
     /// window last sat. Drained as each finishes.
@@ -2558,7 +2583,7 @@ impl Renderer {
             decoration: DecorationConfig::default(),
             win_anims: HashMap::new(),
             pending_open: HashSet::new(),
-            no_anim_move: None,
+            no_anim: NoAnim::None,
             closing: Vec::new(),
             blur_down,
             blur_up,
@@ -3624,7 +3649,16 @@ impl Renderer {
     /// Set (`Some`) or clear (`None`) the window being interactively
     /// moved/resized, which draws 1:1 instead of animating its rect.
     pub fn set_no_anim_move(&mut self, surface: Option<&WlSurface>) {
-        self.no_anim_move = surface.map(Resource::id);
+        self.no_anim = surface.map_or(NoAnim::None, |s| NoAnim::One(s.id()));
+    }
+
+    /// Suppress the move animation for *every* window, not just one.
+    /// An interactive tiled resize reflows the dragged window's
+    /// neighbours as well: animating them would let the edge they share
+    /// with it trail the divider the user is dragging, which reads as
+    /// the cells coming apart. Cleared when the drag ends.
+    pub fn set_no_anim_all(&mut self, on: bool) {
+        self.no_anim = if on { NoAnim::All } else { NoAnim::None };
     }
 
     /// Begin a close animation for a toplevel that's being destroyed.
@@ -3938,14 +3972,14 @@ impl Renderer {
         let cfg = self.animations.clone();
         let move_enabled = cfg.enabled && cfg.window_move.enabled;
         let open_enabled = cfg.enabled && cfg.window_open.enabled;
-        let no_anim_move = self.no_anim_move.clone();
+        let no_anim = self.no_anim.clone();
 
         let mut draws = Vec::with_capacity(placements.len());
         for p in placements {
             let id = p.surface.id();
             let target = p.cell_rect;
             // The interactively dragged window tracks the cursor 1:1.
-            let snap = no_anim_move.as_ref() == Some(&id);
+            let snap = no_anim.covers(&id);
             let entry = self.win_anims.entry(id.clone()).or_insert_with(|| WindowAnim {
                 surface: p.surface.clone(),
                 target,

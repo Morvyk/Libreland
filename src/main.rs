@@ -617,6 +617,10 @@ pub(crate) struct DragState {
     /// Window rect at the moment the drag began. Motion deltas
     /// transform this into the current rect.
     pub(crate) rect_start: smithay::utils::Rectangle<i32, Physical>,
+    /// Which edges a [`DragMode::Resize`] moves, fixed at press time
+    /// from the half of the window the cursor was in. Unused by
+    /// [`DragMode::Move`].
+    pub(crate) edges: layout::ResizeEdges,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1550,14 +1554,37 @@ impl State {
                     self.layout.update_in_transit_rect(new_rect);
                 }
                 DragMode::Resize => {
-                    let new_rect = smithay::utils::Rectangle::new(
-                        drag.rect_start.loc,
-                        smithay::utils::Size::<i32, Physical>::new(
+                    // Only the pressed-nearest edge on each axis moves;
+                    // the opposite one stays anchored, so dragging the
+                    // left half grows the window leftwards. After the
+                    // minimum-size clamp the anchored edge must still
+                    // hold, hence deriving the origin from the width we
+                    // actually granted rather than from the raw delta.
+                    let (x, w) = if drag.edges.right {
+                        (
+                            drag.rect_start.loc.x,
                             (drag.rect_start.size.w + delta_x).max(MIN_DRAG_RESIZE_W),
+                        )
+                    } else {
+                        let w = (drag.rect_start.size.w - delta_x).max(MIN_DRAG_RESIZE_W);
+                        (drag.rect_start.loc.x + drag.rect_start.size.w - w, w)
+                    };
+                    let (y, h) = if drag.edges.bottom {
+                        (
+                            drag.rect_start.loc.y,
                             (drag.rect_start.size.h + delta_y).max(MIN_DRAG_RESIZE_H),
-                        ),
+                        )
+                    } else {
+                        let h = (drag.rect_start.size.h - delta_y).max(MIN_DRAG_RESIZE_H);
+                        (drag.rect_start.loc.y + drag.rect_start.size.h - h, h)
+                    };
+                    let new_rect = smithay::utils::Rectangle::new(
+                        Point::<i32, Physical>::new(x, y),
+                        smithay::utils::Size::<i32, Physical>::new(w, h),
                     );
-                    self.layout.set_floating_rect(&drag.surface, new_rect);
+                    // Floating takes the rect; a tile turns it into new
+                    // split ratios and reflows its neighbours.
+                    self.layout.apply_resize(&drag.surface, new_rect, drag.edges);
                 }
             }
             return;
@@ -1782,6 +1809,7 @@ impl State {
                 // Re-enable move animation for the window so it eases into
                 // its final tile (move) or stays put (resize).
                 self.renderer.set_no_anim_move(None);
+                self.renderer.set_no_anim_all(false);
             }
             return;
         }
@@ -1844,6 +1872,9 @@ impl State {
                         DragMode::Resize => self.layout.start_resize_drag(&surface),
                     };
                     if let Some(rect_start) = rect_start {
+                        // The press half fixes which edges follow the
+                        // cursor for the whole drag.
+                        let edges = layout::ResizeEdges::from_press(rect_start, cursor_i);
                         info!(
                             ?mode,
                             surface = ?surface.id(),
@@ -1851,28 +1882,42 @@ impl State {
                         );
                         // Draw the dragged window 1:1 with the cursor
                         // (no move-animation lag); it animates into place
-                        // on drop when the override is cleared.
-                        self.renderer.set_no_anim_move(Some(&surface));
+                        // on drop when the override is cleared. A resize
+                        // suppresses the animation for *every* window: a
+                        // tiled resize reflows the neighbours too, and
+                        // animating them would let the shared edge lag
+                        // behind the divider being dragged.
+                        if matches!(mode, DragMode::Resize) {
+                            self.renderer.set_no_anim_all(true);
+                        } else {
+                            self.renderer.set_no_anim_move(Some(&surface));
+                        }
                         self.drag = Some(DragState {
                             surface,
                             mode,
                             cursor_start: (cx, cy),
                             rect_start,
+                            edges,
                         });
                         // Show the gesture cursor for the drag: the
-                        // grabbing hand while moving, a resize cursor
-                        // while resizing. Overrides the client's cursor
-                        // until the drag ends.
+                        // grabbing hand while moving, the matching corner
+                        // arrow while resizing. Overrides the client's
+                        // cursor until the drag ends.
                         let icon = match mode {
                             DragMode::Move => CursorIcon::Grabbing,
-                            DragMode::Resize => CursorIcon::SeResize,
+                            DragMode::Resize => match (edges.right, edges.bottom) {
+                                (true, true) => CursorIcon::SeResize,
+                                (true, false) => CursorIcon::NeResize,
+                                (false, true) => CursorIcon::SwResize,
+                                (false, false) => CursorIcon::NwResize,
+                            },
                         };
                         self.renderer
                             .set_cursor_override(Some(CursorImageStatus::Named(icon)));
                     } else if matches!(mode, DragMode::Resize) {
                         warn!(
                             surface = ?surface.id(),
-                            "Super+RMB resize is only supported on floating windows; toggle floating (Super+F) first"
+                            "Super+RMB resize needs a normal window; unmaximize / leave fullscreen first"
                         );
                     }
                     // Either way we don't forward this press to
