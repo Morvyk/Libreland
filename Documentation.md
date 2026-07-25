@@ -683,7 +683,8 @@ the full usage.
 
 | Command                                      | Effect                                                              |
 | -------------------------------------------- | ------------------------------------------------------------------- |
-| `focus-window <id>`                          | Focus a window, revealing its workspace first.                      |
+| `focus-window <id> [--warp]`                 | Focus a window, revealing its workspace first. `--warp` also moves the pointer to its centre. |
+| `warp-cursor <id>`                           | Move the pointer to a window's centre without changing focus.        |
 | `close [id]`                                 | Ask a window to close.                                              |
 | `toggle-floating [id]`                       | Flip tiled ↔ floating.                                              |
 | `toggle-fullscreen [id]`                     | Flip fullscreen.                                                    |
@@ -696,6 +697,23 @@ the full usage.
 
 `move-to-workspace` only acts on a window that's currently on a visible
 (active) workspace.
+
+Under `focus_model = "hover"`, plain `focus-window` doesn't stick: the
+pointer hasn't moved, so the next mouse movement re-focuses whatever is
+still under it. Use `focus-window <id> --warp` for window switchers and
+"jump to window" scripts — it brings the pointer along, so the focus
+survives. Plain `focus-window` remains right for callers that
+deliberately want the pointer left alone.
+
+`warp-cursor` is the pointer half on its own (park the cursor to prime a
+click, nudge it out of the way) with focus untouched. Both warp paths
+refuse — reporting why — while an interactive gesture owns the pointer (a
+compositor drag, a screenshot selection, a client grab), while a client
+holds a pointer lock (a game that grabbed the cursor keeps it), and for a
+window that isn't on a visible workspace. `focus-window --warp` is
+unaffected by that last case: it reveals the target's workspace before
+warping. A refused warp there still focuses the window (the refusal is
+logged, not returned as an error); `warp-cursor` returns the reason.
 
 ### Event stream
 
@@ -722,6 +740,8 @@ Raw event lines are internally tagged on an `event` field, e.g.
 
     libreland msg windows                 # list windows + their ids
     libreland msg focus-window 3          # focus window id 3
+    libreland msg focus-window 3 --warp   # …and bring the pointer with it
+    libreland msg warp-cursor 3           # move the pointer there, keep focus
     libreland msg focus-workspace next    # next workspace on the primary output
     libreland msg move-to-workspace 2     # move the focused window to workspace 2
     libreland msg spawn kitty --hold      # launch a program

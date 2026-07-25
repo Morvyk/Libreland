@@ -1366,6 +1366,20 @@ impl State {
     /// visible locked surface must not receive a synthetic absolute
     /// motion (pointer-constraints forbids motion events while locked).
     pub(crate) fn refresh_pointer_focus(&mut self) {
+        self.resend_pointer_focus(false);
+    }
+
+    /// Body of [`Self::refresh_pointer_focus`], plus the forced variant the
+    /// pointer-warp path needs.
+    ///
+    /// `force` sends the motion even when the hit surface is unchanged:
+    /// after an explicit warp the cursor really did move, so the client
+    /// must see a `wl_pointer.motion` carrying the new surface-local
+    /// position or its hover state stays stale. Only force after ruling
+    /// out an active pointer lock — the constraints protocol forbids
+    /// motion events while locked, which is exactly what the unforced
+    /// early-return protects (see the doc above).
+    fn resend_pointer_focus(&mut self, force: bool) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -1379,7 +1393,7 @@ impl State {
         )]
         let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
         let (hit, _, _) = self.pointer_hit_test(cursor_i);
-        if pointer.current_focus() == hit.as_ref().map(|(surface, _)| surface.clone()) {
+        if !force && pointer.current_focus() == hit.as_ref().map(|(surface, _)| surface.clone()) {
             return;
         }
         pointer.motion(
@@ -1392,6 +1406,69 @@ impl State {
             },
         );
         pointer.frame(self);
+    }
+
+    /// Warp the pointer to the centre of `surface`'s window and re-home
+    /// pointer focus there. `Err` carries why the warp was refused.
+    ///
+    /// Deliberately *not* part of [`Self::focus_surface`]: that is also
+    /// driven by `xdg_activation`, so a client raising itself (a link
+    /// click opening a browser) would yank the user's pointer across the
+    /// desk. Only an explicit IPC request reaches here.
+    ///
+    /// Refused when something else owns the pointer — a compositor drag,
+    /// a screenshot selection, a client grab (menus route by position) —
+    /// or while a client holds an active pointer lock: a game that
+    /// grabbed the cursor keeps it. Also refused for a window that isn't
+    /// currently visible, since its cell coordinates then land the cursor
+    /// on whatever occupies that space on the active workspace. (The
+    /// `focus-window --warp` path reveals the workspace first, so by the
+    /// time it warps the window *is* visible.)
+    pub(crate) fn warp_pointer_to_window(&mut self, surface: &WlSurface) -> Result<(), &'static str> {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return Err("no pointer on the seat");
+        };
+        if self.drag.is_some() || self.screenshot.is_some() || pointer.is_grabbed() {
+            return Err("an interactive gesture owns the pointer");
+        }
+        if self.pointer_locked() {
+            return Err("a client holds the pointer locked");
+        }
+        let Some(entry) = self
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| &e.surface == surface)
+        else {
+            return Err("target is not a managed window");
+        };
+        if self.layout.active_workspace(&entry.output) != Some(entry.workspace) {
+            return Err("window is not on a visible workspace");
+        }
+        let r = entry.rect;
+        // A window that has never been laid out has no meaningful centre.
+        if r.size.w <= 0 || r.size.h <= 0 {
+            return Err("window has no laid-out geometry yet");
+        }
+        // `WindowEntry::rect` is already absolute compositor (= logical)
+        // pixels — the cursor's own space, so no scale conversion.
+        let (tx, ty) = (
+            f64::from(r.loc.x + r.size.w / 2),
+            f64::from(r.loc.y + r.size.h / 2),
+        );
+        let (cx, cy) = self.renderer.cursor_pos();
+        // Takes a delta and clamps to the layout bounds, same as libinput
+        // motion — a centre outside the bounds can't strand the cursor.
+        self.renderer.on_pointer_motion(tx - cx, ty - cy);
+        self.resend_pointer_focus(true);
+        // Repaint only when the cursor isn't carried by the hardware plane
+        // (or something composited tracks it) — same rule as the
+        // physical-motion path, so a warp can't cost a fullscreen game a
+        // spurious full redraw.
+        if self.renderer.has_dnd_icon() || !self.renderer.move_hw_cursor() {
+            self.queue_redraw_all();
+        }
+        Ok(())
     }
 
     /// Forward the current cursor location to the focused client as

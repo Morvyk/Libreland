@@ -55,8 +55,18 @@ pub enum Request {
     },
 
     // --- actions ---
-    /// Focus a window by id (revealing its workspace first).
-    FocusWindow { id: u64 },
+    /// Focus a window by id (revealing its workspace first). With `warp`,
+    /// also move the pointer to the window's centre — which is what makes
+    /// programmatic focus stick under `focus_model = "hover"`, where the
+    /// next pointer motion otherwise hands focus straight back to whatever
+    /// sits under the un-moved cursor.
+    FocusWindow {
+        id: u64,
+        #[serde(default)]
+        warp: bool,
+    },
+    /// Move the pointer to a window's centre without touching focus.
+    WarpCursor { id: u64 },
     /// Close a window (the focused one if `id` is omitted).
     Close {
         #[serde(default)]
@@ -314,7 +324,7 @@ mod server {
     use smithay::utils::{IsAlive, SERIAL_COUNTER};
     use smithay::wayland::compositor::with_states;
     use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-    use tracing::{info, warn};
+    use tracing::{debug, info, warn};
 
     use super::{
         BindInfo, CursorInfo, Event, EventKind, LayerInfo, OutputInfo, Reply, Request, Response,
@@ -780,7 +790,8 @@ mod server {
             Request::Binds => Ok(Response::Binds(binds(state))),
             Request::Cursor => cursor(state),
             Request::CaptureWindow { id, max } => capture_window(state, id, max),
-            Request::FocusWindow { id } => focus_window(state, id),
+            Request::FocusWindow { id, warp } => focus_window(state, id, warp),
+            Request::WarpCursor { id } => warp_cursor(state, id),
             Request::Close { id } => close_window(state, id),
             Request::ToggleFloating { id } => toggle(state, id, Layout::toggle_floating),
             Request::ToggleFullscreen { id } => toggle(state, id, Layout::toggle_fullscreen),
@@ -872,9 +883,29 @@ mod server {
         }
     }
 
-    fn focus_window(state: &mut State, id: u64) -> Reply {
+    fn focus_window(state: &mut State, id: u64, warp: bool) -> Reply {
         let surface = resolve(state, Some(id))?;
         state.focus_surface(&surface);
+        if warp {
+            // Focus already succeeded and revealed the workspace, so a
+            // refused warp (pointer busy, locked by a game) isn't worth
+            // failing the request over — say so in the log and move on.
+            if let Err(reason) = state.warp_pointer_to_window(&surface) {
+                debug!(id, reason, "IPC: focus-window --warp: pointer not warped");
+            }
+        }
+        Ok(Response::Handled)
+    }
+
+    /// Move the pointer to a window's centre, leaving focus alone. The
+    /// keyboard-focus half of `focus-window --warp`, split out for
+    /// callers that want to park the cursor (prime a click, nudge it out
+    /// of the way) without disturbing what's focused.
+    fn warp_cursor(state: &mut State, id: u64) -> Reply {
+        let surface = resolve(state, Some(id))?;
+        state
+            .warp_pointer_to_window(&surface)
+            .map_err(str::to_owned)?;
         Ok(Response::Handled)
     }
 
@@ -1416,7 +1447,17 @@ mod client {
             max: Option<i32>,
         },
         /// Focus a window by id (revealing its workspace).
-        FocusWindow { id: u64 },
+        FocusWindow {
+            id: u64,
+            /// Also move the pointer to the window's centre. Needed for
+            /// focus to stick under `focus_model = "hover"`, where the
+            /// next mouse movement otherwise refocuses whatever is under
+            /// the (un-moved) cursor.
+            #[arg(long)]
+            warp: bool,
+        },
+        /// Move the pointer to a window's centre, leaving focus alone.
+        WarpCursor { id: u64 },
         /// Close a window (the focused one if no id is given).
         Close { id: Option<u64> },
         /// Toggle a window between tiled and floating.
@@ -1468,7 +1509,11 @@ mod client {
                 Command::Binds => Request::Binds,
                 Command::Cursor => Request::Cursor,
                 Command::CaptureWindow { id, max } => Request::CaptureWindow { id: *id, max: *max },
-                Command::FocusWindow { id } => Request::FocusWindow { id: *id },
+                Command::FocusWindow { id, warp } => Request::FocusWindow {
+                    id: *id,
+                    warp: *warp,
+                },
+                Command::WarpCursor { id } => Request::WarpCursor { id: *id },
                 Command::Close { id } => Request::Close { id: *id },
                 Command::ToggleFloating { id } => Request::ToggleFloating { id: *id },
                 Command::ToggleFullscreen { id } => Request::ToggleFullscreen { id: *id },
@@ -1814,12 +1859,33 @@ mod tests {
             Request::FocusedWindow,
             Request::Binds,
             Request::Cursor,
+            Request::FocusWindow {
+                id: 7,
+                warp: false,
+            },
+            Request::FocusWindow { id: 7, warp: true },
+            Request::WarpCursor { id: 7 },
         ] {
             let json = serde_json::to_string(&req).unwrap();
             let back: Request = serde_json::from_str(&json).unwrap();
             // Re-serializing the decoded value must reproduce the wire form.
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+    }
+
+    /// `warp` was added to `focus-window` after the fact, so a client
+    /// written against the older wire form (no `warp` key) must still
+    /// parse — and must mean "don't warp".
+    #[test]
+    fn focus_window_warp_defaults_off() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"focus-window","id":3}"#).unwrap();
+        assert!(matches!(
+            req,
+            Request::FocusWindow {
+                id: 3,
+                warp: false
+            }
+        ));
     }
 
     #[test]
