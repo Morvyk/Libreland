@@ -200,6 +200,10 @@ pub(crate) struct State {
     /// `NET_WM_STATE` fill (see `xwayland::x11_fill_request`). Keyed by
     /// X window id; entries are dropped when the window unmaps.
     pub(crate) x11_fill_flips: std::collections::HashMap<u32, crate::xwayland::FillFlipGuard>,
+    /// A modifier-tap bind that is armed: its key is down, nothing else
+    /// has happened since, and releasing it fires the action. See
+    /// [`State::update_tap_state`].
+    pub(crate) tap_pending: Option<TapPending>,
     /// Which selections (clipboard / primary) are currently owned by an
     /// X11 client. Routes Wayland-side paste requests back through the
     /// XWM instead of the compositor's clipboard cache.
@@ -627,6 +631,16 @@ pub(crate) enum CapturePurpose {
     },
 }
 
+/// An armed modifier-tap bind: the bound modifier is currently held,
+/// nothing else has happened since it went down, and releasing it will
+/// fire `action`. See [`State::update_tap_state`].
+#[derive(Debug, Clone)]
+pub(crate) struct TapPending {
+    /// The folded keysym that armed this — only its own release fires.
+    keysym: keyboard::Keysym,
+    action: config::Action,
+}
+
 /// In-progress interactive drag. The dragged surface is always
 /// floating (we promote it on drag start if it was tiled).
 #[derive(Debug, Clone)]
@@ -717,6 +731,9 @@ impl State {
         // swallowed (intercepted, never forwarded to a client). We still
         // pump kbd.input so smithay's modifier bookkeeping stays in sync.
         if self.screenshot.is_some() {
+            // The screenshot UI owns the screen; a tap armed before it
+            // opened must not fire behind it.
+            self.tap_pending = None;
             if pressed {
                 use xkbcommon::xkb::keysyms;
                 match result.keysym.raw() {
@@ -747,16 +764,22 @@ impl State {
         // surface (which holds keyboard focus) so the password can be
         // typed; the compositor enforces this regardless of the user's
         // configured binds.
+        // A bind whose key is a held modifier is a TAP bind and is matched
+        // on release instead (`update_tap_state`) — matching it here would
+        // fire it on the press that opens every combo built on that
+        // modifier, and swallow the modifier on the way to the client.
+        let press_match = |keysym: keyboard::Keysym, mods: u32| {
+            !keyboard::is_modifier_keysym(keysym)
+                && keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(keysym)
+                && result.has_all_mods(mods)
+        };
         let matched_action = if pressed && !self.session_locked {
             let normal = self
                 .config
                 .binds
                 .bindings
                 .iter()
-                .find(|b| {
-                    keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
-                        && result.has_all_mods(b.mods)
-                })
+                .find(|b| press_match(b.keysym, b.mods))
                 .map(|b| b.action.clone());
             // Screenshot binds (if configured) are matched the same way;
             // normal binds win a tie.
@@ -764,16 +787,18 @@ impl State {
                 self.config.screenshot.as_ref().and_then(|binds| {
                     binds
                         .iter()
-                        .find(|b| {
-                            keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
-                                && result.has_all_mods(b.mods)
-                        })
+                        .find(|b| press_match(b.keysym, b.mods))
                         .map(|b| config::Action::Screenshot(std::sync::Arc::new(b.clone())))
                 })
             })
         } else {
             None
         };
+
+        // Modifier-tap binds are decided here, but never intercept: the
+        // client must see the modifier's press and release like any other
+        // key, or its own modifier state drifts out of sync with ours.
+        let tap_action = self.update_tap_state(pressed, &result);
 
         let key_code = event.key_code();
         let key_state = event.state();
@@ -792,9 +817,111 @@ impl State {
                 matched_action.map_or(FilterResult::Forward, FilterResult::Intercept)
             },
         );
-        if let Some(action) = action {
+        // At most one of the two can be set — an intercept only comes from
+        // a press, a tap only from a release — and the tap's own release
+        // has already been forwarded above.
+        if let Some(action) = action.or(tap_action) {
             self.dispatch_action(action);
         }
+    }
+
+    /// Advance the modifier-tap state machine for one key event, and
+    /// return the action to fire if this event completed a tap.
+    ///
+    /// A bind whose key is a bare modifier keysym (`Super_L`, `Alt_R`, …)
+    /// cannot usefully fire on press: that same press begins every combo
+    /// built on the modifier, so `Super+Return` would run the Super bind
+    /// first and the terminal second. Such a bind is therefore matched as
+    /// a *tap* — it fires on release, and only if the modifier went down
+    /// and came back up with nothing in between:
+    ///
+    /// - armed on press, but only when no other key is already held;
+    /// - cancelled here by any other key press and by the release of a
+    ///   different key, and from the input loop by any pointer button,
+    ///   scroll or touchpad gesture (`Super`+drag and `Super`+wheel are
+    ///   compositor gestures, so they must not leave a tap armed behind
+    ///   them);
+    /// - never fires while the session is locked or a screenshot session
+    ///   owns the screen, exactly like every other bind.
+    ///
+    /// A tap bind with `mods` can never arm — the modifiers would have to
+    /// be held, and arming requires nothing else to be — so `parse_bind`
+    /// warns about one at load time rather than leaving it silently inert.
+    ///
+    /// There is deliberately no hold timeout: the tap is cancelled by
+    /// *doing* something, not by time, which is how the same gesture
+    /// behaves on Windows and GNOME. Holding the modifier for a while and
+    /// releasing it still fires.
+    fn update_tap_state(
+        &mut self,
+        pressed: bool,
+        result: &keyboard::KeyResult,
+    ) -> Option<config::Action> {
+        if self.session_locked {
+            self.tap_pending = None;
+            return None;
+        }
+        let folded = keyboard::fold_keysym(result.keysym);
+        if !pressed {
+            // Taking unconditionally is the cancel for "released some
+            // other key while a tap was armed".
+            let pending = self.tap_pending.take()?;
+            if pending.keysym != folded {
+                return None;
+            }
+            debug!(keysym = ?result.keysym, "tap bind fired");
+            return Some(pending.action);
+        }
+        // Any press supersedes a pending tap, including a second modifier.
+        self.tap_pending = None;
+        if !keyboard::is_modifier_keysym(result.keysym) {
+            return None;
+        }
+        // Only arm when this modifier is the only key down. xkb has
+        // already seen this press but smithay has not (`kbd.input` runs
+        // after us), so a non-empty pressed set means something else is
+        // being held and this modifier is qualifying it, not being tapped.
+        if self
+            .seat
+            .get_keyboard()
+            .is_some_and(|kbd| !kbd.pressed_keys().is_empty())
+        {
+            return None;
+        }
+        let tap_match = |keysym: keyboard::Keysym, mods: u32| {
+            keyboard::is_modifier_keysym(keysym)
+                && keyboard::fold_keysym(keysym) == folded
+                && result.has_all_mods(mods)
+        };
+        let action = self
+            .config
+            .binds
+            .bindings
+            .iter()
+            .find(|b| tap_match(b.keysym, b.mods))
+            .map(|b| b.action.clone())
+            // Screenshot binds follow the same rule, and lose the same tie.
+            .or_else(|| {
+                self.config.screenshot.as_ref().and_then(|binds| {
+                    binds
+                        .iter()
+                        .find(|b| tap_match(b.keysym, b.mods))
+                        .map(|b| config::Action::Screenshot(std::sync::Arc::new(b.clone())))
+                })
+            })?;
+        debug!(keysym = ?result.keysym, "tap bind armed");
+        self.tap_pending = Some(TapPending {
+            keysym: folded,
+            action,
+        });
+        None
+    }
+
+    /// Cancel an armed modifier tap. Called from the input loop for every
+    /// pointer event that means the held modifier is qualifying something
+    /// rather than being tapped — see the call site for the list.
+    fn cancel_tap(&mut self) {
+        self.tap_pending = None;
     }
 
     /// Whether the focused surface currently holds an *active*
@@ -983,6 +1110,9 @@ impl State {
     /// confirms the lock.
     pub(crate) fn on_session_locked(&mut self) {
         self.session_locked = true;
+        // A tap armed a moment before the lock engaged must not fire into
+        // the locked session on release.
+        self.tap_pending = None;
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
@@ -4424,6 +4554,7 @@ fn main() -> Result<()> {
         x11_or_windows: Vec::new(),
         x11_kbd_focus: None,
         x11_fill_flips: std::collections::HashMap::new(),
+        tap_pending: None,
         x11_owns_selection: crate::xwayland::X11SelectionOwnership::default(),
         xwayland_shell_state: wayland_init.xwayland_shell_state,
         display_handle: wayland_init.display_handle,
@@ -4948,6 +5079,24 @@ fn wire_event_sources(
                     | InputEvent::PointerAxis { .. }
             ) {
                 state.note_input_activity();
+            }
+            // Anything the user does with the pointer while a modifier is
+            // held means that modifier is qualifying the gesture, not being
+            // tapped: `Super`+drag moves a window, `Super`+wheel switches
+            // workspace, and a touchpad gesture under `Super` is still a
+            // deliberate act. Cancelling here rather than inside each
+            // handler keeps the whole list of tap-cancelling events in one
+            // readable place (key events are handled by
+            // `State::update_tap_state` instead).
+            if matches!(
+                event,
+                InputEvent::PointerButton { .. }
+                    | InputEvent::PointerAxis { .. }
+                    | InputEvent::GestureSwipeBegin { .. }
+                    | InputEvent::GesturePinchBegin { .. }
+                    | InputEvent::GestureHoldBegin { .. }
+            ) {
+                state.cancel_tap();
             }
             match event {
                 InputEvent::Keyboard { event: ke } => state.handle_key(&ke),

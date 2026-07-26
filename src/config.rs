@@ -852,13 +852,15 @@ fn parse_binds(t: &Table, defaults: BindsConfig) -> mlua::Result<BindsConfig> {
 }
 
 fn parse_bind(t: &Table) -> mlua::Result<KeyBinding> {
-    let mods_table: Table = t
-        .get("mods")
-        .context("missing or invalid `mods` (expected array of modifier names)")?;
+    // `mods` is optional — a bare `Print`, a media key, or a modifier-tap
+    // bind like `{ key = "Super_L" }` has none. (It used to be required
+    // here while `screenshot` binds already allowed omitting it.)
     let mut mods: u32 = 0;
-    for (i, entry) in mods_table.sequence_values::<String>().enumerate() {
-        let name = entry.with_context(|_| format!("mods[{i}] not a string"))?;
-        mods |= parse_modifier(&name).with_context(|_| format!("mods[{i}]"))?;
+    if let Some(mods_table) = t.get::<Option<Table>>("mods")? {
+        for (i, entry) in mods_table.sequence_values::<String>().enumerate() {
+            let name = entry.with_context(|_| format!("mods[{i}] not a string"))?;
+            mods |= parse_modifier(&name).with_context(|_| format!("mods[{i}]"))?;
+        }
     }
 
     let key_name: String = t
@@ -869,6 +871,19 @@ fn parse_bind(t: &Table) -> mlua::Result<KeyBinding> {
         lua_bail!(
             "unknown key name {key_name:?}; must be a name xkbcommon's \
              xkb_keysym_from_name accepts (e.g. \"E\", \"Return\", \"F1\", \"space\")"
+        );
+    }
+
+    // A bind on a held modifier fires as a TAP (on release, in isolation),
+    // and arming it requires that modifier to be the only key down — so
+    // asking for extra modifiers as well describes something that can
+    // never happen. Warn rather than bail: the rest of the config is fine
+    // and the user gets told exactly why this line does nothing.
+    if keyboard::is_modifier_keysym(keysym) && mods != 0 {
+        tracing::warn!(
+            key = %key_name,
+            "config: a bind on a modifier key fires as a tap (press and release it alone), \
+             so it cannot also require `mods` — this bind will never fire"
         );
     }
 
@@ -1308,6 +1323,60 @@ fn parse_rgb_triple(t: &Table) -> mlua::Result<[f32; 3]> {
         }
     }
     Ok([values[0], values[1], values[2]])
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Config {
+        let lua = Lua::new();
+        lua.load(src).exec().expect("lua exec");
+        Config::populate_from_globals(&lua.globals()).expect("populate")
+    }
+
+    fn find(c: &Config, keysym: Keysym) -> Option<&KeyBinding> {
+        c.binds.bindings.iter().find(|b| b.keysym == keysym)
+    }
+
+    #[test]
+    fn mods_are_optional() {
+        let c = parse(r#"binds = { { key = "Super_L", action = "close" } }"#);
+        let bind = find(&c, Keysym::Super_L).expect("bind parsed without `mods`");
+        assert_eq!(bind.mods, 0);
+        assert_eq!(bind.action, Action::Close);
+    }
+
+    #[test]
+    fn a_modifier_key_bind_is_a_tap_bind() {
+        // Nothing in the config marks it — the keysym is what makes it one.
+        let c = parse(r#"binds = { { mods = {}, key = "Super_L", action = "close" } }"#);
+        let bind = find(&c, Keysym::Super_L).expect("bind present");
+        assert!(keyboard::is_modifier_keysym(bind.keysym));
+        // …and the defaults are all ordinary press binds.
+        for b in &c.binds.bindings {
+            assert_eq!(
+                keyboard::is_modifier_keysym(b.keysym),
+                b.keysym == Keysym::Super_L,
+                "unexpected modifier-key default bind: {:?}",
+                b.keysym
+            );
+        }
+    }
+
+    #[test]
+    fn user_binds_still_override_defaults_by_trigger() {
+        let c = parse(
+            r#"binds = { { mods = {"super", "shift"}, key = "E", action = "close" } }"#,
+        );
+        let bind = find(&c, Keysym::E).expect("default Super+Shift+E present");
+        assert_eq!(bind.action, Action::Close, "user action replaced the default");
+        assert_eq!(
+            c.binds.bindings.iter().filter(|b| b.keysym == Keysym::E).count(),
+            1,
+            "override must not append a duplicate"
+        );
+    }
 }
 
 #[cfg(test)]

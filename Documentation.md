@@ -271,6 +271,11 @@ idle = {
 Anything xkbcommon's `xkb_keysym_from_name` accepts — `"E"`,
 `"Return"`, `"F1"`, `"space"`, `"comma"`, …
 
+A modifier key on its own (`"Super_L"`, `"Super_R"`, `"Alt_L"`,
+`"Control_R"`, `"Shift_L"`, `"Meta_*"`, `"Hyper_*"`, `"ISO_Level3_Shift"`)
+is also a valid key, and binds to a **tap** — see
+[tap binds](#tap-binds-bare-super-etc) below.
+
 ### Actions
 
 | Action              | Effect                                                                                                       |
@@ -318,7 +323,8 @@ the runtime today (✅) or just held in `Config` for a later consumer
 
 A list of keybindings. A press matches when its xkb keysym equals the
 binding's `keysym` **and** every modifier in the binding's `mods` mask is
-held. Extras like `NumLock` are tolerated. First match wins.
+held. Extras like `NumLock` are tolerated. First match wins. `mods` may
+be omitted entirely for a bind that needs none.
 
 Built-in defaults:
 
@@ -335,6 +341,48 @@ touch stays active. So adding a single `Super+Space` bind keeps
 
 Available actions today: `exit`, `togglefloating`, `togglefullscreen`,
 `close`, `spawn`. The list grows as we add `reload`, `change_vt`, …
+
+#### Tap binds (bare `Super`, etc.)
+
+Bind a **modifier key by itself** and it fires on *tap* — press and
+release it alone — which is how a launcher is usually opened:
+
+```lua
+binds = {
+    { key = "Super_L", action = "spawn", command = "qs ipc call launcher toggle" },
+}
+```
+
+There is no flag to set: a bind whose `key` is a held modifier
+(`Super_L`, `Alt_R`, `Control_L`, `Shift_R`, `Meta_*`, `Hyper_*`,
+`ISO_Level3_Shift`, `ISO_Level5_Shift`) is a tap bind, because firing one
+on *press* would fire it at the start of every combo built on that
+modifier — `Super+Return` would open your launcher and then the terminal.
+
+The tap fires on release, and only if the modifier went down and came
+back up with nothing in between. It is cancelled by:
+
+- any other key pressed while it was held (`Super+Return`, `Super+C`, …);
+- any pointer button (`Super`+drag to move, `Super`+right-drag to resize);
+- any scroll (`Super`+wheel switches workspace);
+- the session locking, or a screenshot session opening.
+
+Notes:
+
+- There is **no hold timeout** — the tap is cancelled by *doing*
+  something, not by time, so holding `Super` for a while and then
+  releasing it still fires. (Windows and GNOME behave the same way.)
+- The modifier's press and release are still delivered to the focused
+  client as normal, so client-side modifier state stays correct. A tap
+  bind is the one kind of bind that doesn't swallow its key.
+- Like every other bind, it cannot fire while the session is locked.
+- `mods` on a tap bind can never match (arming requires the modifier to
+  be the only key down), so the compositor logs a warning and the bind
+  stays inert. Write `{ key = "Super_L", … }`, not
+  `{ mods = {"shift"}, key = "Super_L", … }`.
+- The lock keys (`Caps_Lock`, `Num_Lock`, `Scroll_Lock`) are *not* tap
+  keys: they toggle state on press, so a bind on one keeps firing on
+  press.
 
 ### misc
 

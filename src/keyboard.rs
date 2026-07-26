@@ -50,6 +50,39 @@ pub fn fold_keysym(k: Keysym) -> Keysym {
     }
 }
 
+/// Whether `k` is a *held* modifier key — the ones that mean nothing on
+/// their own and exist to qualify another key.
+///
+/// A bind whose key is one of these can only sensibly mean "tap it"
+/// (see `State::update_tap_state`), because its press is also the press
+/// that begins every combo built on it.
+///
+/// The latching locks (`Caps_Lock`, `Num_Lock`, `Shift_Lock`,
+/// `Scroll_Lock`) are deliberately NOT here: they toggle a state on
+/// press, so a plain press-bind on one is already meaningful and must
+/// keep working.
+#[must_use]
+pub fn is_modifier_keysym(k: Keysym) -> bool {
+    use xkbcommon::xkb::keysyms;
+    matches!(
+        k.raw(),
+        keysyms::KEY_Shift_L
+            | keysyms::KEY_Shift_R
+            | keysyms::KEY_Control_L
+            | keysyms::KEY_Control_R
+            | keysyms::KEY_Meta_L
+            | keysyms::KEY_Meta_R
+            | keysyms::KEY_Alt_L
+            | keysyms::KEY_Alt_R
+            | keysyms::KEY_Super_L
+            | keysyms::KEY_Super_R
+            | keysyms::KEY_Hyper_L
+            | keysyms::KEY_Hyper_R
+            | keysyms::KEY_ISO_Level3_Shift
+            | keysyms::KEY_ISO_Level5_Shift
+    )
+}
+
 /// Outcome of feeding a single libinput key event through xkbcommon:
 /// the layout-aware keysym at this moment (with modifier effects
 /// applied — `Shift+e` becomes `Keysym::E`), and a bitmask of the
@@ -144,5 +177,56 @@ impl Keyboard {
             mods |= MOD_SUPER;
         }
         mods
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Keysym, fold_keysym, is_modifier_keysym};
+
+    #[test]
+    fn held_modifiers_are_recognised() {
+        for k in [
+            Keysym::Super_L,
+            Keysym::Super_R,
+            Keysym::Alt_L,
+            Keysym::Alt_R,
+            Keysym::Control_L,
+            Keysym::Control_R,
+            Keysym::Shift_L,
+            Keysym::Shift_R,
+            Keysym::Meta_L,
+            Keysym::Hyper_R,
+            Keysym::ISO_Level3_Shift,
+        ] {
+            assert!(is_modifier_keysym(k), "{k:?} should be a held modifier");
+        }
+    }
+
+    #[test]
+    fn ordinary_and_latching_keys_are_not() {
+        // Latching locks keep their press semantics on purpose.
+        for k in [
+            Keysym::Caps_Lock,
+            Keysym::Num_Lock,
+            Keysym::Scroll_Lock,
+            Keysym::a,
+            Keysym::E,
+            Keysym::Return,
+            Keysym::F1,
+            Keysym::space,
+            Keysym::Print,
+        ] {
+            assert!(!is_modifier_keysym(k), "{k:?} should not be a held modifier");
+        }
+    }
+
+    #[test]
+    fn folding_leaves_modifier_keysyms_alone() {
+        // The tap path compares folded keysyms; folding must be a no-op
+        // here or a bind would never match its own release.
+        for k in [Keysym::Super_L, Keysym::Alt_R, Keysym::Shift_L] {
+            assert_eq!(fold_keysym(k), k);
+        }
     }
 }
