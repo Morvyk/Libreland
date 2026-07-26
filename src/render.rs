@@ -1776,6 +1776,78 @@ fn output_compositor_size(mode: Size<i32, Physical>, scale: f64) -> Size<i32, Ph
     )
 }
 
+/// The scale that maps an output's `compositor` rect onto its `mode`
+/// pixels without losing one to rounding — see
+/// [`Renderer::xwayland_client_scale`], which is the only caller and
+/// carries the full story. The larger axis ratio wins so neither axis
+/// can round short; `fallback` covers a degenerate (zero-sized, or
+/// mid-teardown) output, since every consumer divides by this number.
+fn client_scale_for(
+    mode: Size<i32, Physical>,
+    compositor: Size<i32, Physical>,
+    fallback: f64,
+) -> f64 {
+    if compositor.w <= 0 || compositor.h <= 0 {
+        return fallback;
+    }
+    let ratio = (f64::from(mode.w) / f64::from(compositor.w))
+        .max(f64::from(mode.h) / f64::from(compositor.h));
+    if ratio.is_finite() && ratio > 0.0 {
+        ratio
+    } else {
+        fallback
+    }
+}
+
+#[cfg(test)]
+mod client_scale_tests {
+    use super::{client_scale_for, output_compositor_size};
+    use smithay::utils::{Physical, Size};
+
+    /// smithay's own logical→client conversion (`to_client_precise_round`):
+    /// multiply by the scale, round each axis independently.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "test sizes are display pixels; the product is a few thousand"
+    )]
+    fn to_client(logical: i32, scale: f64) -> i32 {
+        (f64::from(logical) * scale).round() as i32
+    }
+
+    #[test]
+    fn derived_scale_round_trips_a_full_output_rect() {
+        // The box this was reported on: 4K panel, configured scale 1.35.
+        let mode = Size::<i32, Physical>::from((3840, 2160));
+        let comp = output_compositor_size(mode, 1.35);
+        assert_eq!((comp.w, comp.h), (2844, 1600));
+        // The configured scale loses a pixel on the way back — this is the
+        // bug: a "fullscreen" X11 window that doesn't reach the X screen's
+        // right edge, so Wine strips _NET_WM_STATE_FULLSCREEN and the
+        // fullscreen⇄tiled fight starts.
+        assert_eq!(to_client(comp.w, 1.35), 3839);
+        // The derived scale covers both axes, exactly on the wide one.
+        let derived = client_scale_for(mode, comp, 1.35);
+        assert_eq!(to_client(comp.w, derived), mode.w);
+        assert!(to_client(comp.h, derived) >= mode.h);
+    }
+
+    #[test]
+    fn derived_scale_is_the_configured_one_when_the_mode_divides_evenly() {
+        let mode = Size::<i32, Physical>::from((3840, 2160));
+        let comp = output_compositor_size(mode, 2.0);
+        assert_eq!((comp.w, comp.h), (1920, 1080));
+        assert!((client_scale_for(mode, comp, 2.0) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn degenerate_output_falls_back_instead_of_handing_out_zero() {
+        let mode = Size::<i32, Physical>::from((3840, 2160));
+        let zero = Size::<i32, Physical>::from((0, 0));
+        assert!((client_scale_for(mode, zero, 1.35) - 1.35).abs() < 1e-12);
+        assert!((client_scale_for(zero, mode, 1.35) - 1.35).abs() < 1e-12);
+    }
+}
+
 /// Strict rectangle overlap: their X *and* Y ranges must genuinely
 /// intersect. Edge-touching (a shared border, where one's right edge
 /// equals the other's left) is *not* overlap, so adjacent screens pass.
@@ -4186,6 +4258,43 @@ impl Renderer {
     /// per-surface scale tracking is a later milestone).
     pub fn primary_scale(&self) -> f64 {
         self.outputs.get(self.primary_idx).map_or(1.0, |o| o.scale)
+    }
+
+    /// The scale Xwayland's pixel space runs at: the exact ratio between
+    /// the primary output's DRM mode and the compositor rect the layout
+    /// hands out for it. NOT the same number as [`Self::primary_scale`],
+    /// which stays whatever the user configured.
+    ///
+    /// X11 clients render at the output's *physical* resolution, and
+    /// Xwayland takes its screen size straight from the `wl_output` mode
+    /// (3840×2160 here — verified with `xrandr`). Every window rect we
+    /// send it, though, is a compositor rect that smithay multiplies by
+    /// this scale and rounds. Handing over the configured scale is a
+    /// pixel short whenever the mode doesn't divide evenly by it:
+    /// `round(3840 / 1.35) = 2844` logical, and `round(2844 × 1.35)`
+    /// comes back as **3839** — so a window configured to *fill* the
+    /// output lands one pixel narrower than the X screen it is meant to
+    /// cover.
+    ///
+    /// That single pixel is a live-lock with Wine. `is_window_rect_full_screen`
+    /// wants the window to cover the monitor on all four edges; 3839 < 3840
+    /// fails it, so Wine strips `_NET_WM_STATE_FULLSCREEN` — we honour the
+    /// unfullscreen and tile the window — the game immediately re-asserts
+    /// exclusive fullscreen — we fullscreen it to 3839 again. Measured on
+    /// Honkai: Star Rail under Proton-Wine: up to 19 fullscreen↔tiled
+    /// round trips per second, i.e. a violently flickering game, with the
+    /// output's `Auto` VRR flipping on every one of them.
+    ///
+    /// Deriving the scale from the two sizes closes the round trip
+    /// instead: 3840 / 2844 = 1.350211… maps 2844 back to exactly 3840.
+    /// The larger of the two axis ratios wins so neither axis can come up
+    /// short (the other overshoots by a fraction of a pixel), and X11
+    /// buffers for a fullscreen window now match the mode exactly, which
+    /// is also what the 1:1 scanout fast paths require.
+    pub fn xwayland_client_scale(&self) -> f64 {
+        self.outputs
+            .get(self.primary_idx)
+            .map_or(1.0, |o| client_scale_for(o.mode_size, o.compositor_size, o.scale))
     }
 
     /// Settle one output's Variable Refresh Rate state for the frame about
@@ -7880,20 +7989,21 @@ mod gpu_bench {
         // Opaque grey source textures. Grey keeps the BT.709→BT.2020 matrix a
         // no-op (its rows sum to 1), so the readback isolates the transfer
         // maths. import_memory (not create_buffer) so sampler filters are set.
-        let mut mk = |v: u8| -> GlesTexture {
-            let data: Vec<u8> = [v, v, v, 255u8]
-                .iter()
-                .copied()
-                .cycle()
-                .take(64 * 64 * 4)
-                .collect();
-            gles
-                .import_memory(&data, Fourcc::Abgr8888, size, false)
-                .expect("import source")
+        // Scoped so the closure's mutable borrow of `gles` ends here.
+        let (white, quarter) = {
+            let mut mk = |v: u8| -> GlesTexture {
+                let data: Vec<u8> = [v, v, v, 255u8]
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(64 * 64 * 4)
+                    .collect();
+                gles
+                    .import_memory(&data, Fourcc::Abgr8888, size, false)
+                    .expect("import source")
+            };
+            (mk(255), mk(64))
         };
-        let white = mk(255);
-        let quarter = mk(64);
-        drop(mk);
 
         let mut run = |tex: &GlesTexture,
                        shader: &GlesTexProgram,

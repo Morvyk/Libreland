@@ -2609,28 +2609,33 @@ fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
         push_configure_filled(w, area.fill(w.fill));
         return;
     }
-    let size = surface_size(w.rect.size, border);
-    let toplevel = match &w.toplevel {
-        WindowSurface::Xdg(toplevel) => toplevel,
+    match &w.toplevel {
+        WindowSurface::Xdg(toplevel) => {
+            let size = surface_size(w.rect.size, border);
+            toplevel.with_pending_state(|state| {
+                state.size = Some(size);
+                state.states.set(xdg_toplevel::State::Activated);
+                state.states.set(xdg_toplevel::State::TiledLeft);
+                state.states.set(xdg_toplevel::State::TiledRight);
+                state.states.set(xdg_toplevel::State::TiledTop);
+                state.states.set(xdg_toplevel::State::TiledBottom);
+                // Clear any prior fill so unmaximize/unfullscreen → tile works.
+                state.states.unset(xdg_toplevel::State::Maximized);
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            });
+            toplevel.send_configure();
+        }
         // X11: one call carries position + size (inside the border) and
         // clears any stale maximized/fullscreen state.
         WindowSurface::X11 { surface, .. } => {
             push_x11_configure(surface, inside_border(w.rect, border), FillMode::Normal);
-            return;
         }
-    };
-    toplevel.with_pending_state(|state| {
-        state.size = Some(size);
-        state.states.set(xdg_toplevel::State::Activated);
-        state.states.set(xdg_toplevel::State::TiledLeft);
-        state.states.set(xdg_toplevel::State::TiledRight);
-        state.states.set(xdg_toplevel::State::TiledTop);
-        state.states.set(xdg_toplevel::State::TiledBottom);
-        // Clear any prior fill so unmaximize/unfullscreen → tile works.
-        state.states.unset(xdg_toplevel::State::Maximized);
-        state.states.unset(xdg_toplevel::State::Fullscreen);
-    });
-    toplevel.send_configure();
+    }
+    // Logged for BOTH shells. The X11 arm used to return early, so an X11
+    // window dropping out of fullscreen back into its tile was the one
+    // layout transition that left no trace at all — which is exactly how a
+    // ~19 Hz fullscreen↔tiled fight with Wine stayed invisible in session
+    // logs (see `Renderer::xwayland_client_scale`).
     debug!(
         surface = ?w.toplevel.wl_surface().id(),
         x = w.rect.loc.x,

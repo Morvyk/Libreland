@@ -153,8 +153,11 @@ pub(crate) fn spawn_xwayland(
 
     // The client-scale mapping is what makes X windows render at
     // physical resolution: Xwayland sees a world already multiplied by
-    // the output scale and commits buffers at that size, which the
-    // renderer then draws 1:1.
+    // this scale and commits buffers at that size, which the renderer
+    // then draws 1:1. `scale` is deliberately the mode/compositor-rect
+    // ratio (`Renderer::xwayland_client_scale`), not the configured
+    // output scale — see that function for why a pixel of rounding slack
+    // here live-locks fullscreen Wine games.
     if let Some(data) = client.get_data::<XWaylandClientData>() {
         data.compositor_state.set_client_scale(scale);
     }
@@ -205,7 +208,7 @@ impl State {
                 return;
             }
         };
-        let scale = self.renderer.primary_scale();
+        let scale = self.renderer.xwayland_client_scale();
         apply_xsettings(&mut xwm, scale);
         // Root cursor: what X windows show when the app doesn't set its
         // own. Loaded from our theme at the same physical size the
@@ -266,10 +269,12 @@ impl State {
 
     /// Live `xwayland` toggle / scale change: re-publish XSETTINGS and
     /// the client scale, then re-push every X11 window's configure so
-    /// Xwayland re-maps them into the new pixel space. Called from the
-    /// config-reload path when the primary scale changes.
+    /// Xwayland re-maps them into the new pixel space. Called whenever
+    /// the primary output's scale *or mode* changes (config reload,
+    /// hotplug) — both move the ratio
+    /// [`Renderer::xwayland_client_scale`] derives.
     pub(crate) fn update_xwayland_scale(&mut self) {
-        let scale = self.renderer.primary_scale();
+        let scale = self.renderer.xwayland_client_scale();
         if let Some(client) = &self.xwayland_client
             && let Some(data) = client.get_data::<XWaylandClientData>()
         {
@@ -817,6 +822,16 @@ impl State {
             return;
         };
         let has = entry.fill == mode;
+        // Every fill change an X client asks for, honoured or not. A
+        // client that keeps flipping the same bit is fighting the
+        // compositor's idea of its geometry, and that shows up here first.
+        debug!(
+            window = id,
+            ?mode,
+            want,
+            already = has,
+            "xwayland: NET_WM_STATE fill request"
+        );
         if has == want {
             return;
         }

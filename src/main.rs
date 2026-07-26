@@ -3282,7 +3282,7 @@ impl State {
     fn apply_xwayland_toggle(&mut self, enable: bool) {
         if enable {
             let dh = self.display_handle.clone();
-            let scale = self.renderer.primary_scale();
+            let scale = self.renderer.xwayland_client_scale();
             if let Some(spawned) = crate::xwayland::spawn_xwayland(&self.loop_handle, &dh, scale) {
                 info!(
                     x_display = %spawned.display,
@@ -4221,7 +4221,7 @@ fn main() -> Result<()> {
         && let Some(spawned) = xwayland::spawn_xwayland(
             &handle,
             &wayland_init.display_handle,
-            renderer.primary_scale(),
+            renderer.xwayland_client_scale(),
         )
     {
         // SAFETY: same single-threaded-init reasoning as the
