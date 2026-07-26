@@ -18,8 +18,11 @@
 //!    path we export.
 //! 2. polkitd calls back `BeginAuthentication(action, message, icon, details,
 //!    cookie, identities)` whenever the session needs to authenticate.
-//! 3. We pick an identity (prefer the logged-in user — self-auth), resolve its
-//!    uid to a username, and spawn the setuid/socket-activated helper
+//! 3. We pick an identity from everything polkitd offers — `unix-user`
+//!    entries plus the members of any `unix-group` (the stock `auth_admin`
+//!    rule offers only `unix-group:wheel`, which polkitd does NOT expand),
+//!    preferring the logged-in user for self-auth. We resolve it to a
+//!    username and spawn the setuid/socket-activated helper
 //!    `/usr/lib/polkit-1/polkit-agent-helper-1 <username>`. The helper — not
 //!    us — runs PAM as root and reports the result to polkitd using the
 //!    cookie, which is why the password never needs root here.
@@ -574,23 +577,82 @@ impl AuthAgent {
     }
 }
 
-/// Choose which identity to authenticate as. Prefer the logged-in user
-/// (self-auth) when offered; otherwise the first `unix-user` identity.
+/// Choose which identity to authenticate as, out of everything polkitd
+/// says may authorise this action.
+///
+/// polkitd hands over the identity list **as configured** — it does not
+/// expand groups. The stock rule for administrative actions
+/// (`auth_admin`, which covers `pkexec` and most system settings) is
+/// `unix-group:wheel`, so the list very often contains NO `unix-user`
+/// entry at all: only a group. Considering just `unix-user` meant every
+/// admin action was refused outright with no prompt ever shown, even
+/// though the logged-in user is a member of the group and perfectly
+/// entitled to authenticate. So expand groups to their members too —
+/// what every other agent (mate-polkit, lxqt-policykit, KDE) does.
+///
+/// Preference order: **ourselves** when we're among the candidates
+/// (self-auth is what a desktop user expects — their own password), then
+/// the lowest uid offered, which lands on `root` when polkit falls back
+/// to it. Returns `None` only when nothing resolvable was offered.
 fn pick_username(
     identities: &[(String, HashMap<String, OwnedValue>)],
     our_uid: u32,
 ) -> Option<String> {
-    let uids: Vec<u32> = identities
-        .iter()
-        .filter(|(kind, _)| kind == "unix-user")
-        .filter_map(|(_, details)| details.get("uid").and_then(value_to_u32))
-        .collect();
-    let chosen = if uids.contains(&our_uid) {
-        our_uid
-    } else {
-        *uids.first()?
+    let mut uids: Vec<u32> = Vec::new();
+    for (kind, details) in identities {
+        match kind.as_str() {
+            "unix-user" => uids.extend(details.get("uid").and_then(value_to_u32)),
+            "unix-group" => {
+                let Some(gid) = details.get("gid").and_then(value_to_u32) else {
+                    continue;
+                };
+                uids.extend(group_member_uids(gid));
+            }
+            // `unix-netgroup` needs NIS to resolve and no desktop uses
+            // it; skip rather than guess.
+            _ => {}
+        }
+    }
+    if uids.is_empty() {
+        return None;
+    }
+    if uids.contains(&our_uid) {
+        return uid_to_username(our_uid);
+    }
+    uids.sort_unstable();
+    uids.dedup();
+    // First resolvable candidate — a uid with no passwd entry is skipped
+    // rather than failing the whole request.
+    uids.into_iter().find_map(uid_to_username)
+}
+
+/// The uids that belong to `gid`: the group's listed members, plus any
+/// user whose *primary* group it is (those don't appear in the member
+/// list). Silently empty when the group can't be resolved.
+fn group_member_uids(gid: u32) -> Vec<u32> {
+    let Ok(Some(group)) = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid)) else {
+        return Vec::new();
     };
-    uid_to_username(chosen)
+    let mut uids: Vec<u32> = group
+        .mem
+        .iter()
+        .filter_map(|name| {
+            nix::unistd::User::from_name(name)
+                .ok()
+                .flatten()
+                .map(|u| u.uid.as_raw())
+        })
+        .collect();
+    // A primary-group member is entitled just the same, and `getgrgid`
+    // never lists them. We can only cheaply check ourselves — enumerating
+    // every passwd entry to find the rest would drag in NSS lookups over
+    // the network on LDAP setups.
+    if let Ok(Some(me)) = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        && me.gid.as_raw() == gid
+    {
+        uids.push(me.uid.as_raw());
+    }
+    uids
 }
 
 fn value_to_u32(v: &OwnedValue) -> Option<u32> {
@@ -762,4 +824,50 @@ async fn main() -> anyhow::Result<()> {
         .await;
     let _ = std::fs::remove_file(&sock_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(kind: &str, key: &str, val: u32) -> (String, HashMap<String, OwnedValue>) {
+        let mut d = HashMap::new();
+        d.insert(key.to_string(), OwnedValue::from(val));
+        (kind.to_string(), d)
+    }
+
+    /// The stock `auth_admin` case: polkitd offers ONLY `unix-group:wheel`.
+    /// Before group expansion this returned `None` and every administrative
+    /// action was refused without ever showing a prompt.
+    #[test]
+    fn group_only_identities_resolve_to_a_member() {
+        let gid = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .ok()
+            .flatten()
+            .map(|u| u.gid.as_raw())
+            .expect("current user resolvable");
+        let me = nix::unistd::Uid::current().as_raw();
+        // Our own primary group always contains us, so this stands in for
+        // "a group the running user belongs to" on any machine.
+        let picked = pick_username(&[ident("unix-group", "gid", gid)], me);
+        assert_eq!(picked, uid_to_username(me));
+    }
+
+    /// Self-auth still wins when polkit offers us directly alongside others.
+    #[test]
+    fn own_uid_is_preferred() {
+        let me = nix::unistd::Uid::current().as_raw();
+        let picked = pick_username(
+            &[ident("unix-user", "uid", 0), ident("unix-user", "uid", me)],
+            me,
+        );
+        assert_eq!(picked, uid_to_username(me));
+    }
+
+    /// Nothing resolvable → `None` (caller reports failure to polkitd).
+    #[test]
+    fn unknown_identity_kinds_yield_none() {
+        assert!(pick_username(&[ident("unix-netgroup", "name", 1)], 1000).is_none());
+        assert!(pick_username(&[], 1000).is_none());
+    }
 }
