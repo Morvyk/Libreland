@@ -407,6 +407,7 @@ impl State {
             return;
         };
         let (_, wl_surface) = self.x11_windows.remove(pos);
+        self.x11_fill_flips.remove(&id);
         info!(window = id, "xwayland: X11 window unmanaged");
         self.renderer.start_close(&wl_surface);
         self.layout.remove(&wl_surface);
@@ -601,6 +602,20 @@ impl XwmHandler for State {
     ) {
         let id = window.window_id();
         let managed = self.x11_windows.iter().find(|(win, _)| win.window_id() == id);
+        // The geometry an X client asks for, in COMPOSITOR-logical pixels
+        // (smithay has already divided out the Xwayland client scale).
+        // Logged because a client whose own idea of its size disagrees
+        // with the cell we hand it will say so here, every frame, and
+        // nothing else in the pipeline makes that visible.
+        debug!(
+            window = id,
+            managed = managed.is_some(),
+            x,
+            y,
+            w,
+            h,
+            "xwayland: client configure request"
+        );
         match managed {
             // Not ours (yet): pre-map windows sizing themselves (games
             // picking a resolution) get exactly what they asked for, so
@@ -798,6 +813,26 @@ impl XwmHandler for State {
     }
 }
 
+/// How many honoured fill flips inside [`FILL_STORM_WINDOW`] count as a
+/// client fighting the compositor rather than changing its mind. A real
+/// user (or app) toggling fullscreen manages one or two a second; the
+/// storms measured under Wine ran at ~30.
+const FILL_STORM_FLIPS: u32 = 8;
+const FILL_STORM_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long the latch holds after the last request. It refreshes on every
+/// ignored request, so it only lifts once the client has actually stopped.
+const FILL_STORM_LATCH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Per-window flip bookkeeping for the fill-storm guard.
+#[derive(Debug)]
+pub(crate) struct FillFlipGuard {
+    /// Start of the flip-counting window.
+    since: std::time::Instant,
+    flips: u32,
+    /// While in the future, this window's own fill requests are ignored.
+    latched_until: Option<std::time::Instant>,
+}
+
 impl State {
     /// Shared handler for the four `NET_WM_STATE` fill requests: flip the
     /// layout fill through the same toggles the xdg + IPC paths use
@@ -835,6 +870,9 @@ impl State {
         if has == want {
             return;
         }
+        if !self.fill_request_allowed(id, mode, want) {
+            return;
+        }
         let changed = match mode {
             FillMode::Fullscreen => self.layout.toggle_fullscreen(&wl_surface),
             FillMode::Maximized => self.layout.toggle_maximized(&wl_surface),
@@ -843,6 +881,75 @@ impl State {
         if changed {
             self.queue_redraw_all();
         }
+    }
+
+    /// Fill-storm guard: whether this client-driven fill change should be
+    /// honoured. Only reached for requests that would actually change the
+    /// window's fill.
+    ///
+    /// A client that keeps asking for the same fill bit to go on, off, on
+    /// makes the compositor throw the window between its tile and the
+    /// whole output as fast as the events arrive — measured at ~30 Hz
+    /// against a Wine game, which is a violently flickering screen and a
+    /// client-side swapchain rebuild per flip. Nothing legitimate needs
+    /// more than a couple of fill changes a second, so once a window
+    /// crosses [`FILL_STORM_FLIPS`] the compositor stops listening to
+    /// *that window's* fill requests until it has been quiet for
+    /// [`FILL_STORM_LATCH`].
+    ///
+    /// The latch lands on the FILLED state, never the tiled one: a client
+    /// only storms while it believes it should be covering the output, so
+    /// that is what the user should be left looking at. Denying the
+    /// `want == false` half of the flip-flop is what pins it there.
+    ///
+    /// Only client requests come through here — the compositor's own
+    /// keybind and IPC toggles call `Layout` directly — so the user can
+    /// always pull a latched window back out of fullscreen by hand.
+    fn fill_request_allowed(&mut self, window: u32, mode: FillMode, want: bool) -> bool {
+        let now = std::time::Instant::now();
+        let guard = self
+            .x11_fill_flips
+            .entry(window)
+            .or_insert_with(|| FillFlipGuard {
+                since: now,
+                flips: 0,
+                latched_until: None,
+            });
+        if let Some(until) = guard.latched_until {
+            if now < until {
+                // Refresh while the client keeps pushing: the latch is
+                // meant to lift when it settles, not on a fixed timer that
+                // hands the storm the screen back mid-fight.
+                guard.latched_until = Some(now + FILL_STORM_LATCH);
+                debug!(
+                    window,
+                    ?mode,
+                    want,
+                    "xwayland: fill request ignored (storm latch held)"
+                );
+                return want;
+            }
+            info!(window, "xwayland: fill-storm latch released (client settled)");
+            guard.latched_until = None;
+            guard.since = now;
+            guard.flips = 0;
+        }
+        if now.duration_since(guard.since) > FILL_STORM_WINDOW {
+            guard.since = now;
+            guard.flips = 0;
+        }
+        guard.flips += 1;
+        if guard.flips < FILL_STORM_FLIPS {
+            return true;
+        }
+        guard.latched_until = Some(now + FILL_STORM_LATCH);
+        warn!(
+            window,
+            ?mode,
+            flips = guard.flips,
+            "xwayland: client is flip-flopping its own NET_WM_STATE fill — pinning it filled until it settles"
+        );
+        want
     }
 }
 

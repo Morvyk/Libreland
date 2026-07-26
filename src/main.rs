@@ -196,6 +196,10 @@ pub(crate) struct State {
     /// focus is on an X11 window. Tracked so focus moves can unfocus
     /// the previous X window (see `sync_x11_focus`).
     pub(crate) x11_kbd_focus: Option<smithay::xwayland::X11Surface>,
+    /// Per-X11-window guard against a client that flip-flops its own
+    /// `NET_WM_STATE` fill (see `xwayland::x11_fill_request`). Keyed by
+    /// X window id; entries are dropped when the window unmaps.
+    pub(crate) x11_fill_flips: std::collections::HashMap<u32, crate::xwayland::FillFlipGuard>,
     /// Which selections (clipboard / primary) are currently owned by an
     /// X11 client. Routes Wayland-side paste requests back through the
     /// XWM instead of the compositor's clipboard cache.
@@ -4419,6 +4423,7 @@ fn main() -> Result<()> {
         x11_windows: Vec::new(),
         x11_or_windows: Vec::new(),
         x11_kbd_focus: None,
+        x11_fill_flips: std::collections::HashMap::new(),
         x11_owns_selection: crate::xwayland::X11SelectionOwnership::default(),
         xwayland_shell_state: wayland_init.xwayland_shell_state,
         display_handle: wayland_init.display_handle,

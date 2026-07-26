@@ -2559,9 +2559,24 @@ fn push_x11_configure(surface: &X11Surface, rect: Rectangle<i32, Physical>, fill
     // If the resize polish is wanted back, it has to be scoped to the
     // interactive-drag path alone (thread a flag from
     // `Layout::apply_resize`), never to reflow-driven configures.
-    if let Err(err) = surface.configure(rect) {
-        debug!(window = surface.window_id(), %err, "layout: X11 configure failed");
-    }
+    //
+    // NET_WM_STATE goes out BEFORE the geometry, and the order is
+    // load-bearing. Wine (and Proton's fork) guards its fullscreen
+    // transition with a `pending_fullscreen` flag: from the moment it
+    // asks for `_NET_WM_STATE_FULLSCREEN` it DISCARDS every
+    // ConfigureNotify until a `_NET_WM_STATE` PropertyNotify confirms the
+    // state landed. Resizing first therefore throws the fullscreen
+    // geometry into that hole — Wine clears the flag on the property that
+    // arrives after it, still believing the window has its old, small
+    // rect. Its own fullscreen test is "does the window cover a monitor",
+    // that stale rect fails it, and Wine answers the state we just set by
+    // asking us to remove it again. The compositor grants the
+    // unfullscreen, the game re-asserts, and the two trade
+    // fullscreen⇄tiled configures ~30 times a second.
+    //
+    // State first, geometry second: the property clears Wine's guard, and
+    // the ConfigureNotify that follows is the one it accepts.
+    //
     // Only touch NET_WM_STATE on an actual change — this runs on every
     // reflow, and rewriting the property each time would spam X clients
     // with PropertyNotify events they may react to.
@@ -2570,6 +2585,9 @@ fn push_x11_configure(surface: &X11Surface, rect: Rectangle<i32, Physical>, fill
     }
     if surface.is_fullscreen() != (fill == FillMode::Fullscreen) {
         let _ = surface.set_fullscreen(fill == FillMode::Fullscreen);
+    }
+    if let Err(err) = surface.configure(rect) {
+        debug!(window = surface.window_id(), %err, "layout: X11 configure failed");
     }
 }
 
