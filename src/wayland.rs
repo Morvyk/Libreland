@@ -888,6 +888,72 @@ impl CompositorHandler for State {
                 self.layout.reconfigure(surface);
             }
         }
+        // Floating xdg windows own their size: a client answering an
+        // un-honourable configure (below its declared minimum) commits
+        // its minimum instead, and dialogs resize themselves to fit
+        // content. Adopt the committed window geometry into the stored
+        // rect, or the decoration offscreen keeps compositing at the
+        // wrong size (cropped content, mis-scaled corners, stale hit
+        // rect). Skipped while an interactive drag owns this surface —
+        // the drag's rect is authoritative and the client is merely
+        // catching up to it.
+        if self.mapped_toplevels.contains(surface)
+            && self.drag.as_ref().is_none_or(|d| d.surface != *surface)
+            // Only adopt a size the client CHOSE. A commit still carrying
+            // geometry from before our latest configure is stale — the
+            // client simply hasn't caught up — and adopting it would undo
+            // our resize (and, if a reflow re-configured from the reverted
+            // rect, ping-pong). `with_committed_state` is the state the
+            // client acked for THIS commit: when its size matches what we
+            // last asked for, the client is answering us, so any geometry
+            // difference is the client's own decision (e.g. it refused a
+            // size below its minimum).
+            && self
+                .layout
+                .window_surface(surface)
+                .and_then(|w| match w {
+                    crate::layout::WindowSurface::Xdg(t) => Some(t),
+                    crate::layout::WindowSurface::X11 { .. } => None,
+                })
+                .is_some_and(|t| {
+                    let requested = t.with_pending_state(|s| s.size);
+                    let confirmed = t.with_committed_state(|s| s.and_then(|st| st.size));
+                    // No configure in flight (the client confirmed what we
+                    // last set), or we never sized it at all.
+                    requested.is_none() || requested == confirmed
+                })
+        {
+            let committed = smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .cached_state
+                    .get::<smithay::wayland::shell::xdg::SurfaceCachedState>()
+                    .current()
+                    .geometry
+                    .map(|g| g.size)
+            })
+            .or_else(|| {
+                // No explicit window geometry: the surface extent is the
+                // window per xdg-shell.
+                smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+                    s.surface_size()
+                })
+                .flatten()
+            });
+            if let Some(size) = committed
+                && self.layout.reconcile_floating_size(
+                    surface,
+                    smithay::utils::Size::from((size.w, size.h)),
+                )
+            {
+                debug!(
+                    surface = ?surface.id(),
+                    w = size.w,
+                    h = size.h,
+                    "float: adopted client-committed size"
+                );
+                self.queue_redraw_for_surface(surface);
+            }
+        }
         // Track fifo-barrier surfaces for the fallback clearer (see
         // [`fifo_fallback_tick`]). Only NVIDIA's Wayland WSI (and other
         // fifo-v1 clients) ever set barriers, so the map stays tiny.

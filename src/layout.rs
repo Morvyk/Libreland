@@ -543,6 +543,115 @@ impl Layout {
     ///
     /// Returns whether `surface` was a tracked window that got toggled
     /// (a silent no-op, `false`, for surfaces we don't track).
+    /// The client's declared size limits — xdg `min_size`/`max_size`,
+    /// X11 `WM_NORMAL_HINTS` — converted to CELL space (content limits
+    /// grown by the border ring) so callers can clamp cell rects
+    /// directly. Unset axes come back as 0 (min) / `i32::MAX` (max).
+    ///
+    /// Configuring a floating window below its declared minimum is a
+    /// protocol violation the client answers by committing its minimum
+    /// anyway — leaving the stored rect lying about the window's real
+    /// size (mis-scaled decoration compositing, wrong hit-testing).
+    /// Every path that PICKS a float size clamps through this.
+    pub fn client_size_limits(
+        &self,
+        surface: &WlSurface,
+    ) -> (Size<i32, Physical>, Size<i32, Physical>) {
+        let unbounded = (
+            Size::<i32, Physical>::from((0, 0)),
+            Size::<i32, Physical>::from((i32::MAX, i32::MAX)),
+        );
+        let Some(w) = self.window_ref(surface) else {
+            return unbounded;
+        };
+        self.window_limits(w)
+    }
+
+    /// [`Self::client_size_limits`] for a window already in hand — needed
+    /// mid-move, when the window is owned by neither the tree nor the
+    /// float list and a surface lookup can't find it.
+    fn window_limits(&self, w: &Window) -> (Size<i32, Physical>, Size<i32, Physical>) {
+        let (min, max) = match &w.toplevel {
+            WindowSurface::Xdg(t) => with_states(t.wl_surface(), |states| {
+                let mut cached = states.cached_state.get::<SurfaceCachedState>();
+                let cur = cached.current();
+                (cur.min_size, cur.max_size)
+            }),
+            WindowSurface::X11 { surface, .. } => (
+                surface.min_size().unwrap_or_default(),
+                surface.max_size().unwrap_or_default(),
+            ),
+        };
+        let b2 = self.border_width * 2;
+        // 0 means "unconstrained" on that axis, per both protocols.
+        let min = Size::<i32, Physical>::from((
+            if min.w > 0 { min.w.saturating_add(b2) } else { 0 },
+            if min.h > 0 { min.h.saturating_add(b2) } else { 0 },
+        ));
+        let max = Size::<i32, Physical>::from((
+            if max.w > 0 { max.w.saturating_add(b2) } else { i32::MAX },
+            if max.h > 0 { max.h.saturating_add(b2) } else { i32::MAX },
+        ));
+        (min, max)
+    }
+
+    /// Adopt a client-chosen size for a visible floating window: xdg
+    /// clients answer an un-honourable configure (below their minimum)
+    /// by committing their minimum, and self-resizing dialogs commit new
+    /// sizes unprompted — in both cases the client's committed window
+    /// geometry is authoritative and the stored rect must follow, or the
+    /// decoration offscreen composites a lie (cropped/mis-scaled
+    /// content, wrong hit rect). `content` is the committed window
+    /// geometry size; the rect resizes around its top-left. Returns
+    /// whether anything changed. No configure is pushed back — the size
+    /// IS the client's, and echoing it would only add an ack cycle.
+    ///
+    /// Xdg only: X11 float resizes are granted (and the rect updated) in
+    /// the `ConfigureRequest` path.
+    pub fn reconcile_floating_size(
+        &mut self,
+        surface: &WlSurface,
+        content: Size<i32, Physical>,
+    ) -> bool {
+        if content.w <= 0 || content.h <= 0 {
+            return false;
+        }
+        let b2 = self.border_width * 2;
+        for oi in 0..self.outputs.len() {
+            // A window geometry is entirely client-chosen and validated by
+            // the protocol only for positivity, so it must never reach the
+            // rect raw: the rect drives a cell-sized GPU offscreen (a
+            // 30000×30000 "window" is multi-GiB, re-allocated every frame
+            // while the size animates) and the pointer hit-test (an
+            // oversized invisible float would swallow every click on the
+            // desktop). Cap at the output's full size — no real window is
+            // usefully larger, and the client keeps rendering whatever it
+            // likes inside. Saturating maths so a near-i32::MAX geometry
+            // can't overflow the border add.
+            let full = self.outputs[oi].full.size;
+            let active = self.outputs[oi].active;
+            if let Some(w) = self.outputs[oi].workspaces[active]
+                .floating
+                .iter_mut()
+                .find(|w| w.toplevel.wl_surface() == surface)
+            {
+                if w.fill != FillMode::Normal || !matches!(w.toplevel, WindowSurface::Xdg(_)) {
+                    return false;
+                }
+                let cell = Size::<i32, Physical>::from((
+                    content.w.saturating_add(b2).min(full.w.max(1)),
+                    content.h.saturating_add(b2).min(full.h.max(1)),
+                ));
+                if w.rect.size == cell {
+                    return false;
+                }
+                w.rect.size = cell;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn toggle_floating(&mut self, surface: &WlSurface) -> bool {
         // Toggling never crosses workspaces: the window stays on the
         // active workspace it's currently visible on.
@@ -556,11 +665,24 @@ impl Layout {
                 ws.tree = root_after;
                 if let Some(mut window) = removed {
                     let prev = window.rect;
-                    let new_size =
+                    // 70% of the tile cell, but never outside the
+                    // client's declared limits — a float configured
+                    // below its min is answered with the min anyway,
+                    // and the stored rect would lie about it.
+                    let shrunk =
                         Size::<i32, Physical>::new((prev.size.w * 7) / 10, (prev.size.h * 7) / 10);
+                    let (lmin, lmax) = self.window_limits(&window);
+                    // A client minimum larger than the tile cell makes the
+                    // float GROW, so the recentring offset goes negative —
+                    // keep the top-left inside the work area (the user
+                    // needs the titlebar/edges reachable).
+                    let new_size = Size::<i32, Physical>::new(
+                        shrunk.w.min(lmax.w).max(lmin.w).min(area.work.size.w),
+                        shrunk.h.min(lmax.h).max(lmin.h).min(area.work.size.h),
+                    );
                     let new_loc = Point::<i32, Physical>::new(
-                        prev.loc.x + (prev.size.w - new_size.w) / 2,
-                        prev.loc.y + (prev.size.h - new_size.h) / 2,
+                        (prev.loc.x + (prev.size.w - new_size.w) / 2).max(area.work.loc.x),
+                        (prev.loc.y + (prev.size.h - new_size.h) / 2).max(area.work.loc.y),
                     );
                     window.rect = Rectangle::new(new_loc, new_size);
                     push_configure_for_floating(&window, self.border_width, area);
@@ -649,16 +771,30 @@ impl Layout {
             let Some(mut window) = removed else { continue };
             // Honour the dialog's requested size, clamped to the work area;
             // fall back to a third of it on any axis it left unconstrained.
+            // The client's declared minimum outranks the work-area clamp
+            // (a dialog larger than the screen is the client's own call —
+            // shrinking it below its min just makes the client override
+            // us and the rect lie), and its maximum caps the fallback.
+            // `pref` is CONTENT space (the client's window geometry);
+            // `window.rect` and the limits are CELL space, so grow by the
+            // border ring before comparing or storing — otherwise the
+            // dialog is configured 2*border smaller than it asked for.
+            let (lmin, lmax) = self.window_limits(&window);
+            let b2 = self.border_width * 2;
             let w = if pref.w > 0 {
-                pref.w.min(work.size.w)
+                pref.w.saturating_add(b2).min(work.size.w)
             } else {
                 work.size.w / 3
-            };
+            }
+            .min(lmax.w)
+            .max(lmin.w);
             let h = if pref.h > 0 {
-                pref.h.min(work.size.h)
+                pref.h.saturating_add(b2).min(work.size.h)
             } else {
                 work.size.h / 3
-            };
+            }
+            .min(lmax.h)
+            .max(lmin.h);
             let loc = Point::<i32, Physical>::new(
                 work.loc.x + (work.size.w - w) / 2,
                 work.loc.y + (work.size.h - h) / 2,

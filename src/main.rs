@@ -639,6 +639,15 @@ pub(crate) struct DragState {
     /// from the half of the window the cursor was in. Unused by
     /// [`DragMode::Move`].
     pub(crate) edges: layout::ResizeEdges,
+    /// The client's declared min/max size (cell space), captured at
+    /// resize-drag start so per-motion clamping doesn't re-query
+    /// surface state. A drag below the client's minimum would be
+    /// answered with the minimum anyway — clamping keeps the rect
+    /// honest and the anchored edge truly anchored.
+    pub(crate) size_limits: (
+        smithay::utils::Size<i32, smithay::utils::Physical>,
+        smithay::utils::Size<i32, smithay::utils::Physical>,
+    ),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1594,26 +1603,40 @@ impl State {
                 DragMode::Resize => {
                     // Only the pressed-nearest edge on each axis moves;
                     // the opposite one stays anchored, so dragging the
-                    // left half grows the window leftwards. After the
-                    // minimum-size clamp the anchored edge must still
-                    // hold, hence deriving the origin from the width we
-                    // actually granted rather than from the raw delta.
+                    // left half grows the window leftwards. Sizes clamp
+                    // to the client's declared min/max (captured at drag
+                    // start) on top of the compositor floor — granting a
+                    // size the client refuses would leave the rect lying
+                    // about the window. After the clamp the anchored
+                    // edge must still hold, hence deriving the origin
+                    // from the width actually granted rather than from
+                    // the raw delta.
+                    let (lmin, lmax) = drag.size_limits;
+                    // The client's declared limits outrank the compositor
+                    // floor: a window whose max is below MIN_DRAG_RESIZE
+                    // must not be pinned above its max (it would refuse
+                    // the size and the rect would lie). Order the bounds
+                    // so the floor can never exceed the client max.
+                    let min_w = MIN_DRAG_RESIZE_W.max(lmin.w).min(lmax.w);
+                    let min_h = MIN_DRAG_RESIZE_H.max(lmin.h).min(lmax.h);
+                    let clamp_w = move |w: i32| w.min(lmax.w).max(min_w);
+                    let clamp_h = move |h: i32| h.min(lmax.h).max(min_h);
                     let (x, w) = if drag.edges.right {
                         (
                             drag.rect_start.loc.x,
-                            (drag.rect_start.size.w + delta_x).max(MIN_DRAG_RESIZE_W),
+                            clamp_w(drag.rect_start.size.w + delta_x),
                         )
                     } else {
-                        let w = (drag.rect_start.size.w - delta_x).max(MIN_DRAG_RESIZE_W);
+                        let w = clamp_w(drag.rect_start.size.w - delta_x);
                         (drag.rect_start.loc.x + drag.rect_start.size.w - w, w)
                     };
                     let (y, h) = if drag.edges.bottom {
                         (
                             drag.rect_start.loc.y,
-                            (drag.rect_start.size.h + delta_y).max(MIN_DRAG_RESIZE_H),
+                            clamp_h(drag.rect_start.size.h + delta_y),
                         )
                     } else {
-                        let h = (drag.rect_start.size.h - delta_y).max(MIN_DRAG_RESIZE_H);
+                        let h = clamp_h(drag.rect_start.size.h - delta_y);
                         (drag.rect_start.loc.y + drag.rect_start.size.h - h, h)
                     };
                     let new_rect = smithay::utils::Rectangle::new(
@@ -1913,6 +1936,7 @@ impl State {
                         // The press half fixes which edges follow the
                         // cursor for the whole drag.
                         let edges = layout::ResizeEdges::from_press(rect_start, cursor_i);
+                        let size_limits = self.layout.client_size_limits(&surface);
                         info!(
                             ?mode,
                             surface = ?surface.id(),
@@ -1936,6 +1960,7 @@ impl State {
                             cursor_start: (cx, cy),
                             rect_start,
                             edges,
+                            size_limits,
                         });
                         // Show the gesture cursor for the drag: the
                         // grabbing hand while moving, the matching corner
