@@ -61,7 +61,8 @@ use smithay::reexports::wayland_server::Resource as _;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::shell::xdg::{SurfaceCachedState, ToplevelSurface};
+use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
+use smithay::wayland::shell::xdg::{SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceData};
 use smithay::xwayland::X11Surface;
 use smithay::xwayland::xwm::WmWindowType;
 use tracing::debug;
@@ -2092,13 +2093,25 @@ fn dialog_size(toplevel: &WindowSurface) -> Option<Size<i32, Physical>> {
     match toplevel {
         WindowSurface::Xdg(toplevel) => {
             let has_parent = toplevel.parent().is_some();
-            let (min, max, geo) = with_states(toplevel.wl_surface(), |states| {
+            let (min, max, geo, hint) = with_states(toplevel.wl_surface(), |states| {
+                let hint = states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .map(|d| d.lock().unwrap().dialog_hint)
+                    .unwrap_or_default();
                 let mut cached = states.cached_state.get::<SurfaceCachedState>();
                 let cur = cached.current();
-                (cur.min_size, cur.max_size, cur.geometry.map(|g| g.size))
+                (cur.min_size, cur.max_size, cur.geometry.map(|g| g.size), hint)
             });
+            // xdg-wm-dialog: the client's own declaration beats any
+            // heuristic — a window that says "I'm a dialog" floats, full
+            // stop (the output-sized guard in the caller still applies).
+            let declared = matches!(
+                hint,
+                ToplevelDialogHint::Dialog | ToplevelDialogHint::Modal
+            );
             let fixed = min.w > 0 && min.h > 0 && min == max;
-            if !has_parent && !fixed {
+            if !declared && !has_parent && !fixed {
                 return None;
             }
             // Window geometry is the visible size sans shadows; prefer it,
@@ -2128,13 +2141,20 @@ fn dialog_size(toplevel: &WindowSurface) -> Option<Size<i32, Physical>> {
             );
             let (min, max) = (surface.min_size(), surface.max_size());
             let fixed = min.is_some() && min == max;
-            if !has_parent && !typed_dialog && !fixed {
+            // `is_modal()`: an explicit _NET_WM_STATE_MODAL declaration —
+            // the X11 twin of the xdg dialog hint honoured above (tracked
+            // by git-smithay; 0.7.0 ignored MODAL entirely).
+            if !has_parent && !typed_dialog && !fixed && !surface.is_modal() {
                 return None;
             }
-            // The window's own geometry is the size the client asked to
-            // map at (Xwayland keeps it current), which is exactly the
-            // dialog's preferred size; fall back to the pinned minimum.
-            let size = Some(surface.geometry().size)
+            // `last_configure()` is the size the client asked to map at
+            // (the tracked X-side rect — 0.7.0's `geometry()`), which is
+            // exactly the dialog's preferred size; fall back to the
+            // pinned minimum. The NEW `geometry()` subtracts
+            // _GTK_FRAME_EXTENTS, and configuring an X window (full-size
+            // space) to the shadow-subtracted size shrinks the visible
+            // dialog by its shadows on every map.
+            let size = Some(surface.last_configure().size)
                 .filter(|s| s.w > 0 && s.h > 0)
                 .or(if fixed { min } else { None })
                 .unwrap_or_default();

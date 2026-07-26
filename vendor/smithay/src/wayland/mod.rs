@@ -1,3 +1,5 @@
+// Allow in this module because of existing usage
+#![allow(clippy::uninlined_format_args)]
 //! Protocol-related utilities
 //!
 //! This module contains several handlers to manage the Wayland protocol
@@ -46,26 +48,33 @@
 //!
 
 pub mod alpha_modifier;
+pub mod background_effect;
 pub mod buffer;
 pub mod commit_timing;
 pub mod compositor;
 pub mod content_type;
 pub mod cursor_shape;
+mod dispatch2;
+pub use dispatch2::{Dispatch2, GlobalDispatch2};
 pub mod dmabuf;
 #[cfg(feature = "backend_drm")]
 pub mod drm_lease;
 #[cfg(feature = "backend_drm")]
 pub mod drm_syncobj;
 pub mod fifo;
+pub mod fixes;
 pub mod foreign_toplevel_list;
 pub mod fractional_scale;
 pub mod idle_inhibit;
 pub mod idle_notify;
+pub mod image_capture_source;
+pub mod image_copy_capture;
 pub mod input_method;
 pub mod keyboard_shortcuts_inhibit;
 pub mod output;
 pub mod pointer_constraints;
 pub mod pointer_gestures;
+pub mod pointer_warp;
 pub mod presentation;
 pub mod relative_pointer;
 pub mod seat;
@@ -89,3 +98,7 @@ pub mod xdg_toplevel_tag;
 pub mod xwayland_keyboard_grab;
 #[cfg(feature = "xwayland")]
 pub mod xwayland_shell;
+
+/// Empty user-data
+#[derive(Debug)]
+pub struct GlobalData;

@@ -137,6 +137,7 @@ pub(crate) fn spawn_xwayland(
         dh,
         None,
         std::iter::empty::<(String, String)>(),
+        std::iter::empty::<String>(),
         true,
         Stdio::null(),
         Stdio::null(),
@@ -192,7 +193,12 @@ impl State {
     /// Xwayland reported ready: attach the X11 window manager, publish
     /// XSETTINGS (DPI + cursor theme), and install the root cursor.
     pub(crate) fn on_xwayland_ready(&mut self, x11_socket: std::os::unix::net::UnixStream, client: Client) {
-        let mut xwm = match X11Wm::start_wm(self.loop_handle.clone(), x11_socket, client) {
+        let mut xwm = match X11Wm::start_wm(
+            self.loop_handle.clone(),
+            &self.display_handle,
+            x11_socket,
+            client,
+        ) {
             Ok(wm) => wm,
             Err(err) => {
                 warn!(error = %err, "failed to attach the X11 window manager; X11 apps unavailable");
@@ -329,8 +335,12 @@ impl State {
         // window sized exactly to the display, without _NET_WM_STATE_FULLSCREEN
         // — tiling it makes Wine destroy and recreate the window in a loop
         // (swapchain-invalidating resize), so the game never stays visible.
-        // xwayland-satellite ships this same size heuristic.
-        let geo = window.geometry();
+        // xwayland-satellite ships this same size heuristic — against the
+        // size the client CONFIGURED (`last_configure()`, 0.7.0's
+        // `geometry()`), not the new shadow-subtracted buffer bbox, which
+        // would spuriously fullscreen a GTK CSD window whose visible area
+        // happens to match an output.
+        let geo = window.last_configure();
         let output_sized = self.layout.any_output_full_size(geo.size.w, geo.size.h);
         if window.is_fullscreen() || output_sized {
             if output_sized && !window.is_fullscreen() {
@@ -589,9 +599,13 @@ impl XwmHandler for State {
         match managed {
             // Not ours (yet): pre-map windows sizing themselves (games
             // picking a resolution) get exactly what they asked for, so
-            // the size they see before mapping matches reality.
+            // the size they see before mapping matches reality. Partial
+            // requests fill in from `last_configure()` — the tracked
+            // X-side rect (0.7.0's `geometry()`); the new `geometry()`
+            // is a zero-origin shadow-subtracted bbox, and seeding from
+            // it teleported size-only requests to (0,0).
             None => {
-                let mut rect = window.geometry();
+                let mut rect = window.last_configure();
                 if let Some(x) = x {
                     rect.loc.x = x;
                 }
@@ -678,6 +692,34 @@ impl XwmHandler for State {
 
     fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
         // Same as resize_request: moves are compositor-driven (Super+LMB).
+    }
+
+    /// `_NET_ACTIVE_WINDOW`: an X client asks for one of its windows to be
+    /// activated — wmctrl/xdotool, a single-instance app re-raising its
+    /// existing window, a tray "bring to front". We advertise the atom in
+    /// `_NET_SUPPORTED`, so honour it through the same path an IPC
+    /// `focus-window` takes: reveal the workspace + keyboard focus (the
+    /// X11-side `SetInputFocus` follows via the focus-change plumbing).
+    /// 0.7.0-era smithay dropped these messages before any handler; the
+    /// git vendor delivers them.
+    fn active_window_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _timestamp: u32,
+        _currently_active_window: Option<X11Surface>,
+    ) {
+        let Some(surface) = self
+            .x11_windows
+            .iter()
+            .find(|(w, _)| w == &window)
+            .map(|(_, s)| s.clone())
+        else {
+            debug!(window = window.window_id(), "xwayland: _NET_ACTIVE_WINDOW for an untracked window; ignored");
+            return;
+        };
+        info!(window = window.window_id(), "xwayland: _NET_ACTIVE_WINDOW → focusing");
+        self.focus_surface(&surface);
     }
 
     fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
@@ -789,4 +831,3 @@ impl State {
     }
 }
 
-smithay::delegate_xwayland_shell!(State);

@@ -98,11 +98,12 @@ pub use error::Error as DrmError;
 use indexmap::IndexSet;
 #[cfg(feature = "backend_gbm")]
 pub use surface::gbm::{Error as GbmBufferedSurfaceError, GbmBufferedSurface};
+// Libreland vendor patch: HdrMetadata added to the reexport.
 pub use surface::{DrmSurface, HdrMetadata, PlaneConfig, PlaneDamageClips, PlaneState, VrrSupport};
 
 use drm::{
-    control::{crtc, framebuffer, plane, Device as ControlDevice, PlaneType},
     DriverCapability,
+    control::{Device as ControlDevice, PlaneType, crtc, framebuffer, plane},
 };
 use tracing::trace;
 
@@ -402,8 +403,7 @@ fn plane_formats(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> 
 
     trace!(
         "Supported scan-out formats for plane ({:?}): {:?}",
-        plane,
-        formats
+        plane, formats
     );
 
     Ok(FormatSet::from_formats(formats))

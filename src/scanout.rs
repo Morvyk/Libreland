@@ -527,7 +527,15 @@ impl ScanoutSurface {
         let dst = Rectangle::from_size((i32::from(w), i32::from(h)).into());
 
         let damage_clips = damage.and_then(|damage| {
-            PlaneDamageClips::from_damage(self.drm.device_fd(), src, dst, damage)
+            PlaneDamageClips::from_damage(
+                self.drm.device_fd(),
+                src,
+                dst,
+                // Untransformed output; damage is already framebuffer-space.
+                Transform::Normal,
+                Transform::Normal,
+                damage,
+            )
                 .ok()
                 .flatten()
         });

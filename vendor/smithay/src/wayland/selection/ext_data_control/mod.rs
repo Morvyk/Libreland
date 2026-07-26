@@ -8,6 +8,7 @@
 //! ```
 //! # extern crate wayland_server;
 //! # #[macro_use] extern crate smithay;
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
 //! use smithay::wayland::selection::SelectionHandler;
 //! use smithay::wayland::selection::ext_data_control::{DataControlState, DataControlHandler};
 //! # use smithay::input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus};
@@ -24,6 +25,11 @@
 //! // ..
 //!
 //! // implement the necessary traits
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+//! # }
 //! # impl SeatHandler for State {
 //! #     type KeyboardFocus = WlSurface;
 //! #     type PointerFocus = WlSurface;
@@ -36,10 +42,11 @@
 //!     type SelectionUserData = ();
 //! }
 //! impl DataControlHandler for State {
-//!     fn data_control_state(&self) -> &DataControlState { &self.data_control_state }
+//!     fn data_control_state(&mut self) -> &mut DataControlState { &mut self.data_control_state }
 //!     // ... override default implementations here to customize handling ...
 //! }
-//! delegate_ext_data_control!(State);
+//!
+//! smithay::delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
@@ -47,8 +54,12 @@
 //! Be aware that data control clients rely on other selection providers to be implemneted, like
 //! wl_data_device or zwp_primary_selection.
 
+use std::collections::HashMap;
+
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1::ExtDataControlManagerV1;
+use wayland_protocols::ext::data_control::v1::server::ext_data_control_source_v1::ExtDataControlSourceV1;
 use wayland_server::backend::GlobalId;
+use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::{Client, DisplayHandle, GlobalDispatch};
 
 mod device;
@@ -57,19 +68,24 @@ mod source;
 pub use device::ExtDataControlDeviceUserData;
 pub use source::ExtDataControlSourceUserData;
 
-use super::primary_selection::PrimarySelectionState;
 use super::SelectionHandler;
+use super::primary_selection::PrimarySelectionState;
 
 /// Access the data control state.
 pub trait DataControlHandler: Sized + SelectionHandler {
     /// [`DataControlState`] getter.
-    fn data_control_state(&self) -> &DataControlState;
+    fn data_control_state(&mut self) -> &mut DataControlState;
 }
 
 /// State of the data control.
 #[derive(Debug)]
 pub struct DataControlState {
     manager_global: GlobalId,
+    /// Used sources.
+    ///
+    /// Protocol states that each source can only be used once. We
+    /// also use it during destruction to get seat data.
+    pub(crate) used_sources: HashMap<ExtDataControlSourceV1, WlSeat>,
 }
 
 impl DataControlState {
@@ -90,7 +106,10 @@ impl DataControlState {
             filter: Box::new(filter),
         };
         let manager_global = display.create_global::<D, ExtDataControlManagerV1, _>(1, data);
-        Self { manager_global }
+        Self {
+            manager_global,
+            used_sources: Default::default(),
+        }
     }
 
     /// [ExtDataControlManagerV1]  GlobalId getter.
@@ -125,70 +144,66 @@ mod handlers {
         ext_data_control_manager_v1::{self, ExtDataControlManagerV1},
         ext_data_control_source_v1::ExtDataControlSourceV1,
     };
-    use wayland_server::{Client, Dispatch, DisplayHandle, GlobalDispatch};
+    use wayland_server::{Client, Dispatch, DisplayHandle};
 
     use crate::input::Seat;
+    use crate::wayland::selection::SelectionTarget;
     use crate::wayland::selection::device::SelectionDevice;
     use crate::wayland::selection::seat_data::SeatData;
-    use crate::wayland::selection::SelectionTarget;
+    use crate::wayland::{Dispatch2, GlobalDispatch2};
 
     use super::DataControlHandler;
-    use super::DataControlState;
     use super::ExtDataControlDeviceUserData;
     use super::ExtDataControlManagerGlobalData;
     use super::ExtDataControlManagerUserData;
     use super::ExtDataControlSourceUserData;
 
-    impl<D> GlobalDispatch<ExtDataControlManagerV1, ExtDataControlManagerGlobalData, D> for DataControlState
+    impl<D> GlobalDispatch2<ExtDataControlManagerV1, D> for ExtDataControlManagerGlobalData
     where
-        D: GlobalDispatch<ExtDataControlManagerV1, ExtDataControlManagerGlobalData>,
         D: Dispatch<ExtDataControlManagerV1, ExtDataControlManagerUserData>,
-        D: Dispatch<ExtDataControlDeviceV1, ExtDataControlDeviceUserData>,
-        D: Dispatch<ExtDataControlSourceV1, ExtDataControlSourceUserData>,
         D: DataControlHandler,
         D: 'static,
     {
         fn bind(
+            &self,
             _state: &mut D,
             _handle: &DisplayHandle,
             _client: &wayland_server::Client,
             resource: wayland_server::New<ExtDataControlManagerV1>,
-            global_data: &ExtDataControlManagerGlobalData,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
             data_init.init(
                 resource,
                 ExtDataControlManagerUserData {
-                    primary: global_data.primary,
+                    primary: self.primary,
                 },
             );
         }
 
-        fn can_view(client: Client, global_data: &ExtDataControlManagerGlobalData) -> bool {
-            (global_data.filter)(&client)
+        fn can_view(&self, client: &Client) -> bool {
+            (self.filter)(client)
         }
     }
 
-    impl<D> Dispatch<ExtDataControlManagerV1, ExtDataControlManagerUserData, D> for DataControlState
+    impl<D> Dispatch2<ExtDataControlManagerV1, D> for ExtDataControlManagerUserData
     where
-        D: Dispatch<ExtDataControlManagerV1, ExtDataControlManagerUserData>,
         D: Dispatch<ExtDataControlDeviceV1, ExtDataControlDeviceUserData>,
         D: Dispatch<ExtDataControlSourceV1, ExtDataControlSourceUserData>,
         D: DataControlHandler,
         D: 'static,
     {
         fn request(
+            &self,
             _handler: &mut D,
             client: &wayland_server::Client,
             _resource: &ExtDataControlManagerV1,
             request: <ExtDataControlManagerV1 as wayland_server::Resource>::Request,
-            data: &ExtDataControlManagerUserData,
             dh: &DisplayHandle,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
             match request {
                 ext_data_control_manager_v1::Request::CreateDataSource { id } => {
-                    data_init.init(id, ExtDataControlSourceUserData::new());
+                    data_init.init(id, ExtDataControlSourceUserData::new(dh.clone()));
                 }
                 ext_data_control_manager_v1::Request::GetDataDevice { id, seat: wl_seat } => {
                     match Seat::<D>::from_resource(&wl_seat) {
@@ -200,7 +215,7 @@ mod handlers {
                                 id,
                                 ExtDataControlDeviceUserData {
                                     wl_seat,
-                                    primary: data.primary,
+                                    primary: self.primary,
                                 },
                             ));
 
@@ -215,7 +230,7 @@ mod handlers {
                             // NOTE: broadcast selection only to the newly created device.
                             let device = Some(&device);
                             seat_data.send_selection::<D>(dh, SelectionTarget::Clipboard, device, true);
-                            if data.primary {
+                            if self.primary {
                                 seat_data.send_selection::<D>(dh, SelectionTarget::Primary, device, true);
                             }
                         }
@@ -233,23 +248,4 @@ mod handlers {
             }
         }
     }
-}
-
-/// Macro to delegate implementation of the ext_data_control protocol
-#[macro_export]
-macro_rules! delegate_ext_data_control {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1::ExtDataControlManagerV1: $crate::wayland::selection::ext_data_control::ExtDataControlManagerGlobalData
-        ] => $crate::wayland::selection::ext_data_control::DataControlState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1::ExtDataControlManagerV1: $crate::wayland::selection::ext_data_control::ExtDataControlManagerUserData
-        ] => $crate::wayland::selection::ext_data_control::DataControlState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::ext::data_control::v1::server::ext_data_control_device_v1::ExtDataControlDeviceV1: $crate::wayland::selection::ext_data_control::ExtDataControlDeviceUserData
-        ] => $crate::wayland::selection::ext_data_control::DataControlState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::ext::data_control::v1::server::ext_data_control_source_v1::ExtDataControlSourceV1: $crate::wayland::selection::ext_data_control::ExtDataControlSourceUserData
-        ] => $crate::wayland::selection::ext_data_control::DataControlState);
-    };
 }

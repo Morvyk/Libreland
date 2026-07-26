@@ -26,7 +26,7 @@
 //! ```
 //! # extern crate wayland_server;
 //! # #[macro_use] extern crate smithay;
-//! use smithay::delegate_primary_selection;
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
 //! use smithay::wayland::selection::SelectionHandler;
 //! use smithay::wayland::selection::primary_selection::{PrimarySelectionState, PrimarySelectionHandler};
 //! # use smithay::input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus};
@@ -43,6 +43,11 @@
 //! // ..
 //!
 //! // implement the necessary traits
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+//! # }
 //! # impl SeatHandler for State {
 //! #     type KeyboardFocus = WlSurface;
 //! #     type PointerFocus = WlSurface;
@@ -55,23 +60,28 @@
 //!     type SelectionUserData = ();
 //! }
 //! impl PrimarySelectionHandler for State {
-//!     fn primary_selection_state(&self) -> &PrimarySelectionState { &self.primary_selection_state }
+//!     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState { &mut self.primary_selection_state }
 //!     // ... override default implementations here to customize handling ...
 //! }
-//! delegate_primary_selection!(State);
+//!
+//! delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
 
-use std::{
-    cell::{Ref, RefCell},
-    os::unix::io::OwnedFd,
-    sync::Arc,
-};
+use std::cell::{Ref, RefCell};
+use std::collections::HashMap;
+use std::os::unix::io::OwnedFd;
+use std::sync::Arc;
 
 use tracing::instrument;
-use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 as PrimaryDeviceManager;
-use wayland_server::{backend::GlobalId, Client, DisplayHandle, GlobalDispatch};
+use wayland_protocols::wp::primary_selection::zv1::{
+    server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 as PrimaryDeviceManager,
+    server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+};
+use wayland_server::backend::GlobalId;
+use wayland_server::protocol::wl_seat::WlSeat;
+use wayland_server::{Client, DisplayHandle, GlobalDispatch};
 
 use crate::{
     input::{Seat, SeatHandler},
@@ -84,20 +94,25 @@ mod source;
 pub use device::PrimaryDeviceUserData;
 pub use source::{PrimarySourceUserData, SourceMetadata};
 
-use super::source::CompositorSelectionProvider;
 use super::SelectionHandler;
+use super::source::CompositorSelectionProvider;
 use super::{offer::OfferReplySource, seat_data::SeatData};
 
 /// Access the primary selection state.
 pub trait PrimarySelectionHandler: Sized + SeatHandler + SelectionHandler {
     /// [PrimarySelectionState] getter.
-    fn primary_selection_state(&self) -> &PrimarySelectionState;
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState;
 }
 
 /// State of the primary selection.
 pub struct PrimarySelectionState {
     manager_global: GlobalId,
     pub(super) filter: Arc<Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>>,
+    /// Used sources.
+    ///
+    /// Protocol states that each source can only be used once. We
+    /// also use it during destruction to get seat data.
+    pub(crate) used_sources: HashMap<ZwpPrimarySelectionSourceV1, WlSeat>,
 }
 
 impl std::fmt::Debug for PrimarySelectionState {
@@ -136,6 +151,7 @@ impl PrimarySelectionState {
         Self {
             manager_global,
             filter,
+            used_sources: Default::default(),
         }
     }
 
@@ -264,9 +280,7 @@ where
         .get::<RefCell<SeatData<D::SelectionUserData>>>()
         .unwrap();
     Ref::filter_map(seat_data.borrow(), |data| match data.get_primary_selection() {
-        Some(OfferReplySource::Compositor(CompositorSelectionProvider { ref user_data, .. })) => {
-            Some(user_data)
-        }
+        Some(OfferReplySource::Compositor(CompositorSelectionProvider { user_data, .. })) => Some(user_data),
         _ => None,
     })
     .ok()
@@ -298,46 +312,47 @@ mod handlers {
         zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1 as PrimaryDevice,
         zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1 as PrimarySource,
     };
-    use wayland_server::{Dispatch, DisplayHandle, GlobalDispatch};
+    use wayland_server::{Dispatch, DisplayHandle};
 
     use crate::{
         input::{Seat, SeatHandler},
-        wayland::selection::{device::SelectionDevice, seat_data::SeatData},
+        wayland::{
+            Dispatch2, GlobalData, GlobalDispatch2,
+            selection::{device::SelectionDevice, seat_data::SeatData},
+        },
     };
 
+    use super::PrimarySelectionHandler;
     use super::{
-        device::PrimaryDeviceUserData, source::PrimarySourceUserData, PrimaryDeviceManagerGlobalData,
+        PrimaryDeviceManagerGlobalData, device::PrimaryDeviceUserData, source::PrimarySourceUserData,
     };
-    use super::{PrimarySelectionHandler, PrimarySelectionState};
 
-    impl<D> GlobalDispatch<PrimaryDeviceManager, PrimaryDeviceManagerGlobalData, D> for PrimarySelectionState
+    impl<D> GlobalDispatch2<PrimaryDeviceManager, D> for PrimaryDeviceManagerGlobalData
     where
-        D: GlobalDispatch<PrimaryDeviceManager, PrimaryDeviceManagerGlobalData>,
-        D: Dispatch<PrimaryDeviceManager, ()>,
+        D: Dispatch<PrimaryDeviceManager, GlobalData>,
         D: Dispatch<PrimarySource, PrimarySourceUserData>,
         D: Dispatch<PrimaryDevice, PrimaryDeviceUserData>,
         D: PrimarySelectionHandler,
         D: 'static,
     {
         fn bind(
+            &self,
             _state: &mut D,
             _handle: &DisplayHandle,
             _client: &wayland_server::Client,
             resource: wayland_server::New<PrimaryDeviceManager>,
-            _global_data: &PrimaryDeviceManagerGlobalData,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
-            data_init.init(resource, ());
+            data_init.init(resource, GlobalData);
         }
 
-        fn can_view(client: wayland_server::Client, global_data: &PrimaryDeviceManagerGlobalData) -> bool {
-            (global_data.filter)(&client)
+        fn can_view(&self, client: &wayland_server::Client) -> bool {
+            (self.filter)(client)
         }
     }
 
-    impl<D> Dispatch<PrimaryDeviceManager, (), D> for PrimarySelectionState
+    impl<D> Dispatch2<PrimaryDeviceManager, D> for GlobalData
     where
-        D: Dispatch<PrimaryDeviceManager, ()>,
         D: Dispatch<PrimarySource, PrimarySourceUserData>,
         D: Dispatch<PrimaryDevice, PrimaryDeviceUserData>,
         D: PrimarySelectionHandler,
@@ -345,17 +360,17 @@ mod handlers {
         D: 'static,
     {
         fn request(
+            &self,
             _state: &mut D,
             client: &wayland_server::Client,
             _resource: &PrimaryDeviceManager,
             request: primary_device_manager::Request,
-            _data: &(),
-            _dhandle: &DisplayHandle,
+            dhandle: &DisplayHandle,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
             match request {
                 primary_device_manager::Request::CreateSource { id } => {
-                    data_init.init(id, PrimarySourceUserData::new());
+                    data_init.init(id, PrimarySourceUserData::new(dhandle.clone()));
                 }
                 primary_device_manager::Request::GetDevice { id, seat: wl_seat } => {
                     match Seat::<D>::from_resource(&wl_seat) {
@@ -388,24 +403,4 @@ mod handlers {
             }
         }
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_primary_selection {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1: $crate::wayland::selection::primary_selection::PrimaryDeviceManagerGlobalData
-        ] => $crate::wayland::selection::primary_selection::PrimarySelectionState);
-
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1: ()
-        ] => $crate::wayland::selection::primary_selection::PrimarySelectionState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1: $crate::wayland::selection::primary_selection::PrimaryDeviceUserData
-        ] => $crate::wayland::selection::primary_selection::PrimarySelectionState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1: $crate::wayland::selection::primary_selection::PrimarySourceUserData
-        ] => $crate::wayland::selection::primary_selection::PrimarySelectionState);
-    };
 }

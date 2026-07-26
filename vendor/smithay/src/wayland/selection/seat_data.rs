@@ -2,8 +2,6 @@ use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_device_v1
 use wayland_server::protocol::wl_data_device::WlDataDevice;
 use wayland_server::{Client, DisplayHandle, Resource};
 
-use crate::utils::IsAlive;
-
 use super::device::SelectionDevice;
 use super::offer::{OfferReplySource, SelectionOffer};
 use super::{SelectionHandler, SelectionTarget};
@@ -128,8 +126,8 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         &mut self,
         dh: &DisplayHandle,
         ty: SelectionTarget,
-        mut restrict_to: Option<&SelectionDevice>,
-        mut update_data_control: bool,
+        restrict_to: Option<&SelectionDevice>,
+        update_data_control: bool,
     ) where
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
@@ -141,26 +139,10 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
             ),
         };
 
-        // Clear selection if it's no longer alive.
-        if selection.as_ref().is_some_and(|selection| {
-            if let OfferReplySource::Client(source) = selection {
-                !source.alive()
-            } else {
-                false
-            }
-        }) {
-            // Trigger data-control reload when selection is gone.
-            update_data_control |= true;
-            *selection = None;
-
-            // NOTE when selection provider dies, we need to refresh the state in each data device.
-            restrict_to = None;
-        }
-
         for device in self
             .known_devices
             .iter()
-            .filter(|&device| restrict_to.is_none() || restrict_to == Some(device))
+            .filter(|&device| restrict_to.is_none_or(|r| r == device))
             .filter(|&device| match device {
                 // NOTE: filter by actual type here to not get a missmpatches when using selections
                 // later on.
@@ -197,7 +179,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                     device.unset_selection();
                     continue;
                 }
-                (Some(ref selection), _) => {
+                (Some(selection), _) => {
                     // DataControl devices is the client itself, however other devices use
                     // the currently focused one as a client.
                     let client_id = match device {

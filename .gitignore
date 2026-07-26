@@ -16,3 +16,5 @@
 /contrib/no-present-timing-layer/*.so
 # makepkg VCS clone dir for the -git package
 /contrib/libreland-git/libreland-git/
+# rust-analyzer builds the standalone vendored crate in place
+/vendor/smithay/target/

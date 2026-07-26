@@ -5,8 +5,8 @@
 //! conversions to and from [dmabufs](super::dmabuf).
 
 use super::{
-    dmabuf::{AsDmabuf, Dmabuf, DmabufFlags, MAX_PLANES},
     Allocator, Buffer, Format, Fourcc, Modifier,
+    dmabuf::{AsDmabuf, Dmabuf, DmabufFlags, MAX_PLANES},
 };
 use crate::backend::drm::DrmNode;
 use crate::utils::{Buffer as BufferCoords, Size};
@@ -284,13 +284,7 @@ impl AsDmabuf for GbmBuffer {
         for idx in 0..planes {
             let fd = self.fd_for_plane(idx)?;
 
-            builder.add_plane(
-                // SAFETY: `gbm_bo_get_fd_for_plane` returns a new fd owned by the caller.
-                fd,
-                idx as u32,
-                self.offset(idx),
-                self.stride_for_plane(idx),
-            );
+            builder.add_plane(fd, self.offset(idx), self.stride_for_plane(idx));
         }
 
         if let Some(node) = self.device_node() {
@@ -326,13 +320,7 @@ impl AsDmabuf for GbmBuffer {
         for idx in 0..planes {
             let fd = self.fd()?;
 
-            builder.add_plane(
-                // SAFETY: `gbm_bo_get_fd` returns a new fd owned by the caller.
-                fd,
-                idx as u32,
-                self.offset(idx),
-                self.stride_for_plane(idx),
-            );
+            builder.add_plane(fd, self.offset(idx), self.stride_for_plane(idx));
         }
 
         if let Some(node) = self.device_node() {

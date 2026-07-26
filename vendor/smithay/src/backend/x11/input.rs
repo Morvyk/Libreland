@@ -1,6 +1,6 @@
 //! Input backend implementation for the X11 backend.
 
-use super::{window_inner::WindowInner, Window, WindowTemporary};
+use super::{Window, WindowTemporary, window_inner::WindowInner};
 use crate::{
     backend::input::{
         self, AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
@@ -132,7 +132,7 @@ impl PointerAxisEvent<X11Input> for X11MouseWheelEvent {
     }
 
     fn source(&self) -> AxisSource {
-        // X11 seems to act within the scope of individual rachets of a scroll wheel.
+        // X11 seems to act within the scope of individual ratchets of a scroll wheel.
         AxisSource::Wheel
     }
 

@@ -57,13 +57,14 @@ xkbcommon = "0.8"
 [lints]
 workspace = true
 
-# We vendor a lightly-patched smithay 0.7.0 under vendor/smithay: it adds
-# HDR connector-property support (Colorspace / max bpc / HDR_OUTPUT_METADATA)
-# folded into smithay's *own* atomic modeset commit. smithay 0.7 exposes no
-# API for this, and a side-channel atomic commit on the same CRTC wedges the
-# display (proven on real 4K@240 HDR hardware), so the only correct path is
-# to set these properties in the same modeset that brings the pipe up.
-# See vendor/smithay (search "HDR") for the diff against upstream 0.7.0.
+# We vendor a lightly-patched smithay under vendor/smithay, tracking upstream
+# GIT (the exact SHA is in vendor/smithay/UPSTREAM-COMMIT) rather than the
+# year-stale 0.7.0 release. The headline patch adds HDR connector-property
+# support (Colorspace / max bpc / HDR_OUTPUT_METADATA) folded into smithay's
+# *own* atomic modeset commit — a side-channel atomic commit on the same CRTC
+# wedges the display (proven on real 4K@240 HDR hardware). Every deviation
+# from upstream, code and packaging, is indexed in
+# vendor/smithay/LIBRELAND-PATCHES.md and marked in-source with "Libreland".
 [patch.crates-io]
 smithay = { path = "vendor/smithay" }
 

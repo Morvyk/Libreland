@@ -7,26 +7,13 @@ pub static SERIAL_COUNTER: SerialCounter = SerialCounter::new();
 
 /// A serial type, whose comparison takes into account the wrapping-around behavior of the
 /// underlying counter.
-#[derive(Debug, Copy, Clone)]
+#[derive(Hash, PartialEq, Eq, Debug, Copy, Clone)]
 pub struct Serial(pub(crate) u32);
-
-impl PartialEq for Serial {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for Serial {}
 
 impl PartialOrd for Serial {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        let distance = if self.0 > other.0 {
-            self.0 - other.0
-        } else {
-            other.0 - self.0
-        };
+        let distance = self.0.abs_diff(other.0);
         if distance < u32::MAX / 2 {
             self.0.partial_cmp(&other.0)
         } else {

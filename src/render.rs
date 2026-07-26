@@ -6690,7 +6690,10 @@ fn capture_dmabuf(
     let src = spec.region;
     let dst_rect = Rectangle::<i32, Physical>::from_size(spec.region.size);
     match gles.blit(target, &mut dst, src, dst_rect, TextureFilter::Linear) {
-        Ok(()) => CaptureOutcome::Dmabuf,
+        // The returned SyncPoint is dropped: same-context GL ordering plus
+        // the dmabuf's implicit fence cover the client's read, matching the
+        // pre-git-smithay behaviour (blit used to return no sync at all).
+        Ok(_) => CaptureOutcome::Dmabuf,
         Err(err) => {
             warn!(error = %err, output = %output_name, "screencopy: blit to client dmabuf failed");
             CaptureOutcome::Failed

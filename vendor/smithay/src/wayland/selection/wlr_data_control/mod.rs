@@ -8,6 +8,7 @@
 //! ```
 //! # extern crate wayland_server;
 //! # #[macro_use] extern crate smithay;
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
 //! use smithay::wayland::selection::SelectionHandler;
 //! use smithay::wayland::selection::wlr_data_control::{DataControlState, DataControlHandler};
 //! # use smithay::input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus};
@@ -24,6 +25,11 @@
 //! // ..
 //!
 //! // implement the necessary traits
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+//! # }
 //! # impl SeatHandler for State {
 //! #     type KeyboardFocus = WlSurface;
 //! #     type PointerFocus = WlSurface;
@@ -36,10 +42,11 @@
 //!     type SelectionUserData = ();
 //! }
 //! impl DataControlHandler for State {
-//!     fn data_control_state(&self) -> &DataControlState { &self.data_control_state }
+//!     fn data_control_state(&mut self) -> &mut DataControlState { &mut self.data_control_state }
 //!     // ... override default implementations here to customize handling ...
 //! }
-//! delegate_data_control!(State);
+//!
+//! smithay::delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
@@ -47,10 +54,13 @@
 //! Be aware that data control clients rely on other selection providers to be implemneted, like
 //! wl_data_device or zwp_primary_selection.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
+use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_source_v1::ZwlrDataControlSourceV1;
 use wayland_server::backend::GlobalId;
+use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::{Client, DisplayHandle, GlobalDispatch};
 
 mod device;
@@ -59,19 +69,24 @@ mod source;
 pub use device::DataControlDeviceUserData;
 pub use source::DataControlSourceUserData;
 
-use super::primary_selection::PrimarySelectionState;
 use super::SelectionHandler;
+use super::primary_selection::PrimarySelectionState;
 
 /// Access the data control state.
 pub trait DataControlHandler: Sized + SelectionHandler {
     /// [`DataControlState`] getter.
-    fn data_control_state(&self) -> &DataControlState;
+    fn data_control_state(&mut self) -> &mut DataControlState;
 }
 
 /// State of the data control.
 #[derive(Debug)]
 pub struct DataControlState {
     manager_global: GlobalId,
+    /// Used sources.
+    ///
+    /// Protocol states that each source can only be used once. We
+    /// also use it during destruction to get seat data.
+    pub(crate) used_sources: HashMap<ZwlrDataControlSourceV1, WlSeat>,
 }
 
 impl DataControlState {
@@ -94,7 +109,10 @@ impl DataControlState {
             filter: Box::new(filter),
         };
         let manager_global = display.create_global::<D, ZwlrDataControlManagerV1, _>(2, data);
-        Self { manager_global }
+        Self {
+            manager_global,
+            used_sources: Default::default(),
+        }
     }
 
     /// [ZwlrDataControlManagerV1]  GlobalId getter.
@@ -130,23 +148,22 @@ mod handlers {
     use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1;
     use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
     use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_source_v1::ZwlrDataControlSourceV1;
-    use wayland_server::{Client, Dispatch, DisplayHandle, GlobalDispatch};
+    use wayland_server::{Client, Dispatch, DisplayHandle};
 
     use crate::input::Seat;
+    use crate::wayland::selection::SelectionTarget;
     use crate::wayland::selection::device::SelectionDevice;
     use crate::wayland::selection::seat_data::SeatData;
-    use crate::wayland::selection::SelectionTarget;
+    use crate::wayland::{Dispatch2, GlobalDispatch2};
 
     use super::DataControlDeviceUserData;
     use super::DataControlHandler;
     use super::DataControlManagerGlobalData;
     use super::DataControlManagerUserData;
     use super::DataControlSourceUserData;
-    use super::DataControlState;
 
-    impl<D> GlobalDispatch<ZwlrDataControlManagerV1, DataControlManagerGlobalData, D> for DataControlState
+    impl<D> GlobalDispatch2<ZwlrDataControlManagerV1, D> for DataControlManagerGlobalData
     where
-        D: GlobalDispatch<ZwlrDataControlManagerV1, DataControlManagerGlobalData>,
         D: Dispatch<ZwlrDataControlManagerV1, DataControlManagerUserData>,
         D: Dispatch<ZwlrDataControlDeviceV1, DataControlDeviceUserData>,
         D: Dispatch<ZwlrDataControlSourceV1, DataControlSourceUserData>,
@@ -154,46 +171,45 @@ mod handlers {
         D: 'static,
     {
         fn bind(
+            &self,
             _state: &mut D,
             _handle: &DisplayHandle,
             _client: &wayland_server::Client,
             resource: wayland_server::New<ZwlrDataControlManagerV1>,
-            global_data: &DataControlManagerGlobalData,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
             data_init.init(
                 resource,
                 DataControlManagerUserData {
-                    primary_selection_filter: Arc::clone(&global_data.primary_selection_filter),
+                    primary_selection_filter: Arc::clone(&self.primary_selection_filter),
                 },
             );
         }
 
-        fn can_view(client: Client, global_data: &DataControlManagerGlobalData) -> bool {
-            (global_data.filter)(&client)
+        fn can_view(&self, client: &Client) -> bool {
+            (self.filter)(client)
         }
     }
 
-    impl<D> Dispatch<ZwlrDataControlManagerV1, DataControlManagerUserData, D> for DataControlState
+    impl<D> Dispatch2<ZwlrDataControlManagerV1, D> for DataControlManagerUserData
     where
-        D: Dispatch<ZwlrDataControlManagerV1, DataControlManagerUserData>,
         D: Dispatch<ZwlrDataControlDeviceV1, DataControlDeviceUserData>,
         D: Dispatch<ZwlrDataControlSourceV1, DataControlSourceUserData>,
         D: DataControlHandler,
         D: 'static,
     {
         fn request(
+            &self,
             _handler: &mut D,
             client: &wayland_server::Client,
             _resource: &ZwlrDataControlManagerV1,
             request: <ZwlrDataControlManagerV1 as wayland_server::Resource>::Request,
-            data: &DataControlManagerUserData,
             dh: &DisplayHandle,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
             match request {
                 zwlr_data_control_manager_v1::Request::CreateDataSource { id } => {
-                    data_init.init(id, DataControlSourceUserData::new());
+                    data_init.init(id, DataControlSourceUserData::new(dh.clone()));
                 }
                 zwlr_data_control_manager_v1::Request::GetDataDevice { id, seat: wl_seat } => {
                     match Seat::<D>::from_resource(&wl_seat) {
@@ -205,7 +221,7 @@ mod handlers {
                                 id,
                                 DataControlDeviceUserData {
                                     wl_seat,
-                                    primary_selection_filter: Arc::clone(&data.primary_selection_filter),
+                                    primary_selection_filter: Arc::clone(&self.primary_selection_filter),
                                 },
                             ));
 
@@ -220,7 +236,7 @@ mod handlers {
                             // NOTE: broadcast selection only to the newly created device.
                             let device = Some(&device);
                             seat_data.send_selection::<D>(dh, SelectionTarget::Clipboard, device, true);
-                            if (*data.primary_selection_filter)(client) {
+                            if (*self.primary_selection_filter)(client) {
                                 seat_data.send_selection::<D>(dh, SelectionTarget::Primary, device, true);
                             }
                         }
@@ -238,23 +254,4 @@ mod handlers {
             }
         }
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_data_control {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1: $crate::wayland::selection::wlr_data_control::DataControlManagerGlobalData
-        ] => $crate::wayland::selection::wlr_data_control::DataControlState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1: $crate::wayland::selection::wlr_data_control::DataControlManagerUserData
-        ] => $crate::wayland::selection::wlr_data_control::DataControlState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_device_v1::ZwlrDataControlDeviceV1: $crate::wayland::selection::wlr_data_control::DataControlDeviceUserData
-        ] => $crate::wayland::selection::wlr_data_control::DataControlState);
-        $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            $crate::reexports::wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_source_v1::ZwlrDataControlSourceV1: $crate::wayland::selection::wlr_data_control::DataControlSourceUserData
-        ] => $crate::wayland::selection::wlr_data_control::DataControlState);
-    };
 }

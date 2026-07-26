@@ -229,7 +229,7 @@ pub(crate) struct State {
     /// decorations at all (it's a tiler).
     #[allow(
         dead_code,
-        reason = "held so delegate_xdg_decoration! can route global dispatch through it; the global is the only externally-visible effect"
+        reason = "held so the global stays alive; dispatch routes via delegate_dispatch2!"
     )]
     pub(crate) xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
     /// KDE `org_kde_kwin_server_decoration` substate. Held so the
@@ -242,7 +242,7 @@ pub(crate) struct State {
     /// globals live on the individual `Output`s in `outputs`.
     #[allow(
         dead_code,
-        reason = "held so delegate_output! can route global dispatch through it; the outputs vec is the per-display source of truth"
+        reason = "held so the global stays alive (dispatch via delegate_dispatch2!); the outputs vec is the per-display source of truth"
     )]
     pub(crate) output_manager_state: OutputManagerState,
     /// One `smithay::output::Output` per DRM connector. Held so
@@ -261,7 +261,7 @@ pub(crate) struct State {
     /// `wp_fractional_scale_manager_v1` substate.
     #[allow(
         dead_code,
-        reason = "held so delegate_fractional_scale! routes through it; new_fractional_scale callbacks read preferred_scale"
+        reason = "held so the global stays alive (dispatch via delegate_dispatch2!); new_fractional_scale callbacks read preferred_scale"
     )]
     pub(crate) fractional_scale_state:
         smithay::wayland::fractional_scale::FractionalScaleManagerState,
@@ -272,7 +272,7 @@ pub(crate) struct State {
     /// Required for fractional scaling to size client buffers right.
     #[allow(
         dead_code,
-        reason = "held so the wp_viewporter global stays alive and delegate_viewporter! can route through State; smithay reads the per-surface viewport during compositing"
+        reason = "held so the wp_viewporter global stays alive (dispatch via delegate_dispatch2!); smithay reads the per-surface viewport during compositing"
     )]
     pub(crate) viewporter_state: smithay::wayland::viewporter::ViewporterState,
     /// `wl_data_device_manager` global — clipboard + drag-and-drop.
@@ -299,16 +299,16 @@ pub(crate) struct State {
         reason = "held to keep the zwp_linux_dmabuf_v1 global alive for the compositor's lifetime"
     )]
     pub(crate) dmabuf_global: smithay::wayland::dmabuf::DmabufGlobal,
-    /// The v4 default dmabuf feedback, re-sent per-surface when a window
-    /// leaves fullscreen; `None` on a v3-only global.
-    #[allow(dead_code, reason = "kept for the from-birth scanout-feedback redesign; see sync_scanout_feedback")]
+    /// The v4 default dmabuf feedback — what every surface receives
+    /// until it fullscreens; `None` on a v3-only global. NEVER re-sent
+    /// on unfullscreen: feedback is sticky for the surface's life (see
+    /// [`State::sync_scanout_feedback`]).
     pub(crate) dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// Default feedback + a Scanout-flagged tranche of the primary
     /// plane's explicit modifiers, sent per-surface to fullscreen windows
     /// so their swapchains re-allocate into plane-scannable buffers (the
     /// missing piece between the single-pass composite and true
     /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
-    #[allow(dead_code, reason = "kept for the from-birth scanout-feedback redesign; see sync_scanout_feedback")]
     pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// Last known lock-key LED state (num/caps/scroll) from xkb, pushed
     /// to every keyboard by [`State::apply_keyboard_leds`]. Kept so a
@@ -769,7 +769,7 @@ impl State {
     /// Whether the focused surface currently holds an *active*
     /// pointer-lock constraint. The renderer hides our cursor while
     /// this is true (the locked client — a game — draws its own).
-    fn pointer_locked(&self) -> bool {
+    pub(crate) fn pointer_locked(&self) -> bool {
         let Some(pointer) = self.seat.get_pointer() else {
             return false;
         };
@@ -1292,7 +1292,7 @@ impl State {
         clippy::type_complexity,
         reason = "the tuple mirrors smithay's pointer focus type (surface + f64 origin); naming it would add a struct used by exactly two callers"
     )]
-    fn pointer_hit_test(
+    pub(crate) fn pointer_hit_test(
         &self,
         cursor_i: Point<i32, Physical>,
     ) -> (
@@ -1383,7 +1383,7 @@ impl State {
     /// out an active pointer lock — the constraints protocol forbids
     /// motion events while locked, which is exactly what the unforced
     /// early-return protects (see the doc above).
-    fn resend_pointer_focus(&mut self, force: bool) {
+    pub(crate) fn resend_pointer_focus(&mut self, force: bool) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -2309,14 +2309,17 @@ impl State {
         // position the client chose. X apps position these against
         // their toplevel's geometry — which our configures keep in
         // sync — and constrain them on-screen themselves, so unlike
-        // xdg popups there's nothing to clamp or offset (an X window
-        // has no shadow-padded window geometry; buffer (0,0) is the
-        // rect's top-left).
+        // xdg popups there's nothing to clamp or offset: buffer (0,0)
+        // is the rect's top-left. `last_configure()` is the tracked
+        // X-side rect (git-smithay's rename of what `geometry()` was on
+        // 0.7.0, position included and kept current on ConfigureNotify);
+        // the NEW `geometry()` is a zero-origin buffer bbox minus
+        // _GTK_FRAME_EXTENTS — using it put every menu at (0,0).
         for (window, surface) in &self.x11_or_windows {
             if !window.alive() {
                 continue;
             }
-            let geo = window.geometry();
+            let geo = window.last_configure();
             out.push(render::PopupPlacement {
                 surface: surface.clone(),
                 buffer_origin: Point::new(geo.loc.x, geo.loc.y),
@@ -3036,30 +3039,58 @@ impl State {
     /// menu opening over the game doesn't flap the feedback and force
     /// swapchain rebuilds. smithay dedupes internally (`set_feedback`
     /// no-ops when unchanged), so per-frame calls cost a short tree walk.
-    #[allow(
-        clippy::unused_self,
-        reason = "kept as a method: the from-birth feedback redesign will need State again"
-    )]
+    ///
+    /// History: this was disabled from cc1eaf7 until the smithay-git
+    /// re-vendor, because on smithay 0.7.0 the per-surface switch was the
+    /// swapchain-rebuild storm that black-screened idTech games — 0.7.0
+    /// CLEARED a surface's stored feedback when its last feedback object
+    /// died, so every rebuilt feedback object saw the DEFAULT feedback
+    /// first and this sync re-delivered the Scanout switch, at ~1 rebuild
+    /// per second, forever (76/76 teardowns in a `WAYLAND_DEBUG` trace were
+    /// preceded by our feedback delivery). Upstream `7286dbd1` ("dmabuf:
+    /// Don't clear `last_feedback` for surface") makes the stored feedback
+    /// live as long as the surface: a fullscreen window now takes exactly
+    /// ONE switch, and every feedback object its WSI recreates afterwards
+    /// receives the Scanout variant from birth — the "from its first
+    /// delivery" precondition the disable comment demanded. Sticky is
+    /// still load-bearing: never flip BACK on unfullscreen (a switch is a
+    /// swapchain rebuild, and rebuilds are where fragile present code
+    /// runs); scanout-capable modifiers render fine windowed.
     fn sync_scanout_feedback(&self, placements: &[layout::Placement], out_name: Option<&str>) {
-        // PERMANENTLY DISABLED — the per-surface feedback SWITCH was the
-        // swapchain-rebuild storm that black-screened idTech games. Measured
-        // with WAYLAND_DEBUG on DOOM Eternal (Wine-Wayland): all 76 of 76
-        // swapchain teardowns were immediately preceded by a dmabuf-feedback
-        // delivery. The chain: a NEW feedback object always receives the
-        // DEFAULT feedback as its initial state (smithay hands out the stored
-        // per-surface state, which starts as the default — nothing sent later
-        // changes what a fresh object sees first); this sync then switched the
-        // surface to the Scanout variant; the WSI treats that change as
-        // "reallocate" → VK_SUBOPTIMAL → idTech recreates its VkSurface → new
-        // surface → same switch again → ~1 rebuild/second forever, each
-        // boundary risking a permanent present-wedge. KWin and cosmic-comp
-        // never switch per-surface feedback; the same game rebuilds exactly
-        // TWICE there. On NVIDIA the scanout tranche never bought zero-copy
-        // anyway (the primary plane rejects the allocated modifiers on nearly
-        // every frame). If zero-copy matters later (AMD), the tranche must be
-        // present in a surface's feedback FROM ITS FIRST DELIVERY — never as
-        // a mid-life switch.
-        let _ = (placements, out_name);
+        let (Some(default_fb), Some(scanout_fb)) = (
+            self.dmabuf_default_feedback.as_ref(),
+            self.dmabuf_scanout_feedback.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(name) = out_name else { return };
+        let Some(output) = self.outputs.iter().find(|o| o.name() == name) else {
+            return;
+        };
+        let Some(rect) = self.renderer.output_rect(name) else {
+            return;
+        };
+        for p in placements.iter().filter(|p| p.cell_rect.overlaps(rect)) {
+            let fullscreen = p.fill == layout::FillMode::Fullscreen;
+            if fullscreen {
+                self.scanout_feedback_given
+                    .borrow_mut()
+                    .insert(p.surface.id());
+            }
+            let feedback = if fullscreen
+                || self.scanout_feedback_given.borrow().contains(&p.surface.id())
+            {
+                scanout_fb
+            } else {
+                default_fb
+            };
+            smithay::desktop::utils::send_dmabuf_feedback_surface_tree(
+                &p.surface,
+                output,
+                |_, _| Some(output.clone()),
+                |_, _| feedback,
+            );
+        }
     }
 
     /// Keep `wl_surface.enter`/`leave` in sync with where surfaces live.
@@ -4670,7 +4701,7 @@ fn wire_event_sources(
         .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
 
     handle
-        .insert_source(udev, |event, (), state: &mut State| match event {
+        .insert_source(udev, |event, _, state: &mut State| match event {
             UdevEvent::Added { device_id, path } => {
                 info!(device_id, path = %path.display(), "udev: device added");
             }

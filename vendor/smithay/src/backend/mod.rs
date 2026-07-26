@@ -1,3 +1,5 @@
+// Allow in this module because of existing usage
+#![allow(clippy::uninlined_format_args)]
 //! Backend (rendering/input) helpers
 //!
 //! This module provides helpers for interaction with the operating system.
@@ -102,6 +104,9 @@ pub mod winit;
 
 #[cfg(feature = "backend_x11")]
 pub mod x11;
+
+#[cfg(feature = "backend_libei")]
+pub mod libei;
 
 /// Error that can happen when swapping buffers.
 #[derive(Debug, thiserror::Error)]

@@ -1,13 +1,19 @@
-use std::sync::Mutex;
+use std::{cell::RefCell, sync::Mutex};
 
 use wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::{
     self as primary_source, ZwpPrimarySelectionSourceV1 as PrimarySource,
 };
-use wayland_server::{backend::ClientId, Dispatch, DisplayHandle, Resource};
+use wayland_server::{DisplayHandle, backend::ClientId};
 
-use crate::utils::{alive_tracker::AliveTracker, IsAlive};
+use crate::{
+    input::Seat,
+    wayland::{
+        Dispatch2,
+        selection::{offer::OfferReplySource, seat_data::SeatData, source::SelectionSourceProvider},
+    },
+};
 
-use super::{PrimarySelectionHandler, PrimarySelectionState};
+use super::PrimarySelectionHandler;
 
 /// The metadata describing a data source
 #[derive(Debug, Default, Clone)]
@@ -20,35 +26,34 @@ pub struct SourceMetadata {
 #[derive(Debug)]
 pub struct PrimarySourceUserData {
     pub(crate) inner: Mutex<SourceMetadata>,
-    alive_tracker: AliveTracker,
+    display_handle: DisplayHandle,
 }
 
 impl PrimarySourceUserData {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(display_handle: DisplayHandle) -> Self {
         Self {
             inner: Default::default(),
-            alive_tracker: Default::default(),
+            display_handle,
         }
     }
 }
 
-impl<D> Dispatch<PrimarySource, PrimarySourceUserData, D> for PrimarySelectionState
+impl<D> Dispatch2<PrimarySource, D> for PrimarySourceUserData
 where
-    D: Dispatch<PrimarySource, PrimarySourceUserData>,
     D: PrimarySelectionHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         _resource: &PrimarySource,
         request: primary_source::Request,
-        data: &PrimarySourceUserData,
         _dhandle: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
         let _primary_selection_state = state.primary_selection_state();
-        let mut data = data.inner.lock().unwrap();
+        let mut data = self.inner.lock().unwrap();
 
         match request {
             primary_source::Request::Offer { mime_type } => {
@@ -59,15 +64,32 @@ where
         }
     }
 
-    fn destroyed(_state: &mut D, _client: ClientId, _resource: &PrimarySource, data: &PrimarySourceUserData) {
-        data.alive_tracker.destroy_notify();
-    }
-}
+    fn destroyed(&self, state: &mut D, _client: ClientId, source: &PrimarySource) {
+        // Remove the source from the used ones.
+        let seat = match state
+            .primary_selection_state()
+            .used_sources
+            .remove(source)
+            .as_ref()
+            .and_then(Seat::<D>::from_resource)
+        {
+            Some(seat) => seat,
+            None => return,
+        };
 
-impl IsAlive for PrimarySource {
-    #[inline]
-    fn alive(&self) -> bool {
-        let data: &PrimarySourceUserData = self.data().unwrap();
-        data.alive_tracker.alive()
+        let mut seat_data = seat
+            .user_data()
+            .get::<RefCell<SeatData<D::SelectionUserData>>>()
+            .unwrap()
+            .borrow_mut();
+
+        match seat_data.get_primary_selection() {
+            Some(OfferReplySource::Client(SelectionSourceProvider::Primary(set_source)))
+                if set_source == source =>
+            {
+                seat_data.set_primary_selection::<D>(&self.display_handle, None)
+            }
+            _ => (),
+        }
     }
 }

@@ -7,7 +7,7 @@
 //! client buffers is the 4b milestone; input forwarding is 4c.
 //!
 //! Wayland state lives on [`crate::State`] as flat fields so the
-//! `delegate_*` macros work without intermediate wrappers. The calloop
+//! `delegate_dispatch2!` macro works without intermediate wrappers. The calloop
 //! loop data type *is* `State`; the owned `Display<State>` (which can't
 //! live inside `State` without making the type circular) is moved into
 //! the dispatch source's closure, and outbound flushing goes through the
@@ -18,29 +18,6 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use smithay::backend::renderer::sync::Fence as _;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::delegate_compositor;
-use smithay::delegate_cursor_shape;
-use smithay::delegate_data_control;
-use smithay::delegate_data_device;
-use smithay::delegate_ext_data_control;
-use smithay::delegate_idle_inhibit;
-use smithay::delegate_idle_notify;
-use smithay::delegate_pointer_gestures;
-use smithay::delegate_xdg_activation;
-use smithay::delegate_content_type;
-use smithay::delegate_dmabuf;
-use smithay::delegate_fractional_scale;
-use smithay::delegate_kde_decoration;
-use smithay::delegate_layer_shell;
-use smithay::delegate_viewporter;
-use smithay::delegate_output;
-use smithay::delegate_pointer_constraints;
-use smithay::delegate_primary_selection;
-use smithay::delegate_relative_pointer;
-use smithay::delegate_seat;
-use smithay::delegate_shm;
-use smithay::delegate_xdg_decoration;
-use smithay::delegate_xdg_shell;
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -74,9 +51,10 @@ use smithay::wayland::pointer_constraints::{
     PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint,
 };
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
+use smithay::input::dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source as DndSource};
+use smithay::input::pointer::Focus as GrabFocus;
 use smithay::wayland::selection::data_device::{
-    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-    set_data_device_focus,
+    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
 };
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
@@ -97,7 +75,7 @@ use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::session_lock::{
     LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
 };
-use smithay::wayland::tablet_manager::TabletSeatHandler;
+use smithay::input::tablet::TabletSeatHandler;
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
@@ -177,9 +155,12 @@ pub struct WaylandInit {
     /// show anything; without it their surfaces render blank.
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
-    /// The v4 default dmabuf feedback (render device + import formats),
-    /// re-sent per-surface when a window leaves fullscreen. `None` when
-    /// only a v3 global could be advertised.
+    /// The v4 default dmabuf feedback (render device + import formats) —
+    /// what every surface receives until it fullscreens. `None` when
+    /// only a v3 global could be advertised. NEVER re-sent to a window
+    /// leaving fullscreen: feedback is sticky for the surface's life
+    /// (every switch is a swapchain rebuild; see
+    /// `State::sync_scanout_feedback`).
     pub dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
     /// The default feedback plus a Scanout-flagged tranche of the primary
     /// plane's explicit modifiers. Sent per-surface to fullscreen windows
@@ -253,7 +234,7 @@ pub struct WaylandInit {
     /// VK and D3D-translated titles with the layer disabled, so the layer
     /// was removed. If a present-timing SIGSEGV ever returns, that layer
     /// (git history: contrib/no-present-timing-layer) is the known shield.
-    #[allow(dead_code, reason = "held so the wp_fifo global stays alive; delegate_fifo! routes through it")]
+    #[allow(dead_code, reason = "held so the wp_fifo global stays alive; dispatch routes through it")]
     pub fifo_manager_state: Option<smithay::wayland::fifo::FifoManagerState>,
     /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
     /// `wl_surface`s with X11 windows (see `src/xwayland.rs`). Held so
@@ -275,6 +256,23 @@ pub struct WaylandInit {
     /// output's scale; multi-output per-surface scale tracking
     /// lands with workspaces.
     pub preferred_scale: f64,
+    /// `xdg_wm_dialog_v1` — clients declare "this toplevel is a
+    /// dialog/modal"; feeds the auto-float decision so it no longer
+    /// rests on heuristics alone (see `layout::dialog_size`).
+    #[allow(dead_code, reason = "held so the xdg-wm-dialog global stays alive")]
+    pub xdg_dialog_state: smithay::wayland::shell::xdg::dialog::XdgDialogState,
+    /// `wp_pointer_warp_v1` — clients ask the compositor to move the
+    /// pointer to a surface-local position (games/emulators recentring
+    /// the cursor without a lock). Honoured only for the surface that
+    /// currently holds pointer focus; see `PointerWarpHandler` on
+    /// `State`.
+    #[allow(dead_code, reason = "held so the wp_pointer_warp global stays alive")]
+    pub pointer_warp_manager: smithay::wayland::pointer_warp::PointerWarpManager,
+    /// `wl_fixes` — lets clients destroy `wl_registry` objects they no
+    /// longer need (long-lived clients otherwise leak registries
+    /// server-side). Entirely handled inside smithay.
+    #[allow(dead_code, reason = "held so the wl_fixes global stays alive")]
+    pub fixes_state: smithay::wayland::fixes::FixesState,
 }
 
 /// Build a smithay [`Output`] from a descriptor and apply its current
@@ -290,6 +288,7 @@ pub(crate) fn make_output(desc: &OutputDescriptor) -> Output {
             subpixel: Subpixel::Unknown,
             make: "libreland".into(),
             model: desc.name.clone(),
+            serial_number: "unknown".into(),
         },
     );
     let mode = OutputMode {
@@ -382,11 +381,11 @@ pub fn init(
                     let builder = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
                         .add_preference_tranche(
                             node.dev_id(),
-                            Some(
-                                smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1
-                                    ::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
-                            ),
+                            smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1
+                                ::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
                             scanout_formats,
+                            // Same version span the default feedback serves.
+                            3u32..=6,
                         );
                     match builder.build() {
                         Ok(scanout) => {
@@ -435,6 +434,15 @@ pub fn init(
     // to clients (handled in the libinput event loop).
     let pointer_gestures_state =
         smithay::wayland::pointer_gestures::PointerGesturesState::new::<State>(&dh);
+    // xdg_wm_dialog_v1: clients declare dialog/modal toplevels; the
+    // auto-float path reads the stored hint (layout::dialog_size).
+    let xdg_dialog_state = smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<State>(&dh);
+    // wp_pointer_warp_v1: client-requested pointer warps (see the
+    // PointerWarpHandler impl for the honour/reject policy).
+    let pointer_warp_manager =
+        smithay::wayland::pointer_warp::PointerWarpManager::new::<State>(&dh);
+    // wl_fixes: registry destruction for long-lived clients.
+    let fixes_state = smithay::wayland::fixes::FixesState::new::<State>(&dh);
     // zwp_primary_selection_v1: the middle-click "primary" selection.
     // Both it and the regular clipboard are persisted compositor-side
     // (see crate::clipboard) so a copied buffer survives the source app
@@ -589,6 +597,9 @@ pub fn init(
         outputs,
         output_globals,
         preferred_scale,
+        xdg_dialog_state,
+        pointer_warp_manager,
+        fixes_state,
     })
 }
 
@@ -1319,7 +1330,12 @@ impl SeatHandler for State {
 // `wp_cursor_shape_v1` covers tablet tools too, so the delegate
 // requires this. We don't advertise tablets, so the default no-op
 // (ignore tablet-tool cursor requests) is all we need.
-impl TabletSeatHandler for State {}
+impl TabletSeatHandler for State {
+    // `wp_cursor_shape_v1` covers tablet tools, so its dispatch requires
+    // this handler. No tablets are advertised on the seat; the focus type
+    // just has to name a valid target.
+    type ToolFocus = WlSurface;
+}
 
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
@@ -1338,6 +1354,12 @@ impl PointerConstraintsHandler for State {
         }
     }
 
+    fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        // A removed lock/confine can unhide the cursor (visibility keys
+        // off the active constraint each frame) — repaint promptly.
+        self.queue_redraw_all();
+    }
+
     fn cursor_position_hint(
         &mut self,
         _surface: &WlSurface,
@@ -1348,6 +1370,116 @@ impl PointerConstraintsHandler for State {
         // could warp there on unlock. We keep the visible cursor parked
         // where the lock engaged (it doesn't move during the lock and
         // reappears in place on unlock), so there's nothing to do.
+    }
+}
+
+impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for State {
+    /// A client declared (or cleared) its toplevel's dialog/modal hint.
+    /// smithay has already stored the hint in the toplevel's role data —
+    /// `layout::dialog_size` reads it at map time. The hint usually
+    /// arrives before the first commit; when it lands on an
+    /// already-mapped tiled window, re-run the auto-float so the
+    /// declaration still takes effect.
+    fn dialog_hint_changed(
+        &mut self,
+        toplevel: smithay::wayland::shell::xdg::ToplevelSurface,
+        hint: smithay::wayland::shell::xdg::dialog::ToplevelDialogHint,
+    ) {
+        use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
+        if matches!(hint, ToplevelDialogHint::Dialog | ToplevelDialogHint::Modal)
+            && self.mapped_toplevels.contains(toplevel.wl_surface())
+            && self.layout.float_if_dialog(toplevel.wl_surface())
+        {
+            self.queue_redraw_all();
+        }
+    }
+}
+
+impl smithay::wayland::pointer_warp::PointerWarpHandler for State {
+    /// A client asked to move the pointer to a surface-local position
+    /// (`wp_pointer_warp_v1` — games and emulators recentring the cursor
+    /// without taking a full pointer lock).
+    ///
+    /// Honoured only when `surface` is the surface currently holding
+    /// pointer focus (the protocol's own baseline) and nothing else owns
+    /// the pointer: not during a compositor drag, screenshot selection,
+    /// client grab, or an active pointer lock (constraints forbid
+    /// synthetic motion while locked — the client should use the lock's
+    /// own position hint instead). The target is clamped into the
+    /// focused surface's global rect, so a stale/oversized position can
+    /// never throw the cursor onto another window. The enter serial is
+    /// not cross-checked: the focus requirement already pins the request
+    /// to the surface the pointer is actually on.
+    fn warp_pointer(
+        &mut self,
+        surface: WlSurface,
+        _pointer: smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+        _serial: Serial,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        // ANY active constraint refuses the warp — not just a lock. A
+        // confined client warping outside its confine region would have
+        // the forced focus change deactivate its own confinement; a
+        // client wanting to steer a locked pointer has the lock's
+        // position hint.
+        let constrained = pointer.current_focus().as_ref().is_some_and(|focus| {
+            with_pointer_constraint(focus, &pointer, |constraint| {
+                constraint.is_some_and(|c| c.is_active())
+            })
+        });
+        if self.drag.is_some() || self.screenshot.is_some() || pointer.is_grabbed() || constrained
+        {
+            return;
+        }
+        if pointer.current_focus().as_ref() != Some(&surface) {
+            return;
+        }
+        // The focused surface's global origin comes from the same
+        // hit-test that granted it focus, so surface-local + origin is
+        // exactly the space the client computed `pos` in.
+        let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+        )]
+        let cursor_i =
+            smithay::utils::Point::<i32, smithay::utils::Physical>::from((cx as i32, cy as i32));
+        let (hit, _, _) = self.pointer_hit_test(cursor_i);
+        let Some((hit_surface, origin)) = hit else {
+            return;
+        };
+        if hit_surface != surface {
+            return;
+        }
+        let bbox = smithay::desktop::utils::bbox_from_surface_tree(&surface, (0, 0));
+        let tx = origin.x + pos.x.clamp(0.0, f64::from(bbox.size.w.max(0)));
+        let ty = origin.y + pos.y.clamp(0.0, f64::from(bbox.size.h.max(0)));
+        // The bbox spans the full buffer including any CSD shadow margin,
+        // which hangs OUTSIDE the window's hit rect — a warp into it (or
+        // any stale position) must not land the pointer on a neighbouring
+        // window, a gap, or an overlaying popup. Only honour targets that
+        // hit-test back to the requesting surface; refuse the rest
+        // outright rather than second-guessing where the client wanted.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "target coords derive from output-bounded rects and a clamped pos"
+        )]
+        let target_i =
+            smithay::utils::Point::<i32, smithay::utils::Physical>::from((tx as i32, ty as i32));
+        let (target_hit, _, _) = self.pointer_hit_test(target_i);
+        if target_hit.map(|(s, _)| s) != Some(surface.clone()) {
+            debug!(surface = ?surface.id(), x = tx, y = ty, "wp_pointer_warp: target outside the surface's hit rect; refused");
+            return;
+        }
+        self.renderer.on_pointer_motion(tx - cx, ty - cy);
+        self.resend_pointer_focus(true);
+        if self.renderer.has_dnd_icon() || !self.renderer.move_hw_cursor() {
+            self.queue_redraw_all();
+        }
+        debug!(surface = ?surface.id(), x = tx, y = ty, "wp_pointer_warp: pointer warped");
     }
 }
 
@@ -1618,54 +1750,91 @@ impl SelectionHandler for State {
         // When an X11 client owns the selection the bytes live on the X
         // side — have Xwayland fetch and stream them into the paster's
         // fd. Otherwise serve from the compositor's clipboard cache.
-        if self.x11_owns_selection.owns(ty) {
-            let loop_handle = self.loop_handle.clone();
-            if let Some(xwm) = &mut self.xwm {
-                if let Err(err) = xwm.send_selection(ty, mime_type, fd, loop_handle) {
-                    warn!(?ty, error = %err, "failed to request the selection from Xwayland");
-                }
-                return;
+        if self.x11_owns_selection.owns(ty)
+            && let Some(xwm) = &mut self.xwm
+        {
+            if let Err(err) = xwm.send_selection(ty, mime_type, fd) {
+                warn!(?ty, error = %err, "failed to request the selection from Xwayland");
             }
+            return;
         }
         crate::clipboard::on_send_selection(self, ty, &mime_type, fd);
     }
 }
 
-impl ClientDndGrabHandler for State {
-    /// A client started a drag. Smithay has already installed the
-    /// drag-and-drop pointer grab (which routes the offer to whatever
-    /// surface our pointer focus lands on); we just composite the drag
-    /// icon at the cursor for the duration.
-    fn started(
+impl WaylandDndGrabHandler for State {
+    /// A client requested a drag as response to a pointer action. Unlike
+    /// the pre-0.7-git API (which installed the grab itself), the handler
+    /// now owns installing the [`DnDGrab`] — the grab then routes the
+    /// offer to whatever surface pointer focus lands on. We composite
+    /// the drag icon at the cursor for the duration. Touch drags are
+    /// declined (no touch devices are advertised on this seat).
+    fn dnd_requested<S: DndSource>(
         &mut self,
-        _source: Option<
-            smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
-        >,
+        source: S,
         icon: Option<WlSurface>,
-        _seat: Seat<Self>,
+        seat: Seat<Self>,
+        serial: Serial,
+        type_: GrabType,
     ) {
+        let GrabType::Pointer = type_ else {
+            source.cancel();
+            return;
+        };
+        let Some(pointer) = seat.get_pointer() else {
+            source.cancel();
+            return;
+        };
+        let Some(start_data) = pointer.grab_start_data() else {
+            source.cancel();
+            return;
+        };
+        // Install the grab BEFORE setting the icon: set_grab unsets any
+        // still-active DnD grab, whose `cancelled` clears the icon — the
+        // other order wipes the icon set for THIS drag. `Focus::Clear`
+        // matches 0.7.0's StartDrag path (the origin surface gets its
+        // wl_pointer.leave at drag start, not at the first motion).
+        let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat.clone());
+        pointer.set_grab(self, grab, serial, GrabFocus::Clear);
         self.renderer.set_dnd_icon(icon);
         // Show/hide the drag icon (it then follows the cursor via motion).
         self.queue_redraw_nonfullscreen();
     }
+}
 
-    /// The drag ended (dropped or cancelled) — remove the icon.
-    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+impl DndGrabHandler for State {
+    /// The drag ended in a drop — remove the icon.
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: Seat<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        self.renderer.set_dnd_icon(None);
+        self.queue_redraw_nonfullscreen();
+    }
+
+    /// The drag was cancelled — same cleanup.
+    fn cancelled(
+        &mut self,
+        _seat: Seat<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
         self.renderer.set_dnd_icon(None);
         self.queue_redraw_nonfullscreen();
     }
 }
-impl ServerDndGrabHandler for State {}
 
 impl DataDeviceHandler for State {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
     }
 }
 
 impl PrimarySelectionHandler for State {
-    fn primary_selection_state(&self) -> &PrimarySelectionState {
-        &self.primary_selection_state
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
     }
 }
 
@@ -1674,14 +1843,14 @@ impl PrimarySelectionHandler for State {
 // selection routes through `crate::clipboard` exactly like a normal
 // client would — no extra handling needed beyond exposing the state.
 impl WlrDataControlHandler for State {
-    fn data_control_state(&self) -> &WlrDataControlState {
-        &self.wlr_data_control_state
+    fn data_control_state(&mut self) -> &mut WlrDataControlState {
+        &mut self.wlr_data_control_state
     }
 }
 
 impl ExtDataControlHandler for State {
-    fn data_control_state(&self) -> &ExtDataControlState {
-        &self.ext_data_control_state
+    fn data_control_state(&mut self) -> &mut ExtDataControlState {
+        &mut self.ext_data_control_state
     }
 }
 
@@ -1768,7 +1937,6 @@ impl DmabufHandler for State {
     }
 }
 
-delegate_dmabuf!(State);
 
 // KDE server-side decoration. We force Server for every decoration
 // object regardless of what the client asks for — Libreland is a
@@ -1922,32 +2090,15 @@ impl FractionalScaleHandler for State {
     }
 }
 
-delegate_compositor!(State);
-delegate_shm!(State);
-delegate_seat!(State);
-delegate_xdg_shell!(State);
-delegate_xdg_decoration!(State);
-delegate_output!(State);
-delegate_fractional_scale!(State);
-delegate_layer_shell!(State);
-delegate_viewporter!(State);
-delegate_data_device!(State);
-delegate_kde_decoration!(State);
-delegate_relative_pointer!(State);
-delegate_pointer_constraints!(State);
-delegate_cursor_shape!(State);
-delegate_primary_selection!(State);
-delegate_data_control!(State);
-delegate_ext_data_control!(State);
-delegate_idle_inhibit!(State);
-delegate_idle_notify!(State);
-delegate_xdg_activation!(State);
-delegate_pointer_gestures!(State);
-delegate_content_type!(State);
-smithay::delegate_session_lock!(State);
-smithay::delegate_presentation!(State);
-smithay::delegate_drm_syncobj!(State);
-smithay::delegate_fifo!(State);
+// One macro replaces the per-protocol delegate_* family upstream removed:
+// it blanket-implements wayland-server's Dispatch/GlobalDispatch for every
+// user-data type that implements smithay's Dispatch2/GlobalDispatch2 —
+// i.e. all of smithay's protocols. Libreland's OWN protocols
+// (color_management, screencopy) keep their direct old-style
+// `impl Dispatch<…> for State` blocks: those coexist with this blanket
+// because their user-data types never implement Dispatch2, so there is
+// no overlap — do NOT "convert" them on a future rebase.
+smithay::delegate_dispatch2!(State);
 
 impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
     fn drm_syncobj_state(

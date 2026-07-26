@@ -3,18 +3,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::backend::renderer::buffer_dimensions;
-use crate::utils::Size;
 use crate::wayland::compositor::SurfaceAttributes;
 use crate::wayland::compositor::{self, BufferAssignment};
-use crate::wayland::viewporter::{ViewportCachedState, ViewporterSurfaceState};
 use _session_lock::ext_session_lock_surface_v1::ExtSessionLockSurfaceV1;
 use _session_lock::ext_session_lock_v1::{Error, ExtSessionLockV1, Request};
-use wayland_protocols::ext::session_lock::v1::server::{self as _session_lock, ext_session_lock_surface_v1};
+use wayland_protocols::ext::session_lock::v1::server::{self as _session_lock};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, Resource};
 
+use crate::wayland::Dispatch2;
+use crate::wayland::session_lock::SessionLockHandler;
 use crate::wayland::session_lock::surface::{ExtLockSurfaceUserData, LockSurface, LockSurfaceAttributes};
-use crate::wayland::session_lock::{SessionLockHandler, SessionLockManagerState};
 
 /// Surface role for ext-session-lock surfaces.
 const LOCK_SURFACE_ROLE: &str = "ext_session_lock_surface_v1";
@@ -33,19 +31,18 @@ impl SessionLockState {
     }
 }
 
-impl<D> Dispatch<ExtSessionLockV1, SessionLockState, D> for SessionLockManagerState
+impl<D> Dispatch2<ExtSessionLockV1, D> for SessionLockState
 where
-    D: Dispatch<ExtSessionLockV1, SessionLockState>,
     D: Dispatch<ExtSessionLockSurfaceV1, ExtLockSurfaceUserData>,
     D: SessionLockHandler,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &Client,
         lock: &ExtSessionLockV1,
         request: Request,
-        data: &SessionLockState,
         _display: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
@@ -101,82 +98,7 @@ where
                 });
 
                 // Add pre-commit hook for updating surface state.
-                compositor::add_pre_commit_hook::<D, _>(&surface, |_state, _dh, surface| {
-                    compositor::with_states(surface, |states| {
-                        let attributes = states.data_map.get::<Mutex<LockSurfaceAttributes>>();
-                        let attributes = attributes.unwrap().lock().unwrap();
-
-                        let Some(state) = attributes.last_acked else {
-                            attributes.surface.post_error(
-                                ext_session_lock_surface_v1::Error::CommitBeforeFirstAck,
-                                "Committed before the first ack_configure.",
-                            );
-                            return;
-                        };
-
-                        // Verify the attached buffer: ext-session-lock requires no NULL buffers
-                        // and an exact dimentions match.
-                        let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                        let surface_attrs = guard.pending();
-                        if let Some(assignment) = surface_attrs.buffer.as_ref() {
-                            match assignment {
-                                BufferAssignment::Removed => {
-                                    // A NULL-buffer commit is how a client unmaps its lock
-                                    // surface during teardown (unlock_and_destroy): Qt/quickshell
-                                    // attach(null)+commit before destroying the objects. The spec
-                                    // calls this a protocol error, but treating it as fatal here
-                                    // *disconnects the locker mid-unlock* — which killed quickshell
-                                    // on every unlock and, combined with the desktop being revealed,
-                                    // left the session with no bar (and could strand a lock that
-                                    // recommits). Tolerate it: ignore the unmap rather than kill the
-                                    // client. During an active lock this just means the surface stops
-                                    // updating (the lock stays up); it can never reveal the desktop.
-                                    return;
-                                }
-                                BufferAssignment::NewBuffer(buffer) => {
-                                    if let Some(buf_size) = buffer_dimensions(buffer) {
-                                        let viewport = states
-                                            .data_map
-                                            .get::<ViewporterSurfaceState>()
-                                            .map(|v| v.lock().unwrap());
-                                        let surface_size = if let Some(dest) =
-                                            viewport.as_ref().and_then(|_| {
-                                                let mut guard =
-                                                    states.cached_state.get::<ViewportCachedState>();
-                                                let viewport_state = guard.pending();
-                                                viewport_state.dst
-                                            }) {
-                                            Size::from((dest.w as u32, dest.h as u32))
-                                        } else {
-                                            let scale = surface_attrs.buffer_scale;
-                                            let transform = surface_attrs.buffer_transform.into();
-                                            let surface_size = buf_size.to_logical(scale, transform);
-
-                                            Size::from((surface_size.w as u32, surface_size.h as u32))
-                                        };
-
-                                        if Some(surface_size) != state.size {
-                                            attributes.surface.post_error(
-                                                ext_session_lock_surface_v1::Error::DimensionsMismatch,
-                                                "Surface dimensions do not match acked configure.",
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
-                });
-                compositor::add_post_commit_hook::<D, _>(&surface, |_state, _dh, surface| {
-                    compositor::with_states(surface, |states| {
-                        let attributes = states.data_map.get::<Mutex<LockSurfaceAttributes>>();
-                        let mut attributes = attributes.unwrap().lock().unwrap();
-
-                        if let Some(state) = attributes.last_acked {
-                            attributes.current = state;
-                        }
-                    });
-                });
+                compositor::add_pre_commit_hook::<D, _>(&surface, LockSurface::pre_commit_hook);
 
                 // Call compositor handler.
                 let lock_surface = LockSurface::new(surface, lock_surface);
@@ -187,7 +109,7 @@ where
             }
             Request::UnlockAndDestroy => {
                 // Ensure session is locked.
-                if !data.lock_status.load(Ordering::Relaxed) {
+                if !self.lock_status.load(Ordering::Relaxed) {
                     lock.post_error(Error::InvalidUnlock, "Session is not locked.");
                 }
 
@@ -196,7 +118,7 @@ where
             }
             Request::Destroy => {
                 // Ensure session is not locked.
-                if data.lock_status.load(Ordering::Relaxed) {
+                if self.lock_status.load(Ordering::Relaxed) {
                     lock.post_error(Error::InvalidDestroy, "Cannot destroy session lock while locked.");
                 }
             }
