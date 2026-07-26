@@ -2541,24 +2541,26 @@ fn push_x11_configure(surface: &X11Surface, rect: Rectangle<i32, Physical>, fill
         Point::from((rect.loc.x, rect.loc.y)),
         Size::from((rect.size.w.max(1), rect.size.h.max(1))),
     );
-    // Ride `_NET_WM_SYNC_REQUEST` when the client supports it: the client
-    // repaints at the new size before the configure lands, so an
-    // interactive resize shows no black bars or stale-content edges — and
-    // a configure arriving while one is in flight is buffered (newest
-    // wins), which throttles a per-motion-event drag to the client's own
-    // repaint rate. Falls back to a plain configure internally for
-    // clients without the protocol; the explicit fallback below covers
-    // the error paths (sync-id exhaustion, dying window) where a plain
-    // configure can still land. Known trade-off: a client that
-    // ADVERTISES sync but stalls holds its own window's commits for up
-    // to smithay's 1s sync timeout per size change — the standard
-    // X11-WM behaviour (KWin does the same), and only that window
-    // freezes, never the compositor.
-    if let Err(err) = surface.configure_with_sync(rect, None) {
-        debug!(window = surface.window_id(), %err, "layout: X11 sync configure failed; retrying plain");
-        if let Err(err) = surface.configure(rect) {
-            debug!(window = surface.window_id(), %err, "layout: X11 configure failed");
-        }
+    // Deliberately a PLAIN configure, never `configure_with_sync`.
+    //
+    // `_NET_WM_SYNC_REQUEST` blocks the client's buffer commits
+    // (`_XWAYLAND_ALLOW_COMMITS=0`) until it acks the sync counter or
+    // smithay's 1s timeout expires. That is fine for an interactive
+    // resize — the point is to not show a half-repainted window — but
+    // this function serves EVERY configure: window map, sibling
+    // open/close reflow, fullscreen/maximize toggles, workspace moves,
+    // exclusive-zone changes. Routing all of them through the handshake
+    // made fullscreen X11 games freeze and flicker: fullscreen configure
+    // → commits blocked → nothing on screen → 1s timeout → one frame →
+    // repeat. Games advertise the protocol (SDL/Wine do) but present
+    // through their own swapchain, so they are exactly the clients that
+    // stall the handshake.
+    //
+    // If the resize polish is wanted back, it has to be scoped to the
+    // interactive-drag path alone (thread a flag from
+    // `Layout::apply_resize`), never to reflow-driven configures.
+    if let Err(err) = surface.configure(rect) {
+        debug!(window = surface.window_id(), %err, "layout: X11 configure failed");
     }
     // Only touch NET_WM_STATE on an actual change — this runs on every
     // reflow, and rewriting the property each time would spam X clients

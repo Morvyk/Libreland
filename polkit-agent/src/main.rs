@@ -34,6 +34,11 @@
 //!    it over a dedicated unix socket (line-delimited JSON) so the password
 //!    travels a private local stream — never argv, never the compositor's IPC.
 //!
+//! The agent sets `PR_SET_PDEATHSIG` so it dies with the compositor that
+//! spawned it: polkit permits exactly one registered agent per session, so a
+//! survivor would block the next session's agent from registering — the
+//! failure mode being privilege prompts that silently never appear.
+//!
 //! No `unsafe`: the helper is a subprocess (not FFI), and uid→name resolution
 //! goes through `nix`'s safe `getpwuid_r` wrapper.
 
@@ -716,6 +721,48 @@ fn socket_path() -> PathBuf {
     PathBuf::from(dir).join("libreland-polkit.sock")
 }
 
+/// Claim this session's single polkit agent slot.
+async fn register_agent(authority: &Proxy<'_>, session_id: &str) -> anyhow::Result<()> {
+    let locale = std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string());
+    authority
+        .call_method(
+            "RegisterAuthenticationAgent",
+            &(build_subject(session_id), locale.as_str(), OBJECT_PATH),
+        )
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "RegisterAuthenticationAgent failed ({err}). Another polkit agent \
+                 already holds this session — most often one left behind by a \
+                 previous compositor instance; `pkill libreland-polkit-agent` \
+                 clears it."
+            )
+        })?;
+    Ok(())
+}
+
+/// Die with the compositor that spawned us.
+///
+/// polkit allows exactly ONE registered agent per session, so an agent
+/// that outlives its compositor (we are a plain child process — nothing
+/// reaps us, and unlike a Wayland client we have no display connection
+/// to lose) keeps holding the registration, and the NEXT session's agent
+/// fails to register and exits. The symptom is a session whose privilege
+/// prompts silently never appear, fixed only by killing the stale
+/// process by hand. `PR_SET_PDEATHSIG` covers a compositor crash too,
+/// not just a clean exit.
+fn bind_lifetime_to_parent() -> anyhow::Result<()> {
+    if let Err(err) = nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM) {
+        tracing::warn!(%err, "could not set parent-death signal; a stale agent may outlive the compositor");
+    }
+    // The parent can die inside the window between spawn and the call
+    // above, in which case the signal never arrives — check once.
+    if nix::unistd::getppid() == nix::unistd::Pid::from_raw(1) {
+        anyhow::bail!("parent exited before startup completed");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -724,6 +771,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    bind_lifetime_to_parent()?;
 
     let conn = Connection::system()
         .await
@@ -798,14 +847,7 @@ async fn main() -> anyhow::Result<()> {
         "org.freedesktop.PolicyKit1.Authority",
     )
     .await?;
-    let locale = std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string());
-    authority
-        .call_method(
-            "RegisterAuthenticationAgent",
-            &(build_subject(&session_id), locale.as_str(), OBJECT_PATH),
-        )
-        .await
-        .context("RegisterAuthenticationAgent")?;
+    register_agent(&authority, &session_id).await?;
     tracing::info!(session = %session_id, uid = our_uid, "registered as polkit authentication agent");
 
     // Run until the compositor stops us; then unregister and clean up.
