@@ -273,6 +273,18 @@ pub struct WaylandInit {
     /// server-side). Entirely handled inside smithay.
     #[allow(dead_code, reason = "held so the wl_fixes global stays alive")]
     pub fixes_state: smithay::wayland::fixes::FixesState,
+    /// `ext-background-effect-v1` — clients request backdrop blur behind
+    /// their surfaces; the renderer honours the committed region as an
+    /// opt-in equivalent to `blur.windows`/`blur.layers` (config
+    /// `blur.enabled`/`passes` still gate the pyramid).
+    #[allow(dead_code, reason = "held so the ext-background-effect global stays alive")]
+    pub background_effect_state: smithay::wayland::background_effect::BackgroundEffectState,
+    /// `ext-output-image-capture-source-manager-v1` — moved into
+    /// [`crate::State`] (its handler needs `&mut` access).
+    pub output_capture_source_state:
+        smithay::wayland::image_capture_source::OutputCaptureSourceState,
+    /// `ext-image-copy-capture-manager-v1` — moved into [`crate::State`].
+    pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
 }
 
 /// Build a smithay [`Output`] from a descriptor and apply its current
@@ -443,6 +455,18 @@ pub fn init(
         smithay::wayland::pointer_warp::PointerWarpManager::new::<State>(&dh);
     // wl_fixes: registry destruction for long-lived clients.
     let fixes_state = smithay::wayland::fixes::FixesState::new::<State>(&dh);
+    // ext-background-effect-v1: clients opt into backdrop blur behind
+    // their own surfaces (the render path honours a committed blur
+    // region alongside the config's blur.windows/blur.layers opt-ins).
+    let background_effect_state =
+        smithay::wayland::background_effect::BackgroundEffectState::new::<State>(&dh);
+    // ext-image-capture-source (outputs) + ext-image-copy-capture: the
+    // modern capture stack, riding the same render-path machinery as
+    // wlr-screencopy (see src/copycapture.rs).
+    let output_capture_source_state =
+        smithay::wayland::image_capture_source::OutputCaptureSourceState::new::<State>(&dh);
+    let image_copy_capture_state =
+        smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<State>(&dh);
     // zwp_primary_selection_v1: the middle-click "primary" selection.
     // Both it and the regular clipboard are persisted compositor-side
     // (see crate::clipboard) so a copied buffer survives the source app
@@ -597,6 +621,9 @@ pub fn init(
         outputs,
         output_globals,
         preferred_scale,
+        background_effect_state,
+        output_capture_source_state,
+        image_copy_capture_state,
         xdg_dialog_state,
         pointer_warp_manager,
         fixes_state,
@@ -1391,6 +1418,29 @@ impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for State {
             && self.layout.float_if_dialog(toplevel.wl_surface())
         {
             self.queue_redraw_all();
+        }
+    }
+}
+
+impl smithay::wayland::background_effect::ExtBackgroundEffectHandler for State {
+    // Region storage needs no overrides: smithay stores the pending blur
+    // region in the surface's cached state at commit, and the renderer
+    // reads it per frame (`render::surface_requests_blur`). The commit
+    // itself already queues the redraw that makes the frost
+    // appear/disappear.
+
+    /// Advertise blur only when the config's blur pipeline can actually
+    /// deliver it — a capability-keyed client otherwise renders itself
+    /// translucent expecting frost that never comes. Sent at bind time,
+    /// so a live `blur.enabled` flip only reaches clients that bind
+    /// afterwards (protocol limitation; existing binds keep their
+    /// snapshot).
+    fn capabilities(&self) -> smithay::wayland::background_effect::Capability {
+        let blur = &self.config.decoration.blur;
+        if blur.enabled && blur.passes > 0 {
+            smithay::wayland::background_effect::Capability::Blur
+        } else {
+            smithay::wayland::background_effect::Capability::empty()
         }
     }
 }

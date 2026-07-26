@@ -94,6 +94,25 @@ pub struct LayerPlacement {
     pub namespace: String,
 }
 
+/// Whether the client asked for backdrop blur behind this surface via
+/// `ext-background-effect-v1` (a committed blur region on the root
+/// surface). The region's rects are ignored — Libreland's blur is
+/// already masked by the surface's own alpha (layers) or clipped to the
+/// window shape, which is strictly finer than rect masking.
+fn surface_requests_blur(surface: &WlSurface) -> bool {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<smithay::wayland::background_effect::BackgroundEffectSurfaceCachedState>()
+            .current()
+            .blur_region
+            .as_ref()
+            // An explicitly EMPTY region means "blur nowhere" per the
+            // protocol — only a region with actual rects opts in.
+            .is_some_and(|r| !r.rects.is_empty())
+    })
+}
+
 /// Whether a layer surface with `namespace` should get backdrop blur, per the
 /// configured `blur.layers` rules (substring match; empty rules ignored).
 fn layer_should_blur(blur: &BlurConfig, namespace: &str) -> bool {
@@ -1479,6 +1498,10 @@ struct DrawnState {
     rect: Rectangle<i32, Physical>,
     focused: bool,
     alpha_bits: u32,
+    /// Whether backdrop blur was drawn behind it — an
+    /// ext-background-effect opt-in flip changes the pixels without any
+    /// buffer commit, so it must damage like a focus flip does.
+    blur: bool,
 }
 
 /// Per-output damage tracker: diffs each frame's drawn set against the
@@ -5155,6 +5178,20 @@ impl Renderer {
         // blur drives tier 2. We don't probe per-surface alpha, so a mapped
         // opaque panel/window still pays while it's up; the cost is bounded.
         let blur = self.decoration.blur.clone();
+        // Per-surface opt-in via ext-background-effect-v1: a window or
+        // layer that committed a blur region gets backdrop blur even when
+        // the config didn't opt it in. Collected once per frame; the
+        // config's blur.enabled/passes still gate the pyramid itself.
+        let protocol_blur: HashSet<ObjectId> = placements
+            .iter()
+            .map(|p| &p.surface)
+            .chain(layers.iter().map(|l| &l.surface))
+            .filter(|s| surface_requests_blur(s))
+            .map(Resource::id)
+            .collect();
+        let layer_blurs = |l: &LayerPlacement| {
+            layer_should_blur(&blur, &l.namespace) || protocol_blur.contains(&l.surface.id())
+        };
         // Temporal blur masking (see MASK_BLUR_SHADER + `prev_layer_masks`):
         // for each blur-eligible layer, fetch last frame's surface-alpha
         // texture so the blur can mask by the *min* of this and last frame's
@@ -5167,7 +5204,7 @@ impl Renderer {
             .iter()
             .zip(layer_masks.iter())
             .map(|(l, cur)| {
-                if cur.is_some() && layer_should_blur(&blur, &l.namespace) {
+                if cur.is_some() && layer_blurs(l) {
                     self.outputs[idx].prev_layer_masks.get(&l.surface.id()).cloned()
                 } else {
                     None
@@ -5177,7 +5214,7 @@ impl Renderer {
         self.outputs[idx].prev_layer_masks = layers
             .iter()
             .zip(layer_masks.iter())
-            .filter(|(l, _)| layer_should_blur(&blur, &l.namespace))
+            .filter(|(l, _)| layer_blurs(l))
             .filter_map(|(l, cur)| cur.clone().map(|t| (l.surface.id(), t)))
             .collect();
         // A provably-opaque solo fullscreen window covers everything a blur
@@ -5189,14 +5226,20 @@ impl Renderer {
             .iter()
             .enumerate()
             .any(|(i, p)| visible[i] && p.fill == FillMode::Normal);
-        let need_window = passes_ok && blur.windows && any_normal;
+        let any_protocol_window = placements
+            .iter()
+            .enumerate()
+            .any(|(i, p)| {
+                visible[i] && p.fill == FillMode::Normal && protocol_blur.contains(&p.surface.id())
+            });
+        let need_window = passes_ok && any_normal && (blur.windows || any_protocol_window);
         // Layer blur is opt-in per namespace (config `blur.layers`), so a
         // fullscreen always-mapped overlay (e.g. a launcher) doesn't frost the
         // whole screen — only the layers the user named are blurred.
         let need_layer = passes_ok
             && layers.iter().any(|l| {
                 matches!(l.layer, LayerBucket::Top | LayerBucket::Overlay)
-                    && layer_should_blur(&blur, &l.namespace)
+                    && layer_blurs(l)
             });
         let t = Instant::now();
         // Saved per-tier blurred backdrops. Pull the scratch out of the map
@@ -5281,7 +5324,8 @@ impl Renderer {
                                 rect: Rectangle<i32, Physical>,
                                 focused: bool,
                                 alpha: f32,
-                                animating: bool| {
+                                animating: bool,
+                                blur: bool| {
                     let alpha_bits = alpha.to_bits();
                     match prev.remove(&id) {
                         Some(old)
@@ -5289,6 +5333,7 @@ impl Renderer {
                                 && old.rect == rect
                                 && old.focused == focused
                                 && old.alpha_bits == alpha_bits
+                                && old.blur == blur
                                 && old.fingerprint == fingerprint => {}
                         Some(old) => {
                             damage.push(old.rect);
@@ -5303,6 +5348,7 @@ impl Renderer {
                             rect,
                             focused,
                             alpha_bits,
+                            blur,
                         },
                     );
                 };
@@ -5334,6 +5380,7 @@ impl Renderer {
                         p.focused,
                         wd.alpha,
                         animating,
+                        protocol_blur.contains(&p.surface.id()),
                     );
                 }
                 // Layer surfaces, only the ones this frame actually draws:
@@ -5354,6 +5401,7 @@ impl Renderer {
                         false,
                         1.0,
                         false,
+                        layer_blurs(l),
                     );
                 }
                 // Popups (always drawn).
@@ -5367,6 +5415,7 @@ impl Renderer {
                         rect,
                         false,
                         1.0,
+                        false,
                         false,
                     );
                 }
@@ -5397,7 +5446,7 @@ impl Renderer {
                 if tier_layer.is_some() {
                     for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
                         if matches!(bucket, LayerBucket::Top | LayerBucket::Overlay)
-                            && layer_should_blur(&blur, &l.namespace)
+                            && layer_blurs(l)
                             && let Some(rect) = elements_bbox(elements, elem_scale)
                         {
                             damage.push(rect);
@@ -5675,7 +5724,9 @@ impl Renderer {
                     visible[*i] && p.fill == FillMode::Normal && !p.floating
                 })
             {
-                if let Some(t) = &tier_tiled {
+                if let Some(t) = &tier_tiled
+                    && (blur.windows || protocol_blur.contains(&p.surface.id()))
+                {
                     blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
                 }
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
@@ -5692,7 +5743,9 @@ impl Renderer {
                     visible[*i] && p.fill == FillMode::Normal && p.floating
                 })
             {
-                if let Some(t) = &tier_float {
+                if let Some(t) = &tier_float
+                    && (blur.windows || protocol_blur.contains(&p.surface.id()))
+                {
                     blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
                 }
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
@@ -5727,7 +5780,7 @@ impl Renderer {
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
                     && let Some(mask_prev) = mask_prev
-                    && layer_should_blur(&blur, &l.namespace)
+                    && layer_blurs(l)
                 {
                     // A layer's blur is masked by the temporal min of its
                     // current + previous surface alpha. Both `let Some`s gate
@@ -5805,7 +5858,7 @@ impl Renderer {
                 if let Some(t) = &tier_layer
                     && let Some(mask) = mask
                     && let Some(mask_prev) = mask_prev
-                    && layer_should_blur(&blur, &l.namespace)
+                    && layer_blurs(l)
                 {
                     // Temporal-min masked blur; both `let Some`s gate it (no
                     // buffer → window-fallback whole-rect frost; no previous

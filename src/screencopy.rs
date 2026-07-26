@@ -37,7 +37,7 @@ const MANAGER_VERSION: u32 = 3;
 /// The shm pixel format we capture into. xRGB8888 (little-endian,
 /// 4 bytes/px) is what `grim` and `xdg-desktop-portal-wlr` expect and
 /// what our renderer reads back; we advertise only this one.
-const CAPTURE_SHM_FORMAT: wl_shm::Format = wl_shm::Format::Xrgb8888;
+pub(crate) const CAPTURE_SHM_FORMAT: wl_shm::Format = wl_shm::Format::Xrgb8888;
 /// The `Fourcc` the renderer reads back, matching `CAPTURE_SHM_FORMAT`.
 /// Exposed so the render path captures in the same format we advertise.
 pub(crate) const CAPTURE_FOURCC: smithay::backend::allocator::Fourcc =
@@ -374,7 +374,7 @@ pub fn complete(pending: &PendingCapture, outcome: crate::render::CaptureOutcome
 /// into the client's shm buffer, honouring its stride. The source is
 /// already upright (we never use the `y_invert` flag — see
 /// [`complete`]). Returns whether it fit.
-fn write_to_shm(buffer: &WlBuffer, bytes: &[u8], width: u32, height: u32) -> bool {
+pub(crate) fn write_to_shm(buffer: &WlBuffer, bytes: &[u8], width: u32, height: u32) -> bool {
     let row = width as usize * 4;
     let rows = height as usize;
     smithay::wayland::shm::with_buffer_contents_mut(buffer, |ptr, len, spec| {

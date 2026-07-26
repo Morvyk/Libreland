@@ -65,6 +65,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod anim;
 mod clipboard;
 mod color_management;
+mod copycapture;
 mod config;
 mod cursor;
 mod drm;
@@ -495,6 +496,23 @@ pub(crate) struct State {
     /// `zwlr_screencopy` `copy` requests awaiting the next render of
     /// their output (see [`crate::screencopy`]).
     pub(crate) screencopy_pending: Vec<screencopy::PendingCapture>,
+    /// `ext-output-image-capture-source-manager-v1` delegate state.
+    pub(crate) output_capture_source_state:
+        smithay::wayland::image_capture_source::OutputCaptureSourceState,
+    /// `ext-image-copy-capture-manager-v1` delegate state.
+    pub(crate) image_copy_capture_state:
+        smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    /// Live copy-capture sessions. Owned deliberately: DROPPING a
+    /// [`Session`] is what stops it, so removal happens only in
+    /// `session_destroyed` (client gone) or when the captured output
+    /// vanishes. Constraints are re-announced on mode changes via
+    /// [`State::refresh_copy_capture_constraints`].
+    pub(crate) capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
+    /// Monotonic key generator for [`Self::capture_sessions`] matching.
+    pub(crate) capture_session_key: u64,
+    /// Copy-capture frames parked until their output's next render —
+    /// the ext-image-copy-capture sibling of [`Self::screencopy_pending`].
+    pub(crate) copy_frames: Vec<copycapture::PendingCopyFrame>,
     /// Calloop handle, used to register the async pipe reads/writes
     /// that drain and serve cached selections without blocking.
     pub(crate) loop_handle: smithay::reexports::calloop::LoopHandle<'static, State>,
@@ -1206,16 +1224,28 @@ impl State {
                 target: render::CaptureTarget::Shm,
             });
         }
+        let internal_n = internal.len();
+        // ext-image-copy-capture frames due on this output ride the same
+        // spec list, appended after the internal captures.
+        let copy_due = match out_name.as_deref() {
+            Some(name) if !self.copy_frames.is_empty() => {
+                self.drain_copy_frames(name, &mut specs)
+            }
+            _ => Vec::new(),
+        };
         let capture_hides_cursor =
             !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
         let internal_hides_cursor =
             !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
+        let copy_hides_cursor = !copy_due.is_empty() && copy_due.iter().all(|c| !c.overlay_cursor);
         let locked = self.pointer_locked();
-        let hide_cursor = locked || capture_hides_cursor || internal_hides_cursor;
+        let hide_cursor =
+            locked || capture_hides_cursor || internal_hides_cursor || copy_hides_cursor;
         // A capture this frame wants the cursor baked into the framebuffer —
         // composite the themed cursor even though the hardware plane shows it.
         let compose_cursor = captures.iter().any(|c| c.overlay_cursor)
-            || internal.iter().any(|c| c.show_cursor);
+            || internal.iter().any(|c| c.show_cursor)
+            || copy_due.iter().any(|c| c.overlay_cursor);
         // Sync the hardware cursor plane to the current status before rendering
         // (cheap + idempotent; programs it on the output under the pointer).
         self.renderer.refresh_hw_cursor(locked);
@@ -1239,13 +1269,18 @@ impl State {
             present_output.as_ref(),
         ) {
             Ok((mut results, followup)) => {
-                // Trailing results belong to the internal specs.
-                let internal_results = results.split_off(client_n.min(results.len()));
+                // Result order mirrors the spec list: screencopy clients,
+                // then internal screenshots, then copy-capture frames.
+                let mut internal_results = results.split_off(client_n.min(results.len()));
+                let copy_results = internal_results.split_off(internal_n.min(internal_results.len()));
                 for (pending, captured) in captures.iter().zip(results) {
                     screencopy::complete(pending, captured);
                 }
                 for (cap, outcome) in internal.into_iter().zip(internal_results) {
                     self.complete_internal_capture(cap, outcome);
+                }
+                for (pending, outcome) in copy_due.into_iter().zip(copy_results) {
+                    State::complete_copy_frame(pending, outcome);
                 }
                 followup
             }
@@ -1255,6 +1290,9 @@ impl State {
                 warn!(error = %err, ?crtc, "render_for_crtc failed");
                 for pending in &captures {
                     screencopy::complete(pending, render::CaptureOutcome::Failed);
+                }
+                for pending in copy_due {
+                    State::complete_copy_frame(pending, render::CaptureOutcome::Failed);
                 }
                 if !internal.is_empty() {
                     warn!("screenshot: capture dropped (render failed)");
@@ -2653,11 +2691,14 @@ impl State {
             if exclusive <= 0 {
                 continue;
             }
-            // Per spec: exclusive is meaningful only when anchored
-            // to one edge or to one edge + the two perpendicular
-            // ones. We approximate by attributing the zone to
-            // whichever single edge is anchored without its
-            // opposite.
+            // Which edge does the zone reserve? Layer-shell v5's
+            // `set_exclusive_edge` names it outright — honour that
+            // first (smithay validates it's a single anchored edge).
+            // Without it (v4 clients), fall back to the old
+            // approximation: whichever single edge is anchored without
+            // its opposite. The explicit edge also resolves the case
+            // the heuristic never could: a fully-anchored (all four
+            // edges) surface reserving one side.
             let anchor = cached.anchor;
             let at_top = anchor.contains(Anchor::TOP);
             let at_bottom = anchor.contains(Anchor::BOTTOM);
@@ -2669,7 +2710,15 @@ impl State {
                 .cloned()
                 .unwrap_or_else(|| primary_name.clone());
             let zone = zones.entry(out_name).or_insert((0, 0, 0, 0));
-            if at_top && !at_bottom {
+            if let Some(edge) = cached.exclusive_edge {
+                match edge {
+                    e if e == Anchor::TOP => zone.0 = zone.0.max(exclusive),
+                    e if e == Anchor::BOTTOM => zone.1 = zone.1.max(exclusive),
+                    e if e == Anchor::LEFT => zone.2 = zone.2.max(exclusive),
+                    e if e == Anchor::RIGHT => zone.3 = zone.3.max(exclusive),
+                    _ => {}
+                }
+            } else if at_top && !at_bottom {
                 zone.0 = zone.0.max(exclusive);
             } else if at_bottom && !at_top {
                 zone.1 = zone.1.max(exclusive);
@@ -2762,6 +2811,21 @@ impl State {
                     true
                 }
             });
+            // Same for the ext-image-copy-capture stack: parked frames
+            // fail, and sessions on this output stop (dropping the owned
+            // session sends `stopped`) — refresh_copy_capture_constraints
+            // prunes by output liveness.
+            let (gone, keep) = std::mem::take(&mut self.copy_frames)
+                .into_iter()
+                .partition(|p| p.output == *name);
+            self.copy_frames = keep;
+            for p in gone {
+                p.frame
+                    .fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Stopped);
+            }
+            // (Sessions on this output are stopped by the single
+            // `refresh_copy_capture_constraints` after the reflow — one
+            // announcement per hotplug event, not one per removed output.)
             info!(output = %name, "output disconnected");
         }
 
@@ -2788,6 +2852,9 @@ impl State {
         let descs = self.renderer.reflow_outputs(&self.config.monitors);
         self.sync_output_globals(&descs);
         self.recompute_layer_layout();
+        // Output set / modes changed: re-announce copy-capture buffer
+        // constraints (and stop sessions whose output vanished).
+        self.refresh_copy_capture_constraints();
         self.preferred_scale = self.renderer.primary_scale();
         // A hotplug can change which output is primary (and so its
         // scale) — keep Xwayland's client scale + XSETTINGS DPI in step.
@@ -3225,6 +3292,9 @@ impl State {
                 Ok(()) => {
                     // Prime the CRTC so the next `queue_redraw_all` flips it.
                     self.redraw.insert(crtc, RedrawState::Idle);
+                    // New pixel size ⇒ copy-capture clients must
+                    // re-allocate their buffers.
+                    self.refresh_copy_capture_constraints();
                     info!(output = %name, "applied live mode change (modeset)");
                 }
                 Err(err) => warn!(
@@ -4383,6 +4453,11 @@ fn main() -> Result<()> {
         clipboard: clipboard::Selections::default(),
         screencopy_manager: wayland_init.screencopy_manager,
         screencopy_pending: Vec::new(),
+        output_capture_source_state: wayland_init.output_capture_source_state,
+        image_copy_capture_state: wayland_init.image_copy_capture_state,
+        capture_sessions: Vec::new(),
+        capture_session_key: 0,
+        copy_frames: Vec::new(),
         loop_handle: handle.clone(),
         redraw,
         popup_manager: wayland_init.popup_manager,

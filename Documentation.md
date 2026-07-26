@@ -772,7 +772,7 @@ present and elided here.)
 | `wl_output` + `xdg_output_manager_v1`                          | Output geometry, mode, scale, logical position.                         |
 | `xdg_wm_base` (xdg-shell)                                      | Application windows (`xdg_toplevel` / `xdg_popup`).                      |
 | `xdg_activation_v1`                                            | A client requests focus/raise for a surface (link opens → browser raises). Honoured as reveal + focus; stale tokens (>10 s) ignored. |
-| `zwlr_layer_shell_v1`                                          | Bars, panels, launchers, lock screens, OSDs.                            |
+| `zwlr_layer_shell_v1` (v5)                                     | Bars, panels, launchers, lock screens, OSDs. v5's `set_exclusive_edge` is honoured by the tile-area reservation (a fully-anchored surface can reserve one named edge). |
 | `zxdg_decoration_manager_v1` + `org_kde_kwin_server_decoration` | Decoration negotiation — both advertise a **Server** default, so toolkits drop their CSD titlebars (Libreland draws none). |
 | `wp_fractional_scale_manager_v1`                               | Exact fractional output scale to clients.                               |
 | `wp_viewporter`                                                | Buffer crop/scale — required for fractional scaling.                    |
@@ -792,3 +792,9 @@ present and elided here.)
 | `zwlr_data_control_v1` (v2) + `ext_data_control_v1` (v1)       | Clipboard managers — see [Clipboard & selections](#clipboard--selections). |
 | `ext_session_lock_v1`                                          | Screen lockers (used by the [idle](#idle) locker). **While a lock is active, all user keybinds are suppressed** — `exit`, `spawn`, and screenshot binds can't fire, so there's no way to bypass the lock from the keyboard; every key forwards to the locker for password entry. |
 | `zwlr_screencopy_v1`                                           | Output capture — screenshots + screen sharing via the portal.           |
+| `ext_image_capture_source_v1` (outputs) + `ext_image_copy_capture_v1` | The modern capture stack (successor to wlr-screencopy, spoken by newer portal backends). Output sources only (toplevel sources need ext-foreign-toplevel-list); shm + dmabuf buffers, cursor compositing via the session's paint-cursors option. Same pixels/formats as screencopy — both ride one render-path capture engine. |
+| `wp_fifo_v1`                                                   | FIFO (vsync) presentation barriers — real frame pacing for Vulkan clients; part of what NVIDIA's Wayland driver needs for `VK_EXT_present_timing`. |
+| `xdg_wm_dialog_v1`                                             | Clients declare a toplevel is a dialog/modal — feeds the auto-float decision directly instead of relying on heuristics alone. |
+| `wp_pointer_warp_v1`                                           | Clients ask to move the pointer to a surface-local position (games/emulators recentring the cursor without a lock). Honoured only for the pointer-focused surface; the target must land inside it; refused during grabs/drags or while any pointer constraint is active. |
+| `ext_background_effect_v1`                                     | Clients request backdrop blur behind their own surfaces — an opt-in equivalent to `blur.windows`/`blur.layers`, using the same blur pipeline (`blur.enabled`/`passes` still gate it). The region is honoured as a whole-surface flag; masking is by the surface's own alpha/shape, which is finer than rect masking. |
+| `wl_fixes`                                                     | Registry destruction for long-lived clients.                            |
