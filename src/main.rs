@@ -911,7 +911,7 @@ impl State {
                 .iter()
                 .filter(|b| {
                     !keyboard::is_modifier_keysym(b.keysym)
-                        && keyboard::matches_key(&result, b.keysym)
+                        && keyboard::matches_key(result, b.keysym)
                         && result.has_all_mods(b.mods)
                 })
                 .max_by_key(|b| b.mods.count_ones())

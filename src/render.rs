@@ -565,6 +565,23 @@ void main() {
 /// still gets the full frost and only the shape's AA edge blends out. Both
 /// textures are premultiplied; output stays premult for the
 /// `GL_ONE / GL_ONE_MINUS_SRC_ALPHA` blend.
+/// How far, in physical pixels, the temporal blur veto is dilated before it
+/// can suppress a pixel (see `prev_coverage` in [`MASK_BLUR_SHADER`]).
+///
+/// It has to exceed how far a client's content can travel between two frames,
+/// or the leading edge of a sliding popup is vetoed and left un-frosted. The
+/// worst case is the first frame of a decelerating slide: an ease-out cubic
+/// leaves at 3x its average speed, so a card crossing a 1440 px display in
+/// 300 ms peaks near 14 px/ms — about 87 px on a 60 Hz frame. 128 px covers
+/// that with margin.
+///
+/// Erring large is close to free: the current mask still confines the frost
+/// exactly, so a wider radius cannot smear it, and the only cost is that a
+/// transient full-surface fill keeps a 128 px halo around last frame's card
+/// instead of being suppressed outright — invisible next to the full-screen
+/// flash this guard exists to stop.
+const MASK_DILATE_PX: f32 = 128.0;
+
 const MASK_BLUR_SHADER: &str = r"#version 100
 //_DEFINES_
 #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -579,8 +596,37 @@ uniform sampler2D mask_prev;
 uniform float alpha;
 uniform vec2 mask_mul;
 uniform vec2 mask_add;
+uniform vec2 mask_dilate;
 
 varying vec2 v_coords;
+
+// Was this pixel covered by the surface *near here* last frame? A straight
+// point sample assumes the client's content is stationary; a popup that
+// slides into place lands on new pixels every frame, so the leading edge of
+// a moving card would be vetoed and left un-frosted (it reads as the frost
+// tearing along the card as it travels). Dilating the veto by `mask_dilate`
+// lets content that merely *moved* still count as persistent.
+//
+// This cannot smear the frost: `min` with the current mask still confines it
+// to exactly what the client draws this frame. Dilation only relaxes the
+// veto, so the sole cost is that a transient full-surface fill keeps its
+// frost within `mask_dilate` of last frame's card — a small halo instead of
+// a full-screen flash. Taps at half and full radius so the reach is granular
+// enough for a card thinner than the radius (a notification toast).
+float prev_coverage(vec2 uv) {
+    vec2 d = mask_dilate;
+    vec2 h = d * 0.5;
+    float p = texture2D(mask_prev, uv).a;
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(h.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(h.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(0.0, h.y), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(0.0, h.y), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(d.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(d.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(0.0, d.y), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(0.0, d.y), 0.0, 1.0)).a);
+    return p;
+}
 
 void main() {
     vec4 c = texture2D(tex, v_coords);
@@ -593,7 +639,7 @@ void main() {
     // alpha, so newly-covered pixels get no frost until they persist — that
     // one bad frame can no longer flash the whole screen, and it needs no
     // guess about the alpha (the flash is the same 0.79 as the real card).
-    float m = min(texture2D(mask, muv).a, texture2D(mask_prev, muv).a);
+    float m = min(texture2D(mask, muv).a, prev_coverage(muv));
     // Coverage -> frost strength: a translucent panel body (~0.76-0.79) must
     // still get the full blur behind it, else its transparency shows the
     // sharp backdrop. Saturate so any meaningfully-covered pixel is fully
@@ -620,9 +666,25 @@ uniform sampler2D mask_prev;
 uniform float alpha;
 uniform vec2 mask_mul;
 uniform vec2 mask_add;
+uniform vec2 mask_dilate;
 uniform float reference_white;
 uniform float saturation;
 varying vec2 v_coords;
+// Dilated temporal veto — see MASK_BLUR_SHADER's prev_coverage.
+float prev_coverage(vec2 uv) {
+    vec2 d = mask_dilate;
+    vec2 h = d * 0.5;
+    float p = texture2D(mask_prev, uv).a;
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(h.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(h.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(0.0, h.y), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(0.0, h.y), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(d.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(d.x, 0.0), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv + vec2(0.0, d.y), 0.0, 1.0)).a);
+    p = max(p, texture2D(mask_prev, clamp(uv - vec2(0.0, d.y), 0.0, 1.0)).a);
+    return p;
+}
 vec3 srgb_to_linear(vec3 c) {
     vec3 lo = c / 12.92;
     vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
@@ -632,7 +694,7 @@ void main() {
     vec4 c = texture2D(tex, v_coords);
     vec2 muv = v_coords * mask_mul + mask_add;
     // Temporal coverage min + saturation — see MASK_BLUR_SHADER.
-    float m = min(texture2D(mask, muv).a, texture2D(mask_prev, muv).a);
+    float m = min(texture2D(mask, muv).a, prev_coverage(muv));
     m = min(m * 4.0, 1.0);
     vec3 straight = c.a > 0.0 ? (c.rgb / c.a) : vec3(0.0);
     vec3 lin = srgb_to_linear(straight) * (reference_white / 10000.0);
@@ -2691,6 +2753,7 @@ impl Renderer {
                     UniformName::new("mask_prev", UniformType::_1i),
                     UniformName::new("mask_mul", UniformType::_2f),
                     UniformName::new("mask_add", UniformType::_2f),
+                    UniformName::new("mask_dilate", UniformType::_2f),
                 ],
             )
             .context("alpha-mask blur shader compile failed")?;
@@ -2797,6 +2860,7 @@ impl Renderer {
                     UniformName::new("mask_prev", UniformType::_1i),
                     UniformName::new("mask_mul", UniformType::_2f),
                     UniformName::new("mask_add", UniformType::_2f),
+                    UniformName::new("mask_dilate", UniformType::_2f),
                     UniformName::new("reference_white", UniformType::_1f),
                     UniformName::new("saturation", UniformType::_1f),
                 ],
@@ -6397,11 +6461,17 @@ impl Renderer {
                     mask_mul.1 = -mask_mul.1;
                     mask_add.1 = 1.0 - mask_add.1;
                 }
+                // `mask_add`/`mask_mul` normalise the rect to 0..1 of mask UV,
+                // so one physical pixel is 1/dst_w by 1/dst_h regardless of
+                // tier size or y-inversion (the taps are symmetric, so the
+                // sign does not matter).
+                let mask_dilate = (MASK_DILATE_PX / dst_w, MASK_DILATE_PX / dst_h);
                 let mut uniforms = vec![
                     Uniform::new("mask", 1i32),
                     Uniform::new("mask_prev", 2i32),
                     Uniform::new("mask_mul", mask_mul),
                     Uniform::new("mask_add", mask_add),
+                    Uniform::new("mask_dilate", mask_dilate),
                 ];
                 // The blur pyramid is sRGB; into the linear HDR scene the HDR
                 // variant decodes it to linear BT.2020 (needs reference_white).
@@ -8985,6 +9055,7 @@ mod gpu_bench {
                     UniformName::new("mask_prev", UniformType::_1i),
                     UniformName::new("mask_mul", UniformType::_2f),
                     UniformName::new("mask_add", UniformType::_2f),
+                    UniformName::new("mask_dilate", UniformType::_2f),
                 ],
             )
             .expect("compile mask blur shader");
@@ -9024,6 +9095,10 @@ mod gpu_bench {
             Uniform::new("mask_prev", 2i32),
             Uniform::new("mask_mul", (1.0f32, 1.0f32)),
             Uniform::new("mask_add", (0.0f32, 0.0f32)),
+            // Zero radius: this test is about the veto itself, so pin the
+            // dilation off and let `moving_mask_blur_survives_dilation` cover
+            // the moving-content relaxation separately.
+            Uniform::new("mask_dilate", (0.0f32, 0.0f32)),
         ];
         let mut run = |prev: &GlesTexture| -> [u8; 4] {
             let mut target: GlesTexture =
@@ -9066,6 +9141,126 @@ mod gpu_bench {
         assert!(
             sum(stable) > 600,
             "a stably-covered pixel must frost fully (got {stable:?})"
+        );
+    }
+
+    /// The temporal veto must tolerate content that *moved*. Its original form
+    /// point-sampled last frame's alpha, which silently assumed the client's
+    /// content is stationary — true of a bar, false of a popup that slides
+    /// into place. A sliding card lands on new pixels every frame, so its
+    /// leading edge was vetoed and left un-frosted, and the frost tore along
+    /// the card for the whole entrance (fine once it stopped).
+    ///
+    /// Dilating the veto (`MASK_DILATE_PX`) fixes it. Probed with vertical
+    /// bands so the result cannot depend on texture y-inversion.
+    #[test]
+    #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    fn moving_mask_blur_survives_dilation() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .expect("open render node");
+        let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+        let gbm = GbmDevice::new(fd).expect("GbmDevice");
+        #[allow(unsafe_code, reason = "test-only surfaceless EGL, single thread")]
+        // SAFETY: GbmDevice clone lives in the EGLDisplay for its lifetime.
+        let display = unsafe { EGLDisplay::new(gbm.clone()) }.expect("EGLDisplay");
+        let context = EGLContext::new(&display).expect("EGLContext");
+        #[allow(unsafe_code, reason = "test-only single-thread renderer")]
+        // SAFETY: used only from this test thread.
+        let mut gles = unsafe { GlesRenderer::new(context) }.expect("GlesRenderer");
+
+        let shader = gles
+            .compile_custom_texture_shader(
+                MASK_BLUR_SHADER,
+                &[
+                    UniformName::new("mask", UniformType::_1i),
+                    UniformName::new("mask_prev", UniformType::_1i),
+                    UniformName::new("mask_mul", UniformType::_2f),
+                    UniformName::new("mask_add", UniformType::_2f),
+                    UniformName::new("mask_dilate", UniformType::_2f),
+                ],
+            )
+            .expect("compile mask blur shader");
+
+        let size = Size::<i32, smithay::utils::Buffer>::from((64, 64));
+        let phys = Size::<i32, Physical>::from((64, 64));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((64.0, 64.0)));
+        let dst = Rectangle::<i32, Physical>::from_size(phys);
+
+        let white: Vec<u8> = [255u8; 4].iter().copied().cycle().take(64 * 64 * 4).collect();
+        let tier = gles
+            .import_memory(&white, Fourcc::Abgr8888, size, false)
+            .expect("import tier");
+
+        // The card, as a vertical band of columns [lo, hi) at panel alpha.
+        let mut band = |lo: usize, hi: usize| -> GlesTexture {
+            let mut data = vec![0u8; 64 * 64 * 4];
+            for y in 0..64 {
+                for x in lo..hi {
+                    data[(y * 64 + x) * 4 + 3] = 201;
+                }
+            }
+            gles
+                .import_memory(&data, Fourcc::Abgr8888, size, false)
+                .expect("import mask")
+        };
+        // Last frame the card sat over columns 16..32; this frame it covers
+        // column 40 too — the pixel a moving card has just arrived on.
+        let prev = band(16, 32);
+        let cur = band(16, 48);
+
+        let mut run = |dilate: f32| -> [u8; 4] {
+            let unis = [
+                Uniform::new("mask", 1i32),
+                Uniform::new("mask_prev", 2i32),
+                Uniform::new("mask_mul", (1.0f32, 1.0f32)),
+                Uniform::new("mask_add", (0.0f32, 0.0f32)),
+                Uniform::new("mask_dilate", (dilate / 64.0, dilate / 64.0)),
+            ];
+            let mut target: GlesTexture =
+                gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
+            {
+                let mut b = gles.bind(&mut target).expect("bind target");
+                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
+                f.clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full).expect("clear red");
+                f.with_secondary_textures(&cur, &prev, |f| {
+                    f.render_texture_from_to(
+                        &tier, src, dst, &full, &[], Transform::Normal, 1.0, Some(&shader), &unis,
+                    )
+                })
+                .expect("masked blur draw");
+                let s = f.finish().expect("finish");
+                drop(b);
+                let _ = s.wait();
+            }
+            let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((64, 64)));
+            let bound = gles.bind(&mut target).expect("rebind");
+            let mapping = gles
+                .copy_framebuffer(&bound, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let bytes = gles.map_texture(&mapping).expect("map").to_vec();
+            let c = (32 * 64 + 40) * 4; // column 40: 8 px beyond last frame's card
+            [bytes[c], bytes[c + 1], bytes[c + 2], bytes[c + 3]]
+        };
+
+        let undilated = run(0.0);
+        // 32 px reach => half-radius taps land 16 px away, inside the old band.
+        let dilated = run(32.0);
+        let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+        println!("moved, undilated = {undilated:?} (sum {})", sum(undilated));
+        println!("moved, dilated   = {dilated:?} (sum {})", sum(dilated));
+        // The bug: a point-sampled veto leaves the newly-covered pixel unfrosted.
+        assert!(
+            sum(undilated) < 400,
+            "point-sampled veto should suppress the moved-onto pixel (got {undilated:?})"
+        );
+        // The fix: content that merely moved still counts as persistent.
+        assert!(
+            sum(dilated) > 600,
+            "a dilated veto must let moved-onto content frost (got {dilated:?})"
         );
     }
 
