@@ -821,7 +821,7 @@ impl State {
         // modifier, and swallow the modifier on the way to the client.
         let press_match = |keysym: keyboard::Keysym, mods: u32| {
             !keyboard::is_modifier_keysym(keysym)
-                && keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(keysym)
+                && keyboard::matches_key(&result, keysym)
                 && result.has_all_mods(mods)
         };
         let matched_action = if pressed && !self.session_locked {
@@ -830,7 +830,8 @@ impl State {
                 .binds
                 .bindings
                 .iter()
-                .find(|b| press_match(b.keysym, b.mods))
+                .filter(|b| press_match(b.keysym, b.mods))
+                .max_by_key(|b| b.mods.count_ones())
                 .map(|b| b.action.clone());
             // Screenshot binds (if configured) are matched the same way;
             // normal binds win a tie.
@@ -838,7 +839,8 @@ impl State {
                 self.config.screenshot.as_ref().and_then(|binds| {
                     binds
                         .iter()
-                        .find(|b| press_match(b.keysym, b.mods))
+                        .filter(|b| press_match(b.keysym, b.mods))
+                        .max_by_key(|b| b.mods.count_ones())
                         .map(|b| config::Action::Screenshot(std::sync::Arc::new(b.clone())))
                 })
             })
@@ -907,11 +909,12 @@ impl State {
             let hit = self
                 .external_binds
                 .iter()
-                .find(|b| {
+                .filter(|b| {
                     !keyboard::is_modifier_keysym(b.keysym)
-                        && keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
+                        && keyboard::matches_key(&result, b.keysym)
                         && result.has_all_mods(b.mods)
                 })
+                .max_by_key(|b| b.mods.count_ones())
                 .map(|b| b.id.clone());
             let Some(id) = hit else { return false };
             self.external_held.insert(raw_code, id.clone());
@@ -1001,7 +1004,8 @@ impl State {
             .binds
             .bindings
             .iter()
-            .find(|b| tap_match(b.keysym, b.mods))
+            .filter(|b| tap_match(b.keysym, b.mods))
+            .max_by_key(|b| b.mods.count_ones())
             .map(|b| b.action.clone())
             // Screenshot binds follow the same rule, and lose the same tie.
             .or_else(|| {

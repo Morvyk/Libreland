@@ -718,9 +718,21 @@ empty workspaces are compacted away as you leave them (no wrap at the top).
 Only the active workspace of each output is rendered; each workspace keeps its
 own tiled tree and floating stack.
 
-Letter key bindings match case-insensitively, and the hotkey path uses
-xkb-resolved keysyms, so it keeps working once a future DRM grab disables the
-kernel's Ctrl+C path. Until that grab exists, Ctrl+C on the host TTY also
+Bindings match the key as it is *labelled*, not as the layout renders it
+under modifiers. That distinction matters for `Shift`: no layout leaves the
+digit row alone, so `Shift`+`2` produces `@` on US, `"` on Swedish and
+something else again elsewhere. A bind written `key = "2"` is matched against
+both the symbol actually produced and the key's unmodified symbol, so
+`Super+Shift+2` works everywhere. Letter bindings additionally match
+case-insensitively.
+
+When more than one bind could fire, the **most specific** wins — the one
+naming the most modifiers. Modifiers beyond those a bind names don't
+disqualify it (so `Super+D` still fires with Num Lock on), which is why
+`Super+Shift+2` would otherwise also satisfy a `Super+2` bind.
+
+The hotkey path uses xkb-resolved keysyms, so it keeps working once a future
+DRM grab disables the kernel's Ctrl+C path. Until that grab exists, Ctrl+C on the host TTY also
 exits — but treat `Super+Shift+E` as the canonical exit.
 
 ## Screenshots (built in)

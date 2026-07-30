@@ -50,6 +50,17 @@ pub fn fold_keysym(k: Keysym) -> Keysym {
     }
 }
 
+/// Whether a key event can satisfy a bind written for `want`.
+///
+/// Either the symbol actually produced or the key's unmodified symbol will
+/// do, so `Super+Shift+2` matches a bind on `2` regardless of what the
+/// layout puts on `Shift`+`2`.
+#[must_use]
+pub fn matches_key(result: &KeyResult, want: Keysym) -> bool {
+    let want = fold_keysym(want);
+    fold_keysym(result.keysym) == want || fold_keysym(result.base_keysym) == want
+}
+
 /// Whether `k` is a *held* modifier key — the ones that mean nothing on
 /// their own and exist to qualify another key.
 ///
@@ -89,6 +100,20 @@ pub fn is_modifier_keysym(k: Keysym) -> bool {
 /// effective modifiers.
 pub struct KeyResult {
     pub keysym: Keysym,
+    /// The same key's symbol at shift level 1 — what the key produces with
+    /// no modifiers applied.
+    ///
+    /// Binds are written the way the key is *labelled* (`key = "2"`), but
+    /// with Shift held xkb resolves that keycode to whatever the layout puts
+    /// on its shifted level — `@` on US, `"` on Swedish, and so on. No
+    /// layout leaves the digits alone, so matching on [`Self::keysym`] alone
+    /// breaks `Shift`+digit binds *everywhere*, not just on exotic layouts.
+    /// Silently, too: the bind still lists correctly in
+    /// `libreland msg binds`, it simply never fires.
+    ///
+    /// [`fold_keysym`] can't fix this: it folds A-Z case, and `Shift`+`2`
+    /// is not a case change but a different symbol entirely.
+    pub base_keysym: Keysym,
     pub mods: u32,
 }
 
@@ -143,9 +168,24 @@ impl Keyboard {
         self.state.update_key(keycode, direction);
 
         let keysym = self.state.key_get_one_sym(keycode);
+        // Level 0 of the key's *current* layout group, so a layout switch is
+        // still honoured; only the shift/level part is discarded.
+        let layout = self.state.key_get_layout(keycode);
+        let base_keysym = self
+            .state
+            .get_keymap()
+            .key_get_syms_by_level(keycode, layout, 0)
+            .first()
+            .copied()
+            .unwrap_or(keysym);
         let mods = self.effective_mods();
-        KeyResult { keysym, mods }
+        KeyResult {
+            keysym,
+            base_keysym,
+            mods,
+        }
     }
+
 
     /// Bundle the four modifiers we care about into a single
     /// bitmask. `STATE_MODS_EFFECTIVE` rolls depressed + latched +
@@ -242,9 +282,69 @@ pub fn format_trigger(mods: u32, keysym: Keysym) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Keysym, MOD_SHIFT, MOD_SUPER, fold_keysym, format_trigger, is_modifier_keysym,
-        parse_trigger,
+        KeyResult, Keysym, MOD_SHIFT, MOD_SUPER, fold_keysym, format_trigger,
+        is_modifier_keysym, matches_key, parse_trigger,
     };
+
+    fn ev(produced: Keysym, base: Keysym) -> KeyResult {
+        KeyResult {
+            keysym: produced,
+            base_keysym: base,
+            mods: 0,
+        }
+    }
+
+    /// The bug this exists for, and it is not layout-specific: no layout
+    /// leaves the digit row alone under Shift. US gives `@` for Shift+2,
+    /// Swedish gives `"`. The shifted level is a different symbol, not a
+    /// case change, so matching only the produced keysym meant every
+    /// `Shift`+digit bind silently never fired — on every layout — while
+    /// still listing correctly in `libreland msg binds`.
+    #[test]
+    fn a_shifted_digit_matches_the_bind_written_for_the_digit() {
+        for (produced, digit) in [
+            (Keysym::quotedbl, Keysym::_2),   // se
+            (Keysym::at, Keysym::_2),         // us
+            (Keysym::exclam, Keysym::_1),     // both
+            (Keysym::numbersign, Keysym::_3), // us
+        ] {
+            assert!(
+                matches_key(&ev(produced, digit), digit),
+                "{produced:?} should satisfy a bind on {digit:?}"
+            );
+        }
+    }
+
+    /// The fix reads the keycode's own level 0 rather than consulting a
+    /// table of substitutions, so a layout nobody anticipated works too.
+    #[test]
+    fn the_fix_is_layout_agnostic() {
+        assert!(matches_key(&ev(Keysym::eacute, Keysym::_2), Keysym::_2));
+        assert!(matches_key(&ev(Keysym::periodcentered, Keysym::_3), Keysym::_3));
+    }
+
+    /// A bind written for the *shifted* symbol still matches it directly, so
+    /// `key = "exclam"` keeps working for anyone who wrote it that way.
+    #[test]
+    fn a_bind_on_the_shifted_symbol_still_matches() {
+        assert!(matches_key(&ev(Keysym::exclam, Keysym::_1), Keysym::exclam));
+    }
+
+    /// And it must not match everything: a different key is still a
+    /// different key.
+    #[test]
+    fn unrelated_keys_do_not_match() {
+        assert!(!matches_key(&ev(Keysym::quotedbl, Keysym::_2), Keysym::_3));
+        assert!(!matches_key(&ev(Keysym::a, Keysym::a), Keysym::b));
+    }
+
+    /// Case folding still applies on top, so `Super+Shift+E` reaches a bind
+    /// written `key = "E"` or `key = "e"`.
+    #[test]
+    fn case_folding_still_applies() {
+        assert!(matches_key(&ev(Keysym::E, Keysym::e), Keysym::e));
+        assert!(matches_key(&ev(Keysym::E, Keysym::e), Keysym::E));
+    }
 
     #[test]
     fn triggers_round_trip() {
