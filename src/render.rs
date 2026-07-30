@@ -5431,7 +5431,25 @@ impl Renderer {
         // the passthrough branch below stays PQ-only.
         let solo_scrgb_surface =
             solo_opaque.is_some_and(|i| enc.scrgb.contains(&placements[i].surface.id()));
-        let single_pass_hdr = hdr && solo_opaque.is_some();
+        // ...but not on a frame that has to be captured. The fast path works by
+        // clearing `hdr`, which makes everything downstream treat this as an
+        // SDR output -- including the capture dispatch, which then reads the
+        // scanout directly. On this path the scanout is PQ-encoded BT.2020, so
+        // a capture came out as raw PQ code values written into an sRGB image:
+        // lifted blacks, flat mid-tones, highlights that never reach white.
+        // (Inverting a real capture through the PQ curve reproduced the game's
+        // luminance histogram exactly -- 106 cd/m² median, 1930 cd/m² peak.)
+        //
+        // The generic path composites into the fp16 linear scene, which is what
+        // `capture_tonemapped` needs, so give up the fast path for those frames.
+        // A screenshot costs one slower frame; continuous screencopy of a solo
+        // HDR game gives it up for the duration, which is the same pipeline
+        // every non-solo frame already uses.
+        //
+        // Direct scanout already refuses captures on an HDR output for exactly
+        // this reason (see `capture_ok` above) -- this path simply never
+        // inherited the rule.
+        let single_pass_hdr = hdr && solo_opaque.is_some() && captures.is_empty();
         if single_pass_hdr {
             debug!(
                 output = %output_name,
