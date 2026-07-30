@@ -822,13 +822,24 @@ void main() {
     float s = mix(1.0, clamp(l709 / max(l709 - lo, 1e-5), 0.0, 1.0), step(lo, -1e-6));
     lin = max(mix(vec3(l709), lin, s), vec3(0.0));
 
-    // Roll the highlights off per channel. The previous version clamped here
-    // instead, which gave every value from diffuse white to the 10000-nit peak
-    // the *same* output -- no highlight range at all, so a bright scene turned
-    // into a flat white sheet. The shoulder leaves everything below the knee
-    // untouched, so SDR content keeps its exact mid-tones, and spends the
-    // remaining range on the HDR headroom above it.
-    lin = vec3(shoulder(lin.r, knee), shoulder(lin.g, knee), shoulder(lin.b, knee));
+    // Roll highlights off by compressing the *peak* channel and scaling the
+    // whole colour by that one ratio, so chromaticity survives exactly.
+    //
+    // Running the curve per channel instead -- the obvious way, and what this
+    // did first -- compresses the brightest channel hardest, which squeezes
+    // the ratios between channels and bleaches bright colour toward white. A
+    // sunlit orange came out (252, 242, 128), pale yellow, where this keeps it
+    // (250, 140, 52). Measured over a colour held at constant hue while its
+    // brightness rises, per-channel let saturation fall 0.69 -> 0.58 -> 0.42;
+    // scaling by the peak holds it at 0.79 throughout.
+    //
+    // No highlight-bleach term on purpose. Real film and the eye do desaturate
+    // very bright colour, and the usual formulation blends toward the
+    // compressed peak -- but it is strong enough to undo most of what this
+    // buys (0.05 already drags that ladder back to 0.67/0.55/0.42), and a
+    // faithful capture is the goal here, not a photographic look.
+    float peak = max(max(lin.r, lin.g), lin.b);
+    lin *= mix(1.0, shoulder(peak, knee) / max(peak, 1e-5), step(knee, peak));
 
     gl_FragColor = vec4(linear_to_srgb(clamp(lin, 0.0, 1.0)), 1.0) * alpha;
 }
@@ -842,17 +853,20 @@ void main() {
 /// 1.0, so representing *any* headroom above diffuse white means diffuse white
 /// itself has to sit below 1.0.
 ///
-/// 0.6 was picked by measuring rather than by feel. Against an ACES filmic fit
-/// it lands the same diffuse white (sRGB 0.906 vs 0.908) and the same highlight
-/// range (0.090 vs 0.092), while beating it on the two things that matter here:
-/// mid-tones pass through *exactly* (0.464, identical to no tone mapping at
+/// Picked by measuring rather than by feel. Against an ACES filmic fit this
+/// curve holds mid-tones *exactly* (0.464, identical to no tone mapping at
 /// all), where ACES lifts them to 0.557 and would visibly distort an ordinary
-/// SDR desktop capture; and a saturated colour at 4x diffuse white keeps 0.42
-/// saturation against ACES's 0.31.
+/// SDR desktop capture, which goes through this same path.
+///
+/// 0.50 rather than the 0.60 first shipped: at 0.60 the highlights read a
+/// little hot against the display. It moves the neutral ladder from
+/// 231/245/251 down to 225/240/249 for 203/400/1000 cd/m², which is the
+/// "slightly too bright" complaint's worth of change, and leaves mid-tones
+/// untouched either way since they never reach the knee.
 ///
 /// Raise it toward 1.0 for brighter SDR whites and harsher highlight
 /// compression, lower it for more highlight separation and a dimmer desktop.
-const SCREENSHOT_TONEMAP_KNEE: f32 = 0.60;
+const SCREENSHOT_TONEMAP_KNEE: f32 = 0.50;
 
 /// Decode an SDR (sRGB / BT.709) source into the linear BT.2020 working
 /// space, mapping SDR diffuse white to `reference_white` cd/m². Set as
@@ -9609,6 +9623,45 @@ mod gpu_bench {
         assert!(
             orange[0] > orange[1] && orange[1] > orange[2],
             "channel ordering must survive tone mapping, got {orange:?}"
+        );
+
+        // Saturation must not drain away as a colour gets brighter. Ordering
+        // alone does not catch this — running the curve per channel kept
+        // R>G>B while still washing a sunlit orange to pale yellow, because
+        // the brightest channel compresses hardest and closes the gap to the
+        // others. Compressing the peak and scaling the whole colour by that
+        // one ratio holds chromaticity, so the same hue at rising brightness
+        // holds its saturation instead of fading toward white.
+        let sat = |p: [u8; 4]| -> f32 {
+            let (mx, mn) = (
+                f32::from(p[0].max(p[1]).max(p[2])),
+                f32::from(p[0].min(p[1]).min(p[2])),
+            );
+            if mx <= 0.0 { 0.0 } else { (mx - mn) / mx }
+        };
+        let ramp: Vec<(u32, f32)> = [1_u32, 2, 4]
+            .into_iter()
+            .map(|m| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "small integer multipliers, exact in f32"
+                )]
+                let f = m as f32;
+                (m, sat(shot([300.0 * f, 133.0 * f, 30.0 * f])))
+            })
+            .collect();
+        for (m, s) in &ramp {
+            println!("orange x{m}: saturation {s:.2}");
+        }
+        let (base, top) = (ramp[0].1, ramp[2].1);
+        assert!(
+            base > 0.6,
+            "a saturated colour must stay saturated, got {base:.2}"
+        );
+        assert!(
+            (base - top).abs() < 0.12,
+            "saturation must survive a 4x brightness rise (got {base:.2} -> {top:.2}); \
+             a large drop means the curve is bleaching colour toward white"
         );
 
         // Mid-tones sit below the knee and must pass through untouched, so an
