@@ -1,12 +1,17 @@
-//! Screencast output chooser for Libreland.
+//! Standalone monitor chooser for Libreland.
 //!
-//! Invoked by xdg-desktop-portal-wlr as its `chooser_cmd`: it shows a
-//! translucent `wlr-layer-shell` overlay on every output, highlights the
-//! monitor under the pointer (with its connector name), and on click prints
-//! that output's name to stdout — which xdpw matches against its output list
-//! (`chooser_type=simple`; the bare name matches via xdpw's pre-0.8.0
-//! fallback). Escape, or no selection, prints nothing and exits non-zero,
-//! which xdpw treats as "cancelled".
+//! Shows a translucent `wlr-layer-shell` overlay on every output, highlights
+//! the monitor under the pointer (with its connector name), and on click
+//! prints that output's name to stdout. Escape, or no selection, prints
+//! nothing and exits non-zero.
+//!
+//! Libreland's own desktop portal has this built in, so screen sharing no
+//! longer shells out to anything. This binary stays because "let the user
+//! point at a monitor and tell me which one" is useful on its own — in a
+//! script (`grim -o "$(libreland-output-picker)"`), or as the
+//! `chooser_cmd` for another compositor's portal backend, which is the
+//! interface it was originally written against (`chooser_type=simple`:
+//! a bare connector name on stdout, non-zero exit for "cancelled").
 //!
 //! Replaces slurp, which crashes on this (and any) compositor that delivers a
 //! `wl_pointer.motion` without a usable preceding `enter` — slurp 1.5.0

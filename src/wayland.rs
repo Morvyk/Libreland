@@ -494,7 +494,7 @@ pub fn init(
     // a link → the browser raises, notification click → app raises). We
     // reveal + focus the target if the token is fresh.
     let xdg_activation_state = XdgActivationState::new::<State>(&dh);
-    // zwlr_screencopy_manager_v1: lets grim / xdg-desktop-portal-wlr
+    // zwlr_screencopy_manager_v1: lets grim / the desktop portal
     // capture outputs for screenshots and screen sharing.
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
     // wp_color_management_v1: clients detect output HDR + tag surface

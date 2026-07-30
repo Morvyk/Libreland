@@ -8,14 +8,22 @@ license = "MIT"
 description = "A Wayland compositor in pure Rust, configured in Lua."
 publish = false
 
-# The compositor is the workspace root; `output-picker` is a sibling
-# member — a tiny Wayland *client* (the screencast output chooser), kept
-# separate so it doesn't pull the compositor's server-side smithay deps.
+# The compositor is the workspace root; the other members are sibling
+# session processes — Wayland *clients* and D-Bus services, kept separate so
+# they don't pull the compositor's server-side smithay deps (and so a crash
+# in a dialog is never a crash in the display server):
+#
+#   output-picker  the standalone screencast output chooser
+#   polkit-agent   the PolicyKit authentication agent
+#   portal         the xdg-desktop-portal backend (screencast, screenshot,
+#                  file chooser, settings, … — one binary replacing the
+#                  -wlr and -gtk backends)
+#
 # Members share this manifest's profiles, lockfile, target dir, and the
 # lint policy below.
 [workspace]
 resolver = "3"
-members = ["output-picker", "polkit-agent"]
+members = ["output-picker", "polkit-agent", "portal"]
 
 [dependencies]
 anyhow = "1.0.102"

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.97.0"
 authors = ["Morvyk <Morvyk@proton.me>"]
 license = "MIT"
-description = "Screencast output chooser for Libreland — a wlr-layer-shell overlay that prints the clicked output's name (xdg-desktop-portal-wlr simple chooser)."
+description = "Standalone monitor chooser for Libreland — a wlr-layer-shell overlay that prints the clicked output's name. Libreland's own portal has this built in; this is the scriptable/standalone version."
 publish = false
 
 [lints]

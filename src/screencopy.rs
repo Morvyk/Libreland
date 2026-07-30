@@ -3,7 +3,7 @@
 //!
 //! This is the one compositor-side piece the wlroots portal route
 //! needs: `grim`/`satty` use it directly for screenshots, and
-//! `xdg-desktop-portal-wlr` uses it (feeding `PipeWire`) for
+//! Libreland's own desktop portal uses it (feeding `PipeWire`) for
 //! screencast, so OBS / Discord / browser screen-share work.
 //!
 //! A client asks to capture an output; we reply with the buffer

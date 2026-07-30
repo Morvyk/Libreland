@@ -1,0 +1,69 @@
+[package]
+name = "libreland-portal"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.97.0"
+authors = ["Morvyk <Morvyk@proton.me>"]
+license = "MIT"
+description = "Libreland's xdg-desktop-portal backend — one binary covering what xdg-desktop-portal-wlr and -gtk covered between them (screencast, screenshot, file chooser, settings, notifications, global shortcuts, …)."
+publish = false
+
+[[bin]]
+name = "libreland-xdg-desktop-portal"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+# Async D-Bus. Same shape as the polkit agent: tokio reactor, not async-io,
+# so the bus, the UI thread hand-offs and the capture threads share one
+# runtime.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "signal", "time", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Stream adapters for the D-Bus signal streams we consume (notification
+# actions). zbus exposes the streams but not an extension trait to poll them.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Safe wrappers for the handful of syscalls we need: getpwuid_r (Account),
+# memfd_create (shm + PipeWire buffers) and inotify (live Settings reload).
+nix = { version = "0.29", default-features = false, features = ["user", "fs", "mman", "inotify", "poll", "process", "signal"] }
+
+# ── Wayland client ────────────────────────────────────────────────────────
+# The portal is a Wayland *client* of the compositor it serves: it draws its
+# own dialogs (xdg-shell) and pickers (layer-shell), and captures pixels with
+# wlr-screencopy. Same toolkit the output picker uses.
+smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
+wayland-client = "0.31.14"
+# zwp_linux_dmabuf_v1 (buffer import for the zero-copy capture path).
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# zwlr_screencopy_v1 — the capture protocol behind both Screenshot and
+# ScreenCast, and zwlr_layer_shell_v1 (via sctk) for the pickers.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+# ── Text ──────────────────────────────────────────────────────────────────
+# Pure-Rust TTF/OTF rasterizer. We do our own font discovery (a directory
+# walk over the XDG font dirs) rather than linking fontconfig — the file
+# chooser needs real glyphs, not a bitmap grid, but not a font *system*.
+fontdue = "0.9"
+
+# ── Capture ───────────────────────────────────────────────────────────────
+# PipeWire is not optional for ScreenCast: the portal API's whole payload is
+# a PipeWire node id, so speaking it is the interface.
+# `v0_3_65` unlocks the dmabuf-modifier plumbing (SPA_VIDEO_FLAG_MODIFIER);
+# PipeWire on any current distro is far newer than that.
+pipewire = { version = "0.10", features = ["v0_3_65"] }
+libspa = { version = "0.10", features = ["v0_3_65"] }
+# gbm allocates the scanout-capable buffers we hand the compositor for the
+# zero-copy (dmabuf) capture path; drm-fourcc names the formats.
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+drm-fourcc = "2"
+# mmap for shm capture buffers (the fallback path) and for reading a font
+# file without slurping it into the heap.
+memmap2 = "0.9"
+# Screenshot output. Same encoder the compositor's built-in screenshot uses.
+png = "0.18"
