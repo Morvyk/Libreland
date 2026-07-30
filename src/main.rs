@@ -204,6 +204,18 @@ pub(crate) struct State {
     /// has happened since, and releasing it fires the action. See
     /// [`State::update_tap_state`].
     pub(crate) tap_pending: Option<TapPending>,
+    /// Keybindings owned by external clients, registered over the control
+    /// IPC (`register-bind`). They fire no compositor action: a match
+    /// swallows the key and emits a `bind-activated` event carrying the
+    /// registrant's id. This is what backs the desktop portal's
+    /// `GlobalShortcuts` — an app asks the portal for a shortcut, the
+    /// portal asks us, and the keypress comes back to it as an event.
+    pub(crate) external_binds: Vec<ExternalBind>,
+    /// Keycodes currently held down that matched an external bind, and
+    /// which id they matched. Tracked so the *release* is reported (and
+    /// swallowed) even if the modifier state changed while the key was
+    /// down — push-to-talk depends on getting both edges.
+    pub(crate) external_held: std::collections::HashMap<u32, String>,
     /// Which selections (clipboard / primary) are currently owned by an
     /// X11 client. Routes Wayland-side paste requests back through the
     /// XWM instead of the compositor's clipboard cache.
@@ -498,7 +510,7 @@ pub(crate) struct State {
     /// [`crate::clipboard`].
     pub(crate) clipboard: clipboard::Selections,
     /// `zwlr_screencopy_manager_v1` global — held alive so screenshot
-    /// tools and `xdg-desktop-portal-wlr` can capture outputs.
+    /// tools and the desktop portal can capture outputs.
     #[allow(dead_code, reason = "held to keep the global alive")]
     pub(crate) screencopy_manager: screencopy::ScreencopyManagerState,
     /// `zwlr_screencopy` `copy` requests awaiting the next render of
@@ -639,6 +651,21 @@ pub(crate) struct TapPending {
     /// The folded keysym that armed this — only its own release fires.
     keysym: keyboard::Keysym,
     action: config::Action,
+}
+
+/// A keybinding owned by an external client rather than by the config.
+///
+/// Registered over the control IPC and matched in [`State::handle_key`]
+/// alongside the configured binds; a hit is reported back over the event
+/// stream instead of running a compositor action.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalBind {
+    /// The registrant's own identifier, echoed on activation.
+    pub(crate) id: String,
+    pub(crate) mods: u32,
+    pub(crate) keysym: keyboard::Keysym,
+    /// Shown by `libreland msg binds` so a user can see what claimed a key.
+    pub(crate) description: String,
 }
 
 /// In-progress interactive drag. The dragged surface is always
@@ -795,6 +822,12 @@ impl State {
             None
         };
 
+        // Externally-registered binds (the desktop portal's global
+        // shortcuts) lose every tie to a configured bind: the user's own
+        // config outranks an app's request.
+        let external_intercept = matched_action.is_none()
+            && self.match_external_bind(pressed, event.key_code().into(), &result);
+
         // Modifier-tap binds are decided here, but never intercept: the
         // client must see the modifier's press and release like any other
         // key, or its own modifier state drifts out of sync with ours.
@@ -807,22 +840,68 @@ impl State {
         let Some(kbd) = self.seat.get_keyboard() else {
             return;
         };
-        let action = kbd.input::<config::Action, _>(
+        let action = kbd.input::<Option<config::Action>, _>(
             self,
             key_code,
             key_state,
             serial,
             time,
-            |_data, _mods, _keysym| {
-                matched_action.map_or(FilterResult::Forward, FilterResult::Intercept)
+            |_data, _mods, _keysym| match (matched_action, external_intercept) {
+                (Some(action), _) => FilterResult::Intercept(Some(action)),
+                // Intercept with no action: the key is consumed by an
+                // external bind and must not reach the client.
+                (None, true) => FilterResult::Intercept(None),
+                (None, false) => FilterResult::Forward,
             },
         );
+        let action = action.flatten();
         // At most one of the two can be set — an intercept only comes from
         // a press, a tap only from a release — and the tap's own release
         // has already been forwarded above.
         if let Some(action) = action.or(tap_action) {
             self.dispatch_action(action);
         }
+    }
+
+    /// Match one key event against the externally-registered binds (see
+    /// [`ExternalBind`]), reporting any hit on the IPC event stream.
+    ///
+    /// Returns whether the key should be **swallowed**: a global shortcut
+    /// that also reached the focused window would fire twice.
+    fn match_external_bind(
+        &mut self,
+        pressed: bool,
+        raw_code: u32,
+        result: &keyboard::KeyResult,
+    ) -> bool {
+        if pressed {
+            // Same matching rule as a configured bind, and the same lock
+            // rule: nothing fires while the session is locked.
+            if self.session_locked {
+                return false;
+            }
+            let hit = self
+                .external_binds
+                .iter()
+                .find(|b| {
+                    !keyboard::is_modifier_keysym(b.keysym)
+                        && keyboard::fold_keysym(result.keysym) == keyboard::fold_keysym(b.keysym)
+                        && result.has_all_mods(b.mods)
+                })
+                .map(|b| b.id.clone());
+            let Some(id) = hit else { return false };
+            self.external_held.insert(raw_code, id.clone());
+            self.ipc.emit(&ipc::Event::BindActivated { id, pressed: true });
+            return true;
+        }
+        // The release is matched by keycode, not by keysym + modifiers: the
+        // user may have let go of Shift first, and a bind that never reports
+        // its release would leave push-to-talk stuck open.
+        let Some(id) = self.external_held.remove(&raw_code) else {
+            return false;
+        };
+        self.ipc.emit(&ipc::Event::BindActivated { id, pressed: false });
+        true
     }
 
     /// Advance the modifier-tap state machine for one key event, and
@@ -4555,6 +4634,8 @@ fn main() -> Result<()> {
         x11_kbd_focus: None,
         x11_fill_flips: std::collections::HashMap::new(),
         tap_pending: None,
+        external_binds: Vec::new(),
+        external_held: std::collections::HashMap::new(),
         x11_owns_selection: crate::xwayland::X11SelectionOwnership::default(),
         xwayland_shell_state: wayland_init.xwayland_shell_state,
         display_handle: wayland_init.display_handle,

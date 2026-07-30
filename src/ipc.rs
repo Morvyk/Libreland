@@ -103,6 +103,38 @@ pub enum Request {
     },
     /// Spawn a child process. `command` is an argv (program + args).
     Spawn { command: Vec<String> },
+    /// Show `path` (an image/gif/video) as the wallpaper, right now.
+    ///
+    /// Live only: the running config is updated so the wallpaper survives
+    /// everything except a config reload, which goes back to what the Lua
+    /// file says. That's deliberate — the config file stays the source of
+    /// truth, and nothing rewrites it behind the user's back.
+    SetWallpaper {
+        path: String,
+        /// `fill` (default), `fit`, `stretch` or `center`.
+        #[serde(default)]
+        mode: Option<String>,
+    },
+    /// Register a keybinding owned by an external client (the desktop
+    /// portal's `GlobalShortcuts`, a bar, a script).
+    ///
+    /// The bind fires no compositor action: it emits an
+    /// [`Event::BindActivated`] carrying `id` to every subscriber, and the
+    /// key is swallowed rather than forwarded to the focused window.
+    /// Registering an `id` that already exists replaces its trigger.
+    RegisterBind {
+        /// Opaque, caller-chosen identity echoed back on activation.
+        id: String,
+        /// `SUPER+SHIFT+e` — modifier names (`SUPER`/`LOGO`, `CTRL`,
+        /// `ALT`, `SHIFT`) joined to an xkb key name by `+`.
+        trigger: String,
+        /// Human-readable description, for `libreland msg binds`.
+        #[serde(default)]
+        description: String,
+    },
+    /// Drop a bind registered with [`Request::RegisterBind`]. Unregistering
+    /// an unknown id succeeds (it is already not bound).
+    UnregisterBind { id: String },
     /// Re-read the config file now.
     Reload,
     /// Exit the compositor.
@@ -128,6 +160,7 @@ pub enum EventKind {
     WindowClosed,
     WindowFocused,
     WorkspacesChanged,
+    BindActivated,
 }
 
 /// A pushed event on a subscribed connection. Serialized internally
@@ -144,6 +177,11 @@ pub enum Event {
     WindowFocused { window: Option<WindowInfo> },
     /// The set of workspaces changed (switch, add/remove, window counts).
     WorkspacesChanged { workspaces: Vec<WorkspaceInfo> },
+    /// A bind registered through [`Request::RegisterBind`] was pressed
+    /// (`pressed: true`) or released. Both edges are reported because the
+    /// portal's `GlobalShortcuts` clients distinguish them — push-to-talk
+    /// is the obvious case.
+    BindActivated { id: String, pressed: bool },
 }
 
 impl Event {
@@ -154,6 +192,7 @@ impl Event {
             Event::WindowClosed { .. } => EventKind::WindowClosed,
             Event::WindowFocused { .. } => EventKind::WindowFocused,
             Event::WorkspacesChanged { .. } => EventKind::WorkspacesChanged,
+            Event::BindActivated { .. } => EventKind::BindActivated,
         }
     }
 }
@@ -189,6 +228,9 @@ pub enum Response {
         width: i32,
         height: i32,
     },
+    /// A bind was registered; `trigger` is the compositor's normalized
+    /// spelling of it (what `libreland msg binds` will show).
+    Bind(BindRegistration),
     /// An action completed successfully (no payload).
     Handled,
 }
@@ -302,6 +344,13 @@ pub struct BindInfo {
     pub mods: Vec<String>,
     pub key: String,
     pub action: String,
+}
+
+/// Reply to [`Request::RegisterBind`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindRegistration {
+    /// Normalized trigger, e.g. `SUPER+SHIFT+e`.
+    pub trigger: String,
 }
 
 // ======================================================================
@@ -457,6 +506,18 @@ mod server {
         /// Whether anyone is listening (the poll early-outs if not).
         fn has_subscribers(&self) -> bool {
             !self.subscribers.is_empty()
+        }
+
+        /// Push one event immediately, outside the per-iteration diff.
+        ///
+        /// The diffing poll can only report *state* — it has nothing to
+        /// compare an edge against. Keybind activations are edges, so they
+        /// are emitted at the moment they happen.
+        pub fn emit(&mut self, event: &Event) {
+            if self.subscribers.is_empty() {
+                return;
+            }
+            self.broadcast(event);
         }
 
         /// Write `event` to every subscriber that wants its kind, dropping
@@ -776,6 +837,7 @@ mod server {
                 | Request::ToggleMaximized { .. }
                 | Request::FocusWorkspace { .. }
                 | Request::MoveToWorkspace { .. }
+                | Request::SetWallpaper { .. }
         );
         let reply = match req {
             Request::Version => Ok(Response::Version(VersionInfo {
@@ -799,6 +861,16 @@ mod server {
             Request::FocusWorkspace { output, target } => focus_workspace(state, output, target),
             Request::MoveToWorkspace { id, target } => move_to_workspace(state, id, target),
             Request::Spawn { command } => spawn(state, &command),
+            Request::SetWallpaper { path, mode } => set_wallpaper(state, &path, mode.as_deref()),
+            Request::RegisterBind {
+                id,
+                trigger,
+                description,
+            } => register_bind(state, id, &trigger, description),
+            Request::UnregisterBind { id } => {
+                state.external_binds.retain(|b| b.id != id);
+                Ok(Response::Handled)
+            }
             Request::Reload => reload(state),
             Request::Exit => {
                 info!("exit requested via IPC");
@@ -1014,6 +1086,60 @@ mod server {
             }
             Err(e) => Err(format!("spawn failed: {e}")),
         }
+    }
+
+    /// Swap the live wallpaper for `path`.
+    ///
+    /// The running config is updated too, so a later query or a
+    /// re-application of the appearance keeps showing it; a config *reload*
+    /// deliberately puts the file's wallpaper back.
+    fn set_wallpaper(state: &mut State, path: &str, mode: Option<&str>) -> Reply {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_file() {
+            return Err(format!("no such file: {}", path.display()));
+        }
+        let mode = match mode {
+            None | Some("fill") => crate::config::ScaleMode::Fill,
+            Some("fit") => crate::config::ScaleMode::Fit,
+            Some("stretch") => crate::config::ScaleMode::Stretch,
+            Some("center") => crate::config::ScaleMode::Center,
+            Some(other) => return Err(format!("unknown wallpaper mode: {other}")),
+        };
+        let wallpaper = crate::config::Wallpaper::Media {
+            path: path.clone(),
+            mode,
+        };
+        crate::apply_wallpaper(&mut state.renderer, &wallpaper, &state.config.border);
+        state.config.misc.wallpaper = wallpaper;
+        info!(path = %path.display(), "wallpaper set via IPC");
+        Ok(Response::Handled)
+    }
+
+    /// Add (or replace) an externally-owned bind.
+    fn register_bind(
+        state: &mut State,
+        id: String,
+        trigger: &str,
+        description: String,
+    ) -> Reply {
+        let Some((mods, keysym)) = crate::keyboard::parse_trigger(trigger) else {
+            return Err(format!("cannot parse trigger: {trigger}"));
+        };
+        let normalized = crate::keyboard::format_trigger(mods, keysym);
+        // A repeat registration of the same id is a re-bind, not a second
+        // bind: the portal does exactly this when an app changes its
+        // shortcuts.
+        state.external_binds.retain(|b| b.id != id);
+        info!(%id, trigger = %normalized, "external bind registered");
+        state.external_binds.push(crate::ExternalBind {
+            id,
+            mods,
+            keysym,
+            description,
+        });
+        Ok(Response::Bind(super::BindRegistration {
+            trigger: normalized,
+        }))
     }
 
     fn reload(state: &mut State) -> Reply {
@@ -1239,6 +1365,18 @@ mod server {
                 key: xkbcommon::xkb::keysym_get_name(b.keysym),
                 action: action_label(&b.action),
             })
+            // Binds registered over IPC are listed alongside the configured
+            // ones: they occupy the same key space, so leaving them out
+            // would make `libreland msg binds` lie about what's taken.
+            .chain(state.external_binds.iter().map(|b| BindInfo {
+                mods: mod_names(b.mods),
+                key: xkbcommon::xkb::keysym_get_name(b.keysym),
+                action: if b.description.is_empty() {
+                    format!("external:{}", b.id)
+                } else {
+                    format!("external:{} ({})", b.id, b.description)
+                },
+            }))
             .collect()
     }
 
@@ -1485,6 +1623,14 @@ mod client {
             #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
             command: Vec<String>,
         },
+        /// Show an image/gif/video as the wallpaper, right now. Lives until
+        /// the next config reload (the Lua file stays the source of truth).
+        SetWallpaper {
+            path: String,
+            /// `fill` (default), `fit`, `stretch` or `center`.
+            #[arg(long)]
+            mode: Option<String>,
+        },
         /// Re-read the config file now.
         Reload,
         /// Exit the compositor.
@@ -1528,6 +1674,10 @@ mod client {
                 },
                 Command::Spawn { command } => Request::Spawn {
                     command: command.clone(),
+                },
+                Command::SetWallpaper { path, mode } => Request::SetWallpaper {
+                    path: path.clone(),
+                    mode: mode.clone(),
                 },
                 Command::Reload => Request::Reload,
                 Command::Exit => Request::Exit,
@@ -1612,6 +1762,9 @@ mod client {
                 Some(w) => println!("focused  #{} {}", w.id, window_label(w)),
                 None => println!("focused  (none)"),
             },
+            Event::BindActivated { id, pressed } => {
+                println!("bind     {id} {}", if *pressed { "pressed" } else { "released" });
+            }
             Event::WorkspacesChanged { workspaces } => {
                 let active: Vec<String> = workspaces
                     .iter()
@@ -1698,6 +1851,7 @@ mod client {
             Response::WindowCapture { path, width, height } => {
                 println!("{path} ({width}x{height})");
             }
+            Response::Bind(bind) => println!("bound {}", bind.trigger),
             // Actions succeed silently (Unix convention); `--json` above
             // still prints the `"Handled"` marker for scripts that check.
             Response::Handled => {}

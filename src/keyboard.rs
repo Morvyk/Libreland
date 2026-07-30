@@ -180,9 +180,101 @@ impl Keyboard {
     }
 }
 
+/// Parse a `SUPER+SHIFT+e`-style trigger into `(mods, keysym)`.
+///
+/// This is the spelling the desktop portal's `GlobalShortcuts` clients use
+/// (`LOGO`, `CTRL`, `ALT`, `SHIFT` plus an xkb key name), and it's what
+/// [`crate::ipc::Request::RegisterBind`] takes. Key names are resolved by
+/// xkbcommon, case-insensitively as a fallback so `E` and `e` both work —
+/// the bind matcher folds case anyway.
+///
+/// `None` when no part of it names a key we can bind.
+#[must_use]
+pub fn parse_trigger(trigger: &str) -> Option<(u32, Keysym)> {
+    let mut mods = 0;
+    let mut key = None;
+    for part in trigger.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.to_ascii_uppercase().as_str() {
+            "SUPER" | "LOGO" | "META" | "MOD4" | "CMD" => mods |= MOD_SUPER,
+            "CTRL" | "CONTROL" => mods |= MOD_CTRL,
+            "ALT" | "MOD1" => mods |= MOD_ALT,
+            "SHIFT" => mods |= MOD_SHIFT,
+            _ => {
+                let sym = xkb::keysym_from_name(part, xkb::KEYSYM_NO_FLAGS);
+                let sym = if sym == Keysym::NoSymbol {
+                    xkb::keysym_from_name(part, xkb::KEYSYM_CASE_INSENSITIVE)
+                } else {
+                    sym
+                };
+                if sym == Keysym::NoSymbol {
+                    return None;
+                }
+                key = Some(sym);
+            }
+        }
+    }
+    key.map(|k| (mods, k))
+}
+
+/// Render `(mods, keysym)` back into the trigger notation, so a caller can
+/// see what its request actually bound.
+#[must_use]
+pub fn format_trigger(mods: u32, keysym: Keysym) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for (bit, name) in [
+        (MOD_SUPER, "SUPER"),
+        (MOD_CTRL, "CTRL"),
+        (MOD_ALT, "ALT"),
+        (MOD_SHIFT, "SHIFT"),
+    ] {
+        if mods & bit != 0 {
+            parts.push(name);
+        }
+    }
+    let key = xkb::keysym_get_name(keysym);
+    if parts.is_empty() {
+        key
+    } else {
+        format!("{}+{key}", parts.join("+"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Keysym, fold_keysym, is_modifier_keysym};
+    use super::{
+        Keysym, MOD_SHIFT, MOD_SUPER, fold_keysym, format_trigger, is_modifier_keysym,
+        parse_trigger,
+    };
+
+    #[test]
+    fn triggers_round_trip() {
+        let (mods, key) = parse_trigger("SUPER+SHIFT+e").expect("parses");
+        assert_eq!(mods, MOD_SUPER | MOD_SHIFT);
+        assert_eq!(key, Keysym::e);
+        assert_eq!(format_trigger(mods, key), "SUPER+SHIFT+e");
+    }
+
+    #[test]
+    fn trigger_modifier_aliases_are_accepted() {
+        // The portal spells Super as LOGO; xkb tools spell it SUPER.
+        assert_eq!(parse_trigger("LOGO+p"), parse_trigger("SUPER+p"));
+    }
+
+    #[test]
+    fn a_trigger_without_a_key_is_rejected() {
+        assert!(parse_trigger("SUPER+SHIFT").is_none());
+        assert!(parse_trigger("").is_none());
+        assert!(parse_trigger("SUPER+notakey").is_none());
+    }
+
+    #[test]
+    fn function_and_named_keys_parse() {
+        assert_eq!(parse_trigger("F5").map(|(_, k)| k), Some(Keysym::F5));
+        assert_eq!(
+            parse_trigger("CTRL+Print").map(|(_, k)| k),
+            Some(Keysym::Print)
+        );
+    }
 
     #[test]
     fn held_modifiers_are_recognised() {
