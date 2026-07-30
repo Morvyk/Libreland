@@ -6562,7 +6562,16 @@ impl Renderer {
                 // so one physical pixel is 1/dst_w by 1/dst_h regardless of
                 // tier size or y-inversion (the taps are symmetric, so the
                 // sign does not matter).
-                let mask_dilate = (MASK_DILATE_PX / dst_w, MASK_DILATE_PX / dst_h);
+                //
+                // Cap the reach at a quarter of each axis. A bar is only tens
+                // of pixels tall, so a flat 128 px would put every vertical
+                // tap past the far edge — they all clamp to the same edge row
+                // and the veto degenerates into "was this column ever
+                // covered", which is no veto at all. Content cannot travel
+                // far across an axis it barely spans, so capping costs
+                // nothing on exactly the surfaces where it matters.
+                let dilate_px = |extent: f32| MASK_DILATE_PX.min(extent * 0.25);
+                let mask_dilate = (dilate_px(dst_w) / dst_w, dilate_px(dst_h) / dst_h);
                 let mut uniforms = vec![
                     Uniform::new("mask", 1i32),
                     Uniform::new("mask_prev", 2i32),
