@@ -925,6 +925,38 @@ impl AtomicDrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        self.page_flip_internal(planes, event, false)
+    }
+
+    // Libreland: async (tearing) page-flip. Same request as `page_flip`, with
+    // `DRM_MODE_PAGE_FLIP_ASYNC` set so the hardware latches the new
+    // framebuffer as soon as it can instead of at the next vblank — the
+    // immediate-presentation mode `wp_tearing_control_v1` asks for. Split out
+    // as its own entry point rather than a flag on `page_flip` so upstream's
+    // signature is untouched and the rebase surface stays a single method.
+    //
+    // The kernel is strict about what may ride an async flip: on most drivers
+    // only the primary plane's FB may change, and any other property in the
+    // request makes the commit fail with EINVAL. Callers are expected to
+    // treat a failure as "this frame cannot tear" and retry synchronously
+    // rather than as a fatal error.
+    #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        self.page_flip_internal(planes, event, true)
+    }
+
+    fn page_flip_internal<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+        // Libreland: see `page_flip_async`.
+        r#async: bool,
+    ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
@@ -952,10 +984,16 @@ impl AtomicDrmSurface {
         let res = self
             .fd
             .atomic_commit(
-                if event {
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
-                } else {
-                    AtomicCommitFlags::NONBLOCK
+                {
+                    let mut flags = AtomicCommitFlags::NONBLOCK;
+                    if event {
+                        flags |= AtomicCommitFlags::PAGE_FLIP_EVENT;
+                    }
+                    // Libreland: tearing flips.
+                    if r#async {
+                        flags |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
+                    }
+                    flags
                 },
                 req.build()?,
             )

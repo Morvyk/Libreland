@@ -463,6 +463,40 @@ pub struct MiscConfig {
     /// password prompt. `true` by default; set `false` to run your own
     /// agent instead. Applied at launch only (needs a restart).
     pub polkit_agent: bool,
+    /// Tearing (immediate presentation) policy. Defaults to
+    /// [`TearingMode::Never`]. Applied live on reload.
+    pub tearing: TearingMode,
+}
+
+/// Whether a fullscreen window may be presented *immediately* rather than at
+/// the next vblank — an async page-flip, which shows the new frame the moment
+/// the hardware can latch it and tears across the seam where it did.
+///
+/// The point is latency: a synchronous flip makes a finished frame wait up to
+/// a whole refresh period before it is seen, and in a twitch game that wait is
+/// input lag. Tearing trades a visible seam for removing it. It is off by
+/// default because the seam is a real artifact, and because on a
+/// variable-refresh panel VRR already removes most of the same latency without
+/// one.
+///
+/// Only ever applies to a single fullscreen window on the direct-scanout fast
+/// path — never to the composited desktop. Drivers reject async flips that
+/// carry anything beyond a primary-plane framebuffer swap, and Libreland falls
+/// back to a normal flip for that frame rather than dropping it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TearingMode {
+    /// Never tear. Every flip waits for vblank. The default.
+    #[default]
+    Never,
+    /// Tear only when the fullscreen client asks to, via
+    /// `wp_tearing_control_v1`'s async presentation hint. This is what games
+    /// and toolkits expect to drive: Proton/DXVK request it for `IMMEDIATE`
+    /// swapchains, and nothing else on the desktop is affected.
+    Auto,
+    /// Tear for any fullscreen window, whether or not it asked. For people
+    /// who want the lowest latency out of clients that never learned to
+    /// request it.
+    Always,
 }
 
 #[derive(Debug, Clone)]
@@ -567,6 +601,7 @@ impl Default for Config {
                     bottom: [0.10, 0.20, 0.50], // deep navy
                 }),
                 polkit_agent: true,
+                tearing: TearingMode::Never,
             },
             layout: LayoutConfig {
                 gaps_outer: 8,
@@ -1003,7 +1038,21 @@ fn parse_misc(t: &Table, defaults: MiscConfig) -> mlua::Result<MiscConfig> {
     if let Some(v) = t.get::<Option<bool>>("polkit_agent")? {
         cfg.polkit_agent = v;
     }
+    if let Some(v) = t.get::<Option<String>>("tearing")? {
+        cfg.tearing = parse_tearing_mode(&v)?;
+    }
     Ok(cfg)
+}
+
+fn parse_tearing_mode(s: &str) -> mlua::Result<TearingMode> {
+    Ok(match s.to_lowercase().as_str() {
+        "off" | "never" | "false" => TearingMode::Never,
+        "auto" | "on" | "true" => TearingMode::Auto,
+        "always" | "force" => TearingMode::Always,
+        other => lua_bail!(
+            "unknown tearing mode {other:?}; expected \"off\", \"auto\", or \"always\""
+        ),
+    })
 }
 
 /// Parse `misc.wallpaper`: a `solid`/`vertical_gradient` fill, or a
@@ -1524,6 +1573,50 @@ mod decoration_tests {
                 "expected error for: {src}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tearing_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Config {
+        let lua = Lua::new();
+        lua.load(src).exec().expect("lua exec");
+        Config::populate_from_globals(&lua.globals()).expect("populate")
+    }
+
+    /// Tearing is a visible artifact, so nobody gets it without asking.
+    #[test]
+    fn tearing_defaults_to_off() {
+        let c = parse("misc = { polkit_agent = true }");
+        assert_eq!(c.misc.tearing, TearingMode::Never);
+        assert_eq!(TearingMode::default(), TearingMode::Never);
+    }
+
+    #[test]
+    fn tearing_parses_each_mode() {
+        for (lua_val, want) in [
+            ("off", TearingMode::Never),
+            ("never", TearingMode::Never),
+            ("false", TearingMode::Never),
+            ("auto", TearingMode::Auto),
+            ("on", TearingMode::Auto),
+            ("true", TearingMode::Auto),
+            ("always", TearingMode::Always),
+            ("force", TearingMode::Always),
+            ("Always", TearingMode::Always), // case-insensitive
+        ] {
+            let c = parse(&format!(r#"misc = {{ tearing = "{lua_val}" }}"#));
+            assert_eq!(c.misc.tearing, want, "tearing = {lua_val:?}");
+        }
+    }
+
+    #[test]
+    fn tearing_rejects_unknown() {
+        let lua = Lua::new();
+        lua.load(r#"misc = { tearing = "sometimes" }"#).exec().unwrap();
+        assert!(Config::populate_from_globals(&lua.globals()).is_err());
     }
 }
 

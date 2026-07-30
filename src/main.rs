@@ -78,6 +78,7 @@ mod render;
 mod scanout;
 mod screencopy;
 mod screenshot;
+mod tearing;
 mod wayland;
 mod xwayland;
 
@@ -325,12 +326,23 @@ pub(crate) struct State {
     /// on unfullscreen: feedback is sticky for the surface's life (see
     /// [`State::sync_scanout_feedback`]).
     pub(crate) dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
-    /// Default feedback + a Scanout-flagged tranche of the primary
-    /// plane's explicit modifiers, sent per-surface to fullscreen windows
-    /// so their swapchains re-allocate into plane-scannable buffers (the
-    /// missing piece between the single-pass composite and true
-    /// zero-copy direct scanout). See [`State::sync_scanout_feedback`].
-    pub(crate) dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// Default feedback + a Scanout-flagged tranche of *that output's*
+    /// primary-plane modifiers, sent per-surface to fullscreen windows so
+    /// their swapchains re-allocate into plane-scannable buffers (the
+    /// missing piece between the single-pass composite and true zero-copy
+    /// direct scanout). Keyed by connector name, because planes differ
+    /// between outputs and a game on the second monitor needs its own list.
+    /// See [`State::sync_scanout_feedback`].
+    ///
+    /// `RefCell` so a hot-plugged output can fill its entry lazily from
+    /// [`Self::dmabuf_feedback_seed`] during the per-frame sync, which runs
+    /// under `&self`.
+    pub(crate) dmabuf_scanout_feedback:
+        std::cell::RefCell<std::collections::HashMap<String, smithay::wayland::dmabuf::DmabufFeedback>>,
+    /// Render-node device id + import format list, kept so an output that
+    /// appears after startup can build its own scanout feedback variant.
+    /// `None` when only a v3 dmabuf global could be advertised.
+    pub(crate) dmabuf_feedback_seed: Option<(u64, Vec<smithay::backend::allocator::Format>)>,
     /// Last known lock-key LED state (num/caps/scroll) from xkb, pushed
     /// to every keyboard by [`State::apply_keyboard_leds`]. Kept so a
     /// hot-plugged keyboard (which arrives LEDs-off) can be synced to the
@@ -516,6 +528,14 @@ pub(crate) struct State {
     /// `zwlr_screencopy` `copy` requests awaiting the next render of
     /// their output (see [`crate::screencopy`]).
     pub(crate) screencopy_pending: Vec<screencopy::PendingCapture>,
+    /// `wp_tearing_control_manager_v1` global — held alive so clients can
+    /// ask for immediate (tearing) presentation. See [`crate::tearing`].
+    #[allow(dead_code, reason = "held to keep the global alive")]
+    pub(crate) tearing_control: tearing::TearingControlState,
+    /// Surfaces that already own a `wp_tearing_control_v1`, so a second
+    /// `get_tearing_control` can be answered with the protocol error the
+    /// spec requires.
+    pub(crate) tearing_controls: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     /// `ext-output-image-capture-source-manager-v1` delegate state.
     pub(crate) output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
@@ -3362,10 +3382,7 @@ impl State {
     /// swapchain rebuild, and rebuilds are where fragile present code
     /// runs); scanout-capable modifiers render fine windowed.
     fn sync_scanout_feedback(&self, placements: &[layout::Placement], out_name: Option<&str>) {
-        let (Some(default_fb), Some(scanout_fb)) = (
-            self.dmabuf_default_feedback.as_ref(),
-            self.dmabuf_scanout_feedback.as_ref(),
-        ) else {
+        let Some(default_fb) = self.dmabuf_default_feedback.as_ref() else {
             return;
         };
         let Some(name) = out_name else { return };
@@ -3375,6 +3392,31 @@ impl State {
         let Some(rect) = self.renderer.output_rect(name) else {
             return;
         };
+        // This output's own scanout variant, built on first use so an output
+        // hot-plugged after startup still gets one.
+        let mut variants = self.dmabuf_scanout_feedback.borrow_mut();
+        if !variants.contains_key(name)
+            && let Some((dev_id, formats)) = self.dmabuf_feedback_seed.as_ref()
+        {
+            let planes = self.renderer.scanout_formats_for(name);
+            if !planes.is_empty() {
+                match wayland::build_scanout_feedback(*dev_id, formats, planes) {
+                    Ok(fb) => {
+                        info!(output = %name, "built per-output scanout dmabuf feedback (hot-plug)");
+                        variants.insert(name.to_string(), fb);
+                    }
+                    Err(err) => {
+                        warn!(output = %name, error = %err, "scanout dmabuf feedback build failed; fullscreen windows there keep the default");
+                    }
+                }
+            }
+        }
+        // Without a variant for this output there is nothing to switch to,
+        // and the default is what every surface already has.
+        let Some(scanout_fb) = variants.get(name) else {
+            return;
+        };
+
         for p in placements.iter().filter(|p| p.cell_rect.overlaps(rect)) {
             let fullscreen = p.fill == layout::FillMode::Fullscreen;
             if fullscreen {
@@ -3649,6 +3691,7 @@ impl State {
         );
         apply_wallpaper(&mut self.renderer, &new.misc.wallpaper, &new.border);
         self.renderer.set_animations(new.animations.clone());
+        self.renderer.set_tearing_mode(new.misc.tearing);
         self.renderer.set_decoration(new.decoration.clone());
         self.config = new;
         info!("config reloaded");
@@ -4317,6 +4360,7 @@ fn main() -> Result<()> {
     .context("render pipeline init failed")?;
     renderer.set_animations(config.animations.clone());
     renderer.set_decoration(config.decoration.clone());
+    renderer.set_tearing_mode(config.misc.tearing);
     apply_wallpaper(&mut renderer, &config.misc.wallpaper, &config.border);
 
     info!("phase: priming swapchains (one initial frame per output)");
@@ -4327,7 +4371,7 @@ fn main() -> Result<()> {
     let output_descs = renderer.output_descriptors();
     let preferred_scale = renderer.primary_scale();
     let dmabuf_formats = renderer.dmabuf_formats();
-    let scanout_formats = renderer.primary_scanout_formats();
+    let scanout_formats = renderer.scanout_formats_by_output();
     let render_node = renderer.render_drm_node();
     info!(
         count = dmabuf_formats.len(),
@@ -4656,7 +4700,8 @@ fn main() -> Result<()> {
         dmabuf_state: wayland_init.dmabuf_state,
         dmabuf_global: wayland_init.dmabuf_global,
         dmabuf_default_feedback: wayland_init.dmabuf_default_feedback,
-        dmabuf_scanout_feedback: wayland_init.dmabuf_scanout_feedback,
+        dmabuf_scanout_feedback: std::cell::RefCell::new(wayland_init.dmabuf_scanout_feedback),
+        dmabuf_feedback_seed: wayland_init.dmabuf_feedback_seed,
         keyboard_leds: smithay::input::keyboard::LedState::default(),
         scene_epoch: std::cell::Cell::new(1),
         popup_snapshot: std::cell::RefCell::new((0, Vec::new())),
@@ -4694,6 +4739,8 @@ fn main() -> Result<()> {
         ext_data_control_state: wayland_init.ext_data_control_state,
         clipboard: clipboard::Selections::default(),
         screencopy_manager: wayland_init.screencopy_manager,
+        tearing_control: wayland_init.tearing_control,
+        tearing_controls: Vec::new(),
         screencopy_pending: Vec::new(),
         output_capture_source_state: wayland_init.output_capture_source_state,
         image_copy_capture_state: wayland_init.image_copy_capture_state,

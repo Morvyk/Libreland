@@ -102,6 +102,10 @@ misc = {
     -- Or any image/gif/video (needs the ffmpeg package; videos loop).
     -- Paths are literal — use os.getenv for $HOME, like the screenshot dir:
     -- wallpaper = { type = "media", path = os.getenv("HOME") .. "/Pictures/bg.mp4", mode = "fill" },
+
+    -- Lowest-latency fullscreen presentation, at the cost of a tear line.
+    -- "off" (default) / "auto" (only when the game asks) / "always".
+    -- tearing = "auto",
 }
 
 layout = {
@@ -390,6 +394,31 @@ Notes:
 | -------------- | ------------------ | ----- | ----------------------------------------------------------- |
 | `wallpaper`    | vertical gradient  | ✅    | A flat fill, or a media file (image/gif/video). See below.  |
 | `polkit_agent` | `true`             | ✅    | Autostart the bundled PolicyKit agent. Launch-only.         |
+| `tearing`      | `"off"`            | ✅    | Allow immediate (tearing) presentation. See below.          |
+
+`misc.tearing` controls whether a fullscreen window may be presented
+*immediately* instead of at the next vblank — an async page-flip, which shows
+the finished frame the moment the hardware can latch it and tears across the
+seam where it did.
+
+| Value                       | Meaning                                                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"off"` / `"never"`         | Never tear. Every flip waits for vblank. **The default.**                                                                                    |
+| `"auto"` / `"on"`           | Tear only when the fullscreen client asks, via `wp_tearing_control_v1`. Proton/DXVK request it for `IMMEDIATE` swapchains; nothing else is affected. |
+| `"always"` / `"force"`      | Tear for any fullscreen window, whether or not it asked.                                                                                     |
+
+The point is latency: a synchronous flip makes a finished frame wait up to a
+whole refresh period before it is seen, and in a twitch game that wait is input
+lag. Tearing trades a visible seam for removing it. It is off by default
+because the seam is a real artifact — and because on a variable-refresh panel
+`vrr` already removes most of the same latency without one, so try that first.
+
+It only ever applies to a single fullscreen window on the
+[direct-scanout](#direct-scanout) fast path, never to the composited desktop
+and never to a frame that also drives an overlay plane. Drivers reject async
+flips carrying anything beyond a primary-plane framebuffer swap; Libreland
+falls back to a normal flip for that frame rather than dropping it, so a
+driver that refuses outright costs nothing but a line in the debug log.
 
 `misc.polkit_agent` (default `true`) autostarts `libreland-polkit-agent`, the
 bundled PolicyKit authentication agent, so GUI programs that need elevated
@@ -792,6 +821,112 @@ libreland msg set-wallpaper ~/Pictures/wall.png --mode fill
 Live only: the running config is updated so it sticks, but a config reload
 puts your Lua file's wallpaper back. The portal never rewrites your config.
 
+## Direct scanout
+
+Normally a compositor draws every window into one buffer and shows that.
+Direct scanout skips it: when a single fullscreen client's buffer already
+*is* what the screen should show, Libreland hands that buffer straight to the
+display hardware. No GPU pass, no copy, no extra frame of latency — the
+pixels the game rendered are the pixels the panel scans out.
+
+Nothing configures this. It engages on its own whenever a frame qualifies,
+and silently falls back to compositing whenever one doesn't; correctness never
+depends on it. Everything below is for understanding why a given frame did or
+didn't take the fast path.
+
+### When it engages
+
+A frame qualifies when all of the following hold:
+
+- **One fullscreen window covers the output**, settled — no workspace slide,
+  no open/move animation, fully opaque (`alpha == 1`).
+- **Its buffer is a dmabuf with an explicit modifier.** Shared-memory buffers
+  and implicitly-modified ones can't be scanned out; the kernel has no way to
+  know their tiling.
+- **The pixels match the mode exactly.** A cropped buffer is fine (that's the
+  plane's source rectangle, so fractional-scale and XWayland clients qualify),
+  but the visible region has to be the mode's worth of pixels — primary planes
+  generally can't scale.
+- **The content is provably opaque** — either a format with no alpha channel,
+  or a declared opaque region covering the surface.
+- **Its colour mode matches the output**: an SDR window on an HDR output needs
+  the compositor's PQ encode, and a PQ window on an SDR output needs a tonemap.
+- **The driver accepts it**, which Libreland asks with a real KMS test commit.
+
+Anything drawn *above* the window — a notification, a menu — no longer
+disqualifies the frame by itself; see overlay planes below. Compositor-drawn
+overlays still do: a closing-window animation, the screenshot overlay, a
+drag-and-drop icon, or a software-rendered cursor.
+
+Every rejection names its reason at `debug` level, but only while a fullscreen
+window is actually present, so a session log tells you exactly why a game isn't
+on the plane without drowning you in "not fullscreen" for the desktop.
+
+### Overlay planes
+
+Display hardware has more than one plane, and Libreland uses the spare ones.
+When a fullscreen window has a little client content above it, that content
+goes on an overlay plane and the window *stays* on the primary one — the
+display engine composites them for free, at no GPU cost.
+
+This is what stops a single notification from turning the fast path off. It
+applies to `wp_layer_shell` **Overlay** surfaces and to `xdg_popup`s, each of
+which must be a dmabuf-backed single surface (no subsurfaces), fully on the
+output. Only planes the driver places *above* the primary one are used, and
+they're claimed at startup so another output can't take one mid-session.
+
+Assignment is all-or-nothing: if any one piece won't fit on a plane, the whole
+frame is composited. A game with its notification silently missing would be
+worse than a composited game.
+
+### Screen capture
+
+Recording or screen-sharing a game does **not** disable direct scanout. Since
+the client's buffer is by definition the whole output, a `zwlr_screencopy` or
+`ext-image-copy-capture` request is served with one textured blit from that
+buffer rather than by compositing the scene. The capture runs after the flip,
+so a slow consumer costs the recorder frames, never the game.
+
+Two cases still fall back to compositing, because there the capture needs a
+composed framebuffer that only the GPU path produces: an **HDR** output (the
+client's buffer is PQ/BT.2020, and the capture tonemap works on the linear
+scene), and a frame that is also driving **overlay planes** (the composition
+happens in the display engine, where there is nothing to read back).
+
+### Steering clients toward it
+
+None of this helps if clients allocate buffers the plane can't take, so
+Libreland tells them what to allocate. A fullscreen window is sent a
+`zwp_linux_dmabuf_v1` feedback variant carrying a **Scanout**-flagged tranche
+of that output's own primary-plane modifiers, which is what makes a
+Vulkan/EGL swapchain re-allocate into plane-compatible buffers.
+
+The tranche is derived per output, since planes differ between connectors and
+between GPUs — the primary output's modifier list would simply be wrong for a
+game on the second monitor. It is also *sticky*: a window keeps the scanout
+variant once it has had it, even after leaving fullscreen. Every feedback
+change costs the client a swapchain rebuild, and rebuilds are where fragile
+present code goes wrong; scanout-capable modifiers render perfectly well
+windowed.
+
+### Interactions
+
+- **Cursor.** The hardware cursor plane scans out alongside, so pointer motion
+  neither disturbs the frame nor forces a redraw. A cursor too large for the
+  cursor plane falls back to software, which does force compositing.
+- **Explicit sync.** For a surface already on a plane, the client's
+  `linux-drm-syncobj` acquire fence is handed to KMS as `IN_FENCE_FD` instead
+  of gating the commit — the display engine waits, rather than our event loop,
+  saving a wakeup per frame. The moment the window stops being eligible, the
+  compositor waits on the fence itself before sampling the buffer.
+- **VRR.** Settled before the flip, since enabling it can promote a page-flip
+  to a full modeset. See [`vrr`](#monitors).
+- **Tearing.** Only offered on this path, and only for a plain primary-plane
+  flip. See [`misc.tearing`](#misc).
+- **Damage.** Consecutive direct frames of the same surface pass the client's
+  own damage as `FB_DAMAGE_CLIPS`, so the display engine can skip re-fetching
+  untouched regions. Any composited frame in between resets that to full.
+
 ## Clipboard & selections
 
 Both the regular clipboard (`Ctrl+C`/`Ctrl+V`) and the primary
@@ -998,4 +1133,5 @@ present and elided here.)
 | `xdg_wm_dialog_v1`                                             | Clients declare a toplevel is a dialog/modal — feeds the auto-float decision directly instead of relying on heuristics alone. |
 | `wp_pointer_warp_v1`                                           | Clients ask to move the pointer to a surface-local position (games/emulators recentring the cursor without a lock). Honoured only for the pointer-focused surface; the target must land inside it; refused during grabs/drags or while any pointer constraint is active. |
 | `ext_background_effect_v1`                                     | Clients request backdrop blur behind their own surfaces — an opt-in equivalent to `blur.windows`/`blur.layers`, using the same blur pipeline (`blur.enabled`/`passes` still gate it). The region is honoured as a whole-surface flag; masking is by the surface's own alpha/shape, which is finer than rect masking. |
+| `wp_tearing_control_v1`                                        | Clients ask for immediate (tearing) presentation, e.g. Proton/DXVK `IMMEDIATE` swapchains. Always advertised; whether it is honoured is [`misc.tearing`](#misc), off by default. |
 | `wl_fixes`                                                     | Registry destruction for long-lived clients.                            |

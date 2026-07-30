@@ -466,6 +466,41 @@ impl DrmSurface {
         }
     }
 
+    // Libreland: async (tearing) page-flip — see `AtomicDrmSurface::page_flip_async`.
+    /// Page-flip like [`DrmSurface::page_flip`], but asking the hardware to
+    /// latch the new framebuffer *immediately* rather than at the next
+    /// vblank (`DRM_MODE_PAGE_FLIP_ASYNC`).
+    ///
+    /// This is what `wp_tearing_control_v1`'s async presentation hint asks
+    /// for: the scanout switches mid-frame, tearing, in exchange for the
+    /// lowest possible present latency.
+    ///
+    /// Drivers are strict about async flips — typically only the primary
+    /// plane's framebuffer may change, the format and modifier must match
+    /// what is already scanned out, and some hardware refuses them entirely.
+    /// A rejection is reported as an ordinary [`Error`]; treat it as "not
+    /// this frame" and retry with [`DrmSurface::page_flip`].
+    ///
+    /// Not supported on legacy (non-atomic) surfaces, which return
+    /// [`Error::Access`] from the underlying commit.
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip_async(planes, event),
+            // The legacy API has its own async flip path we deliberately do
+            // not wire up: direct scanout (the only caller) already requires
+            // an atomic surface.
+            DrmSurfaceInternal::Legacy(_) => Err(Error::UnknownProperty {
+                handle: self.plane().into(),
+                name: "async page-flip is atomic-only",
+            }),
+        }
+    }
+
     /// Returns a set of available planes for this surface
     pub fn planes(&self) -> &Planes {
         &self.planes

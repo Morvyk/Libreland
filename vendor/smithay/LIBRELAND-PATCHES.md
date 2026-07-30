@@ -101,6 +101,32 @@ follows upstream naming.
 Publish the xrdb resource database (`Xcursor.size`, `Xft.dpi`) on the root
 window for X clients that don't speak XSETTINGS. Upstream has no API for it.
 
+### 10. Async (tearing) page-flips
+`src/backend/drm/surface/atomic.rs` (`page_flip_async` + `page_flip_internal`),
+`src/backend/drm/surface/mod.rs` (`DrmSurface::page_flip_async`)
+
+Upstream has **no way to set `DRM_MODE_PAGE_FLIP_ASYNC`**, so a compositor
+cannot implement `wp_tearing_control_v1`'s immediate-presentation hint at all.
+This factors upstream's `page_flip` into a shared `page_flip_internal` and adds
+an `page_flip_async` entry point that ORs in `AtomicCommitFlags::PAGE_FLIP_ASYNC`
+— upstream's own signature is untouched, so the rebase surface is one method.
+
+Drivers are strict about async flips (typically only the primary plane's FB may
+change, and the format/modifier must match what is already scanned out), so
+Libreland treats a rejection as "not this frame" and retries synchronously —
+see `ScanoutSurface::submit`. Gated behind `misc.tearing`, off by default.
+Upstreaming candidate; upstream would likely want it as a flag on `page_flip`.
+
+### 11. Public `Buffer::acquire_point`
+`src/backend/renderer/utils/wayland.rs` (`pub(crate)` → `pub`, ~1 line + docs)
+
+The explicit-sync acquire point is already stored on the buffer; upstream just
+never exposes it, because its own `DrmCompositor` gates commits instead.
+Libreland hands the fence to KMS as `IN_FENCE_FD` for a directly-scanned-out
+surface, which saves an eventfd wakeup and a second trip through the event loop
+on every game frame (see `Renderer::direct_surfaces`). Pure visibility change,
+no behaviour. Prime upstreaming candidate.
+
 ## Packaging deviations (not code)
 
 - `Cargo.toml`: the upstream repo's `[workspace]` members (anvil, smallvil,

@@ -13,6 +13,7 @@
 //! the dispatch source's closure, and outbound flushing goes through the
 //! `DisplayHandle` on `State`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -162,12 +163,20 @@ pub struct WaylandInit {
     /// (every switch is a swapchain rebuild; see
     /// `State::sync_scanout_feedback`).
     pub dmabuf_default_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
-    /// The default feedback plus a Scanout-flagged tranche of the primary
-    /// plane's explicit modifiers. Sent per-surface to fullscreen windows
-    /// only (see `State::sync_scanout_feedback`) so their swapchains
-    /// re-allocate into plane-scannable buffers; never the default —
-    /// see the comment at its construction site.
-    pub dmabuf_scanout_feedback: Option<smithay::wayland::dmabuf::DmabufFeedback>,
+    /// The default feedback plus a Scanout-flagged tranche of one output's
+    /// primary-plane modifiers, keyed by connector name. Sent per-surface to
+    /// fullscreen windows only (see `State::sync_scanout_feedback`) so their
+    /// swapchains re-allocate into plane-scannable buffers; never the
+    /// default — see the comment at its construction site.
+    ///
+    /// One entry per output because planes differ between connectors: the
+    /// primary output's modifier list is simply wrong for a game on the
+    /// second monitor.
+    pub dmabuf_scanout_feedback: HashMap<String, smithay::wayland::dmabuf::DmabufFeedback>,
+    /// What a *hot-plugged* output needs to build its own scanout feedback
+    /// variant later: the render node's device id and the full import format
+    /// list. `None` when only a v3 dmabuf global could be advertised.
+    pub dmabuf_feedback_seed: Option<(u64, Vec<Format>)>,
     /// `wp_viewporter` global. Fractional-scale-aware clients render
     /// an oversized buffer and use `wp_viewport` to map it down to
     /// the logical surface rect; without this global they can't, and
@@ -205,6 +214,9 @@ pub struct WaylandInit {
     /// `zwlr_screencopy_manager_v1` — output capture for screenshots
     /// and screen sharing. Held so the global stays alive.
     pub screencopy_manager: crate::screencopy::ScreencopyManagerState,
+    /// `wp_tearing_control_manager_v1` — clients request immediate
+    /// presentation. Held so the global stays alive.
+    pub tearing_control: crate::tearing::TearingControlState,
     /// `wp_color_management_v1` — clients detect output HDR and tag their
     /// surfaces' colour space. Held so the global stays alive.
     pub color_management: crate::color_management::ColorManagementState,
@@ -335,7 +347,7 @@ pub fn init(
     output_descs: &[OutputDescriptor],
     preferred_scale: f64,
     dmabuf_formats: Vec<Format>,
-    scanout_formats: Vec<Format>,
+    scanout_formats: Vec<(String, Vec<Format>)>,
     render_node: Option<DrmNode>,
 ) -> Result<WaylandInit> {
     let dh = display.handle();
@@ -373,42 +385,39 @@ pub fn init(
     // render node or feedback can't be built.
     let mut dmabuf_state = DmabufState::new();
     let mut dmabuf_default_feedback = None;
-    let mut dmabuf_scanout_feedback = None;
+    let mut dmabuf_scanout_feedback = HashMap::new();
+    let mut dmabuf_feedback_seed = None;
     let dmabuf_global = if let Some(node) = render_node {
         match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
             Ok(feedback) => {
                 info!(node = ?node, "advertising zwp_linux_dmabuf_v1 with default feedback (v4)");
                 let global =
                     dmabuf_state.create_global_with_default_feedback::<State>(&dh, &feedback);
-                // A second feedback variant carrying a Scanout-flagged
-                // preference tranche (the primary plane's explicit
-                // modifiers). Sent ONLY per-surface, to fullscreen windows
-                // (`State::sync_scanout_feedback`) — putting the tranche in
-                // the *default* feedback broke every GPU client's EGL init
-                // wholesale (see the revert of fe142c7). The tranche's
-                // target is the render node — the device clients already
-                // open; the primary card node may not be openable from
-                // inside a session while the compositor holds the seat.
-                if !scanout_formats.is_empty() {
-                    let builder = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
-                        .add_preference_tranche(
-                            node.dev_id(),
-                            smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1
-                                ::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
-                            scanout_formats,
-                            // Same version span the default feedback serves.
-                            3u32..=6,
-                        );
-                    match builder.build() {
+                // A second feedback variant per output, carrying a
+                // Scanout-flagged preference tranche of that output's
+                // primary-plane modifiers. Sent ONLY per-surface, to
+                // fullscreen windows (`State::sync_scanout_feedback`) —
+                // putting the tranche in the *default* feedback broke every
+                // GPU client's EGL init wholesale (see the revert of
+                // fe142c7). The tranche's target is the render node — the
+                // device clients already open; the primary card node may not
+                // be openable from inside a session while the compositor
+                // holds the seat.
+                for (output, formats) in scanout_formats {
+                    if formats.is_empty() {
+                        continue;
+                    }
+                    match build_scanout_feedback(node.dev_id(), &dmabuf_formats, formats) {
                         Ok(scanout) => {
-                            info!("built per-surface scanout dmabuf feedback (fullscreen windows)");
-                            dmabuf_scanout_feedback = Some(scanout);
+                            info!(%output, "built per-output scanout dmabuf feedback (fullscreen windows)");
+                            dmabuf_scanout_feedback.insert(output, scanout);
                         }
                         Err(err) => {
-                            warn!(error = %err, "scanout dmabuf feedback build failed; fullscreen windows keep the default");
+                            warn!(%output, error = %err, "scanout dmabuf feedback build failed; fullscreen windows there keep the default");
                         }
                     }
                 }
+                dmabuf_feedback_seed = Some((node.dev_id(), dmabuf_formats));
                 dmabuf_default_feedback = Some(feedback);
                 global
             }
@@ -497,6 +506,10 @@ pub fn init(
     // zwlr_screencopy_manager_v1: lets grim / the desktop portal
     // capture outputs for screenshots and screen sharing.
     let screencopy_manager = crate::screencopy::ScreencopyManagerState::new(&dh);
+    // wp_tearing_control_v1: clients (Proton/DXVK immediate swapchains) ask to
+    // be presented without waiting for vblank. Always advertised; whether we
+    // act on it is `misc.tearing` — see crate::tearing.
+    let tearing_control = crate::tearing::TearingControlState::new(&dh);
     // wp_color_management_v1: clients detect output HDR + tag surface
     // colour spaces (Proton/mpv use this to enable HDR).
     // Re-enabled at KWin parity (v2, matching feature set) after the bisect
@@ -601,6 +614,7 @@ pub fn init(
         dmabuf_global,
         dmabuf_default_feedback,
         dmabuf_scanout_feedback,
+        dmabuf_feedback_seed,
         viewporter_state,
         layer_shell_state,
         relative_pointer_state,
@@ -612,6 +626,7 @@ pub fn init(
         xdg_activation_state,
         pointer_gestures_state,
         screencopy_manager,
+        tearing_control,
         color_management,
         content_type_state,
         presentation_state,
@@ -691,13 +706,33 @@ pub fn new_client_data() -> Arc<ClientState> {
 
 // ---- Handler implementations on `crate::State` ------------------
 
+/// Build the Scanout-tranche feedback variant for one output's plane
+/// formats. Shared by [`init`] and the hot-plug path, which has to build the
+/// same thing for an output that didn't exist at startup.
+pub(crate) fn build_scanout_feedback(
+    dev_id: u64,
+    dmabuf_formats: &[Format],
+    scanout_formats: Vec<Format>,
+) -> Result<smithay::wayland::dmabuf::DmabufFeedback, std::io::Error> {
+    DmabufFeedbackBuilder::new(dev_id, dmabuf_formats.to_vec())
+        .add_preference_tranche(
+            dev_id,
+            smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server
+                ::zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+            scanout_formats,
+            // Same version span the default feedback serves.
+            3u32..=6,
+        )
+        .build()
+}
+
 /// Absolute `CLOCK_MONOTONIC` deadline ~1s out (nanoseconds) for the
 /// explicit-sync CPU-wait fallback. `DrmSyncPoint::wait` takes an absolute
 /// monotonic deadline; the 1s cap stops a never-signalling fence from wedging
 /// the whole compositor on the (rare) eventfd-setup failure path — at worst
 /// that one frame tears, versus the normal eventfd path which only stalls the
 /// single surface.
-fn acquire_wait_deadline() -> i64 {
+pub(crate) fn acquire_wait_deadline() -> i64 {
     let now = std::time::Duration::from(
         smithay::utils::Clock::<smithay::utils::Monotonic>::new().now(),
     );
@@ -746,6 +781,17 @@ impl CompositorHandler for State {
             surface,
             |state, _dh, surface| {
                 if state.drm_syncobj_state.is_none() {
+                    return;
+                }
+                // ...unless the surface's buffers are going straight onto a
+                // primary plane. There the *display engine* waits on the
+                // fence (we hand it over as `IN_FENCE_FD`), which is strictly
+                // better: gating here costs an eventfd wakeup and a second
+                // trip through the event loop on every single game frame,
+                // just to arrive at a buffer KMS was willing to wait for
+                // itself. The renderer keeps the promise on the frame this
+                // stops being true — see `Renderer::settle_skipped_fences`.
+                if state.renderer.is_direct_scanning(surface) {
                     return;
                 }
                 // Build an eventfd-backed blocker for this surface's acquire
@@ -994,8 +1040,11 @@ impl CompositorHandler for State {
         // And the offscreen-heartbeat throttle entry + fifo watch entry.
         self.offscreen_frame_ts.remove(&surface.id());
         self.fifo_barrier_watch.remove(&surface.id());
-        // Same for the sticky scanout-feedback record.
+        // Same for the sticky scanout-feedback record, the tearing hint and
+        // the direct-scanout marker.
         self.scanout_feedback_given.borrow_mut().remove(&surface.id());
+        self.renderer.forget_surface_scanout_state(&surface.id());
+        self.tearing_controls.retain(|s| s != surface);
         // Color-management records are otherwise only removed by explicit
         // client requests — a client that crashes without sending destroy
         // (a Proton game, say) would leak its entries.

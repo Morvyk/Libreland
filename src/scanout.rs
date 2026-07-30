@@ -31,6 +31,7 @@
 //! `Composite` slot back to the swapchain, a `Direct` frame's client buffer
 //! back to the client (via `wl_buffer.release`).
 
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsFd;
 use std::sync::Arc;
 
@@ -43,7 +44,8 @@ use smithay::backend::drm::gbm::{
     GbmFramebuffer, framebuffer_from_bo, framebuffer_from_dmabuf,
 };
 use smithay::backend::drm::{
-    DrmDeviceFd, DrmSurface, PlaneConfig, PlaneDamageClips, PlaneState, VrrSupport,
+    DrmDeviceFd, DrmSurface, PlaneClaim, PlaneConfig, PlaneDamageClips, PlaneInfo, PlaneState,
+    VrrSupport,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::Buffer as ClientBuffer;
@@ -56,50 +58,167 @@ use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::utils::{Physical, Rectangle, Transform};
 use tracing::{debug, warn};
 
-/// One frame in the present pipeline.
-enum Frame {
-    /// A compositor-rendered swapchain buffer. Dropping the slot releases it
-    /// back to the swapchain.
+/// One frame in the present pipeline: everything on every plane for one flip.
+///
+/// The primary layer is always present. Overlay layers appear when the scene
+/// is a fullscreen client with a *little* on top of it — a notification, a
+/// popup, an oversized cursor — which the hardware can composite for free
+/// instead of us doing a full GPU pass to draw the same thing.
+struct Frame {
+    primary: Layer,
+    /// Content on overlay planes, bottom-up. Empty for a composited frame,
+    /// which by definition already has everything in its one buffer.
+    overlays: Vec<(plane::Handle, Layer)>,
+}
+
+/// What one plane shows for one flip, and what keeps it alive that long.
+struct Layer {
+    /// The buffer's owner. A composited frame owns a swapchain slot (dropping
+    /// it returns the buffer); a direct one owns the client's `wl_buffer`
+    /// keep-alive (dropping it sends `wl_buffer.release`).
+    hold: Hold,
+    placement: Placement,
+    /// `FB_DAMAGE_CLIPS` for this plane, in buffer pixels. `None` = all of it.
+    damage: Option<Vec<Rectangle<i32, Physical>>>,
+    /// Per-plane blend factor. Always `1.0` today — the field exists because
+    /// `PlaneConfig` demands one, and an overlay plane is where a future
+    /// hardware-accelerated window opacity would apply it.
+    alpha: f32,
+}
+
+/// What a [`Layer`] holds to keep its framebuffer valid until a later flip
+/// replaces it.
+enum Hold {
+    /// A compositor-rendered swapchain buffer; its framebuffer lives in the
+    /// slot's userdata.
     Composite(Slot<GbmBuffer>),
-    /// A client buffer scanned out directly on the primary plane. Holds the
-    /// `wl_buffer` keep-alive (dropping it sends `wl_buffer.release`) and the
-    /// imported KMS framebuffer (shared with the FB cache; `rmfb` on last drop).
-    Direct {
+    /// A client buffer, with the framebuffer we imported for it (shared with
+    /// [`ScanoutSurface::fb_cache`]; `rmfb` on last drop).
+    Client {
         #[allow(dead_code, reason = "kept alive to gate wl_buffer.release until replaced")]
         buffer: ClientBuffer,
         fb: Arc<GbmFramebuffer>,
     },
 }
 
-impl Frame {
-    /// The KMS framebuffer handle to put on the plane for this frame.
-    fn fb_handle(&self) -> framebuffer::Handle {
-        match self {
-            Frame::Composite(slot) => handle_of(
-                slot.userdata()
-                    .get::<GbmFramebuffer>()
-                    .expect("composite slot carries its cached framebuffer"),
-            ),
-            Frame::Direct { fb, .. } => handle_of(fb),
+impl Layer {
+    fn fb(&self) -> framebuffer::Handle {
+        match &self.hold {
+            Hold::Composite(slot) => *slot
+                .userdata()
+                .get::<GbmFramebuffer>()
+                .expect("composite slot carries its cached framebuffer")
+                .as_ref(),
+            Hold::Client { fb, .. } => *fb.as_ref().as_ref(),
+        }
+    }
+
+    fn plane_state<'a>(
+        &self,
+        handle: plane::Handle,
+        clips: Option<&'a PlaneDamageClips>,
+        fence: Option<BorrowedFd<'a>>,
+    ) -> PlaneState<'a> {
+        PlaneState {
+            handle,
+            config: Some(PlaneConfig {
+                src: self.placement.src,
+                dst: self.placement.dst,
+                transform: self.placement.transform,
+                alpha: self.alpha,
+                damage_clips: clips.map(PlaneDamageClips::blob),
+                fb: self.fb(),
+                fence,
+            }),
         }
     }
 }
 
-/// Extract the raw KMS framebuffer handle from a [`GbmFramebuffer`]. Takes
-/// `&GbmFramebuffer` (an `&Arc<GbmFramebuffer>` coerces in) so it works for
-/// both pipeline frame kinds.
-fn handle_of(fb: &GbmFramebuffer) -> framebuffer::Handle {
-    *fb.as_ref()
+impl Frame {
+    /// Whether this frame puts a client's own buffer on the primary plane.
+    fn is_direct(&self) -> bool {
+        matches!(self.primary.hold, Hold::Client { .. })
+    }
+
+    /// Every layer, primary first — the order plane states and damage clips
+    /// are built in.
+    fn layers(&self) -> impl Iterator<Item = &Layer> {
+        std::iter::once(&self.primary).chain(self.overlays.iter().map(|(_, l)| l))
+    }
+
+    /// The overlay planes this frame drives, so a later frame knows which
+    /// ones it has to switch back off.
+    fn overlay_planes(&self) -> Vec<plane::Handle> {
+        self.overlays.iter().map(|(h, _)| *h).collect()
+    }
 }
 
 /// A frame queued for scanout while a previous flip is in flight.
 struct QueuedFrame {
     frame: Frame,
-    /// GPU completion fence for a composited frame; `None` for a direct frame
-    /// (client buffers use implicit sync via the dmabuf's own fence).
-    sync: Option<SyncPoint>,
-    /// Optional `FB_DAMAGE_CLIPS` damage (compositor currently passes `None`).
-    damage: Option<Vec<Rectangle<i32, Physical>>>,
+    /// GPU completion fence for a composited frame, or a direct frame's
+    /// exported explicit-sync acquire fence. `None` means the buffer carries
+    /// an implicit fence the kernel will wait on by itself.
+    sync: Option<FrameFence>,
+}
+
+/// The GPU work a frame must wait on before it may be scanned out.
+pub enum FrameFence {
+    /// A render fence from our own GLES frame.
+    Render(SyncPoint),
+    /// A client's explicit-sync acquire point, already exported to a syncobj
+    /// fd. Handed to KMS as `IN_FENCE_FD`; there is no CPU-wait fallback
+    /// (the caller only produces this when the plane supports fencing).
+    Acquire(std::os::fd::OwnedFd),
+}
+
+/// Where a frame's pixels land on the primary plane.
+#[derive(Clone, Copy, PartialEq)]
+struct Placement {
+    /// Source rectangle within the buffer, in buffer pixels.
+    src: Rectangle<f64, smithay::utils::Buffer>,
+    /// Destination rectangle on the CRTC, in physical pixels.
+    dst: Rectangle<i32, Physical>,
+    /// Plane rotation/reflection applied between the two.
+    transform: Transform,
+}
+
+/// The client-side half of a direct-scanout placement: how the client's
+/// buffer should be mapped onto the plane. Produced by the renderer's
+/// eligibility check, which has the surface's view and transform to hand.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectPlacement {
+    /// Source rectangle within the client buffer, in buffer pixels. Lets a
+    /// viewport-cropped client (fractional scaling, Xwayland under a client
+    /// scale) scan out instead of falling back to compositing.
+    pub src: Rectangle<f64, smithay::utils::Buffer>,
+    /// Where it goes on the CRTC, in physical pixels. The whole mode for the
+    /// primary layer; an overlay's own rect otherwise.
+    pub dst: Rectangle<i32, Physical>,
+    /// Buffer transform to undo on the plane. `Normal` for almost everything;
+    /// a rotated output's client may hand us a pre-rotated buffer, and most
+    /// planes expose a `rotation` property that can absorb it.
+    pub transform: Transform,
+}
+
+/// One client buffer the renderer wants on a plane this frame.
+///
+/// The primary layer is the fullscreen window; overlay layers are whatever
+/// little is drawn above it. Handing them over together lets the whole frame
+/// be validated and flipped as one atomic commit — either the hardware takes
+/// the lot, or we composite the lot.
+pub struct ScanoutLayer {
+    /// Keep-alive for the client buffer; holding it defers
+    /// `wl_buffer.release` until a later flip replaces this buffer.
+    pub buffer: ClientBuffer,
+    pub dmabuf: Dmabuf,
+    pub place: DirectPlacement,
+    /// The client's own damage since what this plane currently shows, in
+    /// buffer pixels, or `None` for "assume all of it changed".
+    pub damage: Option<Vec<Rectangle<i32, Physical>>>,
+    /// An exported explicit-sync acquire fence for KMS to wait on. Only
+    /// honoured on the primary layer — a commit carries one `IN_FENCE_FD`.
+    pub acquire: Option<std::os::fd::OwnedFd>,
 }
 
 /// A cached KMS framebuffer for a client buffer, keyed by a weak ref so it is
@@ -108,6 +227,45 @@ struct ClientFb {
     buffer: Weak<WlBuffer>,
     use_opaque: bool,
     fb: Arc<GbmFramebuffer>,
+}
+
+/// The plane configuration a direct-scanout `test_state` verdict applies to.
+///
+/// The driver's answer is a function of the buffer's format and the geometry
+/// we ask it to put on the plane — never of the framebuffer *handle*. A game
+/// cycling a swapchain re-asks the identical question every frame, so once a
+/// probe is accepted we can skip the `TEST_ONLY` atomic ioctl until something
+/// in the key actually changes. `allow_modeset` is part of the key because a
+/// modeset commit is a materially different request, and it flips back to
+/// `false` on the frame after a mode/VRR change — which re-probes exactly
+/// when the new mode needs validating.
+#[derive(Clone, PartialEq)]
+struct DirectProbe {
+    /// One entry per plane, primary first. A frame that gains or loses an
+    /// overlay is a different request and re-probes.
+    layers: Vec<ProbeLayer>,
+    allow_modeset: bool,
+    /// Whether the flip would carry an `IN_FENCE_FD`. Fencing is a separate
+    /// atomic property, so a fenced and an unfenced commit are distinct
+    /// requests as far as the driver is concerned.
+    fenced: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ProbeLayer {
+    plane: plane::Handle,
+    code: Fourcc,
+    modifier: Modifier,
+    placement: Placement,
+    use_opaque: bool,
+}
+
+/// An overlay plane we may put content on, claimed for this CRTC's exclusive
+/// use for as long as the surface lives.
+struct OverlayPlane {
+    info: PlaneInfo,
+    #[allow(dead_code, reason = "the claim's lifetime is the point; it is never read")]
+    claim: PlaneClaim,
 }
 
 /// A swapchain bound to a [`DrmSurface`]'s primary plane that we flip
@@ -132,6 +290,22 @@ pub struct ScanoutSurface {
     supports_fencing: bool,
     /// Imported framebuffers for client buffers scanned out directly.
     fb_cache: Vec<ClientFb>,
+    /// Overlay planes usable for content *above* the primary one, ordered
+    /// bottom-up by the z-position the driver gives them. Claimed at
+    /// construction so no other CRTC can take them mid-session.
+    overlays: Vec<OverlayPlane>,
+    /// Overlay planes the last submitted commit turned on. A later frame that
+    /// doesn't use one must explicitly switch it off, or the hardware keeps
+    /// scanning stale content over the new frame.
+    lit_overlays: Vec<plane::Handle>,
+    /// Last direct-scanout plane configuration the driver accepted, so an
+    /// unchanged one skips its per-frame `test_state`. Cleared whenever a
+    /// flip fails, so a bad guess costs one frame and re-probes.
+    last_probe: Option<DirectProbe>,
+    /// Whether the *next* flip should be an async (tearing) one. Set per
+    /// frame by the renderer from the config plus the focused client's
+    /// `wp_tearing_control_v1` hint; see [`Self::set_tearing`].
+    tearing: bool,
 }
 
 impl ScanoutSurface {
@@ -169,8 +343,19 @@ impl ScanoutSurface {
                             .context("query SyncObj driver capability")?
                         && plane_has_property(drm.device_fd(), drm.plane(), "IN_FENCE_FD")?;
 
+                    let overlays = claim_overlay_planes(&drm);
+                    let (w, h) = drm.pending_mode().size();
+                    let placement = full_placement(w, h);
                     return Ok(Self {
-                        current: Frame::Composite(current_fb),
+                        current: Frame {
+                            primary: Layer {
+                                hold: Hold::Composite(current_fb),
+                                placement,
+                                damage: None,
+                                alpha: 1.0,
+                            },
+                            overlays: Vec::new(),
+                        },
                         pending: None,
                         queued: None,
                         next_fb: None,
@@ -180,6 +365,10 @@ impl ScanoutSurface {
                         is_opaque,
                         supports_fencing,
                         fb_cache: Vec::new(),
+                        overlays,
+                        lit_overlays: Vec::new(),
+                        last_probe: None,
+                        tearing: false,
                     });
                 }
                 Err(err) => {
@@ -349,10 +538,20 @@ impl ScanoutSurface {
         // next acquire sees correct damage history.
         self.swapchain.submitted(&next_fb);
 
+        let (w, h) = self.drm.pending_mode().size();
         self.queued = Some(QueuedFrame {
-            frame: Frame::Composite(next_fb),
-            sync,
-            damage,
+            frame: Frame {
+                primary: Layer {
+                    hold: Hold::Composite(next_fb),
+                    placement: full_placement(w, h),
+                    damage,
+                    alpha: 1.0,
+                },
+                // A composited frame already contains everything, so every
+                // overlay plane goes dark — `submit` emits the disables.
+                overlays: Vec::new(),
+            },
+            sync: sync.map(FrameFence::Render),
         });
         if self.pending.is_none() {
             self.submit()?;
@@ -360,54 +559,170 @@ impl ScanoutSurface {
         Ok(())
     }
 
-    /// Try to scan a client buffer straight onto the primary plane (direct
-    /// scanout), skipping compositing entirely. The caller has already
-    /// verified the frame is geometrically eligible (one settled fullscreen
-    /// opaque client, colour mode matched, 1:1 with the mode).
+    /// How many overlay planes are free for content above a direct-scanned
+    /// window. `0` means the renderer must composite anything drawn on top.
+    pub fn overlay_capacity(&self) -> usize {
+        self.overlays.len()
+    }
+
+    /// Try to scan client buffers straight onto the hardware planes, skipping
+    /// compositing entirely: `primary` onto the primary plane, and each of
+    /// `overlays` (bottom-up) onto an overlay plane above it.
     ///
-    /// Returns `Ok(true)` when the buffer was latched and flipped; `Ok(false)`
-    /// when it isn't scannable (implicit modifier, un-importable, or rejected
-    /// by the plane) and the caller must fall back to compositing this frame.
+    /// The caller has already verified the frame is geometrically eligible —
+    /// one settled fullscreen opaque client covering the output, colour mode
+    /// matched, and at most [`Self::overlay_capacity`] things drawn over it.
+    ///
+    /// Returns `Ok(true)` when the whole frame was latched and flipped;
+    /// `Ok(false)` when any layer isn't scannable (implicit modifier,
+    /// un-importable, or rejected by the driver) and the caller must fall back
+    /// to compositing *the entire frame*. It is all-or-nothing on purpose: a
+    /// half-assigned frame would show the game with its notification missing.
     /// `Err` is a real failure (inactive device, flip error).
     ///
-    /// On success ownership of `buffer` (the `wl_buffer` keep-alive) is taken
-    /// so `wl_buffer.release` is deferred until a later flip replaces it.
-    pub fn try_queue_external(&mut self, buffer: ClientBuffer, dmabuf: &Dmabuf) -> Result<bool> {
+    /// On success ownership of each layer's `buffer` keep-alive is taken, so
+    /// `wl_buffer.release` is deferred until a later flip replaces it.
+    pub fn try_queue_direct(
+        &mut self,
+        primary: ScanoutLayer,
+        overlays: Vec<ScanoutLayer>,
+    ) -> Result<bool> {
         ensure!(self.drm.is_active(), "DRM device is inactive");
 
-        // A legacy (non-atomic) surface can't reliably test a foreign FB.
+        // A legacy (non-atomic) surface can't reliably test a foreign FB, and
+        // has no overlay planes to speak of.
         if self.drm.is_legacy() {
             debug!("legacy DRM surface can't test client buffers; compositing");
             return Ok(false);
         }
-        // KMS can't safely scan out a buffer allocated with an implicit
-        // (Invalid) modifier — its tiling/layout is unknown (the Weston rule).
-        if dmabuf.format().modifier == Modifier::Invalid {
+        if overlays.len() > self.overlays.len() {
             debug!(
-                code = ?dmabuf.format().code,
-                "client buffer has an implicit modifier; compositing"
+                wanted = overlays.len(),
+                have = self.overlays.len(),
+                "more content above the window than there are overlay planes; compositing"
             );
             return Ok(false);
         }
 
+        // An acquire fence is only usable where the plane exposes IN_FENCE_FD;
+        // without that the commit blocker upstream has already waited for us.
+        let mut primary = primary;
+        let acquire = primary.acquire.take().filter(|_| self.supports_fencing);
+        let fenced = acquire.is_some();
+
+        // Build every layer before touching any state, so a rejection part
+        // way through leaves nothing half-applied.
+        let planes: Vec<plane::Handle> = std::iter::once(self.drm.plane())
+            .chain(self.overlays.iter().take(overlays.len()).map(|o| o.info.handle))
+            .collect();
+        let mut built = Vec::with_capacity(planes.len());
+        for (plane, layer) in planes.iter().zip(std::iter::once(primary).chain(overlays)) {
+            match self.build_layer(*plane, layer) {
+                Some(built_layer) => built.push(built_layer),
+                None => return Ok(false),
+            }
+        }
+
+        // Authoritative gate: ask the driver whether it can actually scan this
+        // out. Match the flip's modeset-ness (VRR/mode change → commit). The
+        // question is identical frame after frame while a game holds the
+        // plane, so an accepted probe short-circuits the ioctl.
+        let allow_modeset = self.drm.commit_pending();
+        let probe = DirectProbe {
+            layers: built.iter().map(|(_, _, p)| *p).collect(),
+            allow_modeset,
+            fenced,
+        };
+        if self.last_probe.as_ref() != Some(&probe) {
+            let mut states: Vec<PlaneState<'_>> = built
+                .iter()
+                .enumerate()
+                .map(|(i, (plane, layer, _))| {
+                    layer.plane_state(
+                        *plane,
+                        None,
+                        // Only the primary plane can carry the frame's fence:
+                        // a commit has one IN_FENCE_FD, and the overlays'
+                        // buffers have their own implicit fences anyway.
+                        acquire.as_ref().filter(|_| i == 0).map(AsFd::as_fd),
+                    )
+                })
+                .collect();
+            states.extend(self.dark_overlay_states(&planes[1..]));
+            if let Err(err) = self.drm.test_state(states, allow_modeset) {
+                debug!(
+                    error = %err,
+                    overlays = built.len() - 1,
+                    "driver rejected the direct-scanout plane set; compositing"
+                );
+                // Don't cache rejections: the reason may be transient (a
+                // mode change mid-settle), and re-probing a rejected config
+                // costs nothing — we're compositing that frame regardless.
+                self.last_probe = None;
+                return Ok(false);
+            }
+            self.last_probe = Some(probe);
+        }
+
+        // Committed to direct scanout: queue the client frame and flip it.
+        let mut built = built.into_iter();
+        let (_, primary_layer, _) = built.next().expect("primary layer always built");
+        self.queued = Some(QueuedFrame {
+            frame: Frame {
+                primary: primary_layer,
+                overlays: built.map(|(plane, layer, _)| (plane, layer)).collect(),
+            },
+            sync: acquire.map(FrameFence::Acquire),
+        });
+        if self.pending.is_none() {
+            self.submit()?;
+        }
+        Ok(true)
+    }
+
+    /// Turn one requested layer into a plane-ready [`Layer`] plus the probe
+    /// entry describing it. `None` means it can't go on a plane at all and
+    /// the caller must composite the frame.
+    fn build_layer(
+        &mut self,
+        plane: plane::Handle,
+        layer: ScanoutLayer,
+    ) -> Option<(plane::Handle, Layer, ProbeLayer)> {
+        // KMS can't safely scan out a buffer allocated with an implicit
+        // (Invalid) modifier — its tiling/layout is unknown (the Weston rule).
+        let fmt = layer.dmabuf.format();
+        if fmt.modifier == Modifier::Invalid {
+            debug!(code = ?fmt.code, "client buffer has an implicit modifier; compositing");
+            return None;
+        }
+
         // Prefer the buffer's own fourcc when the plane advertises it with
-        // this modifier: the caller proved the content opaque, and on the
-        // primary plane an unused alpha channel scans out over the CRTC's
-        // black background — indistinguishable. Swap to the opaque sibling
-        // only when the plane lacks the native format. Forcing the sibling
-        // unconditionally broke the import on planes that advertise the
-        // alpha fourcc but not its sibling (NVIDIA lists AB30 but no XB30:
-        // addfb2 failed for every HDR game frame → zero direct scans).
-        let fmt = dmabuf.format();
-        let plane_has_native = self
-            .drm
-            .plane_info()
-            .formats
+        // this modifier: on the primary plane the caller proved the content
+        // opaque, and an unused alpha channel scans out over the CRTC's black
+        // background — indistinguishable. Swap to the opaque sibling only when
+        // the plane lacks the native format. Forcing the sibling
+        // unconditionally broke the import on planes that advertise the alpha
+        // fourcc but not its sibling (NVIDIA lists AB30 but no XB30: addfb2
+        // failed for every HDR game frame → zero direct scans).
+        //
+        // An *overlay* must keep its alpha either way — it is composited over
+        // the window below it, so dropping the channel would paint a hard
+        // rectangle where a rounded, shadowed notification belongs.
+        let plane_formats = self.plane_formats_of(plane);
+        let has_native = plane_formats
             .iter()
             .any(|f| f.code == fmt.code && f.modifier == fmt.modifier);
-        let use_opaque = !plane_has_native;
+        let use_opaque = !has_native;
+        if use_opaque && plane != self.drm.plane() {
+            debug!(
+                code = ?fmt.code,
+                modifier = ?fmt.modifier,
+                "overlay plane lacks the buffer's format and its alpha can't be dropped; compositing"
+            );
+            return None;
+        }
 
-        let fb = match self.import_client_fb(&buffer, dmabuf, use_opaque) {
+        let fb = match self.import_client_fb(&layer.buffer, &layer.dmabuf, use_opaque) {
             Ok(fb) => fb,
             Err(err) => {
                 debug!(
@@ -417,46 +732,60 @@ impl ScanoutSurface {
                     use_opaque,
                     "client buffer not importable for scanout; compositing"
                 );
-                return Ok(false);
+                return None;
             }
         };
 
-        // The caller guaranteed the buffer is 1:1 with the mode, so src == dst.
-        let (w, h) = self.drm.pending_mode().size();
-        let src = Rectangle::from_size((i32::from(w), i32::from(h)).into()).to_f64();
-        let dst = Rectangle::from_size((i32::from(w), i32::from(h)).into());
-        let plane_state = PlaneState {
-            handle: self.drm.plane(),
-            config: Some(PlaneConfig {
-                src,
-                dst,
-                transform: Transform::Normal,
-                alpha: 1.0,
-                damage_clips: None,
-                fb: handle_of(&fb),
-                // Implicit sync: the kernel waits on the dmabuf's own fence.
-                fence: None,
-            }),
+        let placement = Placement {
+            src: layer.place.src,
+            dst: layer.place.dst,
+            transform: layer.place.transform,
         };
+        Some((
+            plane,
+            Layer {
+                hold: Hold::Client {
+                    buffer: layer.buffer,
+                    fb,
+                },
+                placement,
+                damage: layer.damage,
+                alpha: 1.0,
+            },
+            ProbeLayer {
+                plane,
+                code: fmt.code,
+                modifier: fmt.modifier,
+                placement,
+                use_opaque,
+            },
+        ))
+    }
 
-        // Authoritative gate: ask the driver whether it can actually scan this
-        // out. Match the flip's modeset-ness (VRR/mode change → commit).
-        let allow_modeset = self.drm.commit_pending();
-        if let Err(err) = self.drm.test_state([plane_state], allow_modeset) {
-            debug!(error = %err, "primary plane rejected client buffer; compositing");
-            return Ok(false);
-        }
+    /// `config: None` states for every overlay plane the last commit lit that
+    /// `keeping` doesn't. Without these the hardware happily keeps scanning
+    /// last frame's notification over this frame.
+    fn dark_overlay_states(&self, keeping: &[plane::Handle]) -> Vec<PlaneState<'static>> {
+        self.lit_overlays
+            .iter()
+            .filter(|h| !keeping.contains(h))
+            .map(|h| PlaneState {
+                handle: *h,
+                config: None,
+            })
+            .collect()
+    }
 
-        // Committed to direct scanout: queue the client frame and flip it.
-        self.queued = Some(QueuedFrame {
-            frame: Frame::Direct { buffer, fb },
-            sync: None,
-            damage: None,
-        });
-        if self.pending.is_none() {
-            self.submit()?;
+    /// The `(fourcc, modifier)` pairs one of our planes advertises.
+    fn plane_formats_of(&self, plane: plane::Handle) -> Vec<Format> {
+        if plane == self.drm.plane() {
+            return self.drm.plane_info().formats.iter().copied().collect();
         }
-        Ok(true)
+        self.overlays
+            .iter()
+            .find(|o| o.info.handle == plane)
+            .map(|o| o.info.formats.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Import a client `dmabuf` as a scanout framebuffer, caching it per
@@ -518,67 +847,93 @@ impl ScanoutSurface {
     /// a full `commit` (modeset) when state is pending (first frame,
     /// mode/VRR/HDR change), otherwise a plain `page_flip`.
     fn submit(&mut self) -> Result<()> {
-        let QueuedFrame { frame, sync, damage } =
+        let QueuedFrame { frame, sync } =
             self.queued.take().expect("submit called with a queued frame");
-        let fb = frame.fb_handle();
 
-        let (w, h) = self.drm.pending_mode().size();
-        let src = Rectangle::from_size((i32::from(w), i32::from(h)).into()).to_f64();
-        let dst = Rectangle::from_size((i32::from(w), i32::from(h)).into());
-
-        let damage_clips = damage.and_then(|damage| {
-            PlaneDamageClips::from_damage(
-                self.drm.device_fd(),
-                src,
-                dst,
-                // Untransformed output; damage is already framebuffer-space.
-                Transform::Normal,
-                Transform::Normal,
-                damage,
-            )
+        // Damage blobs have to outlive the plane states that borrow them, so
+        // they are built up front, one per layer in `frame.layers()` order.
+        let clips: Vec<Option<PlaneDamageClips>> = frame
+            .layers()
+            .map(|layer| {
+                let damage = layer.damage.clone()?;
+                PlaneDamageClips::from_damage(
+                    self.drm.device_fd(),
+                    layer.placement.src,
+                    layer.placement.dst,
+                    layer.placement.transform,
+                    // Damage arrives in buffer pixels already, so it needs no
+                    // transform of its own — only the src→dst mapping applies.
+                    Transform::Normal,
+                    damage,
+                )
                 .ok()
                 .flatten()
-        });
+            })
+            .collect();
 
-        // Explicit sync: hand the render fence to KMS as IN_FENCE_FD when the
-        // plane supports it; otherwise (or if the fence isn't exportable)
-        // block on the GPU here and rely on implicit sync. Direct frames carry
-        // no SyncPoint (implicit sync via the dmabuf's own fence).
+        // Explicit sync: hand the fence to KMS as IN_FENCE_FD when the plane
+        // supports it; otherwise block on the GPU here and rely on implicit
+        // sync. A client's acquire fence is only ever produced when fencing
+        // is supported (`try_queue_direct` filters it), so it needs no
+        // CPU-wait arm — and could not have one, being a bare fd.
         let fence = match sync {
-            Some(sync) if self.supports_fencing => {
+            Some(FrameFence::Acquire(fd)) => Some(fd),
+            Some(FrameFence::Render(sync)) if self.supports_fencing => {
                 let fence = sync.export();
                 if fence.is_none() {
                     let _ = sync.wait();
                 }
                 fence
             }
-            Some(sync) => {
+            Some(FrameFence::Render(sync)) => {
                 let _ = sync.wait();
                 None
             }
             None => None,
         };
 
-        let plane_state = PlaneState {
-            handle: self.drm.plane(),
-            config: Some(PlaneConfig {
-                src,
-                dst,
-                transform: Transform::Normal,
-                alpha: 1.0,
-                damage_clips: damage_clips.as_ref().map(PlaneDamageClips::blob),
-                fb,
-                fence: fence.as_ref().map(AsFd::as_fd),
-            }),
-        };
+        let lit = frame.overlay_planes();
+        let mut states = vec![frame.primary.plane_state(
+            self.drm.plane(),
+            clips[0].as_ref(),
+            fence.as_ref().map(AsFd::as_fd),
+        )];
+        for (i, (plane, layer)) in frame.overlays.iter().enumerate() {
+            states.push(layer.plane_state(*plane, clips[i + 1].as_ref(), None));
+        }
+        // Switch off any overlay plane the previous commit lit that this
+        // frame doesn't use — including all of them for a composited frame,
+        // whose single buffer already contains everything.
+        states.extend(self.dark_overlay_states(&lit));
+
+        // Tearing is only offered for a plain primary-plane flip. Drivers
+        // reject an async commit that carries anything else, and an overlay
+        // update is exactly that; the extra plane also means the frame isn't
+        // the pure game-swapchain swap tearing exists to accelerate.
+        let tearing = self.tearing && frame.is_direct() && frame.overlays.is_empty();
 
         let flip = if self.drm.commit_pending() {
-            self.drm.commit([plane_state], true)
+            self.drm.commit(states, true)
+        } else if tearing {
+            // Immediate presentation: the flip takes effect as soon as the
+            // hardware can latch it rather than at the next vblank. Falls
+            // back to a normal flip when the driver refuses (see `tearing`).
+            self.drm
+                .page_flip_async(states.clone(), true)
+                .or_else(|err| {
+                    debug!(error = %err, "async page-flip rejected; falling back to vsync for this frame");
+                    self.drm.page_flip(states, true)
+                })
         } else {
-            self.drm.page_flip([plane_state], true)
+            self.drm.page_flip(states, true)
         };
         if flip.is_ok() {
+            self.lit_overlays = lit;
             self.pending = Some(frame);
+        } else {
+            // The driver disagreed with a configuration we may have cached as
+            // good; make the next direct frame re-probe rather than repeat it.
+            self.last_probe = None;
         }
         flip.context("atomic page-flip/commit failed")
     }
@@ -586,6 +941,29 @@ impl ScanoutSurface {
     /// The swapchain's scanout fourcc.
     pub fn format(&self) -> Fourcc {
         self.swapchain.format()
+    }
+
+    /// Ask for the next flips to be async (tearing) ones.
+    ///
+    /// Tearing is only ever *offered* — `submit` retries synchronously the
+    /// moment a driver refuses, and a modeset commit always ignores it. A
+    /// legacy surface can't do async flips at all, so the request is dropped
+    /// there rather than failing every frame.
+    pub fn set_tearing(&mut self, tearing: bool) {
+        let tearing = tearing && !self.drm.is_legacy();
+        if self.tearing != tearing {
+            debug!(tearing, "tearing (async page-flip) state changed");
+            self.tearing = tearing;
+            // A fenced or damage-clipped request is exactly the kind of extra
+            // state a driver rejects on an async flip, so the accepted-probe
+            // cache no longer describes the request we're about to make.
+            self.last_probe = None;
+        }
+    }
+
+    /// Whether the next flip would be an async (tearing) one.
+    pub fn tearing(&self) -> bool {
+        self.tearing
     }
 
     /// Whether the connector advertises adaptive-sync (VRR) support.
@@ -607,6 +985,57 @@ impl ScanoutSurface {
     pub fn surface(&self) -> &DrmSurface {
         &self.drm
     }
+}
+
+/// The placement a compositor-rendered frame always uses: the whole buffer
+/// onto the whole mode, untransformed.
+fn full_placement(w: u16, h: u16) -> Placement {
+    let size = (i32::from(w), i32::from(h));
+    Placement {
+        src: Rectangle::from_size(size.into()).to_f64(),
+        dst: Rectangle::from_size(size.into()),
+        transform: Transform::Normal,
+    }
+}
+
+/// Claim every overlay plane this CRTC can drive that sits *above* its
+/// primary plane, ordered bottom-up.
+///
+/// Only planes with a higher z-position qualify. Smithay's atomic commit
+/// doesn't program `zpos`, so a plane's position is whatever the driver
+/// defaults it to — which makes the ones below the primary underlays, useful
+/// only for content behind an opaque window (i.e. never, for us). Claiming
+/// them up front stops another CRTC taking one mid-session, which would turn
+/// a working fast path into a per-frame rejection.
+///
+/// A legacy surface gets none: it has no atomic commit to put them in.
+fn claim_overlay_planes(drm: &Arc<DrmSurface>) -> Vec<OverlayPlane> {
+    if drm.is_legacy() {
+        return Vec::new();
+    }
+    let primary_zpos = drm.plane_info().zpos.unwrap_or_default();
+    let mut usable: Vec<&PlaneInfo> = drm
+        .planes()
+        .overlay
+        .iter()
+        .filter(|p| p.zpos.unwrap_or_default() > primary_zpos)
+        .collect();
+    usable.sort_by_key(|p| p.zpos.unwrap_or_default());
+
+    let claimed: Vec<OverlayPlane> = usable
+        .into_iter()
+        .filter_map(|info| {
+            drm.claim_plane(info.handle).map(|claim| OverlayPlane {
+                info: info.clone(),
+                claim,
+            })
+        })
+        .collect();
+    debug!(
+        count = claimed.len(),
+        primary_zpos, "claimed overlay planes for direct scanout"
+    );
+    claimed
 }
 
 /// Collect a modifier sequence preserving first-seen order and dropping

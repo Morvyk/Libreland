@@ -26,6 +26,7 @@ use smithay::backend::allocator::{Buffer as _, Format, Fourcc};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode, VrrSupport};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::sync::Fence as _;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
@@ -68,11 +69,11 @@ use tracing::{debug, info, warn};
 use crate::anim::{Animation, lerp};
 use crate::config::{
     AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode,
-    VrrMode,
+    TearingMode, VrrMode,
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
-use crate::scanout::ScanoutSurface;
+use crate::scanout::{DirectPlacement, ScanoutLayer, ScanoutSurface};
 
 /// A layer surface to render this frame. Pre-computed by main
 /// before calling `render_for_crtc` so the renderer doesn't need
@@ -1153,6 +1154,23 @@ pub struct Renderer {
     /// is in flight (see [`NoAnim`]). Cleared on drop, which lets them
     /// animate into their final tiles again.
     no_anim: NoAnim,
+    /// Surfaces whose buffers are currently going straight onto a primary
+    /// plane, so their explicit-sync acquire fence is handed to KMS as
+    /// `IN_FENCE_FD` instead of being waited on by the compositor.
+    ///
+    /// The commit hook in [`crate::wayland`] reads this to decide whether to
+    /// gate a commit on its acquire fence at all: for a surface on the plane
+    /// the display engine does the waiting, which saves an event-loop
+    /// round-trip on every single game frame. The invariant that keeps that
+    /// safe is [`Self::settle_skipped_fences`] — the composite path CPU-waits
+    /// on anything in this set before it may sample the buffer.
+    direct_surfaces: HashSet<ObjectId>,
+    /// Tearing (async page-flip) policy, from `misc.tearing`. Live-reloaded
+    /// via [`Self::set_tearing_mode`].
+    tearing: TearingMode,
+    /// Surfaces that asked for immediate presentation through
+    /// `wp_tearing_control_v1`. Consulted under [`TearingMode::Auto`].
+    tearing_hints: HashSet<ObjectId>,
     /// Windows mid close-animation: a snapshot texture taken the moment
     /// the toplevel was destroyed, fading + shrinking out where the
     /// window last sat. Drained as each finishes.
@@ -1473,6 +1491,12 @@ struct OutputRender {
     /// must skip those: the client buffer is literally what's on screen, so
     /// releasing it would let the client overwrite the displayed image.
     pending_direct: bool,
+    /// The surface + commit of the last frame we direct-scanned onto this
+    /// output's plane, so the next one can ask for damage *since* it and hand
+    /// KMS a `FB_DAMAGE_CLIPS` blob. `None` means the plane holds something
+    /// whose delta we can't describe (a composite frame, a different surface,
+    /// or a failed flip) and the next direct frame must claim full damage.
+    direct_damage_ref: Option<(ObjectId, CommitCounter)>,
     /// Rolling per-phase frame-cost accumulator, logged + reset every ~5 s
     /// (see [`RenderProfile`]). Always on: the bookkeeping is a handful of
     /// `Instant::now()` calls per frame.
@@ -1796,6 +1820,101 @@ fn client_scale_for(
         ratio
     } else {
         fallback
+    }
+}
+
+#[cfg(test)]
+mod opaque_region_tests {
+    use super::opaque_region_covers;
+    use smithay::utils::{Logical, Rectangle, Size};
+
+    fn size(w: i32, h: i32) -> Size<i32, Logical> {
+        Size::from((w, h))
+    }
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+    /// `opaque_region_covers` with the borrow spelled out, so each case below
+    /// reads as just its rects and the surface they should (not) cover.
+    fn covers(rects: &[Rectangle<i32, Logical>], s: Size<i32, Logical>) -> bool {
+        opaque_region_covers(Some(rects), s)
+    }
+
+    #[test]
+    fn no_declared_region_is_not_provably_opaque() {
+        assert!(!opaque_region_covers(None, size(100, 100)));
+        assert!(!opaque_region_covers(Some(&[]), size(100, 100)));
+    }
+
+    #[test]
+    fn one_covering_rect_is_the_fast_path() {
+        assert!(covers(&[rect(0, 0, 100, 100)], size(100, 100)));
+        // Oversized (a client may declare past its own edges).
+        assert!(covers(&[rect(-5, -5, 200, 200)], size(100, 100)));
+    }
+
+    #[test]
+    fn one_partial_rect_does_not_cover() {
+        assert!(!covers(&[rect(0, 0, 100, 99)], size(100, 100)));
+        assert!(!covers(&[rect(1, 0, 100, 100)], size(100, 100)));
+    }
+
+    /// The case the single-rect check used to miss: a toolkit declaring its
+    /// opacity as tiles. Together they cover the surface, so the surface is
+    /// opaque and may go on the primary plane.
+    #[test]
+    fn tiled_rects_that_together_cover_do_count() {
+        // Two halves, split horizontally.
+        assert!(covers(&[rect(0, 0, 100, 50), rect(0, 50, 100, 50)], size(100, 100)
+        ));
+        // Two halves, split vertically.
+        assert!(covers(&[rect(0, 0, 50, 100), rect(50, 0, 50, 100)], size(100, 100)
+        ));
+        // Four quadrants, out of order, with overlap.
+        assert!(covers(&[
+                rect(50, 50, 50, 50),
+                rect(0, 0, 60, 60),
+                rect(50, 0, 50, 50),
+                rect(0, 50, 50, 50),
+            ], size(100, 100)
+        ));
+    }
+
+    #[test]
+    fn tiled_rects_with_a_gap_do_not_cover() {
+        // A one-pixel column missed between the two halves.
+        assert!(!covers(&[rect(0, 0, 49, 100), rect(50, 0, 50, 100)], size(100, 100)
+        ));
+        // Full-width bands that don't reach the bottom.
+        assert!(!covers(&[rect(0, 0, 100, 40), rect(0, 40, 100, 40)], size(100, 100)
+        ));
+        // A hole in the middle: bands cover top and bottom, sides cover the
+        // middle band only partially.
+        assert!(!covers(&[
+                rect(0, 0, 100, 30),
+                rect(0, 70, 100, 30),
+                rect(0, 30, 40, 40),
+                rect(60, 30, 40, 40),
+            ], size(100, 100)
+        ));
+    }
+
+    /// The sweep is bounded: a client declaring its opacity in dozens of
+    /// pieces is not the fullscreen game this fast path exists for, and the
+    /// scan would cost more than the frame it might save.
+    #[test]
+    fn absurdly_many_rects_are_declined_rather_than_swept() {
+        let strips: Vec<_> = (0..100).map(|i| rect(i, 0, 1, 100)).collect();
+        assert!(!covers(&strips, size(100, 100)));
+    }
+
+    /// A zero-sized surface is vacuously "covered" by any rect, which would
+    /// hand the primary plane a buffer with no pixels. `Size` refuses to hold
+    /// a negative dimension at all, so zero is the whole degenerate case.
+    #[test]
+    fn a_degenerate_surface_is_never_opaque() {
+        assert!(!covers(&[rect(0, 0, 100, 100)], size(0, 100)));
+        assert!(!covers(&[rect(0, 0, 100, 100)], size(100, 0)));
     }
 }
 
@@ -2598,6 +2717,7 @@ impl Renderer {
                 pending_feedback: None,
                 pending_frame_roots: Vec::new(),
                 pending_direct: false,
+                direct_damage_ref: None,
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
                 prev_layer_masks: HashMap::new(),
@@ -2678,6 +2798,9 @@ impl Renderer {
             decoration: DecorationConfig::default(),
             win_anims: HashMap::new(),
             pending_open: HashSet::new(),
+            direct_surfaces: HashSet::new(),
+            tearing: TearingMode::default(),
+            tearing_hints: HashSet::new(),
             no_anim: NoAnim::None,
             closing: Vec::new(),
             blur_down,
@@ -2775,6 +2898,66 @@ impl Renderer {
             .get(&icon)
             .and_then(Clone::clone)
             .or_else(|| self.cursor.clone())
+    }
+
+    /// Whether `surface`'s buffers are going straight onto a primary plane
+    /// right now, so its explicit-sync acquire fence can be handed to KMS
+    /// rather than gating the commit. See [`Self::direct_surfaces`].
+    pub fn is_direct_scanning(&self, surface: &WlSurface) -> bool {
+        self.direct_surfaces.contains(&surface.id())
+    }
+
+    /// CPU-wait on the acquire fence of every surface whose commit blocker we
+    /// skipped, then forget them.
+    ///
+    /// This is the safety net for the frame where a direct-scanned window
+    /// stops being eligible — a popup opens over the game, it un-fullscreens,
+    /// a capture starts. Those commits were let through un-gated on the
+    /// promise that KMS would wait on the fence; the moment we instead intend
+    /// to *sample* the buffer, that promise is ours to keep, or we composite
+    /// a half-rendered frame.
+    ///
+    /// The set is emptied wholesale even though only this output's surfaces
+    /// are waited on. A surface still direct-scanning on *another* output
+    /// simply goes back to being gated at commit time until its next direct
+    /// frame re-adds it — a lost wakeup, not a lost fence. Clearing
+    /// conservatively is what makes the invariant easy to state: anything in
+    /// the set has a fence nobody has waited on yet.
+    fn settle_skipped_fences(&mut self, placements: &[Placement]) {
+        if self.direct_surfaces.is_empty() {
+            return;
+        }
+        for p in placements {
+            with_surface_tree_downward(
+                &p.surface,
+                (),
+                |_, _, ()| TraversalAction::DoChildren(()),
+                |surface, _, ()| {
+                    if !self.direct_surfaces.contains(&surface.id()) {
+                        return;
+                    }
+                    with_renderer_surface_state(surface, |state| {
+                        let Some(acquire) =
+                            state.buffer().and_then(ClientBuffer::acquire_point)
+                        else {
+                            return;
+                        };
+                        if acquire.is_signaled() {
+                            return;
+                        }
+                        debug!(
+                            surface = ?surface.id(),
+                            "explicit sync: CPU-waiting on a fence we let past the commit hook"
+                        );
+                        if let Err(err) = acquire.wait(crate::wayland::acquire_wait_deadline()) {
+                            warn!(error = %err, "explicit sync: acquire wait failed; frame may tear");
+                        }
+                    });
+                },
+                |_, _, ()| true,
+            );
+        }
+        self.direct_surfaces.clear();
     }
 
     /// Whether the hardware cursor plane is currently showing the cursor
@@ -3334,6 +3517,7 @@ impl Renderer {
             pending_feedback: None,
             pending_frame_roots: Vec::new(),
             pending_direct: false,
+            direct_damage_ref: None,
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
             prev_layer_masks: HashMap::new(),
@@ -3663,6 +3847,29 @@ impl Renderer {
     pub fn set_decoration(&mut self, cfg: DecorationConfig) {
         self.decoration = cfg;
         self.invalidate_damage();
+    }
+
+    /// Replace the tearing policy (`misc.tearing`). Live config reload; the
+    /// next frame's [`Self::apply_tearing`] settles each output.
+    pub fn set_tearing_mode(&mut self, mode: TearingMode) {
+        self.tearing = mode;
+    }
+
+    /// Record a surface's `wp_tearing_control_v1` presentation hint.
+    /// `immediate` is the client asking to be shown as soon as possible,
+    /// tearing if need be; `false` restores vsync for it.
+    pub fn set_tearing_hint(&mut self, surface: &WlSurface, immediate: bool) {
+        if immediate {
+            self.tearing_hints.insert(surface.id());
+        } else {
+            self.tearing_hints.remove(&surface.id());
+        }
+    }
+
+    /// Forget a dead surface's tearing hint and direct-scanout marker.
+    pub fn forget_surface_scanout_state(&mut self, id: &ObjectId) {
+        self.tearing_hints.remove(id);
+        self.direct_surfaces.remove(id);
     }
 
     /// Ensure output `idx` has a backdrop-blur scratch chain sized for its
@@ -4178,20 +4385,47 @@ impl Renderer {
         }
     }
 
-    /// Scanout-capable `(fourcc, modifier)` pairs: the primary output's
-    /// plane formats, intersected with what the renderer can import as a
-    /// texture (the composite fallback must be able to draw the very same
-    /// buffers on frames the plane can't take), with implicit modifiers
-    /// dropped — the whole point is steering clients toward *explicit*
-    /// plane-compatible modifiers; an Invalid entry would invite the
-    /// implicit allocations that can never be latched. Feeds the
+    /// Scanout-capable `(fourcc, modifier)` pairs for each output, by
+    /// connector name: that output's plane formats, intersected with what the
+    /// renderer can import as a texture (the composite fallback must be able
+    /// to draw the very same buffers on frames the plane can't take), with
+    /// implicit modifiers dropped — the whole point is steering clients
+    /// toward *explicit* plane-compatible modifiers; an Invalid entry would
+    /// invite the implicit allocations that can never be latched. Feeds the
     /// per-surface dmabuf-feedback scanout tranche (see wayland.rs).
-    pub fn primary_scanout_formats(&self) -> Vec<Format> {
-        let importable = self.gles.dmabuf_formats();
+    ///
+    /// Keyed per output because planes differ between connectors — and on a
+    /// multi-GPU machine between devices. A single set describing the primary
+    /// output is the wrong answer for a game fullscreened anywhere else: it
+    /// would allocate modifiers that output's plane never advertised, fail
+    /// the import every frame, and composite forever with no indication why.
+    pub fn scanout_formats_by_output(&self) -> Vec<(String, Vec<Format>)> {
         self.outputs
-            .get(self.primary_idx)
-            .map(|o| o.surface.plane_formats())
+            .iter()
+            .map(|o| (o.name.clone(), self.scanout_formats_of(o)))
+            .collect()
+    }
+
+    /// One output's scanout formats by connector name, for the hot-plug path
+    /// that has to build its dmabuf-feedback variant after startup. Empty if
+    /// no such output is bound.
+    pub fn scanout_formats_for(&self, name: &str) -> Vec<Format> {
+        self.outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| self.scanout_formats_of(o))
             .unwrap_or_default()
+    }
+
+    /// One output's primary-plane formats, narrowed to those our renderer can
+    /// also import. Implicit (`Invalid`) modifiers are dropped: KMS can't
+    /// scan out a buffer whose layout it can't name, so advertising them in a
+    /// *scanout* tranche would be a lie.
+    fn scanout_formats_of(&self, output: &OutputRender) -> Vec<Format> {
+        let importable = self.gles.dmabuf_formats();
+        output
+            .surface
+            .plane_formats()
             .into_iter()
             .filter(|f| {
                 f.modifier != smithay::backend::allocator::Modifier::Invalid
@@ -4336,6 +4570,176 @@ impl Renderer {
         }
     }
 
+    /// Service screencopy captures from the client buffer we just put on the
+    /// primary plane, instead of compositing the scene to read it back.
+    ///
+    /// Direct-scanout eligibility already proved this buffer *is* the whole
+    /// output, so the capture is one textured blit rather than a full
+    /// wallpaper-plus-windows-plus-effects pass. It runs after the flip, so a
+    /// slow consumer costs the recorder frames, never the game.
+    ///
+    /// Any GL failure fails just the captures, not the frame — the buffer is
+    /// already scanning out by the time we get here.
+    fn capture_direct(
+        &mut self,
+        idx: usize,
+        dmabuf: &Dmabuf,
+        place: DirectPlacement,
+        captures: &[CaptureSpec],
+    ) -> Vec<CaptureOutcome> {
+        let output_name = self.outputs[idx].name.clone();
+        let mode_size = self.outputs[idx].mode_size;
+        let failed = || captures.iter().map(|_| CaptureOutcome::Failed).collect();
+
+        let tex = match self.gles.import_dmabuf(dmabuf, None) {
+            Ok(tex) => tex,
+            Err(err) => {
+                warn!(error = %err, output = %output_name, "screencopy: importing the scanned-out buffer failed");
+                return failed();
+            }
+        };
+
+        // Output-physical → buffer pixels. The eligibility gate pinned the
+        // source to exactly the mode's worth of pixels, so this is a
+        // translation in practice; deriving it anyway keeps the two in step
+        // if the gate ever loosens.
+        let (sx, sy) = (
+            place.src.size.w / f64::from(mode_size.w.max(1)),
+            place.src.size.h / f64::from(mode_size.h.max(1)),
+        );
+        let src_of = |region: Rectangle<i32, Physical>| {
+            Rectangle::<f64, smithay::utils::Buffer>::new(
+                (
+                    place.src.loc.x + f64::from(region.loc.x) * sx,
+                    place.src.loc.y + f64::from(region.loc.y) * sy,
+                )
+                    .into(),
+                (f64::from(region.size.w) * sx, f64::from(region.size.h) * sy).into(),
+            )
+        };
+
+        // Shm captures have to read back from an FBO, so they go through the
+        // per-output scratch buffer (allocated once, reused across frames);
+        // dmabuf captures render straight into the consumer's own buffer.
+        let needs_scratch = captures
+            .iter()
+            .any(|s| matches!(s.target, CaptureTarget::Shm));
+        if needs_scratch && !self.ensure_capture_scratch(&output_name, mode_size) {
+            return failed();
+        }
+
+        let mut results = Vec::with_capacity(captures.len());
+        for spec in captures {
+            let src = src_of(spec.region);
+            let dst = Rectangle::<i32, Physical>::from_size(spec.region.size);
+            match &spec.target {
+                CaptureTarget::Dmabuf(client) => {
+                    let mut client = client.clone();
+                    let Ok(mut target) = self.gles.bind(&mut client).inspect_err(|err| {
+                        warn!(error = %err, output = %output_name, "screencopy: bind client dmabuf failed");
+                    }) else {
+                        results.push(CaptureOutcome::Failed);
+                        continue;
+                    };
+                    results.push(
+                        match blit_texture(&mut self.gles, &mut target, &tex, src, dst) {
+                            Ok(()) => CaptureOutcome::Dmabuf,
+                            Err(err) => {
+                                warn!(error = %err, output = %output_name, "screencopy: blit to client dmabuf failed");
+                                CaptureOutcome::Failed
+                            }
+                        },
+                    );
+                }
+                CaptureTarget::Shm => {
+                    // Render the requested region to the scratch's origin,
+                    // then read that back — the same shape as the composited
+                    // path, minus the composite.
+                    let mut scratch = self
+                        .sdr_capture
+                        .remove(&output_name)
+                        .expect("scratch ensured above");
+                    let outcome = match self.gles.bind(&mut scratch) {
+                        Ok(mut target) => {
+                            match blit_texture(&mut self.gles, &mut target, &tex, src, dst) {
+                                Ok(()) => {
+                                    let at_origin = CaptureSpec {
+                                        region: dst,
+                                        fourcc: spec.fourcc,
+                                        target: CaptureTarget::Shm,
+                                    };
+                                    capture_shm(&mut self.gles, &target, &at_origin, &output_name)
+                                }
+                                Err(err) => {
+                                    warn!(error = %err, output = %output_name, "screencopy: blit to scratch failed");
+                                    CaptureOutcome::Failed
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, output = %output_name, "screencopy: bind scratch failed");
+                            CaptureOutcome::Failed
+                        }
+                    };
+                    self.sdr_capture.insert(output_name.clone(), scratch);
+                    results.push(outcome);
+                }
+            }
+        }
+        results
+    }
+
+    /// Ensure the per-output 8-bit capture scratch exists at `size`,
+    /// (re)allocating when absent or stale. `false` means allocation failed
+    /// and the caller must fail its captures.
+    fn ensure_capture_scratch(&mut self, output_name: &str, size: Size<i32, Physical>) -> bool {
+        let (w, h) = (
+            u32::try_from(size.w).unwrap_or(0),
+            u32::try_from(size.h).unwrap_or(0),
+        );
+        if self
+            .sdr_capture
+            .get(output_name)
+            .is_some_and(|t| t.width() == w && t.height() == h)
+        {
+            return true;
+        }
+        let buf_size = Size::<i32, smithay::utils::Buffer>::from((size.w, size.h));
+        match self.gles.create_buffer(Fourcc::Abgr8888, buf_size) {
+            Ok(b) => {
+                self.sdr_capture.insert(output_name.to_string(), b);
+                true
+            }
+            Err(err) => {
+                warn!(error = %err, output = %output_name, "screencopy: scratch buffer alloc failed");
+                self.sdr_capture.remove(output_name);
+                false
+            }
+        }
+    }
+
+    /// Settle this output's tearing (async page-flip) state for the frame
+    /// about to be queued.
+    ///
+    /// Tearing is off unless the config asks for it *and* the frame is the
+    /// one it exists for: a single fullscreen window, which is also the only
+    /// shape a driver will accept an async flip for (typically "the primary
+    /// plane's framebuffer and nothing else changed"). `TearingMode::Always`
+    /// still respects that — it means "don't wait for the client to ask", not
+    /// "tear the desktop".
+    fn apply_tearing(&mut self, idx: usize, solo: Option<usize>, placements: &[Placement]) {
+        let want = match self.tearing {
+            TearingMode::Never => false,
+            // The client asked for immediate presentation via
+            // wp_tearing_control_v1.
+            TearingMode::Auto => solo
+                .and_then(|i| placements.get(i))
+                .is_some_and(|p| self.tearing_hints.contains(&p.surface.id())),
+            TearingMode::Always => solo.is_some(),
+        };
+        self.outputs[idx].surface.set_tearing(want);
+    }
+
     /// Render one output's frame: wallpaper, then per window in
     /// bottom-up draw order render its border + surface, then the
     /// cursor sprite on top if its hotspot falls in this output.
@@ -4443,65 +4847,172 @@ impl Renderer {
         // Solo-fullscreen scene test, shared by the two fast paths below
         // (direct scanout, single-pass HDR) and the wallpaper skip.
         let out_rect = Rectangle::new(compositor_position, compositor_size);
-        let solo = self.solo_fullscreen_scene(
+        let scene = self.solo_fullscreen_scene(
             idx,
             &win_draws,
             placements,
             layers,
             popups,
             hide_cursor,
-            captures,
             compose_cursor,
         );
+        // The *strict* reading: a fullscreen window with nothing whatsoever
+        // above it. Direct scanout can handle a notification or a menu by
+        // handing it to an overlay plane, but the composite-side fast paths
+        // below can't — the single-pass HDR program and the wallpaper skip
+        // both assume the window is the only thing in the frame.
+        let solo = scene
+            .as_ref()
+            .filter(|s| s.above.is_empty())
+            .map(|s| s.solo);
 
         // ── Direct-scanout fast path ──────────────────────────────────
-        // A single settled fullscreen opaque client whose colour mode
-        // matches the output: scan its buffer straight to the primary
-        // plane, skipping ALL compositing (≈ zero GPU for this output).
-        // Anything that needs compositing — overlays, popups, animations,
-        // captures, a non-1:1 buffer, or a buffer the plane rejects —
+        // A settled fullscreen opaque client whose colour mode matches the
+        // output: scan its buffer straight to the primary plane, skipping ALL
+        // compositing (≈ zero GPU for this output). A little client content
+        // drawn above it — a notification, a menu — rides overlay planes
+        // instead of dragging the whole frame back through the GPU. Anything
+        // else that needs compositing (animations, a non-1:1 buffer, more
+        // content than there are planes, or a buffer the driver rejects)
         // falls through to the composite path below.
-        if let Some(direct) = self.direct_scanout_inputs(idx, solo, placements, enc) {
-            // VRR must settle before the flip (it may promote the flip to a
-            // modeset); harmlessly re-applied by the composite path on a miss.
-            self.apply_vrr(idx, placements);
-            match self.outputs[idx]
-                .surface
-                .try_queue_external(direct.buffer, &direct.dmabuf)
-            {
-                Ok(true) => {
-                    debug!(output = %output_name, "frame direct-scanned to primary plane (no compositing)");
-                    self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
-                    self.outputs[idx].pending_direct = true;
-                    // Zero-copy presentation: the client's own buffer is on the
-                    // plane, so flag ZeroCopy. Fired on this flip's vblank. A
-                    // feedback still parked from a frame that never reached
-                    // its flip (mailbox replacement) must be DISCARDED, not
-                    // dropped — per wp_presentation every feedback resolves
-                    // exactly once, and a present-timing consumer (Vulkan
-                    // present timing rides these events) errors out waiting
-                    // on one that never fires.
-                    if let Some(out) = present_output {
-                        let replaced = self.outputs[idx].pending_feedback.replace(
-                            collect_presentation_feedback(
-                                out, placements, layers, popups, out_rect, true,
-                            ),
-                        );
-                        if let Some(mut old) = replaced {
-                            debug!(output = %output_name, "wp_presentation: feedback discarded (flip replaced, direct scanout)");
-                            old.discarded();
+        //
+        // A pending capture does NOT disqualify the frame: eligibility
+        // already proved the client's buffer *is* the whole output, so a
+        // screencopy can be served from it with one textured blit instead of
+        // a full scene composite (`capture_direct`). That is the difference
+        // between "screen-sharing a game costs nothing" and "screen-sharing a
+        // game turns the fast path off for the whole session".
+        if let Some(mut direct) = self.direct_scanout_inputs(idx, scene.as_ref(), placements, enc) {
+            // Two exceptions, both about the capture:
+            // - HDR, because the client's buffer is PQ/BT.2020 and our capture
+            //   path can only tonemap the *linear* scene;
+            // - overlay planes, because what a capture must record is the
+            //   composed result, and the composition happens in the display
+            //   engine where we can't read it back.
+            let capture_ok =
+                captures.is_empty() || (!self.outputs[idx].hdr && direct.overlays.is_empty());
+            if capture_ok {
+                // Hand KMS the client's acquire fence rather than having
+                // waited on it ourselves (see `direct_surfaces`). Only worth
+                // exporting when the point hasn't already signalled.
+                direct.primary.acquire = direct
+                    .primary
+                    .buffer
+                    .acquire_point()
+                    .filter(|p| !p.is_signaled())
+                    .and_then(|p| match p.export_sync_file() {
+                        Ok(fd) => Some(fd),
+                        Err(err) => {
+                            // Not fatal: the commit hook only skips its
+                            // blocker for surfaces already on the plane, and
+                            // `settle_skipped_fences` catches this buffer if
+                            // we end up compositing instead.
+                            debug!(error = %err, "explicit sync: could not export acquire fence for KMS");
+                            None
                         }
+                    });
+                let fenced = direct.primary.acquire.is_some();
+                let n_overlays = direct.overlays.len();
+                // Kept for the capture below, which needs the buffer after
+                // ownership of the layer has moved into the flip. The
+                // keep-alive rides along because the capture *samples* the
+                // buffer — KMS was handed the acquire fence, but our GL read
+                // isn't ordered against it, so the capture has to wait
+                // itself. `ClientBuffer` is `Arc`-backed, and the release
+                // point only fires once every clone is gone.
+                let capture_src = (!captures.is_empty()).then(|| {
+                    (
+                        direct.primary.buffer.clone(),
+                        direct.primary.dmabuf.clone(),
+                        direct.primary.place,
+                    )
+                });
+
+                // VRR must settle before the flip (it may promote the flip to
+                // a modeset); harmlessly re-applied by the composite path on
+                // a miss. Same for the tearing hint.
+                self.apply_vrr(idx, placements);
+                self.apply_tearing(idx, solo, placements);
+
+                let commit = direct.commit.clone();
+                match self.outputs[idx]
+                    .surface
+                    .try_queue_direct(direct.primary, direct.overlays)
+                {
+                    Ok(true) => {
+                        debug!(
+                            output = %output_name,
+                            fenced,
+                            overlays = n_overlays,
+                            tearing = self.outputs[idx].surface.tearing(),
+                            "frame direct-scanned to hardware planes (no compositing)"
+                        );
+                        // This surface is on the plane, so its next commit's
+                        // fence can go to KMS instead of the event loop.
+                        self.direct_surfaces.insert(commit.0.clone());
+                        // The plane now holds this exact commit — the next
+                        // direct frame can describe its damage relative to it.
+                        self.outputs[idx].direct_damage_ref = Some(commit);
+                        self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
+                        self.outputs[idx].pending_direct = true;
+                        // Zero-copy presentation: the client's own buffer is on the
+                        // plane, so flag ZeroCopy. Fired on this flip's vblank. A
+                        // feedback still parked from a frame that never reached
+                        // its flip (mailbox replacement) must be DISCARDED, not
+                        // dropped — per wp_presentation every feedback resolves
+                        // exactly once, and a present-timing consumer (Vulkan
+                        // present timing rides these events) errors out waiting
+                        // on one that never fires.
+                        if let Some(out) = present_output {
+                            let replaced = self.outputs[idx].pending_feedback.replace(
+                                collect_presentation_feedback(
+                                    out, placements, layers, popups, out_rect, true,
+                                ),
+                            );
+                            if let Some(mut old) = replaced {
+                                debug!(output = %output_name, "wp_presentation: feedback discarded (flip replaced, direct scanout)");
+                                old.discarded();
+                            }
+                        }
+                        // Serve any screencopy from the buffer we just put on
+                        // the plane. This runs *after* the flip so a slow
+                        // capture consumer can never delay the game's frame.
+                        let results = match capture_src {
+                            Some((buffer, dmabuf, place)) => {
+                                // The scanout flip waits on the acquire fence
+                                // in hardware; a GL read does not, so make
+                                // sure the client has actually finished
+                                // drawing before we sample its buffer.
+                                if let Some(acquire) =
+                                    buffer.acquire_point().filter(|p| !p.is_signaled())
+                                    && let Err(err) =
+                                        acquire.wait(crate::wayland::acquire_wait_deadline())
+                                {
+                                    warn!(error = %err, "explicit sync: acquire wait failed before capture; frame may be torn");
+                                }
+                                self.capture_direct(idx, &dmabuf, place, captures)
+                            }
+                            None => Vec::new(),
+                        };
+                        // No transient state is active (eligibility required it),
+                        // so the output parks until the client's next commit.
+                        return Ok((results, false));
                     }
-                    // No transient state is active (eligibility required it),
-                    // so the output parks until the client's next commit.
-                    return Ok((Vec::new(), false));
+                    Ok(false) => {} // not scannable this frame → composite below
+                    Err(err) => {
+                        warn!(output = %output_name, error = %err, "direct scanout failed; compositing");
+                    }
                 }
-                Ok(false) => {} // not scannable this frame → composite below
-                Err(err) => {
-                    warn!(output = %output_name, error = %err, "direct scanout failed; compositing");
-                }
+            } else {
+                debug!(output = %output_name, "direct scanout rejected; compositing (capture needs a composed framebuffer)");
             }
         }
+        // Compositing from here on: the plane's contents are about to stop
+        // being a client buffer, so damage can no longer be described
+        // relative to one, and any fence we waved through the commit hook is
+        // now ours to wait on.
+        self.outputs[idx].direct_damage_ref = None;
+        self.settle_skipped_fences(placements);
 
         // The solo window, when its visually-topmost mapped node covers the
         // output *provably opaquely*: with every output pixel guaranteed
@@ -6339,8 +6850,8 @@ impl Renderer {
     /// Whether this output's frame is exactly one settled fullscreen
     /// window and nothing else — the scene precondition shared by direct
     /// scanout and the single-pass HDR fast path. Returns the covering
-    /// placement's index when: no captures, the cursor needs no
-    /// compositing (hidden / off-output / on the HW plane), no popup or
+    /// placement's index when: the cursor needs no compositing (hidden /
+    /// off-output / on the HW plane), no popup or
     /// layer-shell/session-lock surface overlaps this output, no
     /// transient overlay or window animation is running, and exactly one
     /// placement covers the output — `Fullscreen` fill, settled at 1:1
@@ -6362,9 +6873,8 @@ impl Renderer {
         layers: &[LayerPlacement],
         popups: &[PopupPlacement],
         hide_cursor: bool,
-        captures: &[CaptureSpec],
         compose_cursor: bool,
-    ) -> Option<usize> {
+    ) -> Option<SoloScene> {
         let output = &self.outputs[idx];
         let out_rect = Rectangle::new(output.compositor_position, output.compositor_size);
 
@@ -6385,35 +6895,54 @@ impl Renderer {
             }};
         }
 
-        // A capture must read a composited framebuffer; the cursor must not
-        // need drawing into this output's frame (hidden and off-output
-        // pointers need nothing; a plane-resident one scans out alongside).
-        if !captures.is_empty() {
-            veto!("pending capture");
-        }
+        // The cursor must not need drawing into this output's frame (hidden
+        // and off-output pointers need nothing; a plane-resident one scans
+        // out alongside). Note a *capture* is not disqualifying: a
+        // cursorless one reads back from whatever we present, and a
+        // cursor-inclusive one already forces `compose_cursor` here.
         if self.cursor_needs_composite(idx, hide_cursor, compose_cursor) {
             veto!("software cursor");
         }
-        // Anything that draws ABOVE a fullscreen window forces compositing:
-        // popups, and *Overlay* layer surfaces (which include the
-        // session-lock surface, injected as Overlay by render_crtc).
+        // Client content that draws ABOVE a fullscreen window: *Overlay*
+        // layer surfaces (which include the session-lock surface, injected
+        // as Overlay by render_crtc), then popups on top of those — the same
+        // order the composite path draws them in, which is the order the
+        // overlay planes have to be handed out in.
+        //
         // Top/Bottom/Background layers draw BELOW fullscreen windows — a
-        // fullscreen game covers the bar — so a mapped panel must not veto.
-        // And an Overlay only counts when it actually has a committed
-        // buffer: shells pre-create buffer-less popup slots that sit mapped
-        // over the whole session (quickshell parks ten such `qs-popup`
-        // Overlay surfaces at startup), and a buffer-less surface draws
-        // nothing.
-        if popups.iter().any(|pp| pp.rect.overlaps(out_rect)) {
-            veto!("popup overlaps");
-        }
-        if layers.iter().any(|l| {
-            matches!(l.layer, LayerBucket::Overlay)
+        // fullscreen game covers the bar — so a mapped panel is not "above"
+        // and never appears here. And an Overlay only counts when it actually
+        // has a committed buffer: shells pre-create buffer-less popup slots
+        // that sit mapped over the whole session (quickshell parks ten such
+        // `qs-popup` Overlay surfaces at startup), and a buffer-less surface
+        // draws nothing.
+        //
+        // None of this vetoes on its own any more. A little content above the
+        // window can ride overlay planes and leave the game on the primary
+        // one; the callers that need a *strictly* solo scene (the HDR
+        // single-pass path, the wallpaper skip) filter on `above.is_empty()`.
+        let mut above: Vec<OverlayCandidate> = Vec::new();
+        for l in layers {
+            if matches!(l.layer, LayerBucket::Overlay)
                 && l.rect.overlaps(out_rect)
                 && with_renderer_surface_state(&l.surface, |state| state.buffer().is_some())
                     .unwrap_or(false)
-        }) {
-            veto!("mapped overlay layer overlaps");
+            {
+                // A layer surface's `rect` *is* its buffer rect — layer shell
+                // has no window geometry to subtract.
+                above.push(OverlayCandidate {
+                    surface: l.surface.clone(),
+                    buffer_origin: l.rect.loc,
+                });
+            }
+        }
+        for pp in popups {
+            if pp.rect.overlaps(out_rect) {
+                above.push(OverlayCandidate {
+                    surface: pp.surface.clone(),
+                    buffer_origin: pp.buffer_origin,
+                });
+            }
         }
         // Transient overlays that draw ABOVE a fullscreen window →
         // composite. Scoped to this output where possible: a closing
@@ -6464,23 +6993,37 @@ impl Renderer {
         {
             veto!("window open/move animation running");
         }
-        Some(i)
+        Some(SoloScene { solo: i, above })
     }
 
-    /// Eligible only when the scene is a solo fullscreen window (see
+    /// Eligible only when the scene is a fullscreen window (see
     /// [`Self::solo_fullscreen_scene`], decided by the caller) whose colour
-    /// mode matches the output (HDR output ⇔ PQ surface), backed by a
-    /// single dmabuf buffer with no transform that is pixel-exact with the
-    /// mode.
+    /// mode matches the output (HDR output ⇔ PQ surface), backed by a single
+    /// dmabuf buffer that is pixel-exact with the mode — plus, optionally, a
+    /// little client content above it that fits on the overlay planes.
     fn direct_scanout_inputs(
         &self,
         idx: usize,
-        solo: Option<usize>,
+        scene: Option<&SoloScene>,
         placements: &[Placement],
         enc: &SurfaceEncodings,
     ) -> Option<DirectInputs> {
+        let scene = scene?;
+        let above = &scene.above;
         let output = &self.outputs[idx];
-        let p = placements.get(solo?)?;
+        let p = placements.get(scene.solo)?;
+
+        // More things above the window than there are planes to put them on:
+        // the composite path is the only way to draw them all.
+        if above.len() > output.surface.overlay_capacity() {
+            debug!(
+                output = %output.name,
+                above = above.len(),
+                planes = output.surface.overlay_capacity(),
+                "not enough overlay planes for the content above the window; compositing"
+            );
+            return None;
+        }
 
         // Every rejection names itself at debug so a session log can say
         // exactly why a fullscreen game isn't on the plane (the caller
@@ -6527,40 +7070,85 @@ impl Renderer {
         }
 
         // Extract a scanout-ready dmabuf + keep-alive from the node's
-        // committed buffer. Rejects shm buffers, transformed buffers,
-        // viewport-cropped buffers, buffers whose pixels don't match the
-        // mode 1:1, and buffers we can't prove are opaque.
-        let mode_size = output.mode_size;
+        // committed buffer. Rejects shm buffers, buffers whose pixels don't
+        // match the mode 1:1, and buffers we can't prove are opaque.
+        //
+        // Damage is only meaningful relative to the buffer currently ON the
+        // plane, so it needs the previous *direct* frame's commit — cleared
+        // whenever a composite frame intervenes.
+        let damage_ref = output.direct_damage_ref.clone();
+        let (primary, commit) =
+            self.scanout_layer_for(idx, &node, LayerTarget::Primary, damage_ref.as_ref())?;
+
+        // Content above the window, each onto its own overlay plane. All or
+        // nothing: one candidate the hardware can't take means the frame is
+        // composited whole, because a game with its notification silently
+        // missing is worse than a composited game.
+        let mut overlays = Vec::with_capacity(above.len());
+        for cand in above {
+            // One buffer per plane: a candidate with subsurfaces is a *tree*,
+            // and flattening it is exactly the compositing we're avoiding.
+            let Some(node) = single_node_surface(&cand.surface) else {
+                debug!(output = %output.name, "overlay candidate has subsurfaces; compositing");
+                return None;
+            };
+            let origin = self.output_local_point(idx, cand.buffer_origin);
+            let (layer, _) =
+                self.scanout_layer_for(idx, &node, LayerTarget::Overlay(origin), None)?;
+            overlays.push(layer);
+        }
+
+        Some(DirectInputs {
+            primary,
+            overlays,
+            commit,
+        })
+    }
+
+    /// Build the scanout layer for one surface node, or `None` when it can't
+    /// go on a plane (which sends the whole frame to the composite path).
+    ///
+    /// `damage_ref` is the commit this plane currently shows, if it is this
+    /// very surface; damage is only expressible relative to that.
+    fn scanout_layer_for(
+        &self,
+        idx: usize,
+        node: &WlSurface,
+        target: LayerTarget,
+        damage_ref: Option<&(ObjectId, CommitCounter)>,
+    ) -> Option<(ScanoutLayer, (ObjectId, CommitCounter))> {
+        let output = &self.outputs[idx];
         let name = &output.name;
-        with_renderer_surface_state(&node, |state| {
+        let mode_rect = Rectangle::from_size(output.mode_size);
+        let out_scale = output.scale;
+        let role = target.role();
+        let node_id = node.id();
+        let damage_ref = damage_ref.filter(|(id, _)| *id == node_id).cloned();
+        with_renderer_surface_state(node, |state| {
             macro_rules! reject {
                 ($reason:literal) => {{
-                    debug!(output = %name, reason = $reason, "direct scanout rejected; compositing");
+                    debug!(output = %name, ?role, reason = $reason, "direct scanout rejected; compositing");
                     return None;
                 }};
             }
-            // The buffer must land on the plane 1:1: no rotation and no crop
-            // (src covers the whole surface). The destination was already
-            // checked above against the OUTPUT size, not the buffer: a
-            // fractional-aware client (oversized buffer + viewport) and an
-            // Xwayland client under the client scale (physical-sized buffer
-            // that smithay shrinks logically) both have dst < buffer *by
-            // design* while their pixels still match the mode exactly —
-            // `dmabuf.size == mode_size` below is the pixel-exactness gate.
-            // `buffer_scale` needs no check of its own — it's already folded
-            // into both src (surface-logical units) and dst.
-            if state.buffer_transform() != Transform::Normal {
-                reject!("buffer is transformed");
-            }
+            // The buffer's own transform rides the plane's `rotation`
+            // property rather than disqualifying the frame; `test_state`
+            // rejects it on hardware that can't rotate, which costs the one
+            // probe and falls back to compositing.
+            let transform = state.buffer_transform();
+            // For the primary layer the destination was already checked
+            // against the OUTPUT size, not the buffer: a fractional-aware
+            // client (oversized buffer + viewport) and an Xwayland client
+            // under the client scale (physical-sized buffer that smithay
+            // shrinks logically) both have dst < buffer *by design* while
+            // their pixels still match the mode exactly. `buffer_scale` needs
+            // no check of its own — it's already folded into both src and dst.
             let buf = state.buffer_size()?;
             let view = state.view()?;
-            let src_loc = view.src.loc.to_i32_round::<i32>();
-            if src_loc.x != 0
-                || src_loc.y != 0
-                || view.src.size.to_i32_round::<i32>() != buf
-            {
-                reject!("viewport crops the buffer");
-            }
+
+            let Some(dst) = layer_dst(target, view.dst, out_scale, mode_rect) else {
+                reject!("layer has no on-screen size, or hangs off the output edge");
+            };
 
             let buffer = state.buffer()?.clone();
             let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(&buffer) else {
@@ -6568,57 +7156,296 @@ impl Renderer {
             };
             let dmabuf = dmabuf.clone();
             let size = dmabuf.size();
-            if size.w != mode_size.w || size.h != mode_size.h {
+
+            // A crop is expressible as the plane's source rectangle, so a
+            // viewport no longer forces compositing. `view.src` is in
+            // surface-logical units; scale it into buffer pixels with the
+            // logical→buffer ratio the surface itself defines.
+            let (sx, sy) = (
+                f64::from(size.w) / f64::from(buf.w.max(1)),
+                f64::from(size.h) / f64::from(buf.h.max(1)),
+            );
+            let src = Rectangle::<f64, smithay::utils::Buffer>::new(
+                (view.src.loc.x * sx, view.src.loc.y * sy).into(),
+                (view.src.size.w * sx, view.src.size.h * sy).into(),
+            );
+            // It must lie inside the buffer.
+            if src.loc.x < 0.0
+                || src.loc.y < 0.0
+                || src.loc.x + src.size.w > f64::from(size.w) + 0.5
+                || src.loc.y + src.size.h > f64::from(size.h) + 0.5
+            {
+                reject!("source rectangle falls outside the buffer");
+            }
+            // Pixel-exactness gate for the primary layer: whatever
+            // sub-rectangle we show must be the mode's worth of pixels.
+            // Anything else would need the plane to scale, which primary
+            // planes generally can't. An overlay may scale — plenty of
+            // overlay planes can, and `test_state` refuses the ones that
+            // can't, at the cost of a single probe.
+            let src_px = src.size.to_i32_round::<i32>();
+            if role == LayerRole::Primary && (src_px.w != dst.size.w || src_px.h != dst.size.h) {
                 reject!("buffer pixels don't match the mode 1:1");
             }
 
-            // Provable opacity. The composite path blends an alpha buffer
-            // over what's beneath (wallpaper, or lower tree nodes); direct
-            // scanout ignores the alpha (the opaque sibling fourcc), so the
-            // two only agree when the surface is actually opaque. A no-alpha
-            // format is inherently opaque; an 8-bit alpha format must
-            // declare a full opaque region (a translucent fullscreen
-            // terminal must keep compositing); a [`vestigial_alpha`] HDR
-            // swapchain format is accepted as-is.
+            // Provable opacity, for the primary layer only. The composite
+            // path blends an alpha buffer over what's beneath (wallpaper, or
+            // lower tree nodes); on the primary plane there is nothing
+            // beneath, and we may drop the alpha channel entirely (the opaque
+            // sibling fourcc), so the two only agree when the surface really
+            // is opaque. A no-alpha format is inherently opaque; an 8-bit
+            // alpha format must declare a covering opaque region (a
+            // translucent fullscreen terminal must keep compositing); a
+            // [`vestigial_alpha`] HDR swapchain format is accepted as-is.
+            //
+            // An overlay is the opposite case: it is *supposed* to blend over
+            // the window below, and the plane does that in hardware.
             let code = dmabuf.format().code;
-            if has_alpha(code)
+            if role == LayerRole::Primary
+                && has_alpha(code)
                 && !vestigial_alpha(code)
                 && !opaque_region_covers(state.opaque_regions(), buf)
             {
                 reject!("alpha buffer without a covering opaque region");
             }
-            Some(DirectInputs { buffer, dmabuf })
+
+            // Damage, in buffer pixels, since the buffer currently on the
+            // plane. Only usable when the last flip put this same surface
+            // there — otherwise the screen holds something whose delta we
+            // can't describe, and the full plane is the only honest answer.
+            let commit = (node_id.clone(), state.current_commit());
+            let damage = damage_ref
+                .map(|(_, since)| {
+                    state
+                        .damage_since(Some(since))
+                        .iter()
+                        .map(|r| {
+                            Rectangle::<i32, Physical>::new(
+                                (r.loc.x, r.loc.y).into(),
+                                (r.size.w, r.size.h).into(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                // An empty clip array is invalid; "nothing changed" has to be
+                // spelled as a full-plane flip.
+                .filter(|d: &Vec<_>| !d.is_empty());
+
+            Some((
+                ScanoutLayer {
+                    buffer,
+                    dmabuf,
+                    place: DirectPlacement {
+                        src,
+                        dst,
+                        transform,
+                    },
+                    damage,
+                    acquire: None,
+                },
+                commit,
+            ))
         })
         .flatten()
     }
+
+    /// Convert an absolute compositor point into this output's physical
+    /// (mode) pixels — what a plane's destination rectangle is measured in.
+    fn output_local_point(&self, idx: usize, p: Point<i32, Physical>) -> Point<i32, Physical> {
+        let output = &self.outputs[idx];
+        let local = p - output.compositor_position;
+        let s = output.scale;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "output-sized pixel coordinates, well inside i32 after scaling"
+        )]
+        Point::from((
+            (f64::from(local.x) * s).round() as i32,
+            (f64::from(local.y) * s).round() as i32,
+        ))
+    }
 }
 
-/// Buffer to latch directly onto the primary plane (direct scanout). Produced
-/// by [`Renderer::direct_scanout_inputs`] and consumed by
-/// [`ScanoutSurface::try_queue_external`].
+/// Where a [`Renderer::scanout_layer_for`] layer should land.
+#[derive(Debug, Clone, Copy)]
+enum LayerTarget {
+    /// The primary plane: the whole mode, by construction.
+    Primary,
+    /// An overlay plane, with the buffer's `(0, 0)` at this output-local
+    /// physical point and the size taken from the surface itself.
+    Overlay(Point<i32, Physical>),
+}
+
+impl LayerTarget {
+    fn role(self) -> LayerRole {
+        match self {
+            LayerTarget::Primary => LayerRole::Primary,
+            LayerTarget::Overlay(_) => LayerRole::Overlay,
+        }
+    }
+}
+
+/// Where a layer lands on the CRTC, in physical pixels, or `None` when it
+/// can't go on a plane at all.
+///
+/// The primary layer is the whole mode by construction. An overlay sits at
+/// its buffer origin, sized by the surface's own destination size scaled into
+/// physical pixels, and must fit entirely on the output: a plane's
+/// destination is *clipped* to the CRTC, so content hanging off the edge
+/// would be cut rather than positioned, which only the composite path gets
+/// right.
+fn layer_dst(
+    target: LayerTarget,
+    view_dst: Size<i32, Logical>,
+    out_scale: f64,
+    mode_rect: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    let LayerTarget::Overlay(origin) = target else {
+        return Some(mode_rect);
+    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "surface sizes are display pixels; the product stays small"
+    )]
+    let size = Size::<i32, Physical>::from((
+        (f64::from(view_dst.w) * out_scale).round() as i32,
+        (f64::from(view_dst.h) * out_scale).round() as i32,
+    ));
+    let dst = Rectangle::new(origin, size);
+    (size.w > 0 && size.h > 0 && mode_rect.contains_rect(dst)).then_some(dst)
+}
+
+/// Which plane a layer is destined for. The two differ in what they must
+/// prove: the primary layer has nothing beneath it and must be opaque and
+/// unscaled, an overlay blends and may scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerRole {
+    Primary,
+    Overlay,
+}
+
+/// The surface itself, if its tree is exactly that one node — no subsurfaces.
+/// A multi-node tree needs compositing to flatten, which is the thing an
+/// overlay plane exists to avoid.
+fn single_node_surface(surface: &WlSurface) -> Option<WlSurface> {
+    let mut count = 0usize;
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, ()| TraversalAction::DoChildren(()),
+        |_, _, ()| count += 1,
+        |_, _, ()| true,
+    );
+    (count == 1).then(|| surface.clone())
+}
+
+/// The shape of a frame that *might* skip compositing: one fullscreen window
+/// covering the output, plus whatever little draws above it.
+struct SoloScene {
+    /// Index into `placements` of the covering fullscreen window.
+    solo: usize,
+    /// Client surfaces drawn above it, bottom-up. Empty is the pure case —
+    /// the game and nothing else. Non-empty means the frame can still avoid a
+    /// composite *if* every one of these fits on an overlay plane.
+    above: Vec<OverlayCandidate>,
+}
+
+/// A client surface drawn above the fullscreen window, and where.
+struct OverlayCandidate {
+    surface: WlSurface,
+    /// Where the surface *buffer*'s `(0, 0)` lands, in absolute compositor
+    /// coordinates.
+    ///
+    /// Deliberately not the visible rect. A popup's `rect` is its window
+    /// geometry, which for a client-decorated menu is smaller than the buffer
+    /// by however much shadow it draws around itself; feeding that to a plane
+    /// as the destination would squash the whole buffer into the menu's
+    /// frame. The composite path positions popups by `buffer_origin` for the
+    /// same reason.
+    buffer_origin: Point<i32, Physical>,
+}
+
+/// Buffers to latch directly onto the hardware planes (direct scanout).
+/// Produced by [`Renderer::direct_scanout_inputs`] and consumed by
+/// [`ScanoutSurface::try_queue_direct`].
 struct DirectInputs {
-    /// Keep-alive for the client buffer; holding it defers `wl_buffer.release`
-    /// until a later flip replaces this buffer on the plane.
-    buffer: ClientBuffer,
-    dmabuf: Dmabuf,
+    /// The fullscreen window, for the primary plane.
+    primary: ScanoutLayer,
+    /// Content for overlay planes above it, bottom-up.
+    overlays: Vec<ScanoutLayer>,
+    /// Identity of the primary layer's commit, so the *next* frame can ask
+    /// for damage relative to it (see [`OutputRender::direct_damage_ref`]).
+    commit: (ObjectId, CommitCounter),
 }
 
 /// Whether the surface's opaque regions cover the whole surface — i.e. it is
-/// provably fully opaque. (smithay auto-fills a full opaque region for no-alpha
-/// buffers; alpha buffers carry whatever region the client declared.) A single
-/// region covering the surface is the common case; partial-tiling regions
-/// conservatively read as "not provably opaque".
+/// provably fully opaque. (smithay auto-fills a full opaque region for
+/// no-alpha buffers; alpha buffers carry whatever region the client
+/// declared.)
+///
+/// A single region covering the surface is the common case and is answered by
+/// inspection. Toolkits that declare a *tiled* opaque region — several rects
+/// that only together cover the surface — used to read as "not provably
+/// opaque" and could never scan out, so a union test backs the fast path up:
+/// sweep the rows the rect edges cut the surface into and require every band
+/// to be spanned edge to edge.
 fn opaque_region_covers(
     regions: Option<&[Rectangle<i32, Logical>]>,
     size: Size<i32, Logical>,
 ) -> bool {
-    regions.is_some_and(|rs| {
-        rs.iter().any(|r| {
-            r.loc.x <= 0
-                && r.loc.y <= 0
-                && r.loc.x + r.size.w >= size.w
-                && r.loc.y + r.size.h >= size.h
-        })
+    let Some(rs) = regions else { return false };
+    if size.w <= 0 || size.h <= 0 {
+        return false;
+    }
+    let covers_all = |r: &Rectangle<i32, Logical>| {
+        r.loc.x <= 0 && r.loc.y <= 0 && r.loc.x + r.size.w >= size.w && r.loc.y + r.size.h >= size.h
+    };
+    if rs.iter().any(covers_all) {
+        return true;
+    }
+    // More than a handful of rects and the sweep costs more than the frame it
+    // might save; a client declaring its opacity in that many pieces is not
+    // the fullscreen game this fast path exists for.
+    if rs.len() < 2 || rs.len() > 16 {
+        return false;
+    }
+
+    // Horizontal bands, cut at every rect's top and bottom edge (clamped to
+    // the surface). Within a band no rect starts or stops, so a band is
+    // covered iff the rects spanning it tile [0, size.w] with no gap.
+    let mut edges: Vec<i32> = Vec::with_capacity(rs.len() * 2 + 2);
+    edges.push(0);
+    edges.push(size.h);
+    for r in rs {
+        for y in [r.loc.y, r.loc.y + r.size.h] {
+            if y > 0 && y < size.h {
+                edges.push(y);
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+
+    edges.windows(2).all(|band| {
+        let (top, bottom) = (band[0], band[1]);
+        // Rects covering this whole band, by left edge.
+        let mut spans: Vec<(i32, i32)> = rs
+            .iter()
+            .filter(|r| r.loc.y <= top && r.loc.y + r.size.h >= bottom)
+            .map(|r| (r.loc.x, r.loc.x + r.size.w))
+            .collect();
+        spans.sort_unstable();
+        let mut reached = 0;
+        for (start, end) in spans {
+            if start > reached {
+                return false; // gap
+            }
+            reached = reached.max(end);
+            if reached >= size.w {
+                return true;
+            }
+        }
+        reached >= size.w
     })
 }
 
@@ -6826,6 +7653,39 @@ fn capture_shm(
             CaptureOutcome::Failed
         }
     }
+}
+
+/// Draw `src` of `tex` into `dst` of the bound `target`, opaquely and with no
+/// shader of its own — the one-pass copy the direct-scanout capture path uses
+/// in place of compositing the scene.
+fn blit_texture(
+    gles: &mut GlesRenderer,
+    target: &mut GlesTarget<'_>,
+    tex: &GlesTexture,
+    src: Rectangle<f64, smithay::utils::Buffer>,
+    dst: Rectangle<i32, Physical>,
+) -> Result<()> {
+    let mut frame = gles
+        .render(target, dst.size, Transform::Normal)
+        .context("capture blit: begin frame")?;
+    frame
+        .render_texture_from_to(
+            tex,
+            src,
+            dst,
+            &[dst],
+            &[dst],
+            Transform::Normal,
+            1.0,
+            None,
+            &[],
+        )
+        .context("capture blit: draw")?;
+    // Same-context sequential GL: the read-back (or the client's own use of
+    // the dmabuf, ordered by its implicit fence) follows this draw, so the
+    // returned sync point needn't be awaited — matching `capture_dmabuf`.
+    let _ = frame.finish().context("capture blit: finish")?;
+    Ok(())
 }
 
 /// Zero-copy GPU path: bind the client's dmabuf as a framebuffer and

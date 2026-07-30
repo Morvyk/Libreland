@@ -110,9 +110,16 @@ impl Buffer {
         }
     }
 
+    // Libreland: made public (was `pub(crate)`).
+    /// This buffer's explicit-sync acquire point, if the client attached one
+    /// via `wp_linux_drm_syncobj_v1`.
+    ///
+    /// The GPU work filling the buffer is complete once this point signals.
+    /// A compositor that does not gate the commit itself must wait on it —
+    /// or export it as a `sync_file` and hand it to KMS as `IN_FENCE_FD` —
+    /// before the buffer's contents may be read or scanned out.
     #[cfg(feature = "backend_drm")]
-    #[allow(dead_code)]
-    pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
+    pub fn acquire_point(&self) -> Option<&DrmSyncPoint> {
         self.inner.acquire_point.as_ref()
     }
 }
