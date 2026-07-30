@@ -1,0 +1,14 @@
+# Libreland's xdg-desktop-portal backend.
+#
+# Installed to /usr/share/xdg-desktop-portal/portals/libreland.portal. The
+# frontend daemon reads this to learn which interfaces we implement and which
+# desktops to use us in; the routing (which backend wins for which interface)
+# is in libreland-portals.conf.
+#
+# One backend covers what xdg-desktop-portal-wlr and xdg-desktop-portal-gtk
+# covered between them, plus GlobalShortcuts, which neither provided.
+
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.libreland
+Interfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.Account;org.freedesktop.impl.portal.AppChooser;org.freedesktop.impl.portal.Background;org.freedesktop.impl.portal.DynamicLauncher;org.freedesktop.impl.portal.Email;org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.GlobalShortcuts;org.freedesktop.impl.portal.Inhibit;org.freedesktop.impl.portal.Lockdown;org.freedesktop.impl.portal.Notification;org.freedesktop.impl.portal.Print;org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Settings;org.freedesktop.impl.portal.Wallpaper;
+UseIn=libreland

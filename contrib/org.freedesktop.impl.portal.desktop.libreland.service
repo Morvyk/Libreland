@@ -1,0 +1,16 @@
+# D-Bus activation for Libreland's portal backend.
+#
+# Installed to /usr/share/dbus-1/services/. The portal frontend starts us on
+# demand — nothing autostarts the backend, and nothing needs to.
+#
+# `SystemdService=` hands the activation to systemd instead of letting
+# dbus-daemon fork the binary directly. That's what every working backend
+# does, and it's what gets us the graphical session's environment
+# (WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP, LIBRELAND_SOCKET — the compositor
+# pushes these into the activation environment at startup) plus a restart if
+# we ever die. See libreland-xdg-desktop-portal.service.
+
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.libreland
+Exec=/usr/bin/libreland-xdg-desktop-portal
+SystemdService=libreland-xdg-desktop-portal.service

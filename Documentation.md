@@ -615,49 +615,178 @@ screenshot = {
 (Region capture currently resolves to the single output the drag starts
 on; cross-monitor region grabs are a follow-up.)
 
-## Screen capture & desktop portals
+## Screen capture & the desktop portal
 
-Libreland implements `zwlr_screencopy_v1`, so external capture also works
-— e.g. `grim` (whole screen) or, for sharing, the portal below.
+Libreland implements `zwlr_screencopy_v1`, so external capture works out of
+the box — `grim` for a still, anything speaking screencopy for a stream.
 
-For app-facing functionality — screen **sharing** (OBS, Discord,
-browsers), **file dialogs**, dark-mode/appearance **settings** — install
-`xdg-desktop-portal` plus the wlroots and a generic backend, and route
-them with a portals config:
+Everything app-facing — screen **sharing**, **file dialogs**, dark-mode
+**settings**, **notifications**, **global shortcuts** — goes through the
+desktop portal, and Libreland ships **its own backend** for it:
+`libreland-xdg-desktop-portal` (the `portal` workspace member). One binary
+covers what `xdg-desktop-portal-wlr` and `xdg-desktop-portal-gtk` covered
+between them, so there is no backend routing to configure, no GTK stack to
+install, and no second theme engine deciding what your file dialog looks
+like.
 
-1. Install `xdg-desktop-portal`, `xdg-desktop-portal-wlr`, and
-   `xdg-desktop-portal-gtk` (or `-kde` to match `QT_QPA_PLATFORMTHEME`).
-2. Route the portal backends: copy
-   [`contrib/libreland-portals.conf`](contrib/libreland-portals.conf)
-   to `~/.config/xdg-desktop-portal/libreland-portals.conf`. That routes
-   `ScreenCast` + `Screenshot` to `xdg-desktop-portal-wlr` (which uses
-   Libreland's screencopy) and everything else to the generic backend.
+You still need **`xdg-desktop-portal`** itself: that's the frontend daemon
+apps actually call, and it owns the document store and permission checks.
+It's part of the portal architecture, not a desktop choice. Screen sharing
+also needs **`pipewire`**, because a screencast *is* a PipeWire node id.
+Both are hard dependencies of the package.
 
-   Libreland already sets `XDG_CURRENT_DESKTOP=libreland` (see
-   [env defaults](#env)) and exports it to the D-Bus activation
-   environment, so this config is selected automatically — no manual
-   env needed.
-3. Pick which monitor to share via the portal's **output chooser**.
-   Libreland ships its own: `libreland-output-picker` (the `output-picker`
-   workspace member) — a `wlr-layer-shell` overlay that dims every monitor,
-   highlights + labels the one under the cursor, and prints its connector
-   name on click (Esc cancels). Install it and point xdpw at it:
+### What it implements
 
-       cargo install --path output-picker     # -> ~/.cargo/bin/libreland-output-picker
+| Interface | What it does here |
+| --- | --- |
+| `ScreenCast` | Screen sharing. Pick a monitor from a built-in overlay, capture via `zwlr_screencopy_v1` into a **dmabuf** (zero-copy, gbm-allocated) or shared memory, feed a PipeWire node. We drive the graph, pacing captures to the framerate the consumer negotiated. Cursor composited in or left out, per the `[screencast] cursor` setting; source choices persist when the app asks them to. |
+| `Screenshot` | Whole desktop (multi-monitor captures are stitched by layout) or interactive: drag a region over a **frozen** capture, or click a monitor for all of it. Saves a PNG under `~/Pictures/Screenshots`. |
+| `Screenshot.PickColor` | Magnifier overlay over the frozen desktop; click a pixel. |
+| `FileChooser` | Open / open-multiple / select-folder / save, with places sidebar, breadcrumbs, filters, sorting, type-to-search, hidden-file toggle, and the app's `choices` combos. |
+| `AppChooser` | "Open with…", over the frontend's suggestions plus a search across every installed `.desktop`. |
+| `Settings` | `color-scheme`, `accent-color`, `contrast` (and the `org.gnome.desktop.interface` mirrors), from a watched keyfile — see [Appearance](#portal-appearance). |
+| `Notification` | Forwarded to whatever notification daemon you run, with actions routed back. |
+| `GlobalShortcuts` | Shortcuts that work while the app is unfocused — see below. |
+| `Inhibit` | Idle/sleep/shutdown inhibition, held as a logind inhibitor for the life of the request. |
+| `Print` | Choose a CUPS queue (or "Save as PDF") and submit with `lp`. No page-setup UI — apps that need one ship their own. |
+| `Access`, `Account`, `Email`, `Background`, `Wallpaper`, `DynamicLauncher`, `Lockdown` | Permission prompts, user info, `mailto:` handoff, autostart entries, wallpaper changes, launcher install consent, and the administrative lockdown switches. |
 
-   then copy [`contrib/xdg-desktop-portal-wlr.config`](contrib/xdg-desktop-portal-wlr.config)
-   to `~/.config/xdg-desktop-portal-wlr/config` (its `chooser_cmd` is the
-   picker; use an absolute path if `~/.cargo/bin` isn't on the portal's
-   `PATH`). It replaces `slurp`, which crashes here: slurp 1.5.0 has an
-   unguarded NULL deref in its `wl_pointer.motion` handler (no released
-   fix). A text menu also works (`chooser_type=dmenu` + `chooser_cmd=fuzzel
-   --dmenu`) if you prefer picking a name from a list.
+`RemoteDesktop` (remote input injection) is deliberately absent: it needs
+virtual pointer/keyboard protocols the compositor doesn't implement, and a
+backend that advertises it and then does nothing is worse than one that
+doesn't claim it.
 
-`xdg-desktop-portal-wlr` drives screen sharing off the same screencopy
-implementation, so OBS / Discord / browser screen-share work once the
-above is in place. Global shortcuts (the `GlobalShortcuts` portal) are
-not yet provided — no off-the-shelf backend covers them for us, so they
-need a dedicated Libreland backend (planned).
+The dialogs are drawn by the portal itself — `wl_shm` surfaces, glyphs
+rasterized from a TTF found by walking the XDG font dirs. No toolkit, no
+fontconfig, no icon theme lookup. They follow the same `color-scheme` the
+portal reports to apps, so the desktop's chrome and its apps agree about
+dark mode.
+
+### Setup
+
+The package installs all five pieces — miss one and the symptom is usually
+silent (a screen-share button that does nothing):
+
+| File | Why |
+| --- | --- |
+| `/usr/bin/libreland-xdg-desktop-portal` | the backend |
+| `/usr/share/xdg-desktop-portal/portals/libreland.portal` | tells the frontend which interfaces we implement. **Must be in a system data dir** — the frontend does not search `$XDG_DATA_HOME` |
+| `/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.libreland.service` | D-Bus activation, delegating to the unit below |
+| `/usr/lib/systemd/user/libreland-xdg-desktop-portal.service` | so activation runs under systemd with the session's environment, and restarts on failure |
+| `…/xdg-desktop-portal.service.wants/libreland-xdg-desktop-portal.service` | a symlink that pre-enables the unit, so the backend starts *before* the frontend |
+| `/usr/share/xdg-desktop-portal/libreland-portals.conf` | makes us the preferred backend for this desktop |
+
+That last symlink is load-bearing, not tidiness. The frontend reads each
+backend's capabilities (`AvailableSourceTypes` and friends) when it builds
+its portal objects; a backend that isn't running yet reads as supporting
+nothing, and the app then sees a portal that exists but can do nothing —
+a screen-share button that goes nowhere. Shipping the `.wants` link is how
+a package enables a user unit, since it can't run `systemctl --user enable`
+at install time.
+
+Building by hand instead:
+
+```sh
+cargo build --release --workspace
+sudo install -Dm755 target/release/libreland-xdg-desktop-portal /usr/bin/libreland-xdg-desktop-portal
+sudo install -Dm644 contrib/libreland.portal /usr/share/xdg-desktop-portal/portals/libreland.portal
+sudo install -Dm644 contrib/org.freedesktop.impl.portal.desktop.libreland.service \
+    /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.libreland.service
+sudo install -Dm644 contrib/libreland-xdg-desktop-portal.service \
+    /usr/lib/systemd/user/libreland-xdg-desktop-portal.service
+sudo install -Dm644 contrib/libreland-portals.conf \
+    /usr/share/xdg-desktop-portal/libreland-portals.conf
+systemctl --user daemon-reload
+systemctl --user enable --now libreland-xdg-desktop-portal.service
+systemctl --user restart xdg-desktop-portal
+```
+
+**Do not uninstall `xdg-desktop-portal` itself.** It is the frontend every
+app actually calls (`org.freedesktop.portal.Desktop`); this backend sits
+behind it and is unreachable without it. The two packages to remove are
+`xdg-desktop-portal-wlr` and `xdg-desktop-portal-gtk`. The package depends
+on the frontend so pacman won't let it go by accident.
+
+If you're coming from the old two-backend setup, remove
+`xdg-desktop-portal-wlr` and `xdg-desktop-portal-gtk` and restart the
+frontend — a leftover backend can still win an interface it also claims.
+
+To hand one interface back to another backend, name it in
+`libreland-portals.conf`:
+
+```ini
+[preferred]
+default=libreland
+org.freedesktop.impl.portal.Print=gtk
+```
+
+<a id="portal-appearance"></a>
+### Appearance, lockdown, and the portal keyfile
+
+Both come from `~/.config/libreland/portal.conf`, watched with inotify —
+edit it and running apps restyle immediately:
+
+```ini
+[org.freedesktop.appearance]
+color-scheme = dark        ; dark | light | default
+accent-color = #4a9eff
+contrast = normal          ; normal | high
+
+[org.gnome.desktop.interface]
+gtk-theme = Adwaita-dark   ; anything here passes through verbatim
+
+[lockdown]
+disable-camera = true
+disable-printing = false
+```
+
+`color-scheme` defaults to `dark`. `[lockdown]` keys turn whole portals off
+for every app; the frontend enforces them before a request reaches any
+backend.
+
+One more section, for screen sharing:
+
+```ini
+[screencast]
+cursor = always            ; always | never | app (default)
+```
+
+`app` follows what the sharing app asks for, plus the picker's own toggle.
+The other two override it, and that override is the point: an app's
+`cursor_mode` is a guess made without asking anyone — Chromium picks
+"hidden" whenever it thinks the backend can't do better — and once an app
+persists its source choice (`persist_mode`), the picker stops appearing, so
+its toggle is no longer reachable. `always` is how you say "my pointer is
+part of what I'm sharing" once and be done.
+
+### Global shortcuts
+
+The `GlobalShortcuts` portal lets an app claim a key combination that fires
+while it isn't focused (push-to-talk, a recording toggle). Neither of the
+backends this replaces implemented it. It works here because the compositor
+grew a matching primitive: **binds registered over the control IPC**.
+
+```sh
+libreland msg binds        # configured binds *and* externally registered ones
+```
+
+An app asks the portal, the portal asks the compositor, and you approve the
+whole set in one dialog. Registered binds swallow their key (so it never
+also reaches the focused window), report both press and release, are
+namespaced per session, and disappear when the app does. Your own config
+binds always win a conflict — an app can't take a key you bound.
+
+### Wallpaper from the portal
+
+`SetWallpaperURI` asks the compositor to switch the wallpaper live, over the
+same IPC:
+
+```sh
+libreland msg set-wallpaper ~/Pictures/wall.png --mode fill
+```
+
+Live only: the running config is updated so it sticks, but a config reload
+puts your Lua file's wallpaper back. The portal never rewrites your config.
 
 ## Clipboard & selections
 
@@ -731,7 +860,7 @@ the full usage.
 | `windows`          | Every managed window: stable id, app-id, title, output, workspace, geometry, state flags, **pid**. |
 | `focused-window`   | The keyboard-focused window (alias `focused`).                                               |
 | `capture-window <id> [--max N]` | Render a window (any workspace/output) to a PNG thumbnail and print its path. `--max` caps the longest side (default 512). |
-| `binds`            | The configured keybindings.                                                                  |
+| `binds`            | Every keybinding in effect — the configured ones, plus any registered over IPC (shown as `external:<id>`), so you can see what has claimed a key. |
 | `cursor`           | The pointer position: global logical coordinates, the output under it, and output-local coordinates. |
 
 **Actions** — windows are addressed by the stable **id** from `windows`
@@ -748,8 +877,27 @@ the full usage.
 | `focus-workspace <N\|next\|prev> [--output NAME]` | Switch a workspace (the primary output unless `--output` is given). |
 | `move-to-workspace <N\|next\|prev> [id]`     | Move a window to a workspace and follow it.                          |
 | `spawn <cmd…>`                               | Run a program (everything after `spawn` is the argv).               |
+| `set-wallpaper <path> [--mode M]`            | Show an image/gif/video as the wallpaper now. `M` is `fill` (default), `fit`, `stretch` or `center`. Lives until the next config reload — the Lua file stays the source of truth. |
 | `reload`                                     | Re-read the config file now.                                        |
 | `exit`                                       | Quit the compositor.                                                |
+
+Two more requests exist on the wire without a CLI subcommand, because
+they're a program-to-program interface rather than something to type:
+`register-bind` / `unregister-bind`. They let a client claim a key
+combination that fires **no compositor action** — instead the press and
+release arrive on the event stream as `bind-activated`, and the key is
+swallowed so it never also reaches the focused window. This is what backs
+the desktop portal's `GlobalShortcuts`:
+
+```json
+{"cmd":"register-bind","id":"ptt","trigger":"SUPER+SHIFT+space","description":"Push to talk"}
+{"cmd":"unregister-bind","id":"ptt"}
+```
+
+`trigger` is modifier names (`SUPER`/`LOGO`, `CTRL`, `ALT`, `SHIFT`) joined
+to an xkb key name by `+`. The reply carries the compositor's normalized
+spelling. Configured binds win every conflict — a client can't take a key
+you bound yourself.
 
 `move-to-workspace` only acts on a window that's currently on a visible
 (active) workspace.
@@ -787,6 +935,7 @@ streamed; otherwise only the named ones.
 | `window-closed`      | A window unmaps. Payload: its id.                                                 |
 | `window-focused`     | Keyboard focus moves (and when the focused window's *title* changes). Payload: the window or null. |
 | `workspaces-changed` | A workspace is switched, added, removed, or its window count changes. Payload: the full workspace list. |
+| `bind-activated`     | A bind registered with `register-bind` was pressed or released. Payload: its `id` and `pressed`. |
 
 Raw event lines are internally tagged on an `event` field, e.g.
 `{"event":"window-focused","window":{…}}`. For a full window list, query

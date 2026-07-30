@@ -1,0 +1,37 @@
+# systemd user unit for Libreland's portal backend.
+#
+# Installed to /usr/lib/systemd/user/. The D-Bus service file names this unit
+# in its `SystemdService=` key, so activation goes through systemd rather than
+# having dbus-daemon fork the binary itself. That matters for two reasons: the
+# unit inherits the graphical session's environment (WAYLAND_DISPLAY,
+# LIBRELAND_SOCKET — which the compositor pushes into it at startup), and a
+# backend that dies gets restarted instead of leaving the desktop with no file
+# dialogs until the next login.
+#
+# `WantedBy=xdg-desktop-portal.service` makes the frontend pull us in *before*
+# it starts, once the unit is enabled:
+#
+#     systemctl --user enable libreland-xdg-desktop-portal.service
+#
+# That ordering is what keeps the frontend from caching an empty set of
+# capabilities: it reads each backend's properties (AvailableSourceTypes and
+# friends) when it builds its portal objects, and a backend that isn't up yet
+# reads as "supports nothing" — which looks exactly like a screen-share button
+# that does nothing.
+
+[Unit]
+Description=Portal service (Libreland implementation)
+PartOf=graphical-session.target
+After=graphical-session.target
+# No point starting outside a Wayland session: every interface here is either
+# a Wayland client (dialogs, capture) or talks to the compositor's IPC.
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.libreland
+ExecStart=/usr/bin/libreland-xdg-desktop-portal
+Restart=on-failure
+
+[Install]
+WantedBy=xdg-desktop-portal.service

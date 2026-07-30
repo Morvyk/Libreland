@@ -32,7 +32,8 @@ Most of the important Wayland protocols are supported:
 - **xdg-decoration** — server-side decorations (toolkits drop their CSD)
 - **xdg-activation** — focus/raise requests
 - **wp_cursor_shape** — themed named cursors
-- **wlr-screencopy** — screenshots & screen sharing (via xdg-desktop-portal)
+- **wlr-screencopy** — screenshots & screen sharing (drives the bundled
+  desktop portal)
 - **wlr-data-control** + **ext-data-control** — clipboard managers
 - **primary-selection** — middle-click paste
 - **ext-session-lock** — screen lockers
@@ -41,6 +42,20 @@ Most of the important Wayland protocols are supported:
 
 …plus the core globals. The full list with notes lives in
 [Documentation.md](Documentation.md#wayland-protocols).
+
+## Desktop integration
+
+Libreland ships **its own `xdg-desktop-portal` backend** — one binary
+covering what `xdg-desktop-portal-wlr` and `xdg-desktop-portal-gtk` covered
+between them, so screen sharing, file dialogs, dark mode, notifications and
+global shortcuts all work with nothing to configure and no GTK stack
+installed. Its dialogs are drawn by the portal itself: no toolkit, no
+fontconfig, no second theme engine.
+
+It also brings the piece neither of those backends had: **global
+shortcuts**, backed by keybinds an app can register over the compositor's
+control socket. See
+[Screen capture & the desktop portal](Documentation.md#screen-capture--the-desktop-portal).
 
 ## Building
 

@@ -32,15 +32,25 @@ depends=(
     # polkitd + polkit-agent-helper-1, driven by the bundled polkit agent
     # (libreland-polkit-agent) for GUI privilege prompts / pkexec.
     'polkit'
+    # The portal frontend apps talk to. Libreland provides the *backend*
+    # (libreland-xdg-desktop-portal) behind it, replacing what
+    # xdg-desktop-portal-wlr and -gtk would otherwise both be needed for;
+    # the frontend itself is part of the portal architecture, not a
+    # desktop-specific dependency, so it stays.
+    'xdg-desktop-portal'
+    # libpipewire — the transport the ScreenCast portal is defined in terms
+    # of (an app connects to a PipeWire node id). It also carries the
+    # pipewire/spa headers the portal's bindings are generated against at
+    # build time, so it isn't listed separately under makedepends.
+    'libpipewire'
 )
 # `rust` provides cargo; the project's .cargo/config.toml links through mold.
 # clang (libclang) + pkgconf build the ffmpeg-sys bindings (bindgen +
 # pkg-config against the system ffmpeg).
 makedepends=('rust' 'mold' 'clang' 'pkgconf')
 optdepends=(
-    'xdg-desktop-portal: desktop integration frontend (file dialogs, screen sharing)'
-    'xdg-desktop-portal-wlr: screen sharing + screenshots via PipeWire'
-    'xdg-desktop-portal-gtk: file chooser / settings / notification backend'
+    'cups: printing through the portal (the Print backend shells out to lp)'
+    'ttf-dejavu: a UI font for the portal dialogs, if none is installed yet'
     'rofi: app launcher bound to Super+Space in the default config'
     'kitty: terminal bound to Super+Return in the default config'
 )
@@ -70,11 +80,11 @@ build() {
     # single source of truth, regardless of the host's makepkg.conf.
     unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
     # The `release` profile already does fat LTO + symbol stripping; build
-    # the whole workspace (compositor + output picker). --locked uses the
-    # committed Cargo.lock so the package is reproducible. --workspace is
-    # load-bearing: this workspace has a root package, so a bare `cargo
-    # build` compiles only the compositor and package() then fails to
-    # find the output-picker binary.
+    # the whole workspace (compositor, output picker, polkit agent, desktop
+    # portal). --locked uses the committed Cargo.lock so the package is
+    # reproducible. --workspace is load-bearing: this workspace has a root
+    # package, so a bare `cargo build` compiles only the compositor and
+    # package() then fails to find the sibling binaries.
     cargo build --release --locked --workspace
 }
 
@@ -84,6 +94,9 @@ package() {
     # Binaries.
     install -Dm755 "$root/target/release/libreland" \
         "$pkgdir/usr/bin/libreland"
+    # Standalone monitor chooser. The portal has its own built in, so this
+    # is now a general-purpose tool: it prints the clicked output's name,
+    # which scripts (and other compositors' portal backends) can consume.
     install -Dm755 "$root/target/release/libreland-output-picker" \
         "$pkgdir/usr/bin/libreland-output-picker"
     # PolicyKit authentication agent: registers with polkitd and drives the
@@ -98,19 +111,46 @@ package() {
     install -Dm644 "$root/contrib/libreland.desktop" \
         "$pkgdir/usr/share/wayland-sessions/libreland.desktop"
 
-    # Portal routing: xdg-desktop-portal selects this when
-    # XDG_CURRENT_DESKTOP=libreland (which the compositor sets). Screen
-    # capture/share goes to the wlr backend (Libreland's own screencopy),
-    # everything else to the generic backend.
+    # ── Desktop portal ────────────────────────────────────────────────
+    # Three pieces, all required for the backend to be reachable:
+    #
+    #  1. the backend binary itself,
+    #  2. the .portal file, which tells the frontend which interfaces we
+    #     implement and that we're for XDG_CURRENT_DESKTOP=libreland,
+    #  3. the D-Bus service file plus the systemd user unit it activates
+    #     through, so the frontend can start us on demand with the session's
+    #     environment.
+    #
+    # Plus the routing config, which makes us the preferred backend for the
+    # libreland session. Without any one of these, apps silently fall back
+    # to whatever other backend is installed — or to nothing.
+    install -Dm755 "$root/target/release/libreland-xdg-desktop-portal" \
+        "$pkgdir/usr/bin/libreland-xdg-desktop-portal"
+    install -Dm644 "$root/contrib/libreland.portal" \
+        "$pkgdir/usr/share/xdg-desktop-portal/portals/libreland.portal"
+    install -Dm644 "$root/contrib/org.freedesktop.impl.portal.desktop.libreland.service" \
+        "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.libreland.service"
+    # The systemd user unit the D-Bus file activates through. Enabling it
+    # (see the post-install message) orders the backend *before* the portal
+    # frontend, which is what stops the frontend caching "this backend
+    # supports nothing" when it starts first.
+    install -Dm644 "$root/contrib/libreland-xdg-desktop-portal.service" \
+        "$pkgdir/usr/lib/systemd/user/libreland-xdg-desktop-portal.service"
+    # Pre-enable the unit by shipping the `.wants` symlink the [Install]
+    # section would create. systemd reads these under /usr/lib as well as
+    # /etc, so the backend starts before the portal frontend with no
+    # `systemctl --user enable` from the user — and packages can't run that
+    # for them anyway (there's no user session at install time).
+    #
+    # The ordering is the whole point: the frontend reads each backend's
+    # capabilities when it builds its portal objects, and a backend that
+    # isn't up yet reads as supporting nothing — which is indistinguishable,
+    # from the app's side, from a screen-share button that does nothing.
+    install -dm755 "$pkgdir/usr/lib/systemd/user/xdg-desktop-portal.service.wants"
+    ln -sf ../libreland-xdg-desktop-portal.service \
+        "$pkgdir/usr/lib/systemd/user/xdg-desktop-portal.service.wants/libreland-xdg-desktop-portal.service"
     install -Dm644 "$root/contrib/libreland-portals.conf" \
         "$pkgdir/usr/share/xdg-desktop-portal/libreland-portals.conf"
-
-    # xdg-desktop-portal-wlr screencast chooser, scoped to Libreland
-    # sessions (xdpw reads /etc/xdg/xdg-desktop-portal-wlr/$XDG_CURRENT_DESKTOP),
-    # so it doesn't clobber another compositor's xdpw `config`. It points
-    # the chooser at the libreland-output-picker installed above.
-    install -Dm644 "$root/contrib/xdg-desktop-portal-wlr.config" \
-        "$pkgdir/etc/xdg/xdg-desktop-portal-wlr/libreland"
 
     # License + docs.
     install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
