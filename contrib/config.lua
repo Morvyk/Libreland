@@ -102,8 +102,23 @@ border = {
 -- `enabled = false` at the top level switches everything off. Each animation
 -- takes `duration` (ms), `curve`, and its own `enabled`.
 --
--- Curves: "linear", "ease-in", "ease-out", "ease-in-out", or four numbers for
--- a custom cubic bezier, e.g. curve = { 0.05, 0.9, 0.1, 1.0 }.
+-- Curves come in three forms:
+--
+--   "linear" / "ease-in" / "ease-out" / "ease-in-out" / "ease"
+--
+--   { x1, y1, x2, y2 }              -- a CSS cubic-bezier
+--       The x values must be in [0, 1]; the y values need not be. A y past 1
+--       overshoots and settles back, which is where a springy feel comes from.
+--
+--   { type = "spring", mass = 1, stiffness = 238, damping = 24 }
+--       A real damped spring. Overshoot falls out of the physics rather than
+--       being dialled in: the damping ratio (damping / 2*sqrt(stiffness*mass))
+--       decides it. Below 1 rings, 1 is the fastest approach without ringing,
+--       above 1 crawls in without ever passing the target. `dampening` is
+--       accepted as a spelling too. `duration` still sets how long it takes.
+--
+-- Overshoot on an *opacity* is clamped for you, so a spring or an overshooting
+-- bezier can safely drive a fade.
 animations = {
     enabled = true,
 
@@ -124,6 +139,12 @@ animations = {
     -- The border colour crossfading as focus moves, rather than switching in
     -- one frame.
     focus         = { duration = 150, curve = "ease-out"    },
+
+    -- For a springier, Hyprland-like feel, try a spring on window motion:
+    --   local easy = { type = "spring", mass = 1,
+    --                  stiffness = 238.1191, damping = 24.21279333 }
+    --   window_open = { duration = 410, curve = easy },
+    --   window_move = { duration = 480, curve = easy },
 
     workspace = {
         duration = 300,

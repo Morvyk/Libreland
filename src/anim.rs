@@ -30,7 +30,25 @@ pub enum Curve {
     EaseInOut,
     /// Arbitrary cubic Bézier control points `(x1, y1, x2, y2)`.
     Bezier(f64, f64, f64, f64),
+    /// A damped harmonic oscillator — the physical spring a bezier can only
+    /// imitate. Overshoot falls out of the maths instead of being dialled in
+    /// by hand, and undershoot/settling look right because they *are* right.
+    ///
+    /// Only the damping ratio `ζ = damping / 2√(stiffness · mass)` affects
+    /// the shape: the response is run over its own settling time so the
+    /// animation's `duration` still says how long it takes. Two springs with
+    /// the same ζ are the same curve. That is why `mass` exists at all —
+    /// it moves ζ, and it lets numbers be copied verbatim from configs that
+    /// specify all three.
+    Spring {
+        mass: f64,
+        stiffness: f64,
+        damping: f64,
+    },
 }
+
+/// Control points of the straight line from `(0,0)` to `(1,1)`.
+const IDENTITY_POINTS: (f64, f64, f64, f64) = (0.0, 0.0, 1.0, 1.0);
 
 impl Curve {
     /// Resolve to the cubic-Bézier control points the named curves stand
@@ -38,7 +56,10 @@ impl Curve {
     /// [`Self::eval`]); we give it the identity points for completeness.
     fn control_points(self) -> (f64, f64, f64, f64) {
         match self {
-            Self::Linear => (0.0, 0.0, 1.0, 1.0),
+            // Neither of these has a Bézier form, and `eval` handles both
+            // before it reaches here — the identity keeps the match total
+            // for any future caller.
+            Self::Linear | Self::Spring { .. } => IDENTITY_POINTS,
             Self::EaseIn => (0.42, 0.0, 1.0, 1.0),
             Self::EaseOut => (0.0, 0.0, 0.58, 1.0),
             Self::EaseInOut => (0.42, 0.0, 0.58, 1.0),
@@ -48,16 +69,99 @@ impl Curve {
 
     /// Map linear progress `x` (clamped to `[0, 1]`) to the eased value.
     /// Endpoints are exact (`0 → 0`, `1 → 1`).
+    ///
+    /// The *output* is not confined to `[0, 1]`: a [`Curve::Bezier`] whose
+    /// `y` control points sit outside it overshoots and settles back, which
+    /// is how a window springs slightly past its target. Only the `x` points
+    /// are constrained (the config rejects others), because the curve must
+    /// stay monotonic in `x` to be solvable.
+    ///
+    /// Callers interpolating geometry want that overshoot. Callers driving an
+    /// *opacity* must clamp — see [`Animation::value`].
     pub fn eval(self, x: f64) -> f64 {
         let x = x.clamp(0.0, 1.0);
         if matches!(self, Self::Linear) {
             return x;
+        }
+        if let Self::Spring {
+            mass,
+            stiffness,
+            damping,
+        } = self
+        {
+            return spring_eval(x, mass, stiffness, damping);
         }
         let (x1, y1, x2, y2) = self.control_points();
         let t = bezier_t_for_x(x, x1, x2);
         cubic_bezier(t, y1, y2)
     }
 }
+
+/// Step response of a damped spring, normalised so `x ∈ [0, 1]` spans the
+/// time it takes to settle and `x = 1` lands exactly on the target.
+///
+/// The three regimes are the standard closed forms, in `τ = ω₀·t`:
+/// underdamped rings, critically damped is the fastest approach without
+/// ringing, overdamped crawls in. Only ζ selects between them.
+fn spring_eval(x: f64, mass: f64, stiffness: f64, damping: f64) -> f64 {
+    // A zero or negative mass/stiffness is a config that means nothing
+    // physical; clamp rather than produce NaN and paint garbage.
+    let m = mass.max(1e-6);
+    let k = stiffness.max(1e-6);
+    let zeta = (damping.max(0.0) / (2.0 * (k * m).sqrt())).min(SPRING_MAX_ZETA);
+
+    // How far to run it, in τ. The envelope decays as e^(-ζτ) when
+    // underdamped and as e^(-rτ) with the slower root when overdamped, so
+    // running until it is within `SPRING_SETTLE_TOL` covers both.
+    //
+    // The tolerance is tight on purpose. The textbook 2% criterion puts the
+    // end of the run *exactly on the first overshoot peak* for a typical
+    // ζ≈0.78 spring — and the endpoint correction below then cancels the
+    // overshoot completely, turning a spring into an ease. Settling to 0.1%
+    // instead leaves the peak at ~60% of the run, with the ring-down after
+    // it visible, which is the whole reason to use a spring.
+    let rate = if zeta < 1.0 {
+        zeta.max(SPRING_MIN_ZETA)
+    } else {
+        zeta - (zeta * zeta - 1.0).sqrt()
+    };
+    let settle = SPRING_SETTLE_TOL / rate.max(SPRING_MIN_ZETA);
+
+    let at = |tau: f64| -> f64 {
+        if (zeta - 1.0).abs() < 1e-6 {
+            // Critically damped: y = 1 - e^(-τ)(1 + τ).
+            return 1.0 - (-tau).exp() * (1.0 + tau);
+        }
+        if zeta < 1.0 {
+            // Underdamped: decaying oscillation about the target.
+            let wd = (1.0 - zeta * zeta).sqrt();
+            let env = (-zeta * tau).exp();
+            return 1.0 - env * ((wd * tau).cos() + (zeta / wd) * (wd * tau).sin());
+        }
+        // Overdamped: two real roots, no overshoot at all.
+        let s = (zeta * zeta - 1.0).sqrt();
+        let (r1, r2) = (-zeta + s, -zeta - s);
+        1.0 - (r2 * (r1 * tau).exp() - r1 * (r2 * tau).exp()) / (r2 - r1)
+    };
+
+    // Whatever the envelope still has left at `settle` is spread linearly
+    // across the run, so the endpoints are exact (0 → 0, 1 → 1) without
+    // rescaling — which would have flattened the overshoot that is the
+    // entire reason to use a spring.
+    let residual = 1.0 - at(settle);
+    at(x * settle) + residual * x
+}
+
+/// Time-constants to run a spring for, `ln(1/tol)` with `tol = 0.1%`. See
+/// the note in [`spring_eval`] for why this is not the textbook 2%.
+const SPRING_SETTLE_TOL: f64 = 6.907_755;
+
+/// Past this the spring is so overdamped it is indistinguishable from a slow
+/// ease, and the arithmetic starts losing precision.
+const SPRING_MAX_ZETA: f64 = 20.0;
+/// Below this the spring would ring for far longer than any sane animation,
+/// so the settling time is capped instead of running to infinity.
+const SPRING_MIN_ZETA: f64 = 0.05;
 
 /// One axis of a cubic Bézier with implicit endpoints 0 and 1:
 /// `B(t) = 3(1-t)²·t·p1 + 3(1-t)·t²·p2 + t³`.
@@ -138,9 +242,28 @@ impl Animation {
         ((now - self.start) / self.duration).clamp(0.0, 1.0)
     }
 
-    /// Eased value in `[0, 1]` for `now`.
+    /// Eased value for `now`.
+    ///
+    /// Usually in `[0, 1]`, but an overshoot curve deliberately exceeds it
+    /// near the end (see [`Curve::eval`]) — which is the point for position
+    /// and size, and out of range for anything feeding an alpha channel.
+    /// Use [`Self::alpha`] for those.
     pub fn value(&self, now: f64) -> f64 {
         self.curve.eval(self.progress(now))
+    }
+
+    /// [`Self::value`] clamped to `[0, 1]` and narrowed to `f32`, for use as
+    /// an opacity.
+    ///
+    /// An overshoot curve would otherwise hand the renderer an alpha above
+    /// `1.0` (a fade-in) or below `0.0` (a fade-out), which blends as a
+    /// bright flash rather than as the spring it was meant to be.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [0,1] first; f32 is exact enough for an opacity"
+    )]
+    pub fn alpha(&self, now: f64) -> f32 {
+        self.value(now).clamp(0.0, 1.0) as f32
     }
 
     /// Whether the animation has reached its end at `now`.
@@ -157,6 +280,95 @@ pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hyprland's `easy` spring, whose numbers people copy verbatim. The
+    /// textbook step response for its damping ratio (0.7845) overshoots by
+    /// 1.88%; ours must agree, or "copy the numbers from Hyprland" quietly
+    /// produces a different feel.
+    #[test]
+    fn the_reference_spring_overshoots_by_the_textbook_amount() {
+        let c = Curve::Spring {
+            mass: 1.0,
+            stiffness: 238.119_1,
+            damping: 24.212_793_33,
+        };
+        let peak = (0..=2000)
+            .map(|i| c.eval(f64::from(i) / 2000.0))
+            .fold(f64::MIN, f64::max);
+        assert!(
+            (peak - 1.0188).abs() < 0.004,
+            "expected ~1.88% overshoot, got {:.2}%",
+            (peak - 1.0) * 100.0
+        );
+    }
+
+    /// Every regime must start at 0, end exactly at 1, and stay finite.
+    /// The endpoint especially: a window that settles at 0.98 of its target
+    /// is a window in the wrong place.
+    #[test]
+    fn springs_are_well_behaved_in_all_three_regimes() {
+        let spring = |damping| Curve::Spring {
+            mass: 1.0,
+            stiffness: 100.0,
+            damping,
+        };
+        // zeta = damping / (2*sqrt(100)) = damping/20
+        for (name, c) in [
+            ("underdamped", spring(4.0)),   // zeta 0.2
+            ("critical", spring(20.0)),     // zeta 1.0
+            ("overdamped", spring(60.0)),   // zeta 3.0
+            ("undamped-ish", spring(0.0)),  // zeta 0, clamped internally
+            ("absurdly overdamped", spring(100_000.0)),
+        ] {
+            assert!((c.eval(0.0)).abs() < 1e-9, "{name}: must start at 0");
+            assert!((c.eval(1.0) - 1.0).abs() < 1e-9, "{name}: must land on 1");
+            for i in 0..=200 {
+                let v = c.eval(f64::from(i) / 200.0);
+                assert!(v.is_finite(), "{name}: non-finite at {i}");
+                assert!((-1.0..=3.0).contains(&v), "{name}: wild value {v} at {i}");
+            }
+        }
+    }
+
+    /// Overdamped springs approach without ever passing the target — that
+    /// is the defining property, and the thing you pick one for.
+    #[test]
+    fn an_overdamped_spring_never_overshoots() {
+        let c = Curve::Spring {
+            mass: 1.0,
+            stiffness: 100.0,
+            damping: 60.0,
+        };
+        for i in 0..=1000 {
+            let v = c.eval(f64::from(i) / 1000.0);
+            assert!(v <= 1.0 + 1e-9, "overshot to {v}");
+        }
+    }
+
+    /// The Hyprland-style springy feel is a bezier whose final y control
+    /// point sits above 1: the value rises past the target mid-flight and
+    /// settles back exactly onto it. Both halves matter — overshooting and
+    /// *landing*.
+    #[test]
+    fn an_overshoot_bezier_exceeds_one_then_lands() {
+        let c = Curve::Bezier(0.05, 0.9, 0.1, 1.05);
+        let peak = (0..=100)
+            .map(|i| c.eval(f64::from(i) / 100.0))
+            .fold(f64::MIN, f64::max);
+        assert!(peak > 1.0, "expected overshoot, peaked at {peak}");
+        assert!((c.eval(1.0) - 1.0).abs() < 1e-6, "must settle exactly on 1");
+    }
+
+    /// …and that overshoot must never reach an alpha channel.
+    #[test]
+    fn alpha_is_clamped_even_for_overshoot_curves() {
+        let a = Animation::start(0.0, 1.0, Curve::Bezier(0.05, 0.9, 0.1, 1.4));
+        for i in 0..=100 {
+            let t = f64::from(i) / 100.0;
+            let alpha = a.alpha(t);
+            assert!((0.0..=1.0).contains(&alpha), "alpha {alpha} at t={t}");
+        }
+    }
 
     #[test]
     fn endpoints_are_exact() {

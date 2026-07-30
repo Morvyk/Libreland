@@ -1397,10 +1397,24 @@ fn parse_opt_curve(t: &Table, key: &str) -> mlua::Result<Option<Curve>> {
     }
 }
 
-/// A curve is either a named string (`"ease-out"`, `_`/`-` interchangeable)
-/// or a `{x1, y1, x2, y2}` cubic-Bézier (CSS semantics; x's in `[0,1]`).
+/// A curve is a named string (`"ease-out"`, `_`/`-` interchangeable), a
+/// `{x1, y1, x2, y2}` cubic-Bézier (CSS semantics; x's in `[0,1]`), or a
+/// spring: `{ type = "spring", mass = 1, stiffness = 238, damping = 24 }`.
 fn parse_curve(v: &mlua::Value) -> mlua::Result<Curve> {
     if let Some(tbl) = v.as_table() {
+        // A spring is the only curve spelled with named keys, so `type` (or
+        // a bare `stiffness`) is what tells the two table forms apart.
+        let tagged = tbl.get::<Option<String>>("type")?;
+        if tagged.as_deref().map(str::to_lowercase).as_deref() == Some("spring")
+            || (tagged.is_none() && tbl.get::<Option<f64>>("stiffness")?.is_some())
+        {
+            return parse_spring(tbl);
+        }
+        if let Some(other) = tagged {
+            lua_bail!(
+                "unknown curve type {other:?}; the only tagged curve is {{ type = \"spring\", … }}"
+            );
+        }
         let pts: [f64; 4] = [tbl.get(1)?, tbl.get(2)?, tbl.get(3)?, tbl.get(4)?];
         if !(0.0..=1.0).contains(&pts[0]) || !(0.0..=1.0).contains(&pts[2]) {
             lua_bail!(
@@ -1428,6 +1442,34 @@ fn parse_curve(v: &mlua::Value) -> mlua::Result<Curve> {
         };
     }
     lua_bail!("animation curve must be a string or a {{x1,y1,x2,y2}} bezier table")
+}
+
+/// A spring curve. Defaults are Hyprland's `easy` — damping ratio 0.78, so
+/// it overshoots by under 2% — because a bare `{ type = "spring" }` should
+/// give something usable rather than an error.
+fn parse_spring(t: &Table) -> mlua::Result<Curve> {
+    let mass = t.get::<Option<f64>>("mass")?.unwrap_or(1.0);
+    let stiffness = t.get::<Option<f64>>("stiffness")?.unwrap_or(238.119_1);
+    // `dampening` is what Hyprland calls it, so numbers copied from a
+    // Hyprland config work verbatim.
+    let damping = match t.get::<Option<f64>>("damping")? {
+        Some(d) => d,
+        None => t.get::<Option<f64>>("dampening")?.unwrap_or(24.212_793_33),
+    };
+    if !(mass.is_finite() && stiffness.is_finite() && damping.is_finite()) {
+        lua_bail!("spring mass/stiffness/damping must be finite numbers");
+    }
+    if mass <= 0.0 || stiffness <= 0.0 {
+        lua_bail!("spring mass and stiffness must be positive; got mass={mass}, stiffness={stiffness}");
+    }
+    if damping < 0.0 {
+        lua_bail!("spring damping must be >= 0; got {damping}");
+    }
+    Ok(Curve::Spring {
+        mass,
+        stiffness,
+        damping,
+    })
 }
 
 fn parse_fill(t: &Table) -> mlua::Result<Fill> {

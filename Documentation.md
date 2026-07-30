@@ -537,10 +537,52 @@ which in turn default per the table.
 | `focus`        | `150ms`, `ease-out`      | ✅    | The border colour crossfading between the focused and unfocused fills as focus moves, rather than switching in one frame. |
 | `workspace`    | `300ms`, `ease-in-out`   | ✅    | Switching workspaces: the outgoing and incoming workspaces slide. Takes two extra keys — `direction` and `back` — described below. Switching again mid-slide *redirects* it rather than restarting. |
 
-A `curve` is either a **named** string — `"linear"`, `"ease-in"`,
-`"ease-out"`, `"ease-in-out"` (`_` and `-` are interchangeable, case
-insensitive) — or a **`{x1, y1, x2, y2}`** cubic-Bézier with CSS
-semantics (the `x` control points must be in `[0, 1]`).
+A `curve` takes one of three forms.
+
+**Named**: `"linear"`, `"ease"`, `"ease-in"`, `"ease-out"`, `"ease-in-out"`
+(`_` and `-` are interchangeable, case insensitive).
+
+**Cubic-Bézier**: `{x1, y1, x2, y2}`, CSS semantics. The `x` control points
+must be in `[0, 1]` — the curve has to stay monotonic in x to be solvable —
+but the `y` points need not be. A `y` past `1` **overshoots** and settles
+back, which is where a springy feel comes from:
+
+```lua
+window_move = { duration = 300, curve = { 0.05, 0.9, 0.1, 1.1 } }
+```
+
+**Spring**: `{ type = "spring", mass = …, stiffness = …, damping = … }`, a
+real damped harmonic oscillator. Overshoot falls out of the physics instead
+of being dialled in by hand, and the ring-down looks right because it *is*
+right. What decides the shape is the damping ratio:
+
+```
+ζ = damping / (2 · sqrt(stiffness · mass))
+```
+
+`ζ < 1` is underdamped and rings; `ζ = 1` is critical — the fastest approach
+that never passes the target; `ζ > 1` is overdamped and crawls in. Two springs
+with the same ζ are the same curve, which is why `mass` is a knob at all: it
+moves ζ, and it lets three-value springs be copied verbatim from other
+compositors. `dampening` is accepted as an alternative spelling for the same
+reason. Omitted values default to the spring below.
+
+`duration` still sets how long the animation takes: the response is run over
+its own settling time and normalised, so the physical constants choose the
+*shape* and `duration` the *speed*.
+
+```lua
+-- A gentle spring: ζ ≈ 0.78, so it overshoots by under 2% and settles.
+local easy = { type = "spring", mass = 1, stiffness = 238.1191, damping = 24.21279333 }
+animations = {
+    window_open = { duration = 410, curve = easy },
+    window_move = { duration = 480, curve = easy },
+}
+```
+
+Overshoot reaching an **opacity** is clamped, so a spring or an overshooting
+bézier can safely drive a fade without a bright flash at the peak. Geometry
+is left alone — overshooting a position is the point.
 
 ```lua
 animations = {

@@ -4527,12 +4527,10 @@ impl Renderer {
             let (mut effective, mut alpha) = (entry.displayed, 1.0_f32);
             if let Some(a) = entry.open_anim {
                 let v = a.value(now);
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "eased progress is in [0,1]; the f32 cast is exact enough for an opacity"
-                )]
-                let a32 = v as f32;
-                alpha = a32;
+                alpha = a.alpha(now);
+                // The scale *does* take the raw value: an overshoot curve
+                // popping a window a touch past full size and settling back
+                // is the whole point of using one.
                 effective = scale_rect_about_center(entry.displayed, lerp(OPEN_SCALE_FROM, 1.0, v));
                 if a.done(now) {
                     entry.open_anim = None;
@@ -5476,12 +5474,7 @@ impl Renderer {
                     let (mut alpha, mut offset) = (1.0_f32, Point::<i32, Physical>::from((0, 0)));
                     if let Some(a) = self.layer_anims.get(&id).copied() {
                         let v = a.value(now);
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            reason = "eased progress is in [0,1]; f32 is exact enough for an opacity"
-                        )]
-                        let v32 = v as f32;
-                        alpha = v32;
+                        alpha = a.alpha(now);
                         offset = LayerEdge::of(l.rect, out_rect).offset(v, l.rect.size);
                         if a.done(now) {
                             self.layer_anims.remove(&id);
@@ -5610,10 +5603,6 @@ impl Renderer {
         // shrinking copy of where the window last was. Cloned out
         // (textures are Arc-backed) so they outlive the renderer borrow
         // during the frame block below.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "eased progress in [0,1] casts to an f32 opacity exactly enough"
-        )]
         let closing_draws: Vec<(GlesTexture, Rectangle<i32, Physical>, f32)> = self
             .closing
             .iter()
@@ -5628,7 +5617,7 @@ impl Renderer {
                     return None;
                 }
                 let v = c.anim.value(now);
-                let alpha = (1.0 - v) as f32;
+                let alpha = 1.0 - c.anim.alpha(now);
                 let eff = scale_rect_about_center(c.rect, lerp(1.0, OPEN_SCALE_FROM, v));
                 let dest = Rectangle::<i32, Physical>::new(
                     Point::from((
@@ -5644,10 +5633,6 @@ impl Renderer {
         // Closing layer surfaces: the same idea, but sliding back toward the
         // edge they came from rather than shrinking about their centre — a
         // bar should look like it withdrew, not like it imploded.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "eased progress in [0,1] casts to an f32 opacity exactly enough"
-        )]
         let closing_layer_draws: Vec<(GlesTexture, Rectangle<i32, Physical>, f32)> = self
             .closing_layers
             .iter()
@@ -5666,7 +5651,7 @@ impl Renderer {
                     )),
                     Size::from((scale_i(c.rect.size.w, scale), scale_i(c.rect.size.h, scale))),
                 );
-                Some((c.texture.clone(), dest, (1.0 - v) as f32))
+                Some((c.texture.clone(), dest, 1.0 - c.anim.alpha(now)))
             })
             .collect();
 
