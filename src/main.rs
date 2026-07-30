@@ -2493,50 +2493,59 @@ impl State {
     /// choose) get the full output dimension in the unsized axis;
     /// non-anchored surfaces are centred on their output.
     pub(crate) fn snapshot_layer_placements(&self) -> Vec<render::LayerPlacement> {
+        self.layer_shell_state
+            .layer_surfaces()
+            .map(|l| self.layer_placement_of(l.wl_surface()))
+            .collect()
+    }
+
+    /// Where one layer surface sits and which band it draws in.
+    ///
+    /// Split out of [`Self::snapshot_layer_placements`] because the destroy
+    /// path needs it for a surface that is *no longer in the shell's list*:
+    /// smithay removes the entry before calling `layer_destroyed`, so looking
+    /// the surface back up there finds nothing. Only the `wl_surface` is
+    /// needed, and that outlives the callback.
+    pub(crate) fn layer_placement_of(&self, surface: &WlSurface) -> render::LayerPlacement {
         use smithay::wayland::shell::wlr_layer::{Anchor, Layer};
-        let mut out = Vec::new();
-        for layer_surface in self.layer_shell_state.layer_surfaces() {
-            let surface = layer_surface.wl_surface();
-            let area = self.layer_output_rect(surface);
-            let cached = crate::wayland::layer_cached_state(surface);
-            let anchor = cached.anchor;
-            // Size honours anchors/stretch/margins, shared with the
-            // `configure` we send the client so the two can't disagree.
-            let (width, height) = crate::wayland::layer_size(area, &cached);
-            // Position: pinned to an anchored edge (+ its margin), else
-            // centred. When stretched, LEFT/TOP is set so the surface
-            // starts at the margin and spans to the far margin.
-            let x = if anchor.contains(Anchor::LEFT) {
-                area.loc.x + cached.margin.left
-            } else if anchor.contains(Anchor::RIGHT) {
-                area.loc.x + area.size.w - width - cached.margin.right
-            } else {
-                area.loc.x + (area.size.w - width) / 2
-            };
-            let y = if anchor.contains(Anchor::TOP) {
-                area.loc.y + cached.margin.top
-            } else if anchor.contains(Anchor::BOTTOM) {
-                area.loc.y + area.size.h - height - cached.margin.bottom
-            } else {
-                area.loc.y + (area.size.h - height) / 2
-            };
-            let bucket = match cached.layer {
-                Layer::Background => render::LayerBucket::Background,
-                Layer::Bottom => render::LayerBucket::Bottom,
-                Layer::Top => render::LayerBucket::Top,
-                Layer::Overlay => render::LayerBucket::Overlay,
-            };
-            out.push(render::LayerPlacement {
-                surface: surface.clone(),
-                rect: smithay::utils::Rectangle::new(
-                    smithay::utils::Point::new(x, y),
-                    smithay::utils::Size::new(width, height),
-                ),
-                layer: bucket,
-                namespace: self.layer_namespaces.get(surface).cloned().unwrap_or_default(),
-            });
+        let area = self.layer_output_rect(surface);
+        let cached = crate::wayland::layer_cached_state(surface);
+        let anchor = cached.anchor;
+        // Size honours anchors/stretch/margins, shared with the
+        // `configure` we send the client so the two can't disagree.
+        let (width, height) = crate::wayland::layer_size(area, &cached);
+        // Position: pinned to an anchored edge (+ its margin), else
+        // centred. When stretched, LEFT/TOP is set so the surface
+        // starts at the margin and spans to the far margin.
+        let x = if anchor.contains(Anchor::LEFT) {
+            area.loc.x + cached.margin.left
+        } else if anchor.contains(Anchor::RIGHT) {
+            area.loc.x + area.size.w - width - cached.margin.right
+        } else {
+            area.loc.x + (area.size.w - width) / 2
+        };
+        let y = if anchor.contains(Anchor::TOP) {
+            area.loc.y + cached.margin.top
+        } else if anchor.contains(Anchor::BOTTOM) {
+            area.loc.y + area.size.h - height - cached.margin.bottom
+        } else {
+            area.loc.y + (area.size.h - height) / 2
+        };
+        let bucket = match cached.layer {
+            Layer::Background => render::LayerBucket::Background,
+            Layer::Bottom => render::LayerBucket::Bottom,
+            Layer::Top => render::LayerBucket::Top,
+            Layer::Overlay => render::LayerBucket::Overlay,
+        };
+        render::LayerPlacement {
+            surface: surface.clone(),
+            rect: smithay::utils::Rectangle::new(
+                smithay::utils::Point::new(x, y),
+                smithay::utils::Size::new(width, height),
+            ),
+            layer: bucket,
+            namespace: self.layer_namespaces.get(surface).cloned().unwrap_or_default(),
         }
-        out
     }
 
     /// Snapshot every live `xdg_popup` (menus, submenus, combo

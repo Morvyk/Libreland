@@ -2169,16 +2169,16 @@ impl WlrLayerShellHandler for State {
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: layer surface destroyed");
-        // Snapshot it before anything else: the surface is still alive here,
-        // so there is a last frame to capture and fade back out.
-        if let Some(rect) = self
-            .snapshot_layer_placements()
-            .iter()
-            .find(|l| &l.surface == surface.wl_surface())
-            .map(|l| l.rect)
-        {
-            self.renderer.mark_layer_closing(surface.wl_surface(), rect);
-        }
+        // Snapshot it before anything else: the wl_surface is still alive
+        // here (smithay resets its attributes *after* this callback), so
+        // there is a last frame to capture and fade back out.
+        //
+        // The rect is computed from the surface directly rather than looked
+        // up in `snapshot_layer_placements`: smithay removes the entry from
+        // its known-layers list before calling us, so the lookup found
+        // nothing and every close animation was silently skipped.
+        let rect = self.layer_placement_of(surface.wl_surface()).rect;
+        self.renderer.mark_layer_closing(surface.wl_surface(), rect);
         self.layer_outputs.remove(surface.wl_surface());
         self.layer_namespaces.remove(surface.wl_surface());
         self.mapped_layers.remove(surface.wl_surface());

@@ -4123,6 +4123,12 @@ impl Renderer {
             return;
         };
         let now = self.start.elapsed().as_secs_f64();
+        debug!(
+            surface = ?surface.id(),
+            edge = ?LayerEdge::of(rect, out_rect),
+            ?rect,
+            "layer close animation started"
+        );
         self.closing_layers.push(ClosingLayer {
             texture,
             rect,
@@ -5462,6 +5468,13 @@ impl Renderer {
                 .map(|l| {
                     let id = l.surface.id();
                     if self.pending_layer_open.remove(&id) && layer_open_on {
+                        debug!(
+                            surface = ?id,
+                            namespace = %l.namespace,
+                            edge = ?LayerEdge::of(l.rect, out_rect),
+                            ?l.rect,
+                            "layer open animation started"
+                        );
                         self.layer_anims.insert(
                             id.clone(),
                             Animation::start(
