@@ -5833,6 +5833,25 @@ impl Renderer {
                     self.wintex_cache.insert(p.surface.id(), cached);
                     continue;
                 }
+                // The tree committed, but it yields nothing to draw this
+                // frame. Re-rendering now would clear the offscreen to
+                // transparent and cache that blank, so the window vanishes
+                // from the composite *and* from the blur scene until it
+                // commits again -- which drops tier 2 to wallpaper alone and
+                // flips every frosted panel flat for a frame.
+                //
+                // Keep the old texture, and deliberately keep its old
+                // fingerprint too: the entry must still look stale so the
+                // next frame that does have elements re-renders it.
+                if elements.is_empty() && cached.fmt == fmt && cached.size == size {
+                    debug!(
+                        surface = ?p.surface.id(),
+                        "wintex: empty elements on a committed tree; keeping last offscreen"
+                    );
+                    win_tex.push(Some(cached.tex.clone()));
+                    self.wintex_cache.insert(p.surface.id(), cached);
+                    continue;
+                }
                 // Stale content: still reuse the allocation when it fits.
                 reusable = (cached.fmt == fmt && cached.size == size).then_some(cached.tex);
             }
