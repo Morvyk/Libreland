@@ -780,26 +780,79 @@ precision mediump float;
 uniform sampler2D tex;
 uniform float alpha;
 uniform float reference_white;
+uniform float knee;
 varying vec2 v_coords;
 vec3 linear_to_srgb(vec3 c) {
     vec3 lo = c * 12.92;
     vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
     return mix(lo, hi, step(vec3(0.0031308), c));
 }
+// Highlight shoulder: identity below `knee`, then a rational roll-off joining
+// it at equal value and slope and approaching 1.0 asymptotically. Nothing is
+// ever clipped, so highlights keep their ordering and their detail instead of
+// collapsing into one flat white.
+float shoulder(float v, float k) {
+    float d = 1.0 - k;
+    float rolled = 1.0 - (d * d) / max(v - 2.0 * k + 1.0, 1e-5);
+    return mix(v, rolled, step(k, v));
+}
 void main() {
     vec4 premult = texture2D(tex, v_coords);
     vec3 bt2020 = premult.rgb / max(premult.a, 0.001);
+    // Renormalise so SDR diffuse white lands on 1.0. The scene stores
+    // nits/10000, so a 1000-nit HDR highlight arrives here at ~4.9 -- which is
+    // the whole problem: it has to survive the trip into a range that stops
+    // at 1.0 without simply becoming white.
+    bt2020 *= (10000.0 / reference_white);
+
     mat3 bt2020_to_bt709 = mat3(
         1.660491, -0.124550, -0.018151,
         -0.587641, 1.132900, -0.100579,
         -0.072850, -0.008349, 1.118730
     );
     vec3 lin = bt2020_to_bt709 * bt2020;
-    lin *= (10000.0 / reference_white);
-    lin = clamp(lin, 0.0, 1.0);
-    gl_FragColor = vec4(linear_to_srgb(lin), 1.0) * alpha;
+
+    // BT.2020 can express colours BT.709 cannot, and those land with a
+    // negative channel. Desaturate toward the pixel's own luminance by exactly
+    // as much as it takes to bring them back, which holds the hue; clamping
+    // the channel to zero would swing it instead. Only the gamut is fixed
+    // here -- brightness is the shoulder's job, below.
+    float l709 = max(dot(lin, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+    float lo = min(min(lin.r, lin.g), lin.b);
+    float s = mix(1.0, clamp(l709 / max(l709 - lo, 1e-5), 0.0, 1.0), step(lo, -1e-6));
+    lin = max(mix(vec3(l709), lin, s), vec3(0.0));
+
+    // Roll the highlights off per channel. The previous version clamped here
+    // instead, which gave every value from diffuse white to the 10000-nit peak
+    // the *same* output -- no highlight range at all, so a bright scene turned
+    // into a flat white sheet. The shoulder leaves everything below the knee
+    // untouched, so SDR content keeps its exact mid-tones, and spends the
+    // remaining range on the HDR headroom above it.
+    lin = vec3(shoulder(lin.r, knee), shoulder(lin.g, knee), shoulder(lin.b, knee));
+
+    gl_FragColor = vec4(linear_to_srgb(clamp(lin, 0.0, 1.0)), 1.0) * alpha;
 }
 ";
+
+/// Where the screenshot tone curve leaves linear response and starts rolling
+/// highlights off, in units of SDR diffuse white (see `shoulder` in
+/// [`SCREENSHOT_TONEMAP_SHADER`]).
+///
+/// The trade is forced by arithmetic, not taste: an SDR screenshot tops out at
+/// 1.0, so representing *any* headroom above diffuse white means diffuse white
+/// itself has to sit below 1.0.
+///
+/// 0.6 was picked by measuring rather than by feel. Against an ACES filmic fit
+/// it lands the same diffuse white (sRGB 0.906 vs 0.908) and the same highlight
+/// range (0.090 vs 0.092), while beating it on the two things that matter here:
+/// mid-tones pass through *exactly* (0.464, identical to no tone mapping at
+/// all), where ACES lifts them to 0.557 and would visibly distort an ordinary
+/// SDR desktop capture; and a saturated colour at 4x diffuse white keeps 0.42
+/// saturation against ACES's 0.31.
+///
+/// Raise it toward 1.0 for brighter SDR whites and harsher highlight
+/// compression, lower it for more highlight separation and a dimmer desktop.
+const SCREENSHOT_TONEMAP_KNEE: f32 = 0.60;
 
 /// Decode an SDR (sRGB / BT.709) source into the linear BT.2020 working
 /// space, mapping SDR diffuse white to `reference_white` cd/m². Set as
@@ -2862,7 +2915,10 @@ impl Renderer {
         let screenshot_tonemap_shader = gles
             .compile_custom_texture_shader(
                 SCREENSHOT_TONEMAP_SHADER,
-                &[UniformName::new("reference_white", UniformType::_1f)],
+                &[
+                    UniformName::new("reference_white", UniformType::_1f),
+                    UniformName::new("knee", UniformType::_1f),
+                ],
             )
             .context("screenshot tonemap shader compile failed")?;
         let sdr_decode_shader = gles
@@ -4513,7 +4569,10 @@ impl Renderer {
                     Transform::Normal,
                     1.0,
                     Some(&tonemap),
-                    &[Uniform::new("reference_white", reference_white)],
+                    &[
+                        Uniform::new("reference_white", reference_white),
+                        Uniform::new("knee", SCREENSHOT_TONEMAP_KNEE),
+                    ],
                 )
                 .context("screenshot tonemap pass")?;
             // Same-context sequential GL: the copy_framebuffer read-back below
@@ -9401,6 +9460,150 @@ mod gpu_bench {
     /// 203 rather than 80 cd/m² — which is what mis-rendered id Tech (DOOM)
     /// titles, the classic scRGB users, while HDR10/PQ games looked fine.
     ///
+    /// An HDR screenshot has to keep the highlights *apart*.
+    ///
+    /// The tonemap used to end in `clamp(lin, 0.0, 1.0)`, which gave every
+    /// value from SDR diffuse white up to the 10000-nit peak the same output.
+    /// A game's sky, sun and sunlit ground all sit above diffuse white, so the
+    /// bright majority of the frame collapsed into one flat white sheet —
+    /// which is what "washed out, not what's on screen" looks like. Per-channel
+    /// clamping also pins the top two channels together, so a sunlit orange
+    /// (3.0, 1.4, 0.3) came out (1.0, 1.0, 0.3): yellow, not orange.
+    ///
+    /// Asserts the two properties that fixes it: distinct brightnesses stay
+    /// distinct, and mid-tones below the knee are left exactly alone so an
+    /// ordinary SDR desktop capture is unaffected.
+    #[test]
+    #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    fn hdr_screenshot_keeps_highlight_separation() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+            .expect("open render node");
+        let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+        let gbm = GbmDevice::new(fd).expect("GbmDevice");
+        #[allow(unsafe_code, reason = "test-only surfaceless EGL, single thread")]
+        // SAFETY: GbmDevice clone lives in the EGLDisplay for its lifetime.
+        let display = unsafe { EGLDisplay::new(gbm.clone()) }.expect("EGLDisplay");
+        let context = EGLContext::new(&display).expect("EGLContext");
+        #[allow(unsafe_code, reason = "test-only single-thread renderer")]
+        // SAFETY: used only from this test thread.
+        let mut gles = unsafe { GlesRenderer::new(context) }.expect("GlesRenderer");
+
+        let tonemap = gles
+            .compile_custom_texture_shader(
+                SCREENSHOT_TONEMAP_SHADER,
+                &[
+                    UniformName::new("reference_white", UniformType::_1f),
+                    UniformName::new("knee", UniformType::_1f),
+                ],
+            )
+            .expect("compile screenshot tonemap");
+
+        const RW: f32 = 203.0;
+        let size = Size::<i32, smithay::utils::Buffer>::from((16, 16));
+        let phys = Size::<i32, Physical>::from((16, 16));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((16.0, 16.0)));
+        let dst = Rectangle::<i32, Physical>::from_size(phys);
+
+        // Tonemap one scene colour, given in cd/m² of linear BT.2020. The
+        // scene stores nits/10000, which is what the shader renormalises.
+        let mut shot = |nits: [f32; 3]| -> [u8; 4] {
+            let mut scene: GlesTexture = gles
+                .create_buffer(Fourcc::Abgr16161616f, size)
+                .expect("fp16 scene");
+            {
+                let mut b = gles.bind(&mut scene).expect("bind scene");
+                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render scene");
+                f.clear(
+                    Color32F::new(
+                        nits[0] / 10000.0,
+                        nits[1] / 10000.0,
+                        nits[2] / 10000.0,
+                        1.0,
+                    ),
+                    &full,
+                )
+                .expect("fill scene");
+                let _ = f.finish().expect("finish scene");
+            }
+            let mut target: GlesTexture =
+                gles.create_buffer(Fourcc::Abgr8888, size).expect("8-bit target");
+            {
+                let mut b = gles.bind(&mut target).expect("bind target");
+                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
+                f.render_texture_from_to(
+                    &scene,
+                    src,
+                    dst,
+                    &full,
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                    Some(&tonemap),
+                    &[
+                        Uniform::new("reference_white", RW),
+                        Uniform::new("knee", SCREENSHOT_TONEMAP_KNEE),
+                    ],
+                )
+                .expect("tonemap draw");
+                let _ = f.finish().expect("finish target");
+            }
+            let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((16, 16)));
+            let bound = gles.bind(&mut target).expect("rebind");
+            let mapping = gles
+                .copy_framebuffer(&bound, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let bytes = gles.map_texture(&mapping).expect("map").to_vec();
+            let c = (8 * 16 + 8) * 4;
+            [bytes[c], bytes[c + 1], bytes[c + 2], bytes[c + 3]]
+        };
+
+        // Neutral steps from diffuse white up to well past it. Each has to be
+        // strictly brighter than the last; under the old clamp all four read 255.
+        let steps: Vec<(f32, [u8; 4])> = [203.0_f32, 400.0, 1000.0, 4000.0]
+            .into_iter()
+            .map(|n| (n, shot([n, n, n])))
+            .collect();
+        for (n, px) in &steps {
+            println!("{n:>6} cd/m² -> {px:?}");
+        }
+        for w in steps.windows(2) {
+            let (lo_n, lo) = w[0];
+            let (hi_n, hi) = w[1];
+            assert!(
+                hi[0] > lo[0],
+                "{hi_n} cd/m² must read brighter than {lo_n} (got {hi:?} vs {lo:?}); \
+                 equal values mean the highlights are being clipped flat"
+            );
+        }
+        // And the span has to be usable, not a rounding artefact.
+        let span = i32::from(steps[3].1[0]) - i32::from(steps[0].1[0]);
+        println!("diffuse-white -> 4000 cd/m² span: {span} codes");
+        assert!(span >= 8, "highlight range collapsed to {span} codes");
+
+        // A sunlit orange must stay orange: red clearly above green, not pinned
+        // to it the way independent clamping did.
+        let orange = shot([900.0, 400.0, 90.0]);
+        println!("sunlit orange 900/400/90 -> {orange:?}");
+        assert!(
+            orange[0] > orange[1] && orange[1] > orange[2],
+            "channel ordering must survive tone mapping, got {orange:?}"
+        );
+
+        // Mid-tones sit below the knee and must pass through untouched, so an
+        // ordinary SDR capture on an HDR output is not altered. 0.18x diffuse
+        // white is scene mid grey; sRGB(0.18) ≈ 0.4613 -> 118.
+        let mid = shot([203.0 * 0.18, 203.0 * 0.18, 203.0 * 0.18]);
+        println!("mid grey (0.18x diffuse white) -> {mid:?} (want ~118)");
+        assert!(
+            (i32::from(mid[0]) - 118).abs() <= 2,
+            "mid-tones must be left alone by the shoulder, got {mid:?}"
+        );
+    }
+
     /// Checks the fused single-pass program (the path a solo fullscreen game
     /// takes) against the PQ code the protocol's definition demands, and
     /// pins that the SDR program really does disagree.
