@@ -1,51 +1,39 @@
 # pacman scriptlet for the libreland-git package.
+#
+# NOTE ON FILE CONFLICTS. There used to be a pre_install/pre_upgrade hook here
+# that deleted unowned copies of the files this package installs, so that a
+# hand-placed config wouldn't abort the transaction. It cannot work, and never
+# could: pacman detects file conflicts while preparing the transaction, which
+# is *before* any scriptlet of the packages in it runs. By the time pre_install
+# would fire, pacman has already refused with
+#
+#     error: failed to commit transaction (conflicting files)
+#
+# So the hook is gone rather than left as a comforting lie. If you hand-copied
+# the portal files (see the manual install in Documentation.md) and now hit
+# that error, delete the paths it names and install again — or, if you are sure
+# they are yours to lose, `pacman -U --overwrite '/usr/share/xdg-desktop-portal/*'`
+# and friends. Nothing a package installs can decide that for you.
 
-# Files this package now owns. If a copy already exists at any of these
-# paths and is NOT owned by a package (e.g. you hand-placed the contrib
-# configs earlier), remove it before extraction so pacman doesn't abort
-# with a "exists in filesystem" conflict — the package's version wins.
-_libreland_managed=(
-    usr/share/xdg-desktop-portal/libreland-portals.conf
-    usr/share/xdg-desktop-portal/portals/libreland.portal
-    usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.libreland.service
-    usr/lib/systemd/user/libreland-xdg-desktop-portal.service
-    usr/share/wayland-sessions/libreland.desktop
-)
-
-# Left behind by versions before Libreland had its own portal backend: the
-# chooser config for xdg-desktop-portal-wlr, which is no longer used (the
-# monitor picker is built into the backend). Harmless if it stays, but it
-# would keep pointing a now-optional package at us.
+# An obsolete file we used to ship: the chooser config for
+# xdg-desktop-portal-wlr, which is no longer used at all (the monitor picker
+# is built into our own portal backend now). Removing it after an upgrade is
+# safe — this runs once the new files are in place — and unlike the conflict
+# case above, it is a file *we* own, so it is ours to clean up.
 _libreland_stale=(
     etc/xdg/xdg-desktop-portal-wlr/libreland
 )
 
-_libreland_clear_unowned() {
-    local f
-    for f in "${_libreland_managed[@]}"; do
-        if [ -e "/$f" ] && ! pacman -Qqo "/$f" >/dev/null 2>&1; then
-            rm -f "/$f"
-        fi
-    done
-}
-
 _libreland_clear_stale() {
     local f
     for f in "${_libreland_stale[@]}"; do
-        # Only remove one we installed ourselves; a hand-written config is
-        # the user's business.
-        if [ -e "/$f" ] && pacman -Qqo "/$f" 2>/dev/null | grep -q libreland; then
+        # Only remove one this package installed; a hand-written config at the
+        # same path is the user's business.
+        if { [ -e "/$f" ] || [ -L "/$f" ]; } &&
+            pacman -Qqo "/$f" 2>/dev/null | grep -q libreland; then
             rm -f "/$f"
         fi
     done
-}
-
-pre_install() {
-    _libreland_clear_unowned
-}
-
-pre_upgrade() {
-    _libreland_clear_unowned
 }
 
 post_upgrade() {

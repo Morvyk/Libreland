@@ -684,7 +684,11 @@ a screen-share button that goes nowhere. Shipping the `.wants` link is how
 a package enables a user unit, since it can't run `systemctl --user enable`
 at install time.
 
-Building by hand instead:
+Building by hand instead — note that these paths then belong to no package,
+so a later `pacman -U` of the libreland package will refuse to overwrite
+them with `error: failed to commit transaction (conflicting files)`. Delete
+them first if you switch back to the package (no scriptlet can do it for
+you: pacman checks for conflicts before any of them runs).
 
 ```sh
 cargo build --release --workspace
