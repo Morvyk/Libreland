@@ -1783,6 +1783,8 @@ struct OutputRender {
     /// Last-logged backdrop-blur gate signature, so the trace prints only on
     /// change instead of once per frame. Diagnostic only.
     blur_trace: String,
+    /// Last-logged blur damage-coverage signature. Diagnostic only.
+    damage_trace: String,
 }
 
 /// What one drawn thing (window / layer / popup) looked like last frame,
@@ -2996,6 +2998,7 @@ impl Renderer {
                 damage_tracker: DamageTracker::new(),
                 prev_layer_masks: HashMap::new(),
                 blur_trace: String::new(),
+                damage_trace: String::new(),
             });
         }
 
@@ -3739,6 +3742,7 @@ impl Renderer {
             damage_tracker: DamageTracker::new(),
             prev_layer_masks: HashMap::new(),
             blur_trace: String::new(),
+            damage_trace: String::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -6041,6 +6045,12 @@ impl Renderer {
         };
         // Scene stages replayed into the blur accumulator (each on top of
         // the previous): the tiled band, then the floating + maximized band.
+        // Diagnostic counters: how many windows actually landed in the blur
+        // scene this frame. Tier 2 (the bar/popup backdrop) is base + tiled +
+        // floating/max, so if these drop to zero mid-transition the frost has
+        // nothing but wallpaper to blur -- which looks exactly like opaque.
+        let n_tiled = std::cell::Cell::new(0u32);
+        let n_floatmax = std::cell::Cell::new(0u32);
         let draw_tiled = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
             for (((p, elements), wd), tex) in placements
                 .iter()
@@ -6049,6 +6059,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
             {
+                n_tiled.set(n_tiled.get() + 1);
                 draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
             Ok(())
@@ -6061,6 +6072,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
             {
+                n_floatmax.set(n_floatmax.get() + 1);
                 draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
             for (((p, elements), wd), tex) in placements
@@ -6070,6 +6082,7 @@ impl Renderer {
                 .zip(win_tex.iter())
                 .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
             {
+                n_floatmax.set(n_floatmax.get() + 1);
                 draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
             Ok(())
@@ -6223,13 +6236,19 @@ impl Renderer {
                 .collect();
             let sig = format!(
                 "pass={passes_ok} solo={} norm={any_normal} proto={any_protocol_window} \
-                 nwin={need_window} nlay={need_layer} tiers={}{}{} vis={}/{}{mask_sig}",
+                 nwin={need_window} nlay={need_layer} tiers={}{}{} vis={}/{} \
+                 scene(tiled={} fmax={}) elems={} wintex={}/{}{mask_sig}",
                 solo_opaque.is_some(),
                 u8::from(tier_tiled.is_some()),
                 u8::from(tier_float.is_some()),
                 u8::from(tier_layer.is_some()),
                 visible.iter().filter(|v| **v).count(),
                 visible.len(),
+                n_tiled.get(),
+                n_floatmax.get(),
+                grouped.iter().map(Vec::len).sum::<usize>(),
+                win_tex.iter().filter(|t| t.is_some()).count(),
+                win_tex.len(),
             );
             if self.outputs[idx].blur_trace != sig {
                 debug!(output = %output_name, "blurgate {sig}");
@@ -6432,6 +6451,44 @@ impl Renderer {
         } else {
             swap_damage_vec.as_deref().unwrap_or(&full_damage)
         };
+        // Diagnostic: a frosted layer whose rect is only *partly* in the draw
+        // damage gets its blur repainted in that part alone, leaving the rest
+        // showing a swapchain buffer `age` frames stale — a one-frame flash of
+        // old content. Report each blurred layer's damage coverage.
+        {
+            let cover: String = layers
+                .iter()
+                .filter(|l| {
+                    matches!(l.layer, LayerBucket::Top | LayerBucket::Overlay) && layer_blurs(l)
+                })
+                .map(|l| {
+                    let dst = Rectangle::<i32, Physical>::new(
+                        Point::new(
+                            scale_i(l.rect.loc.x - compositor_position.x, scale),
+                            scale_i(l.rect.loc.y - compositor_position.y, scale),
+                        ),
+                        Size::new(scale_i(l.rect.size.w, scale), scale_i(l.rect.size.h, scale)),
+                    );
+                    let want = i64::from(dst.size.w) * i64::from(dst.size.h);
+                    let got: i64 = draw_damage
+                        .iter()
+                        .filter_map(|d| d.intersection(dst))
+                        .map(|i| i64::from(i.size.w) * i64::from(i.size.h))
+                        .sum();
+                    let pct = if want > 0 { got * 100 / want } else { -1 };
+                    format!(" {}={pct}%", l.namespace)
+                })
+                .collect();
+            let sig = format!(
+                "age={buffer_age} rects={} full={}{cover}",
+                draw_damage.len(),
+                std::ptr::eq(draw_damage.as_ptr(), full_damage.as_ptr()),
+            );
+            if self.outputs[idx].damage_trace != sig {
+                debug!(output = %output_name, "blurdamage {sig}");
+                self.outputs[idx].damage_trace = sig;
+            }
+        }
         // Paint a full-res tier's sub-rect behind a translucent surface. The
         // tier texture is 1:1 with the framebuffer, so the source sub-rect
         // matches the on-screen destination rect. With a `mask` texture
