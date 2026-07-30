@@ -116,7 +116,7 @@ pub struct LayoutConfig {
 }
 
 /// One animation's timing: whether it plays, how long, and its easing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnimSpec {
     /// Per-animation switch. The animation plays only when this *and*
     /// the master [`AnimationsConfig::enabled`] are true.
@@ -148,12 +148,62 @@ pub struct AnimationsConfig {
     /// A window disappearing (unmap/close): fade + scale-out of a
     /// snapshot taken just before it goes.
     pub window_close: AnimSpec,
-    /// A window's tile changing position/size — reflow on open/close,
-    /// interactive move/resize, fullscreen toggles: slide + scale to the
-    /// new rect.
+    /// A window's tile changing *position* — reflow on open/close,
+    /// interactive move, fullscreen toggles: slide to the new location.
     pub window_move: AnimSpec,
-    /// Switching workspaces: the outgoing + incoming sets slide across.
+    /// A window's tile changing *size*. Separate from [`Self::window_move`]
+    /// so a reflow can glide into place at one pace while growing at
+    /// another; defaults to matching `window_move`, which is how the two
+    /// behaved when they were one animation.
+    pub window_resize: AnimSpec,
+    /// Switching to a *later* workspace: the outgoing + incoming sets slide
+    /// across.
     pub workspace: AnimSpec,
+    /// Switching to an *earlier* workspace. Inherits from
+    /// [`Self::workspace`] unless the config gives it its own values — some
+    /// people like going back to feel quicker than going forward.
+    pub workspace_back: AnimSpec,
+    /// Which way the workspace slide travels.
+    pub workspace_axis: SlideAxis,
+    /// A layer surface (bar, launcher, notification) appearing: fade in,
+    /// sliding from whichever edge it is anchored to.
+    pub layer_open: AnimSpec,
+    /// A layer surface disappearing: the same, reversed, on a snapshot
+    /// taken just before it goes.
+    pub layer_close: AnimSpec,
+    /// The border colour crossfading between the focused and unfocused
+    /// fills as focus moves, instead of switching in one frame.
+    pub focus: AnimSpec,
+}
+
+/// Which way a workspace slide travels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SlideAxis {
+    /// Next workspace comes up from the bottom, previous down from the top.
+    #[default]
+    Vertical,
+    /// Next workspace comes in from the right, previous from the left.
+    Horizontal,
+}
+
+/// Everything the workspace slide needs, bundled so the switch path and the
+/// render path can't disagree about it.
+#[derive(Debug, Clone, Copy)]
+pub struct SlideSpec {
+    /// Timing for a switch to a later workspace.
+    pub forward: AnimSpec,
+    /// Timing for a switch to an earlier one.
+    pub back: AnimSpec,
+    pub axis: SlideAxis,
+}
+
+impl SlideSpec {
+    /// The timing for a slide covering `steps` workspaces — negative meaning
+    /// backwards.
+    #[must_use]
+    pub fn for_steps(&self, steps: i32) -> AnimSpec {
+        if steps < 0 { self.back } else { self.forward }
+    }
 }
 
 impl Default for AnimationsConfig {
@@ -175,10 +225,44 @@ impl Default for AnimationsConfig {
                 duration: Duration::from_millis(250),
                 curve: Curve::EaseOut,
             },
+            // Matches window_move: the two were one animation until they
+            // were split, and moving+growing at the same pace is the
+            // sensible default.
+            window_resize: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(250),
+                curve: Curve::EaseOut,
+            },
             workspace: AnimSpec {
                 enabled: true,
                 duration: Duration::from_millis(300),
                 curve: Curve::EaseInOut,
+            },
+            // Symmetric by default; `workspace.back` overrides it.
+            workspace_back: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(300),
+                curve: Curve::EaseInOut,
+            },
+            workspace_axis: SlideAxis::Vertical,
+            // Panels and launchers want to feel immediate, so these are
+            // quicker than window motion.
+            layer_open: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(180),
+                curve: Curve::EaseOut,
+            },
+            layer_close: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(150),
+                curve: Curve::EaseIn,
+            },
+            // A border crossfade is a small colour change; long enough to
+            // read as a fade, short enough not to lag the focus itself.
+            focus: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(150),
+                curve: Curve::EaseOut,
             },
         }
     }
@@ -345,6 +429,11 @@ pub struct InputConfig {
     /// light up. A live reload applies a *changed* value in either
     /// direction.
     pub numlock: bool,
+    /// Whether `Super`+scroll switches workspaces (and `Super+Shift`+scroll
+    /// moves the focused window between them). `true` by default. Set it
+    /// `false` if you drive workspaces from keybinds and would rather the
+    /// wheel never move you by accident.
+    pub scroll_workspaces: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +502,14 @@ pub enum Action {
     /// save directory, clipboard). `Arc` so `Action` stays cheap to clone
     /// and `Eq` while carrying the spec through the keybind pipeline.
     Screenshot(Arc<ScreenshotBind>),
+    /// Switch the output under the cursor to a workspace, by zero-based
+    /// index. The config spells it one-based (`workspace = 1` on `Super+1`);
+    /// [`parse_action`] does the conversion, so everything past the parser
+    /// speaks the same index the layout and the IPC do.
+    FocusWorkspace(usize),
+    /// Move the focused window to a workspace and follow it there. Same
+    /// index convention as [`Self::FocusWorkspace`].
+    MoveToWorkspace(usize),
 }
 
 /// What a screenshot bind captures.
@@ -564,6 +661,7 @@ impl Default for Config {
                 mouse_accel_speed: 0.0,
                 focus_model: FocusModel::Hover,
                 numlock: false,
+                scroll_workspaces: true,
             },
             binds: BindsConfig {
                 // Default bindings. The user's `binds` table is
@@ -655,7 +753,9 @@ impl Config {
         let dirs = xdg::BaseDirectories::with_prefix("libreland");
         let Some(path) = dirs.find_config_file("config.lua") else {
             info!(
-                "no config.lua found in XDG search path; using defaults (create one to live-load it)"
+                "no config.lua found in XDG search path; using defaults. \
+                 `libreland config example > ~/.config/libreland/config.lua` \
+                 writes a commented starting point"
             );
             return Self::default();
         };
@@ -858,6 +958,9 @@ fn parse_input(t: &Table, defaults: InputConfig) -> mlua::Result<InputConfig> {
             other => lua_bail!("unknown focus_model {other:?}; expected \"hover\" or \"click\""),
         };
     }
+    if let Some(v) = t.get::<Option<bool>>("scroll_workspaces")? {
+        cfg.scroll_workspaces = v;
+    }
     if let Some(numlock) = t.get::<Option<bool>>("numlock")? {
         cfg.numlock = numlock;
     }
@@ -1024,10 +1127,40 @@ fn parse_action(t: &Table) -> mlua::Result<Action> {
             }
             Ok(Action::Spawn(Arc::from(command)))
         }
+        "workspace" | "focusworkspace" | "focus_workspace" => {
+            Ok(Action::FocusWorkspace(parse_workspace_number(t)?))
+        }
+        "movetoworkspace" | "move_to_workspace" | "moveworkspace" => {
+            Ok(Action::MoveToWorkspace(parse_workspace_number(t)?))
+        }
         other => lua_bail!(
-            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"togglefullscreen\", \"close\", \"spawn\""
+            "unknown action {other:?}; supported actions: \"exit\", \"togglefloating\", \"togglefullscreen\", \"close\", \"spawn\", \"workspace\", \"movetoworkspace\""
         ),
     }
+}
+
+/// A commented example config, covering every section with its defaults.
+///
+/// Embedded rather than only installed to a data directory so
+/// `libreland config example` works from a plain `cargo build`, with no
+/// packaging step and nothing to find at runtime. [`example_config_parses`]
+/// keeps it honest: the example is parsed by the real loader in CI, so it
+/// cannot drift into describing options that no longer exist.
+pub const EXAMPLE: &str = include_str!("../contrib/config.lua");
+
+/// Read a workspace bind's target number.
+///
+/// One-based in the config, because the point of these binds is that
+/// `Super+1` goes to workspace 1. Returned zero-based, which is what the
+/// layout and the control socket use.
+fn parse_workspace_number(t: &Table) -> mlua::Result<usize> {
+    let n: i64 = t.get("workspace").context(
+        "workspace action requires `workspace` (expected a number, counting from 1)",
+    )?;
+    if n < 1 {
+        lua_bail!("workspace {n} out of range; workspaces count from 1");
+    }
+    Ok(usize::try_from(n - 1).unwrap_or(0))
 }
 
 fn parse_misc(t: &Table, defaults: MiscConfig) -> mlua::Result<MiscConfig> {
@@ -1194,8 +1327,36 @@ fn parse_animations(t: &Table, defaults: AnimationsConfig) -> mlua::Result<Anima
     cfg.window_open = parse_anim_spec(t, "window_open", base(cfg.window_open)?)?;
     cfg.window_close = parse_anim_spec(t, "window_close", base(cfg.window_close)?)?;
     cfg.window_move = parse_anim_spec(t, "window_move", base(cfg.window_move)?)?;
+    // `window_resize` inherits from the resolved `window_move` rather than
+    // its own default, so setting just `window_move` still moves both — the
+    // behaviour from before they were separate animations.
+    cfg.window_resize = parse_anim_spec(t, "window_resize", cfg.window_move)?;
+    cfg.layer_open = parse_anim_spec(t, "layer_open", base(cfg.layer_open)?)?;
+    cfg.layer_close = parse_anim_spec(t, "layer_close", base(cfg.layer_close)?)?;
+    cfg.focus = parse_anim_spec(t, "focus", base(cfg.focus)?)?;
+
     cfg.workspace = parse_anim_spec(t, "workspace", base(cfg.workspace)?)?;
+    // The workspace table carries two extras beyond the usual spec: which
+    // axis it slides on, and an optional `back` sub-spec for the reverse
+    // direction, inheriting from the forward one just resolved.
+    cfg.workspace_back = cfg.workspace;
+    if let Some(ws) = t.get::<Option<Table>>("workspace")? {
+        if let Some(dir) = ws.get::<Option<String>>("direction")? {
+            cfg.workspace_axis = parse_slide_axis(&dir).context("workspace")?;
+        }
+        cfg.workspace_back = parse_anim_spec(&ws, "back", cfg.workspace).context("workspace")?;
+    }
     Ok(cfg)
+}
+
+fn parse_slide_axis(s: &str) -> mlua::Result<SlideAxis> {
+    Ok(match s.to_lowercase().as_str() {
+        "vertical" | "v" | "updown" | "up_down" => SlideAxis::Vertical,
+        "horizontal" | "h" | "leftright" | "left_right" => SlideAxis::Horizontal,
+        other => lua_bail!(
+            "unknown workspace slide direction {other:?}; expected \"vertical\" or \"horizontal\""
+        ),
+    })
 }
 
 /// Parse one per-animation sub-table (`{ enabled, duration, curve }`)
@@ -1571,6 +1732,80 @@ mod decoration_tests {
             assert!(
                 Config::populate_from_globals(&lua.globals()).is_err(),
                 "expected error for: {src}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod example_config_tests {
+    use super::{Action, Config, EXAMPLE, SlideAxis, xkb};
+    use mlua::Lua;
+
+    fn parse_example() -> Config {
+        let lua = Lua::new();
+        lua.load(EXAMPLE)
+            .exec()
+            .expect("the shipped example config must be valid Lua");
+        Config::populate_from_globals(&lua.globals())
+            .expect("the shipped example config must satisfy the schema")
+    }
+
+    /// The whole point of shipping an example: it must actually work. This
+    /// runs it through the real loader, so an option renamed or removed in
+    /// the code fails here rather than in a user's session.
+    #[test]
+    fn example_config_parses() {
+        let _ = parse_example();
+    }
+
+    /// And it must *describe* the defaults, not merely parse. An example
+    /// that quietly changes behaviour when copied is worse than none: the
+    /// user would be debugging a config they were told was a no-op.
+    #[test]
+    fn example_config_matches_the_defaults() {
+        let c = parse_example();
+        let d = Config::default();
+        assert_eq!(c.animations.window_open, d.animations.window_open);
+        assert_eq!(c.animations.window_move, d.animations.window_move);
+        assert_eq!(c.animations.window_resize, d.animations.window_resize);
+        assert_eq!(c.animations.layer_open, d.animations.layer_open);
+        assert_eq!(c.animations.layer_close, d.animations.layer_close);
+        assert_eq!(c.animations.focus, d.animations.focus);
+        assert_eq!(c.animations.workspace, d.animations.workspace);
+        assert_eq!(c.animations.workspace_axis, SlideAxis::Vertical);
+        assert_eq!(c.layout.gaps_outer, d.layout.gaps_outer);
+        assert_eq!(c.layout.gaps_inner, d.layout.gaps_inner);
+        assert_eq!(c.border.width, d.border.width);
+        assert_eq!(c.input.repeat_rate, d.input.repeat_rate);
+        assert_eq!(c.input.scroll_workspaces, d.input.scroll_workspaces);
+        assert_eq!(c.misc.tearing, d.misc.tearing);
+        assert_eq!(c.xwayland, d.xwayland);
+    }
+
+    /// The Super+1..9 loop is the fiddliest thing in the file — one-based in
+    /// the config, zero-based everywhere after the parser — so pin it down.
+    #[test]
+    fn example_config_binds_the_workspace_keys() {
+        let c = parse_example();
+        for i in 1..=9u32 {
+            let key = char::from_digit(i, 10).expect("1..=9 is a digit");
+            let keysym = xkb::keysym_from_name(&key.to_string(), xkb::KEYSYM_NO_FLAGS);
+            let found: Vec<_> = c
+                .binds
+                .bindings
+                .iter()
+                .filter(|b| b.keysym == keysym)
+                .map(|b| b.action.clone())
+                .collect();
+            let zero_based = i as usize - 1;
+            assert!(
+                found.contains(&Action::FocusWorkspace(zero_based)),
+                "Super+{i} should focus workspace index {zero_based}, got {found:?}"
+            );
+            assert!(
+                found.contains(&Action::MoveToWorkspace(zero_based)),
+                "Super+Shift+{i} should move to workspace index {zero_based}, got {found:?}"
             );
         }
     }

@@ -400,6 +400,10 @@ pub(crate) struct State {
     /// initial configure and only resize on a later one, so we nudge each
     /// exactly once on first map — this set stops it firing every frame.
     pub(crate) mapped_toplevels: std::collections::HashSet<WlSurface>,
+    /// Layer surfaces that have committed a buffer at least once — the
+    /// moment they map, and so the moment their open animation starts. The
+    /// layer-shell equivalent of [`Self::mapped_toplevels`].
+    pub(crate) mapped_layers: std::collections::HashSet<WlSurface>,
     /// Offscreen-heartbeat throttle (see `wayland::root_offscreen`): last
     /// heartbeat frame-callback time per out-of-scene root surface, so a
     /// commit→callback→commit loop can't spin faster than a fast display.
@@ -1386,13 +1390,58 @@ impl State {
         out
     }
 
+    /// Switch `output` to workspace `index` (zero-based) and move keyboard
+    /// focus onto that workspace, so input and the active border follow.
+    ///
+    /// Shared by the workspace keybinds and the control socket, which must
+    /// not drift: a switch that leaves focus behind on the workspace you
+    /// just left is the kind of thing only one of two copies gets right.
+    fn focus_workspace_on(&mut self, output: &str, index: usize) {
+        let slide = self.ws_slide_spec();
+        if !self.layout.switch_workspace_to(output, index, slide) {
+            return;
+        }
+        let Some(active) = self.layout.active_workspace(output) else {
+            return;
+        };
+        let next = self
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| e.output == output && e.workspace == active)
+            .map(|e| e.surface);
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, next, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// The output a workspace keybind acts on: the one under the cursor,
+    /// falling back to the primary. Matches `Super`+scroll, which these
+    /// binds exist to replace.
+    fn workspace_bind_output(&self) -> Option<String> {
+        let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+        )]
+        let cursor = Point::<i32, Physical>::from((cx as i32, cy as i32));
+        self.layout
+            .output_name_at(cursor)
+            .map(str::to_owned)
+            .or_else(|| self.renderer.primary_output_name().map(str::to_owned))
+    }
+
     /// The workspace-slide animation spec, or `None` when the slide is
     /// disabled (by the master switch or its own). Every workspace switch
     /// needs it as well as the renderer: it decides whether a switch
     /// redirects the slide already running or starts a new one.
-    fn ws_slide_spec(&self) -> Option<config::AnimSpec> {
-        let ws_anim = self.config.animations.workspace;
-        (self.config.animations.enabled && ws_anim.enabled).then_some(ws_anim)
+    fn ws_slide_spec(&self) -> Option<config::SlideSpec> {
+        let anims = &self.config.animations;
+        (anims.enabled && anims.workspace.enabled).then_some(config::SlideSpec {
+            forward: anims.workspace,
+            back: anims.workspace_back,
+            axis: anims.workspace_axis,
+        })
     }
 
     #[allow(
@@ -2379,6 +2428,11 @@ impl State {
     /// switch the workspace on the output under the cursor and
     /// re-derive focus (the previously-focused window is now hidden).
     fn workspace_gesture(&mut self, shift: bool, delta: i32) {
+        // Opt-out for people who drive workspaces from keybinds and would
+        // rather the wheel never move them by accident.
+        if !self.config.input.scroll_workspaces {
+            return;
+        }
         // Switching or moving across workspaces reflows + starts a slide;
         // redraw so it shows (the slide then self-sustains via followup).
         self.queue_redraw_all();
@@ -3208,6 +3262,23 @@ impl State {
                     info!(surface = ?surface.id(), "close action fired");
                     handle.send_close();
                 }
+            }
+            config::Action::FocusWorkspace(index) => {
+                let Some(output) = self.workspace_bind_output() else {
+                    return; // no outputs connected
+                };
+                info!(output = %output, index, "workspace action fired");
+                self.focus_workspace_on(&output, index);
+            }
+            config::Action::MoveToWorkspace(index) => {
+                // The window's own output, not the cursor's: moving a window
+                // to "workspace 3" means workspace 3 of the monitor it is on.
+                let Some(surface) = self.seat.get_keyboard().and_then(|k| k.current_focus())
+                else {
+                    return;
+                };
+                info!(surface = ?surface.id(), index, "move-to-workspace action fired");
+                self.layout.move_window_to_workspace(&surface, index);
             }
             config::Action::Spawn(cmd) => {
                 // Runs at bind-press time. `build_command` whitespace-splits
@@ -4176,6 +4247,32 @@ impl State {
     }
 }
 
+/// `libreland config example` — write the shipped example config to stdout.
+///
+/// Anything else under `config` is a usage error rather than a silent no-op,
+/// so a typo doesn't look like it worked.
+fn print_example_config(sub: Option<&str>) -> Result<()> {
+    if sub == Some("example") {
+        use std::io::Write as _;
+        return std::io::stdout()
+            .write_all(config::EXAMPLE.as_bytes())
+            .context("writing the example config to stdout");
+    }
+    if let Some(other) = sub {
+        eprintln!("libreland config: unknown subcommand {other:?}");
+    }
+    eprintln!(
+        "usage: libreland config example
+
+  Prints a commented example configuration covering every section with
+  its default value. Copy it to get started:
+
+    mkdir -p ~/.config/libreland
+    libreland config example > ~/.config/libreland/config.lua"
+    );
+    std::process::exit(2);
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "init flow is naturally linear (session → udev → DRM → renderer → keyboard → libinput → Wayland → state → run); extracting sub-helpers would obscure ownership/order more than the function being long does"
@@ -4186,6 +4283,13 @@ fn main() -> Result<()> {
     // stays a fast, side-effect-free CLI that just talks to the socket.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("msg")) {
         return ipc::run_client();
+    }
+    // `libreland config example` prints the commented starting point. Handled
+    // here, next to `msg`, because it must not touch the socket, the log or
+    // the GPU — it is something you pipe into a file before the compositor
+    // has ever run.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("config")) {
+        return print_example_config(std::env::args().nth(2).as_deref());
     }
 
     // The WorkerGuard MUST stay alive for the whole of main; dropping it
@@ -4724,6 +4828,7 @@ fn main() -> Result<()> {
         layer_outputs: std::collections::HashMap::new(),
         layer_namespaces: std::collections::HashMap::new(),
         mapped_toplevels: std::collections::HashSet::new(),
+        mapped_layers: std::collections::HashSet::new(),
         offscreen_frame_ts: std::collections::HashMap::new(),
         fifo_barrier_watch: std::collections::HashMap::new(),
         idle_last_input: std::time::Instant::now(),

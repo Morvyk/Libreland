@@ -8,6 +8,16 @@ Drop a Lua file at `$XDG_CONFIG_HOME/libreland/config.lua` (typically
 `~/.config/libreland/config.lua`). Anything you set there overrides
 the corresponding default; anything you don't set keeps its default.
 
+A commented example covering every section — each set to its default, so
+deleting any of it changes nothing — ships with the compositor:
+
+    mkdir -p ~/.config/libreland
+    libreland config example > ~/.config/libreland/config.lua
+
+It is also installed at `/usr/share/libreland/config.lua`. You never *need*
+it: an absent config is a valid config, and anything you leave out keeps its
+default. It exists so you can see what there is to set.
+
 - **No file present**: libreland logs `no config.lua found, using
   defaults` and starts with the defaults below.
 - **File present but Lua syntax or schema error**: libreland logs the
@@ -289,6 +299,25 @@ is also a valid key, and binds to a **tap** — see
 | `"togglefullscreen"`| Flip the focused window in/out of fullscreen. Aliases: `"toggle_fullscreen"`, `"fullscreen"`.                |
 | `"close"`           | Politely ask the focused toplevel to close (`xdg_toplevel.close`). The client runs its own close path, so it may prompt or ignore the request. Aliases: `"closewindow"`, `"close_window"`, `"kill"`. |
 | `"spawn"`           | Run an arbitrary command. Requires an additional `command = "…"` field on the bind table; the string is whitespace-split into program + args, children inherit our env (so `$WAYLAND_DISPLAY`, the configured `env`, and X `$DISPLAY` reach them). Wrap with `"sh -c '…'"` for shell features (pipes, env, `&`). |
+| `"workspace"`       | Switch to a workspace on the output **under the cursor** (falling back to the primary), and move focus onto it. Requires `workspace = N`, **counting from 1** — so `Super+1` carries `workspace = 1`. Aliases: `"focusworkspace"`, `"focus_workspace"`. |
+| `"movetoworkspace"` | Move the focused window to a workspace on **its own** output. Same `workspace = N` field and one-based counting. Aliases: `"move_to_workspace"`, `"moveworkspace"`. |
+
+Note the one-based counting is specific to *binds*, where the number matches
+the key you press. The control socket's `focus-workspace N` and
+`move-to-workspace N` count from **0**, as does the `index` field in
+`libreland msg workspaces` output.
+
+Nine workspace binds is a lot of near-identical lines, and the config is real
+Lua, so a loop is usually nicer:
+
+```lua
+for i = 1, 9 do
+    table.insert(binds, { mods = { "Super" }, key = tostring(i),
+                          action = "workspace", workspace = i })
+    table.insert(binds, { mods = { "Super", "Shift" }, key = tostring(i),
+                          action = "movetoworkspace", workspace = i })
+end
+```
 
 (More actions land as features grow: `"reload"`, `"change_vt"`, …)
 
@@ -459,6 +488,11 @@ misc = { wallpaper = {
 } }
 ```
 
+`input.scroll_workspaces` (default `true`) controls whether `Super`+scroll
+switches workspaces and `Super+Shift`+scroll moves the focused window between
+them. Set it `false` if you drive workspaces from keybinds and would rather
+the wheel never move you by accident.
+
 ### layout
 
 | Field         | Default | State | Notes                                                                                                |
@@ -497,7 +531,11 @@ which in turn default per the table.
 | `window_open`  | `250ms`, `ease-out`      | ✅    | A window mapping: fades + scales in.                                                                        |
 | `window_close` | `200ms`, `ease-in`       | ✅    | A window closing: a snapshot of its last frame fades + scales out. Falls back to an instant close if the client tears its buffer down before the toplevel is destroyed. |
 | `window_move`  | `250ms`, `ease-out`      | ✅    | A window's tile changing position/size — reflow on open/close, fullscreen toggle, or the drop after an interactive move/resize. Slides + scales to the new rect. The window under an active drag tracks the cursor 1:1 (no animation) and eases into place on release. |
-| `workspace`    | `300ms`, `ease-in-out`   | ✅    | Switching workspaces: the outgoing and incoming workspaces slide vertically. Next slides up (incoming from the bottom), previous slides down. Switching again mid-slide *redirects* it rather than restarting — see below. |
+| `window_resize` | `250ms`, `ease-out`     | ✅    | A window's *size* changing. Inherits from `window_move` when unset, so setting only `window_move` still animates both — which is how they behaved when they were one animation. |
+| `layer_open`   | `180ms`, `ease-out`      | ✅    | A layer surface (bar, launcher, notification) appearing: fades in while sliding a short way from the screen edge it sits against. One not against an edge just fades. |
+| `layer_close`  | `150ms`, `ease-in`       | ✅    | The same in reverse, on a snapshot taken just before the surface goes. |
+| `focus`        | `150ms`, `ease-out`      | ✅    | The border colour crossfading between the focused and unfocused fills as focus moves, rather than switching in one frame. |
+| `workspace`    | `300ms`, `ease-in-out`   | ✅    | Switching workspaces: the outgoing and incoming workspaces slide. Takes two extra keys — `direction` and `back` — described below. Switching again mid-slide *redirects* it rather than restarting. |
 
 A `curve` is either a **named** string — `"linear"`, `"ease-in"`,
 `"ease-out"`, `"ease-in-out"` (`_` and `-` are interchangeable, case
@@ -518,6 +556,24 @@ animations = {
     -- e.g. a snappier, custom-bezier move; disable the workspace slide:
     -- window_move = { duration = 200, curve = { 0.05, 0.9, 0.1, 1.0 } },
     -- workspace   = { enabled = false },
+}
+```
+
+**Slide direction.** `animations.workspace.direction` is `"vertical"`
+(default) or `"horizontal"`. Vertical means the next workspace comes up from
+the bottom and the previous down from the top; horizontal means in from the
+right and left respectively.
+
+**Asymmetric slides.** `animations.workspace.back` is an optional sub-spec —
+`{ enabled, duration, curve }` — used when switching to an *earlier*
+workspace. It inherits from the forward spec, so setting it only where you
+want a difference is enough:
+
+```lua
+workspace = {
+    duration = 300, curve = "ease-in-out",
+    direction = "horizontal",
+    back = { duration = 200 },   -- going back is snappier
 }
 ```
 
@@ -603,8 +659,8 @@ in `src/main.rs`.
 | `Super+C`       | Close the focused window (`xdg_toplevel.close`).    |
 | `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled; drop on another monitor to move it there). |
 | `Super+RMB`-drag | Interactively resize the window under the cursor. Works on tiled and floating windows alike; the edges that follow the cursor are the ones nearest where you pressed, so press the right half to drag the right edge, the top-left quadrant to drag that corner, and so on. Not available on maximized/fullscreen windows (they own the whole output — un-fill first). |
-| `Super`+scroll down / up | Switch to the next / previous workspace on the output **under the cursor**. |
-| `Super+Shift`+scroll down / up | Move the focused window to the next / previous workspace on **its** output and follow it there. |
+| `Super`+scroll down / up | Switch to the next / previous workspace on the output **under the cursor**. Disable with `input.scroll_workspaces = false`. |
+| `Super+Shift`+scroll down / up | Move the focused window to the next / previous workspace on **its** output and follow it there. Same toggle. |
 
 Resizing a **tiled** window moves the split dividers on the edges you drag:
 the neighbouring cells give up exactly the space it gains, and the new

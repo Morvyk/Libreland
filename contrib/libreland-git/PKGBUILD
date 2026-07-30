@@ -7,7 +7,7 @@
 # alongside it). The source is cloned from GitHub — no local checkout needed.
 
 pkgname=libreland-git
-pkgver=0.1.0.r184.g2523f61
+pkgver=0.1.0.r188.g785ca4b
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua (git)'
 arch=('x86_64')
@@ -156,4 +156,9 @@ package() {
     # License + docs.
     install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/libreland/LICENSE"
     install -Dm644 "$root/Documentation.md" "$pkgdir/usr/share/doc/libreland/Documentation.md"
+
+    # A commented starting point. Also available from the binary itself
+    # (`libreland config example`), so this copy is for people who go
+    # looking in /usr/share rather than reaching for the CLI.
+    install -Dm644 "$root/contrib/config.lua" "$pkgdir/usr/share/libreland/config.lua"
 }

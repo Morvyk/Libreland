@@ -67,8 +67,8 @@ use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
 use crate::config::{
-    AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig, ScaleMode,
-    TearingMode, VrrMode,
+    AnimSpec, AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig,
+    ScaleMode, TearingMode, VrrMode,
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
@@ -1163,6 +1163,14 @@ pub struct Renderer {
     /// the toplevel was destroyed, fading + shrinking out where the
     /// window last sat. Drained as each finishes.
     closing: Vec<ClosingWindow>,
+    /// Layer surfaces that just mapped and should play an open animation
+    /// the next frame they appear. Mirrors [`Self::pending_open`].
+    pending_layer_open: HashSet<ObjectId>,
+    /// In-flight layer open animations, by surface id. Entries are dropped
+    /// when they finish or the surface goes away.
+    layer_anims: HashMap<ObjectId, Animation>,
+    /// Layer surfaces mid close-animation, drained as each finishes.
+    closing_layers: Vec<ClosingLayer>,
     /// Kawase dual-filter blur shaders (downsample / upsample halves),
     /// run over the backdrop pyramid to produce the blurred backdrop.
     /// `Arc`-backed, cheap to clone out before borrowing the renderer.
@@ -1314,6 +1322,86 @@ struct ClosingWindow {
 /// when it closes): a subtle pop, not a dramatic zoom.
 const OPEN_SCALE_FROM: f64 = 0.90;
 
+/// How far a layer surface slides in from its anchored edge, as a fraction
+/// of its own size along that axis. A short travel: a bar should look like
+/// it settled into place, not like it flew in.
+const LAYER_SLIDE_FROM: f64 = 0.35;
+
+/// Which screen edge a layer surface animates from.
+///
+/// Derived from where the surface actually sits rather than from its
+/// anchors: a panel flush against the top of the output slides down from
+/// the top, and anything not touching an edge — a centred launcher — just
+/// fades, which is what you want for it anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    /// Not against any edge: fade only, no travel.
+    Center,
+}
+
+impl LayerEdge {
+    /// The offset to draw at, given how far through the animation we are
+    /// (`1.0` = fully settled) and the surface's size.
+    fn offset(self, progress: f64, size: Size<i32, Physical>) -> Point<i32, Physical> {
+        let back = 1.0 - progress.clamp(0.0, 1.0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a fraction of a surface dimension; bounded by the output"
+        )]
+        let along = |extent: i32| (f64::from(extent) * LAYER_SLIDE_FROM * back).round() as i32;
+        match self {
+            LayerEdge::Top => Point::from((0, -along(size.h))),
+            LayerEdge::Bottom => Point::from((0, along(size.h))),
+            LayerEdge::Left => Point::from((-along(size.w), 0)),
+            LayerEdge::Right => Point::from((along(size.w), 0)),
+            LayerEdge::Center => Point::from((0, 0)),
+        }
+    }
+
+    /// Pick the edge `rect` is against within `output`, if any. A surface
+    /// touching two edges (a full-height side bar) takes the one it spans
+    /// *less* of, which is the direction it visibly came from.
+    fn of(rect: Rectangle<i32, Physical>, output: Rectangle<i32, Physical>) -> Self {
+        // A few pixels of slack: bars are commonly placed with a small gap.
+        const SLACK: i32 = 8;
+        let touches_top = rect.loc.y - output.loc.y <= SLACK;
+        let touches_bottom =
+            (output.loc.y + output.size.h) - (rect.loc.y + rect.size.h) <= SLACK;
+        let touches_left = rect.loc.x - output.loc.x <= SLACK;
+        let touches_right = (output.loc.x + output.size.w) - (rect.loc.x + rect.size.w) <= SLACK;
+
+        // Spanning the full width means the short axis is vertical, so it
+        // came from top or bottom — and vice versa.
+        let spans_width = touches_left && touches_right;
+        let spans_height = touches_top && touches_bottom;
+        match (spans_width, spans_height) {
+            (true, true) => LayerEdge::Center, // covers the output: fade only
+            (true, false) if touches_top => LayerEdge::Top,
+            (true, false) if touches_bottom => LayerEdge::Bottom,
+            (false, true) if touches_left => LayerEdge::Left,
+            (false, true) if touches_right => LayerEdge::Right,
+            _ if touches_top => LayerEdge::Top,
+            _ if touches_bottom => LayerEdge::Bottom,
+            _ if touches_left => LayerEdge::Left,
+            _ if touches_right => LayerEdge::Right,
+            _ => LayerEdge::Center,
+        }
+    }
+}
+
+/// A layer surface's last frame, captured at destroy time, animating out.
+struct ClosingLayer {
+    texture: GlesTexture,
+    /// Where the content sat on screen — absolute compositor pixels.
+    rect: Rectangle<i32, Physical>,
+    edge: LayerEdge,
+    anim: Animation,
+}
+
 /// Per-window animation state. Rects are absolute compositor pixels (the
 /// same space as [`Placement::cell_rect`]).
 struct WindowAnim {
@@ -1324,12 +1412,138 @@ struct WindowAnim {
     /// The rect actually drawn last frame — the start point a new move
     /// animation interpolates *from*, so retargets mid-flight stay smooth.
     displayed: Rectangle<i32, Physical>,
-    /// Rect a running move animation interpolates from.
+    /// Rect a running move/resize animation interpolates from. One rect
+    /// serves both: the position animation reads its `loc`, the resize its
+    /// `size`, and both start from wherever the window was actually drawn.
     move_from: Rectangle<i32, Physical>,
-    /// In-flight position/size animation, if any.
+    /// In-flight *position* animation, if any.
     move_anim: Option<Animation>,
+    /// In-flight *size* animation, if any. Separate from `move_anim` so a
+    /// reflow can glide into place at one pace while growing at another;
+    /// with the default config the two are identical and run in lockstep.
+    resize_anim: Option<Animation>,
     /// In-flight open (fade + scale-in) animation, if any.
     open_anim: Option<Animation>,
+    /// Focus state as of the last frame, to notice the flip.
+    focused: bool,
+    /// In-flight border crossfade, if any.
+    focus_anim: Option<Animation>,
+    /// Focus level the crossfade started from, so a window refocused
+    /// mid-fade continues from the colour on screen instead of snapping.
+    focus_from: f32,
+    /// Focus level actually drawn last frame — `focus_anim`'s output, kept
+    /// so a retarget has something to start from.
+    focus_now: f32,
+}
+
+impl WindowAnim {
+    /// Whether anything about this window is still moving, so the frame
+    /// can't be considered settled.
+    ///
+    /// One place rather than a disjunction repeated at each call site: the
+    /// three of them decide damage, whether to schedule another frame, and
+    /// whether direct scanout may take the plane, and a new animation that
+    /// only reaches two of them produces a window that animates without
+    /// being repainted.
+    /// Point position and size at `target`, starting (or retargeting) the
+    /// move and resize animations that are enabled.
+    ///
+    /// `move_cfg` / `resize_cfg` are `Some` only when that animation should
+    /// actually run — disabled in the config, or suppressed because the
+    /// window is being dragged and must track the cursor 1:1.
+    ///
+    /// The two start independently: a pure move must not run the resize
+    /// animation, or a window sliding across the screen would also be told
+    /// to "resize" to the size it already has, on the resize timing.
+    fn retarget(
+        &mut self,
+        now: f64,
+        target: Rectangle<i32, Physical>,
+        move_cfg: Option<AnimSpec>,
+        resize_cfg: Option<AnimSpec>,
+    ) {
+        if target == self.target {
+            return;
+        }
+        let moved = target.loc != self.target.loc;
+        let resized = target.size != self.target.size;
+        // Both animations read `move_from`, so latch where the window is
+        // actually drawn once, before either overwrites it.
+        if moved && move_cfg.is_some() || resized && resize_cfg.is_some() {
+            self.move_from = self.displayed;
+        }
+        if moved {
+            self.move_anim =
+                move_cfg.map(|c| Animation::start(now, c.duration_secs(), c.curve));
+        }
+        if resized {
+            self.resize_anim =
+                resize_cfg.map(|c| Animation::start(now, c.duration_secs(), c.curve));
+        }
+        self.target = target;
+    }
+
+    /// Interpolate position and size toward the target on their own clocks,
+    /// leaving the result in [`Self::displayed`]. Whichever isn't animating
+    /// snaps straight to the target.
+    fn advance_geometry(&mut self, now: f64) {
+        let loc = match self.move_anim {
+            Some(a) if !a.done(now) => lerp_point(self.move_from.loc, self.target.loc, a.value(now)),
+            Some(_) => {
+                self.move_anim = None;
+                self.target.loc
+            }
+            None => self.target.loc,
+        };
+        let size = match self.resize_anim {
+            Some(a) if !a.done(now) => {
+                lerp_size(self.move_from.size, self.target.size, a.value(now))
+            }
+            Some(_) => {
+                self.resize_anim = None;
+                self.target.size
+            }
+            None => self.target.size,
+        };
+        self.displayed = Rectangle::new(loc, size);
+    }
+
+    /// Advance the border crossfade toward `focused`, starting one if focus
+    /// just changed. Leaves [`Self::focus_now`] at the level to draw.
+    fn advance_focus(&mut self, now: f64, focused: bool, enabled: bool, cfg: AnimSpec) {
+        if focused != self.focused {
+            self.focused = focused;
+            // Start from the colour actually on screen, so refocusing
+            // mid-fade continues rather than snapping.
+            self.focus_from = self.focus_now;
+            self.focus_anim =
+                enabled.then(|| Animation::start(now, cfg.duration_secs(), cfg.curve));
+        }
+        let target = f32::from(u8::from(self.focused));
+        self.focus_now = match self.focus_anim {
+            Some(a) => {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "eased progress is in [0,1]; f32 is plenty for a colour mix"
+                )]
+                let v = a.value(now) as f32;
+                if a.done(now) {
+                    self.focus_anim = None;
+                    target
+                } else {
+                    self.focus_from + (target - self.focus_from) * v
+                }
+            }
+            None => target,
+        };
+    }
+
+    fn is_animating(&self) -> bool {
+        self.move_anim.is_some()
+            || self.resize_anim.is_some()
+            || self.open_anim.is_some()
+            || self.focus_anim.is_some()
+    }
 }
 
 /// What to draw for one placement this frame, after animation: the
@@ -1340,6 +1554,11 @@ struct WindowAnim {
 struct WinDraw {
     effective: Rectangle<i32, Physical>,
     alpha: f32,
+    /// How focused the border should look: `1.0` fully the active fill,
+    /// `0.0` fully the inactive one, in between while the focus crossfade
+    /// runs. Not a bool, so focus moving between two windows reads as one
+    /// colour handing over rather than two hard flips.
+    focus: f32,
 }
 
 /// What the screenshot selection UI should draw this frame. The
@@ -2790,6 +3009,9 @@ impl Renderer {
             tearing_hints: HashSet::new(),
             no_anim: NoAnim::None,
             closing: Vec::new(),
+            pending_layer_open: HashSet::new(),
+            layer_anims: HashMap::new(),
+            closing_layers: Vec::new(),
             blur_down,
             blur_up,
             mask_blur_shader,
@@ -3870,6 +4092,45 @@ impl Renderer {
     /// Mark a freshly-mapped toplevel so it plays an open animation the
     /// next time it appears in a frame's placements (not on a later
     /// workspace switch that merely surfaces it again).
+    /// A layer surface just mapped: play its open animation next frame.
+    pub fn mark_layer_open(&mut self, surface: &WlSurface) {
+        self.pending_layer_open.insert(surface.id());
+    }
+
+    /// A layer surface is going away: snapshot its last frame and fade it
+    /// back out toward the edge it came from.
+    ///
+    /// Called while the surface is still alive (from `layer_destroyed`), so
+    /// there is still a buffer to capture. A failure anywhere just means the
+    /// surface vanishes instantly, which is the old behaviour.
+    pub fn mark_layer_closing(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
+        let cfg = self.animations.clone();
+        if !cfg.enabled || !cfg.layer_close.enabled || rect.size.w <= 0 || rect.size.h <= 0 {
+            return;
+        }
+        self.pending_layer_open.remove(&surface.id());
+        self.layer_anims.remove(&surface.id());
+
+        let center = Point::<i32, Physical>::from((
+            rect.loc.x + rect.size.w / 2,
+            rect.loc.y + rect.size.h / 2,
+        ));
+        let Some(output) = self.output_at(center) else {
+            return;
+        };
+        let (scale, out_rect) = (output.scale, output.compositor);
+        let Some(texture) = self.snapshot_surface(surface, rect.size, scale) else {
+            return;
+        };
+        let now = self.start.elapsed().as_secs_f64();
+        self.closing_layers.push(ClosingLayer {
+            texture,
+            rect,
+            edge: LayerEdge::of(rect, out_rect),
+            anim: Animation::start(now, cfg.layer_close.duration_secs(), cfg.layer_close.curve),
+        });
+    }
+
     pub fn mark_open(&mut self, surface: &WlSurface) {
         self.pending_open.insert(surface.id());
     }
@@ -3925,6 +4186,34 @@ impl Renderer {
         ));
         let scale = self.output_at(center).map_or(1.0, |o| o.scale);
 
+        let Some(texture) = self.snapshot_surface(surface, inner.size, scale) else {
+            return; // no buffer left to snapshot — close instantly
+        };
+
+        let now = self.start.elapsed().as_secs_f64();
+        self.closing.push(ClosingWindow {
+            texture,
+            rect: inner,
+            anim: Animation::start(
+                now,
+                cfg.window_close.duration_secs(),
+                cfg.window_close.curve,
+            ),
+        });
+    }
+
+    /// Render `surface`'s current tree into an offscreen texture of `size`
+    /// (compositor pixels, scaled by `scale`), for a close animation to keep
+    /// drawing after the surface itself is gone.
+    ///
+    /// `None` on any failure — an unmapped surface with no buffer left, or a
+    /// GL error — which callers treat as "no animation", not as an error.
+    fn snapshot_surface(
+        &mut self,
+        surface: &WlSurface,
+        size: Size<i32, Physical>,
+        scale: f64,
+    ) -> Option<GlesTexture> {
         // Build the surface's elements with its content origin at the
         // texture's (0, 0) (shift past the CSD shadow margin).
         let (geo_x, geo_y) = window_geometry_offset(surface);
@@ -3942,60 +4231,45 @@ impl Renderer {
                 Kind::Unspecified,
             );
         if elements.is_empty() {
-            return; // no buffer left to snapshot — close instantly
+            return None;
         }
 
         let tex_size = Size::<i32, smithay::utils::Buffer>::from((
-            scale_f(f64::from(inner.size.w), scale).max(1),
-            scale_f(f64::from(inner.size.h), scale).max(1),
+            scale_f(f64::from(size.w), scale).max(1),
+            scale_f(f64::from(size.h), scale).max(1),
         ));
-        let mut texture = match self.gles.create_buffer(Fourcc::Abgr8888, tex_size) {
-            Ok(t) => t,
-            Err(err) => {
-                warn!(error = %err, "close snapshot: create_buffer failed");
-                return;
-            }
-        };
+        let mut texture = self
+            .gles
+            .create_buffer(Fourcc::Abgr8888, tex_size)
+            .inspect_err(|err| warn!(%err, "close snapshot: create_buffer failed"))
+            .ok()?;
         let phys = Size::<i32, Physical>::from((tex_size.w, tex_size.h));
         let full = [Rectangle::<i32, Physical>::from_size(phys)];
-        let mut target = match self.gles.bind(&mut texture) {
-            Ok(t) => t,
-            Err(err) => {
-                warn!(error = %err, "close snapshot: bind failed");
-                return;
-            }
-        };
-        match self.gles.render(&mut target, phys, Transform::Normal) {
-            Ok(mut frame) => {
-                let _ = frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full);
-                if let Err(err) =
-                    draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
-                {
-                    warn!(error = %err, "close snapshot: draw failed");
-                    return;
-                }
-                if let Err(err) = frame.finish() {
-                    warn!(error = %err, "close snapshot: finish failed");
-                    return;
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "close snapshot: render failed");
-                return;
-            }
+        {
+            let mut target = self
+                .gles
+                .bind(&mut texture)
+                .inspect_err(|err| warn!(%err, "close snapshot: bind failed"))
+                .ok()?;
+            let mut frame = self
+                .gles
+                .render(&mut target, phys, Transform::Normal)
+                .inspect_err(|err| warn!(%err, "close snapshot: render failed"))
+                .ok()?;
+            let _ = frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full);
+            draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
+                .inspect_err(|err| warn!(%err, "close snapshot: draw failed"))
+                .ok()?;
+            // Same-context sequential GL: the texture is sampled by later
+            // draws on this context, so the sync point needn't be awaited.
+            drop(
+                frame
+                    .finish()
+                    .inspect_err(|err| warn!(%err, "close snapshot: finish failed"))
+                    .ok()?,
+            );
         }
-        drop(target);
-
-        let now = self.start.elapsed().as_secs_f64();
-        self.closing.push(ClosingWindow {
-            texture,
-            rect: inner,
-            anim: Animation::start(
-                now,
-                cfg.window_close.duration_secs(),
-                cfg.window_close.curve,
-            ),
-        });
+        Some(texture)
     }
 
     /// Tonemap an HDR output's linear-BT.2020 scene to an 8-bit sRGB scratch
@@ -4199,7 +4473,9 @@ impl Renderer {
     fn animate_placements(&mut self, now: f64, placements: &[Placement]) -> Vec<WinDraw> {
         let cfg = self.animations.clone();
         let move_enabled = cfg.enabled && cfg.window_move.enabled;
+        let resize_enabled = cfg.enabled && cfg.window_resize.enabled;
         let open_enabled = cfg.enabled && cfg.window_open.enabled;
+        let focus_enabled = cfg.enabled && cfg.focus.enabled;
         let no_anim = self.no_anim.clone();
 
         let mut draws = Vec::with_capacity(placements.len());
@@ -4214,19 +4490,22 @@ impl Renderer {
                 displayed: target,
                 move_from: target,
                 move_anim: None,
+                resize_anim: None,
                 open_anim: None,
+                // Seeded to the window's current focus so the very first
+                // frame doesn't fade in from "unfocused".
+                focused: p.focused,
+                focus_anim: None,
+                focus_from: f32::from(u8::from(p.focused)),
+                focus_now: f32::from(u8::from(p.focused)),
             });
 
-            // Target moved (reflow / interactive move / fullscreen
-            // toggle): start or retarget a move animation from where the
-            // window is being drawn right now, so retargets stay smooth.
-            if target != entry.target {
-                entry.move_anim = (move_enabled && !snap).then(|| {
-                    entry.move_from = entry.displayed;
-                    Animation::start(now, cfg.window_move.duration_secs(), cfg.window_move.curve)
-                });
-                entry.target = target;
-            }
+            entry.retarget(
+                now,
+                target,
+                (move_enabled && !snap).then_some(cfg.window_move),
+                (resize_enabled && !snap).then_some(cfg.window_resize),
+            );
 
             // A just-mapped window starts opening the first frame it's
             // here. Consume the mark regardless so a disabled open
@@ -4239,16 +4518,9 @@ impl Renderer {
                 ));
             }
 
-            // Position/size: interpolate displayed → target.
-            if let Some(a) = entry.move_anim {
-                entry.displayed = lerp_rect(entry.move_from, entry.target, a.value(now));
-                if a.done(now) {
-                    entry.move_anim = None;
-                    entry.displayed = entry.target;
-                }
-            } else {
-                entry.displayed = entry.target;
-            }
+            entry.advance_geometry(now);
+
+            entry.advance_focus(now, p.focused, focus_enabled, cfg.focus);
 
             // Open: fade + scale-about-centre layered on the displayed
             // rect.
@@ -4269,14 +4541,19 @@ impl Renderer {
             // Workspace slide: a uniform vertical offset applied *after*
             // the per-window animation (so it doesn't perturb move/open),
             // translating the whole workspace during a switch.
-            effective.loc.y += p.slide_dy;
-            draws.push(WinDraw { effective, alpha });
+            effective.loc += p.slide;
+            draws.push(WinDraw {
+                effective,
+                alpha,
+                focus: entry.focus_now,
+            });
         }
 
         // Drop tracking for windows whose surface has died.
         self.win_anims.retain(|_, w| w.surface.alive());
         // Drop finished close-out ghosts (frees their snapshot textures).
         self.closing.retain(|c| !c.anim.done(now));
+        self.closing_layers.retain(|c| !c.anim.done(now));
         draws
     }
 
@@ -5175,25 +5452,63 @@ impl Renderer {
         // do for window placements. Each entry pairs the layer
         // bucket with the imported elements so we can paint them
         // in the correct z-order during the frame block below.
+        // Open animations: a layer surface fades in while sliding a short
+        // way from whichever screen edge it sits against. Advanced here,
+        // where the elements are built, so the alpha and the offset are
+        // applied by the same import that would have happened anyway.
+        let layer_open_cfg = self.animations.layer_open;
+        let layer_open_on = self.animations.enabled && layer_open_cfg.enabled;
         let layer_groups: Vec<(LayerBucket, Vec<WaylandSurfaceRenderElement<GlesRenderer>>)> =
             layers
                 .iter()
                 .map(|l| {
+                    let id = l.surface.id();
+                    if self.pending_layer_open.remove(&id) && layer_open_on {
+                        self.layer_anims.insert(
+                            id.clone(),
+                            Animation::start(
+                                now,
+                                layer_open_cfg.duration_secs(),
+                                layer_open_cfg.curve,
+                            ),
+                        );
+                    }
+                    let (mut alpha, mut offset) = (1.0_f32, Point::<i32, Physical>::from((0, 0)));
+                    if let Some(a) = self.layer_anims.get(&id).copied() {
+                        let v = a.value(now);
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "eased progress is in [0,1]; f32 is exact enough for an opacity"
+                        )]
+                        let v32 = v as f32;
+                        alpha = v32;
+                        offset = LayerEdge::of(l.rect, out_rect).offset(v, l.rect.size);
+                        if a.done(now) {
+                            self.layer_anims.remove(&id);
+                            alpha = 1.0;
+                            offset = Point::from((0, 0));
+                        }
+                    }
                     let local_phys = Point::<i32, Physical>::from((
-                        scale_i(l.rect.loc.x - compositor_position.x, scale),
-                        scale_i(l.rect.loc.y - compositor_position.y, scale),
+                        scale_i(l.rect.loc.x + offset.x - compositor_position.x, scale),
+                        scale_i(l.rect.loc.y + offset.y - compositor_position.y, scale),
                     ));
                     let elements = render_elements_from_surface_tree(
                         &mut self.gles,
                         &l.surface,
                         local_phys,
                         scale,
-                        1.0_f32,
+                        alpha,
                         Kind::Unspecified,
                     );
                     (l.layer, elements)
                 })
                 .collect();
+        // Drop entries whose surfaces have gone (destroyed without a close
+        // animation, e.g. when the animation is disabled).
+        let live: HashSet<ObjectId> = layers.iter().map(|l| l.surface.id()).collect();
+        self.layer_anims.retain(|id, _| live.contains(id));
+        self.pending_layer_open.retain(|id| live.contains(id));
 
         // Each layer surface's imported texture (populated by the
         // `render_elements_from_surface_tree` import above), used to
@@ -5323,6 +5638,35 @@ impl Renderer {
                     Size::from((scale_i(eff.size.w, scale), scale_i(eff.size.h, scale))),
                 );
                 Some((c.texture.clone(), dest, alpha))
+            })
+            .collect();
+
+        // Closing layer surfaces: the same idea, but sliding back toward the
+        // edge they came from rather than shrinking about their centre — a
+        // bar should look like it withdrew, not like it imploded.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "eased progress in [0,1] casts to an f32 opacity exactly enough"
+        )]
+        let closing_layer_draws: Vec<(GlesTexture, Rectangle<i32, Physical>, f32)> = self
+            .closing_layers
+            .iter()
+            .filter_map(|c| {
+                if !c.rect.overlaps(out_rect) {
+                    return None;
+                }
+                let v = c.anim.value(now);
+                // `offset` takes "how settled", so a close is the open run
+                // backwards.
+                let off = c.edge.offset(1.0 - v, c.rect.size);
+                let dest = Rectangle::<i32, Physical>::new(
+                    Point::from((
+                        scale_i(c.rect.loc.x + off.x - compositor_position.x, scale),
+                        scale_i(c.rect.loc.y + off.y - compositor_position.y, scale),
+                    )),
+                    Size::from((scale_i(c.rect.size.w, scale), scale_i(c.rect.size.h, scale))),
+                );
+                Some((c.texture.clone(), dest, (1.0 - v) as f32))
             })
             .collect();
 
@@ -5525,15 +5869,11 @@ impl Renderer {
                     return Ok(());
                 };
                 let dst = cell_local(wd.effective);
-                let fill = if p.focused {
-                    &border.active
-                } else {
-                    &border.inactive
-                };
-                let (mut border_top, mut border_bottom) = match fill {
-                    Fill::Solid(rgb) => (*rgb, *rgb),
-                    Fill::VerticalGradient { top, bottom } => (*top, *bottom),
-                };
+                // Mix the two fills by how focused the window currently
+                // looks. `wd.focus` is 0 or 1 outside a crossfade, so this
+                // reduces to picking one of them.
+                let (mut border_top, mut border_bottom) =
+                    mix_fills(&border.inactive, &border.active, wd.focus);
                 // The linear composite (HDR window) needs the border in linear
                 // BT.2020 too — the surface in its fp16 offscreen is already
                 // decoded to linear, so the shader doesn't decode.
@@ -5809,7 +6149,9 @@ impl Renderer {
                 // A media wallpaper's texture is refreshed out-of-band
                 // (refresh_wallpaper) — untracked, so full unless occluded.
                 || (wallpaper_media.is_some() && solo_opaque.is_none())
-                || placements.iter().any(|p| p.slide_dy != 0)
+                || placements.iter().any(|p| p.slide != Point::from((0, 0)))
+                // Closing ghosts have no surface to diff against.
+                || !self.closing_layers.is_empty()
             {
                 break 'damage None;
             }
@@ -5871,7 +6213,7 @@ impl Renderer {
                     let animating = self
                         .win_anims
                         .get(&p.surface.id())
-                        .is_some_and(|w| w.open_anim.is_some() || w.move_anim.is_some());
+                        .is_some_and(WindowAnim::is_animating);
                     note(
                         p.surface.id(),
                         surface_tree_fingerprint(&p.surface),
@@ -5890,6 +6232,7 @@ impl Renderer {
                     if !drawn {
                         continue;
                     }
+                    let animating = self.layer_anims.contains_key(&l.surface.id());
                     let Some(rect) = elements_bbox(elements, elem_scale) else {
                         continue;
                     };
@@ -5899,7 +6242,7 @@ impl Renderer {
                         rect,
                         false,
                         1.0,
-                        false,
+                        animating,
                         layer_blurs(l),
                     );
                 }
@@ -6375,6 +6718,28 @@ impl Renderer {
                     .context("draw_render_elements (layer overlay) failed")?;
             }
 
+            // Closing layer surfaces, in the Overlay band they were drawn
+            // in while alive — above windows, below popups and the cursor.
+            for (texture, dest, alpha) in &closing_layer_draws {
+                let rel = damage_rel(draw_damage, *dest);
+                if rel.is_empty() {
+                    continue;
+                }
+                frame
+                    .render_texture_from_to(
+                        texture,
+                        Rectangle::from_size(texture.size()).to_f64(),
+                        *dest,
+                        &rel,
+                        &[],
+                        Transform::Normal,
+                        *alpha,
+                        None,
+                        &[],
+                    )
+                    .context("render_texture_from_to (closing layer) failed")?;
+            }
+
             // Closing windows: the fade/shrink-out snapshot, above the
             // windows reflowing to fill the freed space, below popups.
             for (texture, dest, alpha) in &closing_draws {
@@ -6663,13 +7028,13 @@ impl Renderer {
         // retargeting), so it's non-empty whenever any window exists — check
         // for an actually-running move/open animation instead, or every
         // output would free-run forever the moment a window maps.
-        let anim_running = self
-            .win_anims
-            .values()
-            .any(|w| w.move_anim.is_some() || w.open_anim.is_some());
+        let anim_running = self.win_anims.values().any(WindowAnim::is_animating);
         let followup = anim_running
             || !self.closing.is_empty()
             || !self.pending_open.is_empty()
+            || !self.layer_anims.is_empty()
+            || !self.closing_layers.is_empty()
+            || !self.pending_layer_open.is_empty()
             || (wallpaper_live && !self.output_has_fill_window(idx, placements));
         Ok((capture_results, followup))
     }
@@ -6831,8 +7196,21 @@ impl Renderer {
         // open marks and running move/open animations are checked against
         // the covering window itself below — on any *other* window they
         // animate beneath the fullscreen one, invisibly.)
-        if self.closing.iter().any(|c| c.rect.overlaps(out_rect)) {
+        if self.closing.iter().any(|c| c.rect.overlaps(out_rect))
+            || self
+                .closing_layers
+                .iter()
+                .any(|c| c.rect.overlaps(out_rect))
+        {
             veto!("closing animation overlaps");
+        }
+        // A layer sliding in is drawn at an offset and a partial alpha, so
+        // it can't ride a plane the way a settled one can.
+        if layers
+            .iter()
+            .any(|l| l.rect.overlaps(out_rect) && self.layer_anims.contains_key(&l.surface.id()))
+        {
+            veto!("layer surface animating");
         }
         if self.screenshot_overlay.is_some()
             || self.dnd_icon.is_some()
@@ -6857,7 +7235,7 @@ impl Renderer {
         // It must be settled: parked at 1:1 over the whole output, fully
         // visible, mid-workspace-slide excluded, and neither waiting on its
         // open animation nor animating its rect.
-        if p.slide_dy != 0 {
+        if p.slide != Point::from((0, 0)) {
             veto!("workspace slide in progress");
         }
         let draw = win_draws.get(i)?;
@@ -6868,9 +7246,9 @@ impl Renderer {
             || self
                 .win_anims
                 .get(&p.surface.id())
-                .is_some_and(|w| w.move_anim.is_some() || w.open_anim.is_some())
+                .is_some_and(WindowAnim::is_animating)
         {
-            veto!("window open/move animation running");
+            veto!("a window animation is still running");
         }
         Some(SoloScene { solo: i, above })
     }
@@ -8092,26 +8470,58 @@ fn window_geometry_size(surface: &WlSurface) -> Option<(i32, i32)> {
     })
 }
 
-/// Interpolate every component of two rects by eased `t`.
+/// Resolve a [`Fill`] to its top and bottom stop colours, and mix two of
+/// them by `t` (`0.0` = all of `a`, `1.0` = all of `b`).
+///
+/// A solid fill is just a gradient whose stops match, so mixing a solid with
+/// a gradient works without a special case — which is what lets the focused
+/// and unfocused border fills be different kinds.
+fn mix_fills(a: &Fill, b: &Fill, t: f32) -> ([f32; 3], [f32; 3]) {
+    let stops = |f: &Fill| match f {
+        Fill::Solid(rgb) => (*rgb, *rgb),
+        Fill::VerticalGradient { top, bottom } => (*top, *bottom),
+    };
+    let (a_top, a_bottom) = stops(a);
+    let (b_top, b_bottom) = stops(b);
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: [f32; 3], y: [f32; 3]| {
+        [
+            x[0] + (y[0] - x[0]) * t,
+            x[1] + (y[1] - x[1]) * t,
+            x[2] + (y[2] - x[2]) * t,
+        ]
+    };
+    (mix(a_top, b_top), mix(a_bottom, b_bottom))
+}
+
+/// Interpolate two positions by eased `t`. Position and size are separate
+/// helpers because a window's move and resize animations run on independent
+/// clocks (`animations.window_move` / `window_resize`).
 #[allow(
     clippy::cast_possible_truncation,
     reason = "interpolated pixel coordinates are bounded by output size, well within i32"
 )]
-fn lerp_rect(
-    a: Rectangle<i32, Physical>,
-    b: Rectangle<i32, Physical>,
+fn lerp_point(
+    a: Point<i32, Physical>,
+    b: Point<i32, Physical>,
     t: f64,
-) -> Rectangle<i32, Physical> {
-    Rectangle::new(
-        Point::from((
-            lerp(f64::from(a.loc.x), f64::from(b.loc.x), t).round() as i32,
-            lerp(f64::from(a.loc.y), f64::from(b.loc.y), t).round() as i32,
-        )),
-        Size::from((
-            lerp(f64::from(a.size.w), f64::from(b.size.w), t).round() as i32,
-            lerp(f64::from(a.size.h), f64::from(b.size.h), t).round() as i32,
-        )),
-    )
+) -> Point<i32, Physical> {
+    Point::from((
+        lerp(f64::from(a.x), f64::from(b.x), t).round() as i32,
+        lerp(f64::from(a.y), f64::from(b.y), t).round() as i32,
+    ))
+}
+
+/// Interpolate two sizes by eased `t`. See [`lerp_point`].
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "interpolated pixel dimensions are bounded by output size, well within i32"
+)]
+fn lerp_size(a: Size<i32, Physical>, b: Size<i32, Physical>, t: f64) -> Size<i32, Physical> {
+    Size::from((
+        lerp(f64::from(a.w), f64::from(b.w), t).round() as i32,
+        lerp(f64::from(a.h), f64::from(b.h), t).round() as i32,
+    ))
 }
 
 /// Shrink/grow a rect about its centre by factor `s` (keeps the centre

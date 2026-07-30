@@ -67,7 +67,7 @@ use smithay::xwayland::X11Surface;
 use smithay::xwayland::xwm::WmWindowType;
 use tracing::debug;
 
-use crate::config::AnimSpec;
+use crate::config::{AnimSpec, SlideAxis, SlideSpec};
 
 /// How a window fills its output. `Maximized` and `Fullscreen` both
 /// cover the window's whole output with no border or rounded corners
@@ -381,7 +381,7 @@ pub struct Placement {
     /// outgoing and incoming workspaces translate together without
     /// disturbing each window's own move animation (`cell_rect` stays
     /// the settled target). `0` outside a workspace transition.
-    pub slide_dy: i32,
+    pub slide: Point<i32, Physical>,
 }
 
 /// Gap configuration. `outer` is empty space between the tile
@@ -1151,7 +1151,7 @@ impl Layout {
     /// `focused` lets the caller mark which surface gets the
     /// `active` border colour; the focus surface is owned by the
     /// seat, not the layout, so it comes in as a parameter.
-    pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<AnimSpec>) -> Vec<Placement> {
+    pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<SlideSpec>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
         let mut out = Vec::new();
         // Only the active workspace of each output is visible — except
@@ -1161,17 +1161,30 @@ impl Layout {
             let area = op.area();
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "slide offset = small fraction × output height (i32), well within range"
+                reason = "slide offset = small fraction × the output's extent (i32), well within range"
             )]
             if let (Some(t), Some(spec)) = (op.transition.as_ref(), slide)
-                && let Some(p) = transition_eased(t, spec)
+                && let Some(p) = transition_eased(t, spec.for_steps(t.steps))
             {
-                let h = f64::from(op.full.size.h);
-                let off_from = (f64::from(t.dir) * p * h).round() as i32;
-                let off_to = (f64::from(-t.dir) * (1.0 - p) * h).round() as i32;
+                // The travel distance is the output's extent along the slide
+                // axis; `dir` gives the sign, and the two workspaces are
+                // always exactly one screen apart.
+                let span = match spec.axis {
+                    SlideAxis::Vertical => f64::from(op.full.size.h),
+                    SlideAxis::Horizontal => f64::from(op.full.size.w),
+                };
+                let along = |d: f64| -> Point<i32, Physical> {
+                    let n = (d * span).round() as i32;
+                    match spec.axis {
+                        SlideAxis::Vertical => Point::new(0, n),
+                        SlideAxis::Horizontal => Point::new(n, 0),
+                    }
+                };
+                let off_from = along(f64::from(t.dir) * p);
+                let off_to = along(f64::from(-t.dir) * (1.0 - p));
                 for fp in &t.from {
                     out.push(Placement {
-                        slide_dy: off_from,
+                        slide: off_from,
                         focused: false, // the outgoing workspace isn't focused
                         ..fp.clone()
                     });
@@ -1179,7 +1192,7 @@ impl Layout {
                 let base = out.len();
                 collect_workspace(&op.workspaces[op.active], &is_focused, area, &mut out);
                 for q in &mut out[base..] {
-                    q.slide_dy = off_to;
+                    q.slide = off_to;
                 }
             } else {
                 collect_workspace(&op.workspaces[op.active], &is_focused, area, &mut out);
@@ -1194,7 +1207,7 @@ impl Layout {
                 fill: t.window.fill,
                 // A window being dragged floats freely over everything.
                 floating: true,
-                slide_dy: 0,
+                slide: Point::from((0, 0)),
             });
         }
         out
@@ -1203,10 +1216,10 @@ impl Layout {
     /// Clear workspace-switch transitions that have finished (or that
     /// can't run because the slide is disabled), freeing their captured
     /// snapshots. Call once per frame before [`Self::placements`].
-    pub fn tick_transitions(&mut self, slide: Option<AnimSpec>) {
+    pub fn tick_transitions(&mut self, slide: Option<SlideSpec>) {
         for op in &mut self.outputs {
             let done = match (op.transition.as_ref(), slide) {
-                (Some(t), Some(spec)) => transition_eased(t, spec).is_none(),
+                (Some(t), Some(s)) => transition_eased(t, s.for_steps(t.steps)).is_none(),
                 (Some(_), None) => true,
                 (None, _) => false,
             };
@@ -1720,6 +1733,13 @@ impl Layout {
         None
     }
 
+    /// Name of the output under `cursor`, if any. Lets a workspace keybind
+    /// act on the same monitor `Super`+scroll would have.
+    #[must_use]
+    pub fn output_name_at(&self, cursor: Point<i32, Physical>) -> Option<&str> {
+        self.outpane_at(cursor).map(|oi| self.outputs[oi].name.as_str())
+    }
+
     /// Switch the active workspace on the output under `cursor` by
     /// `delta` (`+1` = next / scroll-down, `-1` = previous /
     /// scroll-up). No-op if the cursor is over no output. No wrap:
@@ -1735,7 +1755,7 @@ impl Layout {
         &mut self,
         cursor: Point<i32, Physical>,
         delta: i32,
-        slide: Option<AnimSpec>,
+        slide: Option<SlideSpec>,
     ) -> bool {
         self.outpane_at(cursor)
             .is_some_and(|oi| self.switch(oi, delta, slide))
@@ -1747,7 +1767,7 @@ impl Layout {
     /// we left if it became empty and trims back to one trailing
     /// empty, so the list can't grow without bound. Returns whether
     /// the active workspace changed.
-    fn switch(&mut self, oi: usize, delta: i32, slide: Option<AnimSpec>) -> bool {
+    fn switch(&mut self, oi: usize, delta: i32, slide: Option<SlideSpec>) -> bool {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_possible_wrap,
@@ -1765,7 +1785,7 @@ impl Layout {
     /// list with empties if `target` is past the end. Shared by the
     /// scroll gesture ([`Self::switch`]) and the IPC
     /// [`Self::switch_workspace_to`]. Returns whether `active` changed.
-    fn switch_to_index(&mut self, oi: usize, target: usize, slide: Option<AnimSpec>) -> bool {
+    fn switch_to_index(&mut self, oi: usize, target: usize, slide: Option<SlideSpec>) -> bool {
         // `target` arrives unchecked from IPC (`focus-workspace {index}`);
         // growing is only ever meant to open ONE fresh workspace past the
         // end, so clamp before the loop — an arbitrary index must not
@@ -1802,7 +1822,7 @@ impl Layout {
         let running = self.outputs[oi].transition.as_ref().map(|t| {
             (
                 t.steps,
-                slide.is_some_and(|spec| t.elapsed_frac(spec) < WS_RETARGET_UNTIL),
+                slide.is_some_and(|s| t.elapsed_frac(s.for_steps(t.steps)) < WS_RETARGET_UNTIL),
             )
         });
         let action = slide_action(running, delta);
@@ -1852,7 +1872,7 @@ impl Layout {
         &mut self,
         output: &str,
         index: usize,
-        slide: Option<AnimSpec>,
+        slide: Option<SlideSpec>,
     ) -> bool {
         let Some(oi) = self.outputs.iter().position(|o| o.name == output) else {
             return false;
@@ -2219,7 +2239,7 @@ fn collect_placements(
                 focused: is_focused(surface),
                 fill: w.fill,
                 floating: false,
-                slide_dy: 0,
+                slide: Point::from((0, 0)),
             });
         }
         Node::Split { first, second, .. } => {
@@ -2254,7 +2274,7 @@ fn collect_workspace(
             focused: is_focused(surface),
             fill: w.fill,
             floating: true,
-            slide_dy: 0,
+            slide: Point::from((0, 0)),
         });
     }
 }

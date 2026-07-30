@@ -370,7 +370,7 @@ mod server {
     use smithay::reexports::wayland_server::DisplayHandle;
     use smithay::reexports::wayland_server::backend::ObjectId;
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-    use smithay::utils::{IsAlive, SERIAL_COUNTER};
+    use smithay::utils::IsAlive;
     use smithay::wayland::compositor::with_states;
     use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
     use tracing::{debug, info, warn};
@@ -1019,10 +1019,7 @@ mod server {
             .active_workspace(&output)
             .ok_or_else(|| format!("no output named {output}"))?;
         let index = resolve_target(target, active);
-        let slide = state.ws_slide_spec();
-        if state.layout.switch_workspace_to(&output, index, slide) {
-            refocus_active(state, &output);
-        }
+        state.focus_workspace_on(&output, index);
         Ok(Response::Handled)
     }
 
@@ -1049,24 +1046,6 @@ mod server {
             WorkspaceTarget::Index(i) => i,
             WorkspaceTarget::Next => current + 1,
             WorkspaceTarget::Prev => current.saturating_sub(1),
-        }
-    }
-
-    /// After a workspace switch, move keyboard focus to a window on the
-    /// now-active workspace (or clear it when that workspace is empty), so
-    /// input and the active border follow the switch.
-    fn refocus_active(state: &mut State, output: &str) {
-        let Some(active) = state.layout.active_workspace(output) else {
-            return;
-        };
-        let next = state
-            .layout
-            .window_entries()
-            .into_iter()
-            .find(|e| e.output == output && e.workspace == active)
-            .map(|e| e.surface);
-        if let Some(kbd) = state.seat.get_keyboard() {
-            kbd.set_focus(state, next, SERIAL_COUNTER.next_serial());
         }
     }
 
@@ -1408,6 +1387,9 @@ mod server {
             Action::Close => "close".to_owned(),
             Action::Spawn(cmd) => format!("spawn {cmd}"),
             Action::Screenshot(_) => "screenshot".to_owned(),
+            // One-based to match how the config spells them.
+            Action::FocusWorkspace(i) => format!("workspace {}", i + 1),
+            Action::MoveToWorkspace(i) => format!("move-to-workspace {}", i + 1),
         }
     }
 

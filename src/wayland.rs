@@ -1329,6 +1329,18 @@ fn maybe_handle_layer_commit(state: &mut State, surface: &WlSurface) {
         return;
     }
     let cached = layer_cached_state(surface);
+    // First commit that actually carries a buffer is the map: play the open
+    // animation from here. Tracked in the same set the toplevel path uses so
+    // a re-commit doesn't restart it.
+    if !state.mapped_layers.contains(surface)
+        && smithay::backend::renderer::utils::with_renderer_surface_state(surface, |s| {
+            s.buffer().is_some()
+        })
+        .unwrap_or(false)
+    {
+        state.mapped_layers.insert(surface.clone());
+        state.renderer.mark_layer_open(surface);
+    }
     state.recompute_layer_layout();
     // Configure the client with its real size — honouring anchors/stretch/
     // margins — so an anchored bar (which requests a 0-size "stretch" axis)
@@ -2157,8 +2169,19 @@ impl WlrLayerShellHandler for State {
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: layer surface destroyed");
+        // Snapshot it before anything else: the surface is still alive here,
+        // so there is a last frame to capture and fade back out.
+        if let Some(rect) = self
+            .snapshot_layer_placements()
+            .iter()
+            .find(|l| &l.surface == surface.wl_surface())
+            .map(|l| l.rect)
+        {
+            self.renderer.mark_layer_closing(surface.wl_surface(), rect);
+        }
         self.layer_outputs.remove(surface.wl_surface());
         self.layer_namespaces.remove(surface.wl_surface());
+        self.mapped_layers.remove(surface.wl_surface());
         let cur_focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
         if cur_focus.as_ref() == Some(surface.wl_surface())
             && let Some(kbd) = self.seat.get_keyboard()

@@ -70,23 +70,20 @@ impl Dispatch<WpTearingControlManagerV1, ()> for State {
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wp_tearing_control_manager_v1::Request::GetTearingControl { id, surface } => {
-                // One controller per surface, per the spec's
-                // `tearing_control_exists` error.
-                if state.tearing_controls.contains(&surface) {
-                    manager.post_error(
-                        wp_tearing_control_manager_v1::Error::TearingControlExists,
-                        "the surface already has a tearing controller",
-                    );
-                    return;
-                }
-                state.tearing_controls.push(surface.clone());
-                data_init.init(id, surface);
+        // Destroy (a destructor) and any future request need nothing from
+        // us: the manager is a pure factory.
+        if let wp_tearing_control_manager_v1::Request::GetTearingControl { id, surface } = request {
+            // One controller per surface, per the spec's
+            // `tearing_control_exists` error.
+            if state.tearing_controls.contains(&surface) {
+                manager.post_error(
+                    wp_tearing_control_manager_v1::Error::TearingControlExists,
+                    "the surface already has a tearing controller",
+                );
+                return;
             }
-            // Destroy (a destructor) and any future request need nothing
-            // from us: the manager is a pure factory.
-            _ => {}
+            state.tearing_controls.push(surface.clone());
+            data_init.init(id, surface);
         }
     }
 }
@@ -101,26 +98,22 @@ impl Dispatch<WpTearingControlV1, WlSurface> for State {
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wp_tearing_control_v1::Request::SetPresentationHint { hint } => {
-                // The hint is double-buffered in the spec (it applies on the
-                // surface's next commit). We apply it immediately: it only
-                // ever selects between two flip flags for a frame that has
-                // not been submitted yet, so the one-commit skew is
-                // unobservable, and tracking it through the commit cache
-                // would buy nothing.
-                let immediate = matches!(
-                    hint,
-                    smithay::reexports::wayland_server::WEnum::Value(
-                        wp_tearing_control_v1::PresentationHint::Async
-                    )
-                );
-                debug!(surface = ?surface.id(), immediate, "wp_tearing_control: presentation hint");
-                state.renderer.set_tearing_hint(surface, immediate);
-            }
-            // Destroy is handled in `destroyed` below, which also runs when
-            // the client disconnects without sending it.
-            _ => {}
+        // Destroy is handled in `destroyed` below, which also runs when the
+        // client disconnects without sending it.
+        if let wp_tearing_control_v1::Request::SetPresentationHint { hint } = request {
+            // The hint is double-buffered in the spec (it applies on the
+            // surface's next commit). We apply it immediately: it only ever
+            // selects between two flip flags for a frame that has not been
+            // submitted yet, so the one-commit skew is unobservable, and
+            // tracking it through the commit cache would buy nothing.
+            let immediate = matches!(
+                hint,
+                smithay::reexports::wayland_server::WEnum::Value(
+                    wp_tearing_control_v1::PresentationHint::Async
+                )
+            );
+            debug!(surface = ?surface.id(), immediate, "wp_tearing_control: presentation hint");
+            state.renderer.set_tearing_hint(surface, immediate);
         }
     }
 
