@@ -1141,8 +1141,9 @@ impl State {
         else {
             return;
         };
+        let slide = self.ws_slide_spec();
         self.layout
-            .switch_workspace_to(&entry.output, entry.workspace);
+            .switch_workspace_to(&entry.output, entry.workspace, slide);
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
         }
@@ -1385,16 +1386,24 @@ impl State {
         out
     }
 
+    /// The workspace-slide animation spec, or `None` when the slide is
+    /// disabled (by the master switch or its own). Every workspace switch
+    /// needs it as well as the renderer: it decides whether a switch
+    /// redirects the slide already running or starts a new one.
+    fn ws_slide_spec(&self) -> Option<config::AnimSpec> {
+        let ws_anim = self.config.animations.workspace;
+        (self.config.animations.enabled && ws_anim.enabled).then_some(ws_anim)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "linear per-output render driver: snapshot placements/layers/popups, drain captures, sync the hardware cursor, render, then park/retry on the result. Splitting it just threads frame state through extra functions."
     )]
     fn render_crtc(&mut self, crtc: crtc::Handle) {
         let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
-        // Workspace slide spec (None when disabled). Clear finished slides,
-        // then emit (both workspaces during one, the active one otherwise).
-        let ws_anim = self.config.animations.workspace;
-        let slide = (self.config.animations.enabled && ws_anim.enabled).then_some(ws_anim);
+        // Clear finished slides, then emit (both workspaces during one, the
+        // active one otherwise).
+        let slide = self.ws_slide_spec();
         self.layout.tick_transitions(slide);
         let placements = self.layout.placements(focused.as_ref(), slide);
         let layer_placements = self.snapshot_layer_placements();
@@ -2386,7 +2395,8 @@ impl State {
             reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
         )]
         let cursor = Point::<i32, Physical>::from((cx as i32, cy as i32));
-        if !self.layout.switch_at(cursor, delta) {
+        let slide = self.ws_slide_spec();
+        if !self.layout.switch_at(cursor, delta, slide) {
             return;
         }
         // The switch hid the old focus; focus the window now under the

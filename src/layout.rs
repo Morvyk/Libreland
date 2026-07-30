@@ -225,7 +225,79 @@ struct WsTransition {
     dir: i32,
     /// When the slide began.
     start: Instant,
+    /// Net workspace steps from the snapshot's workspace to the current
+    /// active one, signed the same way `delta` is (`+1` = towards later
+    /// workspaces).
+    ///
+    /// A *count*, not an index, precisely because `normalize_output`
+    /// compacts empty workspaces out of the list mid-slide and would
+    /// invalidate any index we stored. Retargeting reads it to tell
+    /// "still heading the same way" from "scrolled back over the start".
+    steps: i32,
 }
+
+impl WsTransition {
+    /// Linear progress through the slide, `0.0` at the start and `>= 1.0`
+    /// once it is over. Unlike [`transition_eased`] this is raw time, which
+    /// is what the retarget decision wants — whether the animation is young
+    /// enough to redirect, not where the eased curve currently sits.
+    fn elapsed_frac(&self, spec: AnimSpec) -> f64 {
+        let dur = spec.duration_secs();
+        if dur <= 0.0 {
+            return 1.0;
+        }
+        self.start.elapsed().as_secs_f64() / dur
+    }
+}
+
+/// What a workspace switch should do with the slide already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlideAction {
+    /// Keep the running slide's origin snapshot and clock, re-aimed to end
+    /// this many steps from where it started. One continuous motion.
+    Aim(i32),
+    /// Leave the output with no slide at all: the new destination is the
+    /// workspace the running one started from, and a slide whose snapshot
+    /// *is* its destination would draw that workspace twice, at two
+    /// different offsets.
+    Drop,
+    /// Snapshot the current workspace and start a new slide.
+    Fresh,
+}
+
+/// Decide what a switch of `delta` workspaces does to the slide in flight.
+///
+/// `running` describes that slide: its net steps from its own origin, and
+/// whether it is still young enough to redirect (see [`WS_RETARGET_UNTIL`]).
+/// `None` means no slide is running.
+fn slide_action(running: Option<(i32, bool)>, delta: i32) -> SlideAction {
+    // No slide, or one too far along to redirect without the incoming
+    // workspace appearing already almost in place.
+    let Some((steps, true)) = running else {
+        return SlideAction::Fresh;
+    };
+    let aimed = steps + delta;
+    if aimed == 0 {
+        SlideAction::Drop
+    } else if aimed.signum() == steps.signum() {
+        SlideAction::Aim(aimed)
+    } else {
+        // Reversed past the origin: the snapshot would have to travel back
+        // the way it came, flipping direction mid-flight.
+        SlideAction::Fresh
+    }
+}
+
+/// How far into a slide a new switch may still redirect it instead of
+/// starting over.
+///
+/// Retargeting keeps the origin snapshot and the clock, so the incoming
+/// workspace inherits however much of the leg is left. Early on that is
+/// nearly all of it and the result is one smooth slide; late on it would be a
+/// sliver, and the new workspace would appear already almost in place. Past
+/// this point a fresh slide looks better, and a switch that late is a
+/// deliberate second scroll rather than the flick this exists for.
+const WS_RETARGET_UNTIL: f64 = 0.5;
 
 /// The two rects a fill mode can target: `full` (entire output, for
 /// fullscreen) and `work` (output minus exclusive zones, for maximized
@@ -1654,9 +1726,19 @@ impl Layout {
     /// scrolling up past the first workspace stays put. Returns
     /// whether the active workspace actually changed (so the caller
     /// can re-derive keyboard focus only when it did).
-    pub fn switch_at(&mut self, cursor: Point<i32, Physical>, delta: i32) -> bool {
+    ///
+    /// `slide` is the workspace-slide animation spec (`None` when disabled),
+    /// needed to tell a flick of the scroll wheel — which redirects the slide
+    /// already running — from a deliberate later switch, which starts a fresh
+    /// one. See [`WS_RETARGET_UNTIL`].
+    pub fn switch_at(
+        &mut self,
+        cursor: Point<i32, Physical>,
+        delta: i32,
+        slide: Option<AnimSpec>,
+    ) -> bool {
         self.outpane_at(cursor)
-            .is_some_and(|oi| self.switch(oi, delta))
+            .is_some_and(|oi| self.switch(oi, delta, slide))
     }
 
     /// Switch output `oi`'s active workspace by `delta`. Materializes
@@ -1665,7 +1747,7 @@ impl Layout {
     /// we left if it became empty and trims back to one trailing
     /// empty, so the list can't grow without bound. Returns whether
     /// the active workspace changed.
-    fn switch(&mut self, oi: usize, delta: i32) -> bool {
+    fn switch(&mut self, oi: usize, delta: i32, slide: Option<AnimSpec>) -> bool {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_possible_wrap,
@@ -1676,14 +1758,14 @@ impl Layout {
             return false; // scroll-up at workspace 0: no wrap, no-op.
         }
         #[allow(clippy::cast_sign_loss, reason = "target >= 0 checked just above")]
-        self.switch_to_index(oi, target as usize)
+        self.switch_to_index(oi, target as usize, slide)
     }
 
     /// Switch output `oi` to the absolute workspace `target`, growing the
     /// list with empties if `target` is past the end. Shared by the
     /// scroll gesture ([`Self::switch`]) and the IPC
     /// [`Self::switch_workspace_to`]. Returns whether `active` changed.
-    fn switch_to_index(&mut self, oi: usize, target: usize) -> bool {
+    fn switch_to_index(&mut self, oi: usize, target: usize, slide: Option<AnimSpec>) -> bool {
         // `target` arrives unchecked from IPC (`focus-workspace {index}`);
         // growing is only ever meant to open ONE fresh workspace past the
         // end, so clamp before the loop — an arbitrary index must not
@@ -1692,28 +1774,72 @@ impl Layout {
         while target >= self.outputs[oi].workspaces.len() {
             self.outputs[oi].workspaces.push(Workspace::default());
         }
-        if target == self.outputs[oi].active {
+        let active = self.outputs[oi].active;
+        if target == active {
             return false;
         }
-        // Snapshot the outgoing workspace for the slide animation before
-        // `active` moves (and before `normalize_output` may reindex the
-        // workspace list, which would invalidate a stored index).
-        let area = self.outputs[oi].area();
-        let mut from = Vec::new();
-        collect_workspace(
-            &self.outputs[oi].workspaces[self.outputs[oi].active],
-            &|_| false,
-            area,
-            &mut from,
-        );
-        self.outputs[oi].transition = Some(WsTransition {
-            from,
-            // Moving to a later workspace slides up (incoming from the
-            // bottom), to an earlier one slides down — the natural
-            // scroll mapping, also correct for absolute IPC jumps.
-            dir: if target > self.outputs[oi].active { -1 } else { 1 },
-            start: Instant::now(),
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "workspace indices are small Vec indices, never near i32 bounds"
+        )]
+        let delta = target as i32 - active as i32;
+
+        // Redirect a slide that is already running rather than replacing it.
+        //
+        // Without this, every switch snapshots the *current* workspace as the
+        // new origin and resets the clock — so scrolling three notches
+        // quickly starts three slides, each superseded a few milliseconds in.
+        // Nothing visibly moves and you simply arrive three workspaces later.
+        // Keeping the origin and the clock turns that into what the user
+        // actually did: one continuous slide from where they were to where
+        // they stopped.
+        //
+        // Only while the slide is young, though: past [`WS_RETARGET_UNTIL`]
+        // the incoming workspace would inherit a sliver of the leg's
+        // remaining time and appear already almost in place. A switch that
+        // late is a deliberate second scroll, and deserves its own slide.
+        let running = self.outputs[oi].transition.as_ref().map(|t| {
+            (
+                t.steps,
+                slide.is_some_and(|spec| t.elapsed_frac(spec) < WS_RETARGET_UNTIL),
+            )
         });
+        let action = slide_action(running, delta);
+        match action {
+            SlideAction::Aim(steps) => {
+                self.outputs[oi]
+                    .transition
+                    .as_mut()
+                    .expect("Aim is only returned for a running slide")
+                    .steps = steps;
+            }
+            SlideAction::Drop => self.outputs[oi].transition = None,
+            SlideAction::Fresh => {}
+        }
+
+        if action == SlideAction::Fresh {
+            // Snapshot the outgoing workspace for the slide animation before
+            // `active` moves (and before `normalize_output` may reindex the
+            // workspace list, which would invalidate a stored index).
+            let area = self.outputs[oi].area();
+            let mut from = Vec::new();
+            collect_workspace(
+                &self.outputs[oi].workspaces[active],
+                &|_| false,
+                area,
+                &mut from,
+            );
+            self.outputs[oi].transition = Some(WsTransition {
+                from,
+                // Moving to a later workspace slides up (incoming from the
+                // bottom), to an earlier one slides down — the natural
+                // scroll mapping, also correct for absolute IPC jumps.
+                dir: if delta > 0 { -1 } else { 1 },
+                start: Instant::now(),
+                steps: delta,
+            });
+        }
         self.outputs[oi].active = target;
         self.normalize_output(oi);
         self.recompute_and_push();
@@ -1722,11 +1848,16 @@ impl Layout {
 
     /// IPC: switch the named output to workspace `index` (absolute).
     /// No-op (returns `false`) if there's no output by that name.
-    pub fn switch_workspace_to(&mut self, output: &str, index: usize) -> bool {
+    pub fn switch_workspace_to(
+        &mut self,
+        output: &str,
+        index: usize,
+        slide: Option<AnimSpec>,
+    ) -> bool {
         let Some(oi) = self.outputs.iter().position(|o| o.name == output) else {
             return false;
         };
-        self.switch_to_index(oi, index)
+        self.switch_to_index(oi, index, slide)
     }
 
     /// Move the keyboard-focused window to the adjacent workspace on
@@ -2786,6 +2917,98 @@ fn rect_contains(r: Rectangle<i32, Physical>, p: Point<i32, Physical>) -> bool {
         && p.x < r.loc.x + r.size.w
         && p.y >= r.loc.y
         && p.y < r.loc.y + r.size.h
+}
+
+#[cfg(test)]
+mod workspace_switch_tests {
+    use super::{SlideAction, slide_action};
+
+    /// Shorthand for the common case: a slide `steps` from its origin, still
+    /// young enough to redirect.
+    fn act(steps: i32, delta: i32) -> SlideAction {
+        slide_action(Some((steps, true)), delta)
+    }
+
+    /// The bug this exists for. Three quick scroll notches used to start
+    /// three slides, each replaced a few milliseconds in, so nothing visibly
+    /// moved and you simply arrived three workspaces later. Each notch must
+    /// instead re-aim the slide already running, which keeps its origin and
+    /// its clock — one continuous motion ending three workspaces out.
+    #[test]
+    fn a_flick_in_one_direction_keeps_re_aiming_the_same_slide() {
+        assert_eq!(act(1, 1), SlideAction::Aim(2));
+        assert_eq!(act(2, 1), SlideAction::Aim(3));
+        // And the same going the other way.
+        assert_eq!(act(-1, -1), SlideAction::Aim(-2));
+        assert_eq!(act(-2, -1), SlideAction::Aim(-3));
+    }
+
+    /// A bigger jump than one notch — an IPC `focus-workspace` landing
+    /// mid-slide — re-aims just the same, as long as it keeps going.
+    #[test]
+    fn a_larger_jump_the_same_way_also_re_aims() {
+        assert_eq!(act(1, 4), SlideAction::Aim(5));
+        assert_eq!(act(-1, -4), SlideAction::Aim(-5));
+    }
+
+    /// Scrolling back onto the workspace the slide started from leaves *no*
+    /// slide. Starting a fresh one instead would snap the half-arrived
+    /// workspace to centre before sliding it back out — the very snap this
+    /// change exists to remove.
+    #[test]
+    fn returning_to_the_origin_drops_the_slide_rather_than_restarting() {
+        assert_eq!(act(1, -1), SlideAction::Drop);
+        assert_eq!(act(-1, 1), SlideAction::Drop);
+        assert_eq!(act(3, -3), SlideAction::Drop);
+    }
+
+    /// Reversing *past* the origin can't reuse the snapshot: it would have to
+    /// travel back the way it came, flipping direction mid-flight.
+    #[test]
+    fn reversing_past_the_origin_starts_over() {
+        assert_eq!(act(1, -2), SlideAction::Fresh);
+        assert_eq!(act(2, -5), SlideAction::Fresh);
+        assert_eq!(act(-1, 2), SlideAction::Fresh);
+    }
+
+    /// With no slide running there is nothing to redirect.
+    #[test]
+    fn a_switch_from_rest_starts_a_slide() {
+        assert_eq!(slide_action(None, 1), SlideAction::Fresh);
+        assert_eq!(slide_action(None, -3), SlideAction::Fresh);
+    }
+
+    /// A slide too far along must be *replaced*, not reused. Reusing it would
+    /// hand the incoming workspace the sliver of time left on the old leg, so
+    /// it would appear already almost in place.
+    #[test]
+    fn a_switch_arriving_late_replaces_the_slide() {
+        let old = Some((1, false));
+        assert_eq!(slide_action(old, 1), SlideAction::Fresh);
+        // Even the cases that would otherwise drop or reverse.
+        assert_eq!(slide_action(old, -1), SlideAction::Fresh);
+        assert_eq!(slide_action(old, -5), SlideAction::Fresh);
+    }
+
+    /// Whatever happens, the decision never leaves a slide aimed at its own
+    /// origin — that is the one state the renderer cannot draw.
+    #[test]
+    fn no_decision_ever_yields_a_zero_aim() {
+        for steps in -5..=5 {
+            for delta in -5..=5 {
+                if steps == 0 || delta == 0 {
+                    continue; // neither is reachable: no slide, or no switch
+                }
+                for fresh_enough in [true, false] {
+                    if let SlideAction::Aim(aimed) =
+                        slide_action(Some((steps, fresh_enough)), delta)
+                    {
+                        assert_ne!(aimed, 0, "steps={steps} delta={delta}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

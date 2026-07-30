@@ -497,7 +497,7 @@ which in turn default per the table.
 | `window_open`  | `250ms`, `ease-out`      | ✅    | A window mapping: fades + scales in.                                                                        |
 | `window_close` | `200ms`, `ease-in`       | ✅    | A window closing: a snapshot of its last frame fades + scales out. Falls back to an instant close if the client tears its buffer down before the toplevel is destroyed. |
 | `window_move`  | `250ms`, `ease-out`      | ✅    | A window's tile changing position/size — reflow on open/close, fullscreen toggle, or the drop after an interactive move/resize. Slides + scales to the new rect. The window under an active drag tracks the cursor 1:1 (no animation) and eases into place on release. |
-| `workspace`    | `300ms`, `ease-in-out`   | ✅    | Switching workspaces: the outgoing and incoming workspaces slide vertically. Next slides up (incoming from the bottom), previous slides down. |
+| `workspace`    | `300ms`, `ease-in-out`   | ✅    | Switching workspaces: the outgoing and incoming workspaces slide vertically. Next slides up (incoming from the bottom), previous slides down. Switching again mid-slide *redirects* it rather than restarting — see below. |
 
 A `curve` is either a **named** string — `"linear"`, `"ease-in"`,
 `"ease-out"`, `"ease-in-out"` (`_` and `-` are interchangeable, case
@@ -520,6 +520,25 @@ animations = {
     -- workspace   = { enabled = false },
 }
 ```
+
+**Switching mid-slide.** A switch that arrives while the workspace slide is
+still running *redirects* it: the slide keeps the workspace it started from
+and its clock, and only its destination moves. Flicking a scroll-wheel bind
+three notches therefore plays one continuous slide that happens to end three
+workspaces away, rather than three slides that each get a few milliseconds
+before the next replaces them — which is what it did before, and looked like
+no animation at all.
+
+Two cases are handled separately. Scrolling back onto the workspace the slide
+started from cancels it outright (that workspace is already most of the way
+back on screen). Reversing *past* the origin, or switching once the slide is
+more than halfway done, starts a fresh slide — in both of those, reusing the
+running one would visibly jump.
+
+Intermediate workspaces are not shown; the slide goes directly from where you
+were to where you stopped. At scroll speed they would each be a frame or two
+of blur, and drawing them would mean holding a snapshot of every workspace
+crossed.
 
 ### decoration
 

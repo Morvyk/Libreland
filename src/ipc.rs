@@ -1019,7 +1019,8 @@ mod server {
             .active_workspace(&output)
             .ok_or_else(|| format!("no output named {output}"))?;
         let index = resolve_target(target, active);
-        if state.layout.switch_workspace_to(&output, index) {
+        let slide = state.ws_slide_spec();
+        if state.layout.switch_workspace_to(&output, index, slide) {
             refocus_active(state, &output);
         }
         Ok(Response::Handled)
