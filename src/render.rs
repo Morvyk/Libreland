@@ -1780,6 +1780,9 @@ struct OutputRender {
     /// flash. `GlesTexture` is `Arc`-backed, so holding last frame's handle
     /// is cheap and keeps that buffer's texture alive until the next frame.
     prev_layer_masks: HashMap<ObjectId, GlesTexture>,
+    /// Last-logged backdrop-blur gate signature, so the trace prints only on
+    /// change instead of once per frame. Diagnostic only.
+    blur_trace: String,
 }
 
 /// What one drawn thing (window / layer / popup) looked like last frame,
@@ -2992,6 +2995,7 @@ impl Renderer {
                 profile: RenderProfile::new(),
                 damage_tracker: DamageTracker::new(),
                 prev_layer_masks: HashMap::new(),
+                blur_trace: String::new(),
             });
         }
 
@@ -3734,6 +3738,7 @@ impl Renderer {
             profile: RenderProfile::new(),
             damage_tracker: DamageTracker::new(),
             prev_layer_masks: HashMap::new(),
+            blur_trace: String::new(),
         });
         self.blur_scratch.clear();
         Ok(())
@@ -6196,6 +6201,41 @@ impl Renderer {
             self.blur_scratch.insert(idx, scratch);
         }
         t_blur += t.elapsed();
+
+        // Diagnostic: every gate that can silently drop a backdrop tier for a
+        // frame, logged only when the combination *changes*. A blur that
+        // flickers during a transition (focus crossfade, popup open) means one
+        // of these flipped for a frame or two; the timeline says which.
+        {
+            let mask_sig: String = layers
+                .iter()
+                .zip(layer_masks.iter())
+                .zip(prev_masks_now.iter())
+                .filter(|((l, _), _)| layer_blurs(l))
+                .map(|((l, cur), prev)| {
+                    format!(
+                        " {}[{}{}]",
+                        l.namespace,
+                        if cur.is_some() { 'c' } else { '-' },
+                        if prev.is_some() { 'p' } else { '-' },
+                    )
+                })
+                .collect();
+            let sig = format!(
+                "pass={passes_ok} solo={} norm={any_normal} proto={any_protocol_window} \
+                 nwin={need_window} nlay={need_layer} tiers={}{}{} vis={}/{}{mask_sig}",
+                solo_opaque.is_some(),
+                u8::from(tier_tiled.is_some()),
+                u8::from(tier_float.is_some()),
+                u8::from(tier_layer.is_some()),
+                visible.iter().filter(|v| **v).count(),
+                visible.len(),
+            );
+            if self.outputs[idx].blur_trace != sig {
+                debug!(output = %output_name, "blurgate {sig}");
+                self.outputs[idx].blur_trace = sig;
+            }
+        }
 
         // ── Damage ────────────────────────────────────────────────────
         // Diff this frame's drawn set against the previous frame's (see
