@@ -914,11 +914,13 @@ windowed.
 - **Cursor.** The hardware cursor plane scans out alongside, so pointer motion
   neither disturbs the frame nor forces a redraw. A cursor too large for the
   cursor plane falls back to software, which does force compositing.
-- **Explicit sync.** For a surface already on a plane, the client's
-  `linux-drm-syncobj` acquire fence is handed to KMS as `IN_FENCE_FD` instead
-  of gating the commit — the display engine waits, rather than our event loop,
-  saving a wakeup per frame. The moment the window stops being eligible, the
-  compositor waits on the fence itself before sampling the buffer.
+- **Explicit sync.** Unchanged by this path: a `linux-drm-syncobj` client's
+  commit is gated on its acquire fence by an eventfd blocker before the buffer
+  is visible to the compositor at all, so anything reaching a plane is already
+  GPU-complete. Handing the fence to KMS instead, and skipping that gate, was
+  tried and reverted — the compositor cannot know at commit time whether the
+  frame will be direct-scanned, so losing that bet meant a synchronous
+  second-long wait on the event loop. See the note below.
 - **VRR.** Settled before the flip, since enabling it can promote a page-flip
   to a full modeset. See [`vrr`](#monitors).
 - **Tearing.** Only offered on this path, and only for a plain primary-plane
@@ -926,6 +928,15 @@ windowed.
 - **Damage.** Consecutive direct frames of the same surface pass the client's
   own damage as `FB_DAMAGE_CLIPS`, so the display engine can skip re-fetching
   untouched regions. Any composited frame in between resets that to full.
+
+> **Do not CPU-wait on a client's acquire fence from the render path.**
+> Explicit-sync gating belongs in the pre-commit hook, where it blocks one
+> surface asynchronously via an eventfd. Moving it into the frame — waiting
+> synchronously when a direct-scanned window stops being eligible — blocks the
+> whole event loop, and a fullscreen game leaves the fast path constantly (any
+> pointer move that needs a software cursor does it). Measured: ~1 s stalls per
+> transition, then a hard hang. The latency it bought back was one event-loop
+> wakeup per frame.
 
 ## Clipboard & selections
 

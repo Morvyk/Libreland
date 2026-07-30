@@ -163,13 +163,14 @@ struct QueuedFrame {
 }
 
 /// The GPU work a frame must wait on before it may be scanned out.
-pub enum FrameFence {
-    /// A render fence from our own GLES frame.
+///
+/// Only ever our own render fence. A *client's* explicit-sync acquire point
+/// never reaches here: the commit that carried it is gated on that fence
+/// before the buffer is visible to us at all (see the pre-commit hook in
+/// [`crate::wayland`]), so by the time a buffer can be latched its GPU work
+/// is already done.
+enum FrameFence {
     Render(SyncPoint),
-    /// A client's explicit-sync acquire point, already exported to a syncobj
-    /// fd. Handed to KMS as `IN_FENCE_FD`; there is no CPU-wait fallback
-    /// (the caller only produces this when the plane supports fencing).
-    Acquire(std::os::fd::OwnedFd),
 }
 
 /// Where a frame's pixels land on the primary plane.
@@ -216,9 +217,6 @@ pub struct ScanoutLayer {
     /// The client's own damage since what this plane currently shows, in
     /// buffer pixels, or `None` for "assume all of it changed".
     pub damage: Option<Vec<Rectangle<i32, Physical>>>,
-    /// An exported explicit-sync acquire fence for KMS to wait on. Only
-    /// honoured on the primary layer — a commit carries one `IN_FENCE_FD`.
-    pub acquire: Option<std::os::fd::OwnedFd>,
 }
 
 /// A cached KMS framebuffer for a client buffer, keyed by a weak ref so it is
@@ -245,10 +243,6 @@ struct DirectProbe {
     /// overlay is a different request and re-probes.
     layers: Vec<ProbeLayer>,
     allow_modeset: bool,
-    /// Whether the flip would carry an `IN_FENCE_FD`. Fencing is a separate
-    /// atomic property, so a fenced and an unfenced commit are distinct
-    /// requests as far as the driver is concerned.
-    fenced: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -606,10 +600,6 @@ impl ScanoutSurface {
 
         // An acquire fence is only usable where the plane exposes IN_FENCE_FD;
         // without that the commit blocker upstream has already waited for us.
-        let mut primary = primary;
-        let acquire = primary.acquire.take().filter(|_| self.supports_fencing);
-        let fenced = acquire.is_some();
-
         // Build every layer before touching any state, so a rejection part
         // way through leaves nothing half-applied.
         let planes: Vec<plane::Handle> = std::iter::once(self.drm.plane())
@@ -631,22 +621,11 @@ impl ScanoutSurface {
         let probe = DirectProbe {
             layers: built.iter().map(|(_, _, p)| *p).collect(),
             allow_modeset,
-            fenced,
         };
         if self.last_probe.as_ref() != Some(&probe) {
             let mut states: Vec<PlaneState<'_>> = built
                 .iter()
-                .enumerate()
-                .map(|(i, (plane, layer, _))| {
-                    layer.plane_state(
-                        *plane,
-                        None,
-                        // Only the primary plane can carry the frame's fence:
-                        // a commit has one IN_FENCE_FD, and the overlays'
-                        // buffers have their own implicit fences anyway.
-                        acquire.as_ref().filter(|_| i == 0).map(AsFd::as_fd),
-                    )
-                })
+                .map(|(plane, layer, _)| layer.plane_state(*plane, None, None))
                 .collect();
             states.extend(self.dark_overlay_states(&planes[1..]));
             if let Err(err) = self.drm.test_state(states, allow_modeset) {
@@ -672,7 +651,9 @@ impl ScanoutSurface {
                 primary: primary_layer,
                 overlays: built.map(|(plane, layer, _)| (plane, layer)).collect(),
             },
-            sync: acquire.map(FrameFence::Acquire),
+            // Direct frames need no fence of their own: the client's
+            // buffer is GPU-complete by the time its commit was applied.
+            sync: None,
         });
         if self.pending.is_none() {
             self.submit()?;
@@ -871,13 +852,10 @@ impl ScanoutSurface {
             })
             .collect();
 
-        // Explicit sync: hand the fence to KMS as IN_FENCE_FD when the plane
-        // supports it; otherwise block on the GPU here and rely on implicit
-        // sync. A client's acquire fence is only ever produced when fencing
-        // is supported (`try_queue_direct` filters it), so it needs no
-        // CPU-wait arm — and could not have one, being a bare fd.
+        // Explicit sync: hand our render fence to KMS as IN_FENCE_FD when the
+        // plane supports it; otherwise block on the GPU here and rely on
+        // implicit sync.
         let fence = match sync {
-            Some(FrameFence::Acquire(fd)) => Some(fd),
             Some(FrameFence::Render(sync)) if self.supports_fencing => {
                 let fence = sync.export();
                 if fence.is_none() {

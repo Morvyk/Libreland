@@ -26,7 +26,6 @@ use smithay::backend::allocator::{Buffer as _, Format, Fourcc};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode, VrrSupport};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::sync::Fence as _;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
@@ -36,7 +35,7 @@ use smithay::backend::renderer::gles::{
     UniformType,
 };
 use smithay::backend::renderer::utils::{
-    Buffer as ClientBuffer, CommitCounter, RendererSurfaceStateUserData, draw_render_elements,
+    CommitCounter, RendererSurfaceStateUserData, draw_render_elements,
     with_renderer_surface_state,
 };
 use smithay::backend::renderer::{
@@ -1154,17 +1153,6 @@ pub struct Renderer {
     /// is in flight (see [`NoAnim`]). Cleared on drop, which lets them
     /// animate into their final tiles again.
     no_anim: NoAnim,
-    /// Surfaces whose buffers are currently going straight onto a primary
-    /// plane, so their explicit-sync acquire fence is handed to KMS as
-    /// `IN_FENCE_FD` instead of being waited on by the compositor.
-    ///
-    /// The commit hook in [`crate::wayland`] reads this to decide whether to
-    /// gate a commit on its acquire fence at all: for a surface on the plane
-    /// the display engine does the waiting, which saves an event-loop
-    /// round-trip on every single game frame. The invariant that keeps that
-    /// safe is [`Self::settle_skipped_fences`] — the composite path CPU-waits
-    /// on anything in this set before it may sample the buffer.
-    direct_surfaces: HashSet<ObjectId>,
     /// Tearing (async page-flip) policy, from `misc.tearing`. Live-reloaded
     /// via [`Self::set_tearing_mode`].
     tearing: TearingMode,
@@ -2798,7 +2786,6 @@ impl Renderer {
             decoration: DecorationConfig::default(),
             win_anims: HashMap::new(),
             pending_open: HashSet::new(),
-            direct_surfaces: HashSet::new(),
             tearing: TearingMode::default(),
             tearing_hints: HashSet::new(),
             no_anim: NoAnim::None,
@@ -2898,66 +2885,6 @@ impl Renderer {
             .get(&icon)
             .and_then(Clone::clone)
             .or_else(|| self.cursor.clone())
-    }
-
-    /// Whether `surface`'s buffers are going straight onto a primary plane
-    /// right now, so its explicit-sync acquire fence can be handed to KMS
-    /// rather than gating the commit. See [`Self::direct_surfaces`].
-    pub fn is_direct_scanning(&self, surface: &WlSurface) -> bool {
-        self.direct_surfaces.contains(&surface.id())
-    }
-
-    /// CPU-wait on the acquire fence of every surface whose commit blocker we
-    /// skipped, then forget them.
-    ///
-    /// This is the safety net for the frame where a direct-scanned window
-    /// stops being eligible — a popup opens over the game, it un-fullscreens,
-    /// a capture starts. Those commits were let through un-gated on the
-    /// promise that KMS would wait on the fence; the moment we instead intend
-    /// to *sample* the buffer, that promise is ours to keep, or we composite
-    /// a half-rendered frame.
-    ///
-    /// The set is emptied wholesale even though only this output's surfaces
-    /// are waited on. A surface still direct-scanning on *another* output
-    /// simply goes back to being gated at commit time until its next direct
-    /// frame re-adds it — a lost wakeup, not a lost fence. Clearing
-    /// conservatively is what makes the invariant easy to state: anything in
-    /// the set has a fence nobody has waited on yet.
-    fn settle_skipped_fences(&mut self, placements: &[Placement]) {
-        if self.direct_surfaces.is_empty() {
-            return;
-        }
-        for p in placements {
-            with_surface_tree_downward(
-                &p.surface,
-                (),
-                |_, _, ()| TraversalAction::DoChildren(()),
-                |surface, _, ()| {
-                    if !self.direct_surfaces.contains(&surface.id()) {
-                        return;
-                    }
-                    with_renderer_surface_state(surface, |state| {
-                        let Some(acquire) =
-                            state.buffer().and_then(ClientBuffer::acquire_point)
-                        else {
-                            return;
-                        };
-                        if acquire.is_signaled() {
-                            return;
-                        }
-                        debug!(
-                            surface = ?surface.id(),
-                            "explicit sync: CPU-waiting on a fence we let past the commit hook"
-                        );
-                        if let Err(err) = acquire.wait(crate::wayland::acquire_wait_deadline()) {
-                            warn!(error = %err, "explicit sync: acquire wait failed; frame may tear");
-                        }
-                    });
-                },
-                |_, _, ()| true,
-            );
-        }
-        self.direct_surfaces.clear();
     }
 
     /// Whether the hardware cursor plane is currently showing the cursor
@@ -3866,10 +3793,9 @@ impl Renderer {
         }
     }
 
-    /// Forget a dead surface's tearing hint and direct-scanout marker.
+    /// Forget a dead surface's tearing hint.
     pub fn forget_surface_scanout_state(&mut self, id: &ObjectId) {
         self.tearing_hints.remove(id);
-        self.direct_surfaces.remove(id);
     }
 
     /// Ensure output `idx` has a backdrop-blur scratch chain sized for its
@@ -4882,7 +4808,7 @@ impl Renderer {
         // a full scene composite (`capture_direct`). That is the difference
         // between "screen-sharing a game costs nothing" and "screen-sharing a
         // game turns the fast path off for the whole session".
-        if let Some(mut direct) = self.direct_scanout_inputs(idx, scene.as_ref(), placements, enc) {
+        if let Some(direct) = self.direct_scanout_inputs(idx, scene.as_ref(), placements, enc) {
             // Two exceptions, both about the capture:
             // - HDR, because the client's buffer is PQ/BT.2020 and our capture
             //   path can only tonemap the *linear* scene;
@@ -4892,41 +4818,11 @@ impl Renderer {
             let capture_ok =
                 captures.is_empty() || (!self.outputs[idx].hdr && direct.overlays.is_empty());
             if capture_ok {
-                // Hand KMS the client's acquire fence rather than having
-                // waited on it ourselves (see `direct_surfaces`). Only worth
-                // exporting when the point hasn't already signalled.
-                direct.primary.acquire = direct
-                    .primary
-                    .buffer
-                    .acquire_point()
-                    .filter(|p| !p.is_signaled())
-                    .and_then(|p| match p.export_sync_file() {
-                        Ok(fd) => Some(fd),
-                        Err(err) => {
-                            // Not fatal: the commit hook only skips its
-                            // blocker for surfaces already on the plane, and
-                            // `settle_skipped_fences` catches this buffer if
-                            // we end up compositing instead.
-                            debug!(error = %err, "explicit sync: could not export acquire fence for KMS");
-                            None
-                        }
-                    });
-                let fenced = direct.primary.acquire.is_some();
                 let n_overlays = direct.overlays.len();
                 // Kept for the capture below, which needs the buffer after
-                // ownership of the layer has moved into the flip. The
-                // keep-alive rides along because the capture *samples* the
-                // buffer — KMS was handed the acquire fence, but our GL read
-                // isn't ordered against it, so the capture has to wait
-                // itself. `ClientBuffer` is `Arc`-backed, and the release
-                // point only fires once every clone is gone.
-                let capture_src = (!captures.is_empty()).then(|| {
-                    (
-                        direct.primary.buffer.clone(),
-                        direct.primary.dmabuf.clone(),
-                        direct.primary.place,
-                    )
-                });
+                // ownership of the layer has moved into the flip.
+                let capture_src = (!captures.is_empty())
+                    .then(|| (direct.primary.dmabuf.clone(), direct.primary.place));
 
                 // VRR must settle before the flip (it may promote the flip to
                 // a modeset); harmlessly re-applied by the composite path on
@@ -4942,14 +4838,10 @@ impl Renderer {
                     Ok(true) => {
                         debug!(
                             output = %output_name,
-                            fenced,
                             overlays = n_overlays,
                             tearing = self.outputs[idx].surface.tearing(),
                             "frame direct-scanned to hardware planes (no compositing)"
                         );
-                        // This surface is on the plane, so its next commit's
-                        // fence can go to KMS instead of the event loop.
-                        self.direct_surfaces.insert(commit.0.clone());
                         // The plane now holds this exact commit — the next
                         // direct frame can describe its damage relative to it.
                         self.outputs[idx].direct_damage_ref = Some(commit);
@@ -4978,18 +4870,7 @@ impl Renderer {
                         // the plane. This runs *after* the flip so a slow
                         // capture consumer can never delay the game's frame.
                         let results = match capture_src {
-                            Some((buffer, dmabuf, place)) => {
-                                // The scanout flip waits on the acquire fence
-                                // in hardware; a GL read does not, so make
-                                // sure the client has actually finished
-                                // drawing before we sample its buffer.
-                                if let Some(acquire) =
-                                    buffer.acquire_point().filter(|p| !p.is_signaled())
-                                    && let Err(err) =
-                                        acquire.wait(crate::wayland::acquire_wait_deadline())
-                                {
-                                    warn!(error = %err, "explicit sync: acquire wait failed before capture; frame may be torn");
-                                }
+                            Some((dmabuf, place)) => {
                                 self.capture_direct(idx, &dmabuf, place, captures)
                             }
                             None => Vec::new(),
@@ -5009,10 +4890,8 @@ impl Renderer {
         }
         // Compositing from here on: the plane's contents are about to stop
         // being a client buffer, so damage can no longer be described
-        // relative to one, and any fence we waved through the commit hook is
-        // now ours to wait on.
+        // relative to one.
         self.outputs[idx].direct_damage_ref = None;
-        self.settle_skipped_fences(placements);
 
         // The solo window, when its visually-topmost mapped node covers the
         // output *provably opaquely*: with every output pixel guaranteed
@@ -7241,7 +7120,6 @@ impl Renderer {
                         transform,
                     },
                     damage,
-                    acquire: None,
                 },
                 commit,
             ))

@@ -4375,7 +4375,9 @@ fn main() -> Result<()> {
     let render_node = renderer.render_drm_node();
     info!(
         count = dmabuf_formats.len(),
-        scanout = scanout_formats.len(),
+        // Summed across outputs — `scanout_formats` is one entry per output.
+        scanout = scanout_formats.iter().map(|(_, f)| f.len()).sum::<usize>(),
+        outputs = scanout_formats.len(),
         render_node = ?render_node,
         "dmabuf import formats advertised to clients"
     );

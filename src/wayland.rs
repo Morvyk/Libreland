@@ -732,7 +732,7 @@ pub(crate) fn build_scanout_feedback(
 /// the whole compositor on the (rare) eventfd-setup failure path — at worst
 /// that one frame tears, versus the normal eventfd path which only stalls the
 /// single surface.
-pub(crate) fn acquire_wait_deadline() -> i64 {
+fn acquire_wait_deadline() -> i64 {
     let now = std::time::Duration::from(
         smithay::utils::Clock::<smithay::utils::Monotonic>::new().now(),
     );
@@ -781,17 +781,6 @@ impl CompositorHandler for State {
             surface,
             |state, _dh, surface| {
                 if state.drm_syncobj_state.is_none() {
-                    return;
-                }
-                // ...unless the surface's buffers are going straight onto a
-                // primary plane. There the *display engine* waits on the
-                // fence (we hand it over as `IN_FENCE_FD`), which is strictly
-                // better: gating here costs an eventfd wakeup and a second
-                // trip through the event loop on every single game frame,
-                // just to arrive at a buffer KMS was willing to wait for
-                // itself. The renderer keeps the promise on the frame this
-                // stops being true — see `Renderer::settle_skipped_fences`.
-                if state.renderer.is_direct_scanning(surface) {
                     return;
                 }
                 // Build an eventfd-backed blocker for this surface's acquire
