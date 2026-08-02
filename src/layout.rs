@@ -579,18 +579,47 @@ enum Node {
 /// behaves identically everywhere and any corner works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResizeEdges {
-    /// Move the right edge (else the left one).
-    pub right: bool,
-    /// Move the bottom edge (else the top one).
-    pub bottom: bool,
+    /// Which vertical edge moves, or `None` to pin the width.
+    ///
+    /// `None` matters for edge grabs: dragging a window's left *edge*
+    /// (rather than a corner) should resize width only, or a few pixels
+    /// of vertical drift on the way would resize the height too. A press
+    /// anywhere inside the window (`Super`+RMB) has both axes live.
+    pub x: Option<EdgeX>,
+    /// Which horizontal edge moves, or `None` to pin the height.
+    pub y: Option<EdgeY>,
+}
+
+/// The vertical edge an interactive resize moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeX {
+    Left,
+    Right,
+}
+
+/// The horizontal edge an interactive resize moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeY {
+    Top,
+    Bottom,
 }
 
 impl ResizeEdges {
-    /// Pick the edges from where `cursor` sits inside `rect`.
+    /// Pick the edges from where `cursor` sits inside `rect`, with both
+    /// axes live — the `Super`+RMB gesture, which can be started
+    /// anywhere in the window and so has no single edge to infer.
     pub fn from_press(rect: Rectangle<i32, Physical>, cursor: Point<i32, Physical>) -> Self {
         Self {
-            right: cursor.x >= rect.loc.x + rect.size.w / 2,
-            bottom: cursor.y >= rect.loc.y + rect.size.h / 2,
+            x: Some(if cursor.x >= rect.loc.x + rect.size.w / 2 {
+                EdgeX::Right
+            } else {
+                EdgeX::Left
+            }),
+            y: Some(if cursor.y >= rect.loc.y + rect.size.h / 2 {
+                EdgeY::Bottom
+            } else {
+                EdgeY::Top
+            }),
         }
     }
 }
@@ -1744,6 +1773,47 @@ impl Layout {
         true
     }
 
+    /// The window under `pos`, with the rect it actually occupies and
+    /// the decoration it currently carries — everything the input path
+    /// needs to work out which *part* of a window was hit.
+    ///
+    /// Same z-order and visibility rules as [`Layout::window_at`], since
+    /// it is that method underneath.
+    pub fn hit_target(
+        &self,
+        pos: Point<i32, Physical>,
+    ) -> Option<(WlSurface, Rectangle<i32, Physical>, Deco)> {
+        self.window_at(pos)
+            .map(|(w, rect)| (w.toplevel.wl_surface().clone(), rect, self.deco_for(w)))
+    }
+
+    /// Bring a floating window to the front of its workspace's stack.
+    /// Returns whether it moved (`false` for a tiled window, which has
+    /// no stacking order, or one already on top).
+    ///
+    /// The float list *is* the z-order — [`Layout::window_at`] walks it
+    /// in reverse and the renderer draws it forwards — so raising is
+    /// moving the entry to the end.
+    pub fn raise(&mut self, surface: &WlSurface) -> bool {
+        for op in &mut self.outputs {
+            let active = op.active;
+            let floats = &mut op.workspaces[active].floating;
+            let Some(i) = floats
+                .iter()
+                .position(|w| w.toplevel.wl_surface() == surface)
+            else {
+                continue;
+            };
+            if i + 1 == floats.len() {
+                return false;
+            }
+            let w = floats.remove(i);
+            floats.push(w);
+            return true;
+        }
+        false
+    }
+
     /// Hide or reveal a window without unmapping it. Returns whether
     /// `surface` was found *and* changed state.
     ///
@@ -1902,7 +1972,7 @@ impl Layout {
 
     /// Find a window by surface anywhere it can live (any output's any
     /// workspace tree or floating stack, or the in-transit drag).
-    fn window_ref(&self, surface: &WlSurface) -> Option<&Window> {
+    pub fn window_ref(&self, surface: &WlSurface) -> Option<&Window> {
         if let Some(t) = &self.in_transit
             && t.window.toplevel.wl_surface() == surface
         {
@@ -2940,9 +3010,9 @@ fn resize_leaf(
                 SplitAxis::LeftRight => (
                     if *done_h {
                         None
-                    } else if in_first && edges.right {
+                    } else if in_first && edges.x == Some(EdgeX::Right) {
                         Some(target.loc.x + target.size.w + half_a)
-                    } else if in_second && !edges.right {
+                    } else if in_second && edges.x == Some(EdgeX::Left) {
                         Some(target.loc.x - half_b)
                     } else {
                         None
@@ -2954,9 +3024,9 @@ fn resize_leaf(
                 SplitAxis::TopBottom => (
                     if *done_v {
                         None
-                    } else if in_first && edges.bottom {
+                    } else if in_first && edges.y == Some(EdgeY::Bottom) {
                         Some(target.loc.y + target.size.h + half_a)
-                    } else if in_second && !edges.bottom {
+                    } else if in_second && edges.y == Some(EdgeY::Top) {
                         Some(target.loc.y - half_b)
                     } else {
                         None
@@ -3593,7 +3663,10 @@ mod deco_tests {
 
 #[cfg(test)]
 mod resize_tests {
-    use super::{MIN_TILE_H, MIN_TILE_W, Point, Rectangle, ResizeEdges, Size, ratio_for_divider};
+    use super::{
+        EdgeX, EdgeY, MIN_TILE_H, MIN_TILE_W, Point, Rectangle, ResizeEdges, Size,
+        ratio_for_divider,
+    };
 
     /// A divider dropped at the middle of a cell is a 0.5 ratio, and the
     /// cell's absolute position is subtracted out (a second monitor's
@@ -3635,33 +3708,15 @@ mod resize_tests {
     fn press_half_picks_the_near_edge() {
         let rect = Rectangle::new(Point::<i32, _>::new(100, 100), Size::new(400, 200));
         let edges = |x, y| ResizeEdges::from_press(rect, Point::new(x, y));
-        assert_eq!(
-            edges(450, 250),
-            ResizeEdges {
-                right: true,
-                bottom: true
-            }
-        );
-        assert_eq!(
-            edges(150, 150),
-            ResizeEdges {
-                right: false,
-                bottom: false
-            }
-        );
-        assert_eq!(
-            edges(450, 150),
-            ResizeEdges {
-                right: true,
-                bottom: false
-            }
-        );
-        assert_eq!(
-            edges(150, 250),
-            ResizeEdges {
-                right: false,
-                bottom: true
-            }
-        );
+        // Both axes stay live: this gesture starts anywhere in the
+        // window, so there is no single edge to infer.
+        let both = |x, y| ResizeEdges {
+            x: Some(x),
+            y: Some(y),
+        };
+        assert_eq!(edges(450, 250), both(EdgeX::Right, EdgeY::Bottom));
+        assert_eq!(edges(150, 150), both(EdgeX::Left, EdgeY::Top));
+        assert_eq!(edges(450, 150), both(EdgeX::Right, EdgeY::Top));
+        assert_eq!(edges(150, 250), both(EdgeX::Left, EdgeY::Bottom));
     }
 }

@@ -62,16 +62,19 @@ use smithay::utils::{
 use smithay::wayland::compositor::{
     BufferAssignment, SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
 };
-use smithay::wayland::shell::xdg::SurfaceCachedState;
+use smithay::wayland::shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData};
 use tracing::{debug, info, warn};
 
 use crate::anim::{Animation, lerp};
+use libreland_text::Fonts;
+
 use crate::config::{
     AnimSpec, AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig,
-    ScaleMode, TearingMode, VrrMode,
+    ScaleMode, TearingMode, TitlebarConfig, VrrMode,
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
+use crate::titlebar::{BarStyle, rasterize as rasterize_bar};
 use crate::scanout::{DirectPlacement, ScanoutLayer, ScanoutSurface};
 
 /// A layer surface to render this frame. Pre-computed by main
@@ -1375,6 +1378,19 @@ pub struct Renderer {
     /// surface destroy ([`Renderer::forget_surface`]) and on size/format
     /// change. `LIBRELAND_NO_WINTEX_CACHE=1` disables for A/B runs.
     wintex_cache: HashMap<ObjectId, WinTexCache>,
+    /// Titlebar configuration (height, font size, buttons). Applied live
+    /// on reload like the rest of the appearance settings.
+    titlebar: TitlebarConfig,
+    /// UI faces for titlebar text. Loading is deferred to the first bar
+    /// that needs one rather than done at startup — walking every font
+    /// directory is not something a tiling session with no titlebars
+    /// should pay for — and [`FontState`] makes the scan run exactly
+    /// once even when it comes back empty.
+    fonts: FontState,
+    /// Rasterized titlebars by [`bar_key`]. Small (one bar-sized RGBA
+    /// texture per distinct title/size/focus), and bounded — a window
+    /// whose title animates would otherwise grow this without limit.
+    bar_cache: HashMap<u64, GlesTexture>,
     /// `LIBRELAND_NO_OCCLUSION=1`: disable the occluded/off-output window
     /// prune, for A/B benchmarking against the render-profile log.
     no_occlusion: bool,
@@ -2019,6 +2035,50 @@ struct WinTexCache {
     /// Per-node commit counters of the window's surface tree at render
     /// time; a commit anywhere in the tree changes the fingerprint.
     fingerprint: Vec<(ObjectId, CommitCounter)>,
+    /// Identity of the titlebar drawn into this offscreen ([`bar_key`]),
+    /// or `0` when the window has none.
+    ///
+    /// The offscreen is cached against the *surface tree*, which knows
+    /// nothing about a title change or a focus change — so without this
+    /// the bar would draw once and then never update, a stale-cache bug
+    /// of exactly the shape 94145d3 fixed for blank offscreens.
+    bar: u64,
+}
+
+/// Lazily-loaded UI faces for titlebar text.
+///
+/// The distinction that matters is "not looked yet" versus "looked and
+/// found nothing": without it, a system with no usable font rescans
+/// every font directory for every bar it draws.
+enum FontState {
+    Unscanned,
+    Scanned(Option<Fonts>),
+}
+
+/// Cap on rasterized titlebars held at once. A bar is one small RGBA
+/// texture, so this is generous; it exists so a client whose title
+/// animates (a download percentage, a clock) can't grow the cache
+/// without limit.
+const BAR_CACHE_MAX: usize = 64;
+
+/// Identity of a window's titlebar: everything that changes its pixels.
+///
+/// Focus is deliberately a *bool* rather than the crossfade's `f32`. The
+/// border colour animates continuously (in the composite shader, where
+/// it costs a uniform), but a bar that re-rasterized on every frame of
+/// a 220 ms crossfade would re-render the window's whole offscreen ~35
+/// times per focus change. Titlebars switch, borders fade.
+fn bar_key(width: i32, height: i32, title: &str, focused: bool, buttons: usize) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut h);
+    height.hash(&mut h);
+    title.hash(&mut h);
+    focused.hash(&mut h);
+    buttons.hash(&mut h);
+    // 0 is reserved for "no titlebar", so a real bar can never collide
+    // with one.
+    h.finish() | 1
 }
 
 /// The window tree's content identity — decides whether a cached
@@ -3263,6 +3323,9 @@ impl Renderer {
             round_blur_shader_hdr,
             hdr_scene: HashMap::new(),
             wintex_cache: HashMap::new(),
+            titlebar: TitlebarConfig::default(),
+            fonts: FontState::Unscanned,
+            bar_cache: HashMap::new(),
             no_occlusion: std::env::var_os("LIBRELAND_NO_OCCLUSION").is_some(),
             no_wintex_cache: std::env::var_os("LIBRELAND_NO_WINTEX_CACHE").is_some(),
             no_damage: std::env::var_os("LIBRELAND_NO_DAMAGE").is_some(),
@@ -4223,6 +4286,98 @@ impl Renderer {
 
     /// Replace the decoration config (window opacity + blur). Live config
     /// reload; read fresh next frame.
+    /// The rasterized titlebar for `key`, drawing it if it isn't cached.
+    ///
+    /// `None` on an upload failure, which the caller treats as "no bar
+    /// this frame" — a window without its titlebar is still usable, and
+    /// the alternative is refusing to draw the window at all.
+    fn bar_texture(
+        &mut self,
+        key: u64,
+        width: i32,
+        height: i32,
+        title: &str,
+        focused: bool,
+        font_px: f32,
+    ) -> Option<GlesTexture> {
+        if let Some(tex) = self.bar_cache.get(&key) {
+            return Some(tex.clone());
+        }
+        // Bounded so a client with an animating title (a progress
+        // percentage, a clock) can't grow this without limit. Cleared
+        // wholesale rather than evicted one at a time: the bars are
+        // small, and picking a victim needs recency bookkeeping that
+        // costs more than re-rasterizing the handful still on screen.
+        if self.bar_cache.len() >= BAR_CACHE_MAX {
+            debug!(
+                entries = self.bar_cache.len(),
+                "titlebar: cache full, clearing"
+            );
+            self.bar_cache.clear();
+        }
+        if matches!(self.fonts, FontState::Unscanned) {
+            let loaded = Fonts::load();
+            if loaded.is_none() {
+                warn!("titlebar: no usable UI font found; bars will draw without titles");
+            }
+            self.fonts = FontState::Scanned(loaded);
+        }
+        let fonts = match &self.fonts {
+            FontState::Scanned(f) => f.as_ref(),
+            FontState::Unscanned => None,
+        };
+        // The bar's colours come from the border fill for the same focus
+        // state, so the frame and the bar are one palette with no second
+        // set of config keys to keep in sync. A gradient contributes its
+        // top stop — the bar is short enough that sampling the ramp
+        // across it would read as flat anyway.
+        let border_rgb = match if focused {
+            &self.border.active
+        } else {
+            &self.border.inactive
+        } {
+            Fill::Solid(rgb) => *rgb,
+            Fill::VerticalGradient { top, .. } => *top,
+        };
+        let rgba = rasterize_bar(
+            fonts,
+            width,
+            height,
+            title,
+            BarStyle::from_border(border_rgb, focused),
+            &self.titlebar.buttons,
+            font_px,
+        );
+        let size = Size::<i32, smithay::utils::Buffer>::from((width.max(1), height.max(1)));
+        match self
+            .gles
+            .import_memory(&rgba, Fourcc::Abgr8888, size, false)
+        {
+            Ok(tex) => {
+                self.bar_cache.insert(key, tex.clone());
+                Some(tex)
+            }
+            Err(err) => {
+                warn!(error = %err, "titlebar: texture upload failed");
+                None
+            }
+        }
+    }
+
+    /// Swap the titlebar settings (live reload). Drops the rasterized
+    /// bars, since height, font size and the button set all change their
+    /// pixels; they re-rasterize on the next frame that needs them.
+    pub fn set_titlebar(&mut self, cfg: TitlebarConfig) {
+        if self.titlebar == cfg {
+            return;
+        }
+        self.titlebar = cfg;
+        self.bar_cache.clear();
+        // Every cached decoration offscreen has a bar drawn into it.
+        self.wintex_cache.clear();
+        self.invalidate_damage();
+    }
+
     pub fn set_decoration(&mut self, cfg: DecorationConfig) {
         self.decoration = cfg;
         self.invalidate_damage();
@@ -5577,11 +5732,17 @@ impl Renderer {
         // fractional displays.
         let bw_comp = border.width.max(0);
         let radius_comp = border.rounded_corners.max(0);
-        // A Normal window with a border and/or rounded corners is composited
-        // through an offscreen texture + the rounded mask shader (so its
-        // corners are genuinely transparent). Without either it's a plain
-        // rectangle drawn straight to the frame, like fullscreen/maximized.
-        let decorated = radius_comp > 0 || bw_comp > 0;
+        // A Normal window with a border, rounded corners and/or a
+        // titlebar is composited through an offscreen texture + the
+        // rounded mask shader (so its corners are genuinely transparent).
+        // Without any of them it's a plain rectangle drawn straight to
+        // the frame, like fullscreen/maximized.
+        //
+        // The titlebar has to be in here: it is drawn *into* that
+        // offscreen, so a window with a bar but no border and no radius
+        // would otherwise take the direct path and lose its bar entirely.
+        let titlebar_comp = placements.iter().any(|p| p.deco.titlebar > 0);
+        let decorated = radius_comp > 0 || bw_comp > 0 || titlebar_comp;
         #[allow(
             clippy::type_complexity,
             reason = "one frame's worth of per-window, rescale-wrapped surface elements"
@@ -5637,20 +5798,33 @@ impl Renderer {
                     // is a frame behind its configure; when settled,
                     // `effective == cell_rect` and the scale is 1 (crisp).
                     let eff = wd.effective;
-                    let (content_w, content_h) =
-                        window_geometry_size(&p.surface).unwrap_or((
-                            p.cell_rect.size.w - 2 * bw_p,
-                            p.cell_rect.size.h - 2 * bw_p,
-                        ));
-                    // Offscreen: fill the cell, anchored at the cell origin
-                    // (0,0). Direct: inset by the border, anchored at the
-                    // output-local cell position.
+                    let fallback = p.deco.content_size(p.cell_rect.size);
+                    let (content_w, content_h) = window_geometry_size(&p.surface)
+                        .unwrap_or((fallback.w, fallback.h));
+                    // The titlebar is opaque and covers the cell's top
+                    // strip, so the surface has to start *below* it.
+                    // Stretching under the bar (as the surface does under
+                    // the border ring) would squash the client's content
+                    // by the bar's whole height — fine for a 2 px ring,
+                    // very much not for a 28 px bar.
+                    let tb = if p.fill == FillMode::Normal {
+                        p.deco.titlebar
+                    } else {
+                        0
+                    };
+                    // Offscreen: fill the cell below the titlebar, anchored
+                    // at the cell origin (0, titlebar). The remaining
+                    // stretch across the border ring is deliberate — it
+                    // keeps the surface opaque over the ring's inner edge,
+                    // so there's no transparent seam there. Direct: inset
+                    // by the border, anchored at the output-local cell
+                    // position.
                     let (target_w, target_h, anchor_x, anchor_y) = if offscreen {
                         (
                             f64::from(eff.size.w.max(1)),
-                            f64::from(eff.size.h.max(1)),
+                            f64::from((eff.size.h - tb).max(1)),
                             0.0,
-                            0.0,
+                            f64::from(tb),
                         )
                     } else {
                         (
@@ -5996,6 +6170,26 @@ impl Renderer {
                 cell.size.w.max(1),
                 cell.size.h.max(1),
             ));
+            // The titlebar's identity joins the surface fingerprint in
+            // deciding whether the offscreen is current: the bar is drawn
+            // *into* it, and a title or focus change moves no commit
+            // counter at all.
+            let bar_h = scale_i(p.deco.titlebar, scale);
+            let (bar, bar_title) = if bar_h > 0 {
+                let title = window_title(&p.surface).unwrap_or_default();
+                (
+                    bar_key(
+                        cell.size.w,
+                        bar_h,
+                        &title,
+                        wd.focus >= 0.5,
+                        self.titlebar.buttons.len(),
+                    ),
+                    title,
+                )
+            } else {
+                (0, String::new())
+            };
             // Cached offscreen still current (same content, cell and
             // format)? Reuse it — an idle window costs a fingerprint walk
             // instead of an allocation + full redraw. On mismatch, reuse
@@ -6006,7 +6200,11 @@ impl Renderer {
                 .flatten();
             let mut reusable = None;
             if let Some(cached) = cached {
-                if cached.fmt == fmt && cached.size == size && cached.fingerprint == fingerprint {
+                if cached.fmt == fmt
+                    && cached.size == size
+                    && cached.fingerprint == fingerprint
+                    && cached.bar == bar
+                {
                     win_tex.push(Some(cached.tex.clone()));
                     self.wintex_cache.insert(p.surface.id(), cached);
                     continue;
@@ -6021,7 +6219,7 @@ impl Renderer {
                 // Keep the old texture, and deliberately keep its old
                 // fingerprint too: the entry must still look stale so the
                 // next frame that does have elements re-renders it.
-                if elements.is_empty() && cached.fmt == fmt && cached.size == size {
+                if elements.is_empty() && cached.fmt == fmt && cached.size == size && cached.bar == bar {
                     debug!(
                         surface = ?p.surface.id(),
                         "wintex: empty elements on a committed tree; keeping last offscreen"
@@ -6035,6 +6233,23 @@ impl Renderer {
             }
             let phys = Size::<i32, Physical>::from((size.w, size.h));
             let full = [Rectangle::<i32, Physical>::from_size(phys)];
+            // Rasterized here, before the closure below borrows
+            // `self.gles` for the whole offscreen render.
+            let bar_tex = (bar_h > 0)
+                .then(|| {
+                    self.bar_texture(
+                        bar,
+                        size.w,
+                        bar_h,
+                        &bar_title,
+                        wd.focus >= 0.5,
+                        // The bar is rasterized in PHYSICAL pixels (the
+                        // offscreen is), so the point size scales with
+                        // the output or the text is tiny on HiDPI.
+                        bar_font_px(self.titlebar.font_size, scale),
+                    )
+                })
+                .flatten();
             let tex = (|| -> Option<GlesTexture> {
                 let mut tex = match reusable {
                     Some(tex) => tex,
@@ -6073,6 +6288,33 @@ impl Renderer {
                 draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full)
                     .inspect_err(|err| warn!(error = %err, "rounded window: draw failed"))
                     .ok()?;
+                // The titlebar goes on last, over the top strip the
+                // surface was inset out of. Into the offscreen rather
+                // than into the frame, so the composite's rounded-rect
+                // mask clips the bar's top corners for free — drawn
+                // after the mask it would square them off again.
+                if let Some(tex) = &bar_tex {
+                    let dst = Rectangle::<i32, Physical>::new(
+                        Point::from((0, 0)),
+                        Size::from((size.w, bar_h)),
+                    );
+                    let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(
+                        Size::from((f64::from(size.w), f64::from(bar_h))),
+                    );
+                    if let Err(err) = frame.render_texture_from_to(
+                        tex,
+                        src,
+                        dst,
+                        &full,
+                        &[dst],
+                        Transform::Normal,
+                        1.0,
+                        None,
+                        &[],
+                    ) {
+                        warn!(error = %err, "titlebar: blit into the window offscreen failed");
+                    }
+                }
                 // Same-context sequential GL: the composite that samples this
                 // texture is ordered after these writes, so the fence is dropped.
                 let _ = frame
@@ -6092,6 +6334,7 @@ impl Renderer {
                         size,
                         fmt,
                         fingerprint,
+                        bar,
                     },
                 );
             }
@@ -8606,6 +8849,17 @@ fn draw_fill_rect(
 }
 
 
+/// Titlebar point size in physical pixels for an output at `scale`.
+/// The bar is rasterized into a physical-pixel offscreen, so an
+/// unscaled point size would draw tiny text on a `HiDPI` display.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a config-bounded point size (1.0..=200.0) times a display scale; f32 is exact well past that"
+)]
+fn bar_font_px(font_size: f32, scale: f64) -> f32 {
+    (f64::from(font_size) * scale) as f32
+}
+
 /// Multiply an i32 by a positive f64 scale and round to the nearest
 /// integer. The cast can't truncate in any practical case: input is
 /// bounded by i32 cell coords and scale is configured-positive.
@@ -8751,6 +9005,21 @@ fn window_geometry_size(surface: &WlSurface) -> Option<(i32, i32)> {
             .geometry
             .map(|g| (g.size.w, g.size.h))
             .filter(|&(w, h)| w > 0 && h > 0)
+    })
+}
+
+/// A toplevel's title, for its titlebar.
+///
+/// Xdg only: this reads the xdg-shell role data, and Xwayland surfaces
+/// carry their `WM_NAME` on the X11 side instead. X11 windows therefore
+/// get a bar with buttons and no text — worth fixing, but a titleless
+/// bar still drags, maximizes and closes.
+fn window_title(surface: &WlSurface) -> Option<String> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().ok().and_then(|d| d.title.clone()))
     })
 }
 

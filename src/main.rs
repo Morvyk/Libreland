@@ -23,6 +23,8 @@
 //! `~/.local/state/libreland/`); read that file when stderr isn't visible
 //! (e.g. after a freeze that needs recovering from another TTY).
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context as _, Result};
 use smithay::backend::drm::{DrmDevice, DrmEventMetadata, DrmEventTime};
 use smithay::backend::input::{
@@ -79,6 +81,7 @@ mod scanout;
 mod screencopy;
 mod screenshot;
 mod tearing;
+mod titlebar;
 mod wayland;
 mod xwayland;
 
@@ -593,6 +596,23 @@ pub(crate) struct State {
     /// reaching its client, and intervening button events are
     /// swallowed.
     pub(crate) drag: Option<DragState>,
+    /// A titlebar button pressed but not yet released.
+    ///
+    /// Buttons act on release over the *same* button, so a mis-aimed
+    /// press on Close can be aborted by sliding off it before letting
+    /// go. That is what every desktop does, and it is the only reason
+    /// clicking Close by accident is recoverable.
+    pub(crate) armed_button: Option<(WlSurface, crate::config::TitlebarButton)>,
+    /// The resize cursor this module currently has set, so hover
+    /// feedback only ever clears an override it put there itself — a
+    /// drag, a screenshot session and a client's own cursor share the
+    /// same channel.
+    pub(crate) decoration_cursor: Option<CursorIcon>,
+    /// Last titlebar press, for double-click detection: the window, when
+    /// it happened, and where. A second press on the same titlebar
+    /// within [`DOUBLE_CLICK`] and [`DOUBLE_CLICK_SLOP`] toggles
+    /// maximize.
+    pub(crate) last_bar_click: Option<(WlSurface, Instant, Point<i32, Physical>)>,
     /// Accumulated high-resolution scroll (v120 units) for the
     /// `Super`+scroll workspace gesture. One physical wheel notch is
     /// 120 units; we fire one workspace step per ±120 accumulated so
@@ -744,6 +764,42 @@ const DEFAULT_SESSION_ENV: &[(&str, &str)] = &[
     ("XDG_SESSION_TYPE", "wayland"),
     ("XDG_SESSION_DESKTOP", "libreland"),
 ];
+
+/// The cursor shown while a drag runs: the grabbing hand for a move,
+/// and for a resize the arrow matching the edges actually being moved.
+///
+/// A single-axis grab (a window's left edge, say) gets the plain
+/// left/right or up/down arrow rather than a corner one — the corner
+/// arrow would promise a two-axis resize the drag will refuse.
+fn drag_cursor(mode: DragMode, edges: layout::ResizeEdges) -> CursorIcon {
+    use layout::{EdgeX, EdgeY};
+    match mode {
+        DragMode::Move => CursorIcon::Grabbing,
+        DragMode::Resize => match (edges.x, edges.y) {
+            (Some(EdgeX::Right), Some(EdgeY::Bottom)) => CursorIcon::SeResize,
+            (Some(EdgeX::Right), Some(EdgeY::Top)) => CursorIcon::NeResize,
+            (Some(EdgeX::Left), Some(EdgeY::Bottom)) => CursorIcon::SwResize,
+            (Some(EdgeX::Left), Some(EdgeY::Top)) => CursorIcon::NwResize,
+            (Some(EdgeX::Right), None) => CursorIcon::EResize,
+            (Some(EdgeX::Left), None) => CursorIcon::WResize,
+            (None, Some(EdgeY::Bottom)) => CursorIcon::SResize,
+            (None, Some(EdgeY::Top)) => CursorIcon::NResize,
+            // No axis to resize: nothing will move, so don't promise it.
+            (None, None) => CursorIcon::Default,
+        },
+    }
+}
+
+/// How close together two titlebar presses must be to read as a
+/// double-click. The usual desktop default; long enough not to need a
+/// deliberate fast tap, short enough that two separate clicks on a
+/// titlebar don't maximize the window by surprise.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// How far the pointer may move between the two presses of a
+/// double-click, in compositor pixels. Without a bound, a click, a drag
+/// across the bar and a click back would count as one.
+const DOUBLE_CLICK_SLOP: i32 = 6;
 
 /// Lower bound a drag-resize will clamp the floating rect to so
 /// the window can't be resized into a slice too small to grab
@@ -1165,6 +1221,230 @@ impl State {
         // dispatch — same reasoning (stale pointer lock / hidden cursor).
         self.refresh_pointer_focus();
         self.queue_redraw_all();
+    }
+
+    /// Which part of which window the cursor is over, if any.
+    ///
+    /// `None` when the pointer is over a popup — a menu overhanging its
+    /// parent's titlebar must not turn into a window drag — or over no
+    /// window at all.
+    fn region_under_cursor(
+        &self,
+    ) -> Option<(
+        WlSurface,
+        smithay::utils::Rectangle<i32, Physical>,
+        titlebar::Region,
+    )> {
+        let pos = self.cursor_point();
+        if self.popup_at(pos).is_some() {
+            return None;
+        }
+        let (surface, cell, deco) = self.layout.hit_target(pos)?;
+        // An undecorated window (fullscreen, or the whole tiling default)
+        // has no regions of its own: every pixel is the client's.
+        if deco == layout::Deco::none() {
+            return Some((surface, cell, titlebar::Region::Content));
+        }
+        let region = titlebar::region_at(
+            cell,
+            deco,
+            &self.config.titlebar.buttons,
+            self.config.layout.resize_zone,
+            pos,
+        );
+        Some((surface, cell, region))
+    }
+
+    /// Handle a pointer button against a window's decoration: titlebar
+    /// buttons, titlebar drags (including double-click to maximize) and
+    /// edge resizes. Returns whether the event was consumed.
+    ///
+    /// Press *arms* a button and release fires it, so sliding off an
+    /// armed button aborts it. Everything else that isn't a decoration
+    /// hit falls through to the normal forwarding path.
+    fn handle_decoration_button(
+        &mut self,
+        button: u32,
+        state: smithay::backend::input::ButtonState,
+    ) -> bool {
+        use smithay::backend::input::ButtonState;
+        // A release always disarms, even one that lands elsewhere —
+        // otherwise an aborted press would fire on some later click.
+        if matches!(state, ButtonState::Released) {
+            let Some((surface, kind)) = self.armed_button.take() else {
+                return false;
+            };
+            if button != BTN_LEFT {
+                return false;
+            }
+            let still_on_it = self
+                .region_under_cursor()
+                .is_some_and(|(s, _, r)| s == surface && r == titlebar::Region::Button(kind));
+            if still_on_it {
+                self.activate_titlebar_button(&surface, kind);
+            }
+            // Consumed either way: the client never saw the press, so it
+            // must not see the release.
+            return true;
+        }
+        if button != BTN_LEFT || self.session_locked {
+            return false;
+        }
+        // Super owns its own drag gestures; don't shadow them.
+        if self
+            .seat
+            .get_keyboard()
+            .is_some_and(|k| k.modifier_state().logo)
+        {
+            return false;
+        }
+        let Some((surface, cell, region)) = self.region_under_cursor() else {
+            return false;
+        };
+        // Any press on a window raises it, including one that lands in
+        // the client's own content — clicking a window brings it to the
+        // front everywhere else, and a click that focuses without
+        // raising leaves the focused window behind another one.
+        if self.layout.raise(&surface) {
+            self.queue_redraw_all();
+        }
+        if matches!(region, titlebar::Region::Content) {
+            // Not ours. Focus/forwarding happen on the normal path.
+            return false;
+        }
+        // Decoration gestures act on the window, so focus follows the
+        // press even in hover mode — the pointer is over our chrome, not
+        // over the client, so nothing else would move focus here.
+        if let Some(kbd) = self.seat.get_keyboard()
+            && kbd.current_focus().as_ref() != Some(&surface)
+        {
+            kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+        }
+        match region {
+            titlebar::Region::Button(kind) => {
+                self.armed_button = Some((surface, kind));
+                true
+            }
+            titlebar::Region::Titlebar => {
+                let now = Instant::now();
+                let pos = self.cursor_point();
+                let double = self.last_bar_click.take().is_some_and(|(s, at, at_pos)| {
+                    s == surface
+                        && now.duration_since(at) <= DOUBLE_CLICK
+                        && (pos.x - at_pos.x).abs() <= DOUBLE_CLICK_SLOP
+                        && (pos.y - at_pos.y).abs() <= DOUBLE_CLICK_SLOP
+                });
+                if double {
+                    self.layout.toggle_maximized(&surface);
+                    self.queue_redraw_all();
+                } else {
+                    self.last_bar_click = Some((surface.clone(), now, pos));
+                    self.begin_window_drag(&surface, DragMode::Move, cell, None);
+                }
+                true
+            }
+            titlebar::Region::Resize(edges) => {
+                self.begin_window_drag(&surface, DragMode::Resize, cell, Some(edges));
+                true
+            }
+            titlebar::Region::Content => unreachable!("returned above"),
+        }
+    }
+
+    /// Show a resize cursor while the pointer is in a window's grab
+    /// margin, and take the override away again when it leaves.
+    ///
+    /// Only ever touches the override it set itself: a drag, a
+    /// screenshot session and a client's own cursor all use the same
+    /// channel, and stealing from any of them would strand their shape.
+    fn refresh_decoration_cursor(&mut self) {
+        // A drag owns the cursor for its whole run, and a screenshot
+        // session owns the screen.
+        if self.drag.is_some() || self.screenshot.is_some() {
+            return;
+        }
+        let want = match self.region_under_cursor() {
+            Some((_, _, titlebar::Region::Resize(edges))) => {
+                Some(drag_cursor(DragMode::Resize, edges))
+            }
+            _ => None,
+        };
+        if want == self.decoration_cursor {
+            return;
+        }
+        self.decoration_cursor = want;
+        self.renderer
+            .set_cursor_override(want.map(CursorImageStatus::Named));
+    }
+
+    /// Run a titlebar button's action.
+    fn activate_titlebar_button(
+        &mut self,
+        surface: &WlSurface,
+        kind: crate::config::TitlebarButton,
+    ) {
+        use crate::config::TitlebarButton;
+        match kind {
+            TitlebarButton::Minimize => {
+                self.minimize_window(surface);
+            }
+            TitlebarButton::Maximize => {
+                self.layout.toggle_maximized(surface);
+                self.queue_redraw_all();
+            }
+            // Politely — the client runs its own teardown. Never a kill.
+            TitlebarButton::Close => {
+                if let Some(w) = self.layout.window_ref(surface) {
+                    w.toplevel.send_close();
+                }
+            }
+        }
+    }
+
+    /// Start an interactive move/resize the same way the `Super` gesture
+    /// does, so both entry points share the drag bookkeeping, the
+    /// animation suppression and the cursor override.
+    ///
+    /// `edges` is `Some` for an edge grab, which already knows which
+    /// edges it took; `None` infers them from the press position.
+    fn begin_window_drag(
+        &mut self,
+        surface: &WlSurface,
+        mode: DragMode,
+        cell: smithay::utils::Rectangle<i32, Physical>,
+        edges: Option<layout::ResizeEdges>,
+    ) {
+        let cursor = self.cursor_point();
+        let rect_start = match mode {
+            DragMode::Move => self.layout.start_move_drag(surface),
+            DragMode::Resize => self.layout.start_resize_drag(surface),
+        };
+        let Some(rect_start) = rect_start else {
+            debug!(
+                surface = ?surface.id(),
+                ?mode,
+                "decoration drag refused (filled window, or not managed)"
+            );
+            return;
+        };
+        let _ = cell;
+        let edges = edges.unwrap_or_else(|| layout::ResizeEdges::from_press(rect_start, cursor));
+        if matches!(mode, DragMode::Resize) {
+            self.renderer.set_no_anim_all(true);
+        } else {
+            self.renderer.set_no_anim_move(Some(surface));
+        }
+        let (cx, cy) = self.renderer.cursor_pos();
+        self.drag = Some(DragState {
+            surface: surface.clone(),
+            mode,
+            cursor_start: (cx, cy),
+            rect_start,
+            edges,
+            size_limits: self.layout.client_size_limits(surface),
+        });
+        self.renderer
+            .set_cursor_override(Some(CursorImageStatus::Named(drag_cursor(mode, edges))));
     }
 
     /// Hide a window without closing it, handing focus on if it held it.
@@ -1958,23 +2238,31 @@ impl State {
                     let min_h = MIN_DRAG_RESIZE_H.max(lmin.h).min(lmax.h);
                     let clamp_w = move |w: i32| w.min(lmax.w).max(min_w);
                     let clamp_h = move |h: i32| h.min(lmax.h).max(min_h);
-                    let (x, w) = if drag.edges.right {
-                        (
+                    // An axis the grab didn't include is pinned: grabbing
+                    // a window's left edge resizes width only, so a few
+                    // pixels of vertical drift on the way don't also
+                    // resize the height. Super+RMB has both axes live.
+                    let (x, w) = match drag.edges.x {
+                        None => (drag.rect_start.loc.x, drag.rect_start.size.w),
+                        Some(layout::EdgeX::Right) => (
                             drag.rect_start.loc.x,
                             clamp_w(drag.rect_start.size.w + delta_x),
-                        )
-                    } else {
-                        let w = clamp_w(drag.rect_start.size.w - delta_x);
-                        (drag.rect_start.loc.x + drag.rect_start.size.w - w, w)
+                        ),
+                        Some(layout::EdgeX::Left) => {
+                            let w = clamp_w(drag.rect_start.size.w - delta_x);
+                            (drag.rect_start.loc.x + drag.rect_start.size.w - w, w)
+                        }
                     };
-                    let (y, h) = if drag.edges.bottom {
-                        (
+                    let (y, h) = match drag.edges.y {
+                        None => (drag.rect_start.loc.y, drag.rect_start.size.h),
+                        Some(layout::EdgeY::Bottom) => (
                             drag.rect_start.loc.y,
                             clamp_h(drag.rect_start.size.h + delta_y),
-                        )
-                    } else {
-                        let h = clamp_h(drag.rect_start.size.h - delta_y);
-                        (drag.rect_start.loc.y + drag.rect_start.size.h - h, h)
+                        ),
+                        Some(layout::EdgeY::Top) => {
+                            let h = clamp_h(drag.rect_start.size.h - delta_y);
+                            (drag.rect_start.loc.y + drag.rect_start.size.h - h, h)
+                        }
                     };
                     let new_rect = smithay::utils::Rectangle::new(
                         Point::<i32, Physical>::new(x, y),
@@ -1987,6 +2275,12 @@ impl State {
             }
             return;
         }
+
+        // Resize margins are invisible, so the cursor is the only thing
+        // that says one is there. Done before the constraint handling
+        // below because it is purely about our own chrome — a client
+        // that locks the pointer never has a decoration under it.
+        self.refresh_decoration_cursor();
 
         let Some(pointer) = self.seat.get_pointer() else {
             return;
@@ -2204,8 +2498,11 @@ impl State {
                     self.layout.finish_move_drag(cursor_i);
                 }
                 // Drop the gesture-cursor override; the client under the
-                // pointer drives the cursor again from here.
+                // pointer drives the cursor again from here. Clearing our
+                // own record too, or the next hover over the same margin
+                // would think the shape was already set and skip it.
                 self.renderer.set_cursor_override(None);
+                self.decoration_cursor = None;
                 // Re-enable move animation for the window so it eases into
                 // its final tile (move) or stays put (resize).
                 self.renderer.set_no_anim_move(None);
@@ -2228,6 +2525,14 @@ impl State {
             if self.popup_at(cursor_i).is_none() {
                 self.dismiss_all_popups();
             }
+        }
+
+        // Decoration gestures: a titlebar button, a titlebar drag, or an
+        // edge grab. These need no modifier — that is the whole point of
+        // a titlebar — so they are matched before the Super gestures and
+        // only when Super is *not* held, leaving Super+drag untouched.
+        if self.handle_decoration_button(button, state) {
+            return;
         }
 
         // Drag start: Super + (LMB or RMB) press on a window.
@@ -2301,21 +2606,9 @@ impl State {
                             edges,
                             size_limits,
                         });
-                        // Show the gesture cursor for the drag: the
-                        // grabbing hand while moving, the matching corner
-                        // arrow while resizing. Overrides the client's
-                        // cursor until the drag ends.
-                        let icon = match mode {
-                            DragMode::Move => CursorIcon::Grabbing,
-                            DragMode::Resize => match (edges.right, edges.bottom) {
-                                (true, true) => CursorIcon::SeResize,
-                                (true, false) => CursorIcon::NeResize,
-                                (false, true) => CursorIcon::SwResize,
-                                (false, false) => CursorIcon::NwResize,
-                            },
-                        };
-                        self.renderer
-                            .set_cursor_override(Some(CursorImageStatus::Named(icon)));
+                        self.renderer.set_cursor_override(Some(
+                            CursorImageStatus::Named(drag_cursor(mode, edges)),
+                        ));
                     } else if matches!(mode, DragMode::Resize) {
                         warn!(
                             surface = ?surface.id(),
@@ -3850,6 +4143,7 @@ impl State {
         self.renderer.set_animations(new.animations.clone());
         self.renderer.set_tearing_mode(new.misc.tearing);
         self.renderer.set_decoration(new.decoration.clone());
+        self.renderer.set_titlebar(new.titlebar.clone());
         self.config = new;
         info!("config reloaded");
         self.queue_redraw_all();
@@ -4951,6 +5245,9 @@ fn main() -> Result<()> {
         kbd_focus_before_layer: None,
         layout,
         drag: None,
+        armed_button: None,
+        decoration_cursor: None,
+        last_bar_click: None,
         ws_scroll_accum: 0.0,
         screenshot: None,
         screenshot_pending: Vec::new(),
