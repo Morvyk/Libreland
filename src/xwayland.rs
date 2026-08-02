@@ -678,6 +678,33 @@ impl XwmHandler for State {
         }
     }
 
+    /// An X11 client changed one of its window properties.
+    ///
+    /// Only `_MOTIF_WM_HINTS` matters here: it is X11's equivalent of
+    /// xdg-decoration, and how Steam (and anything else that draws its
+    /// own titlebar) says it wants no server decoration. The hint is
+    /// read live off the surface, so this just makes the layout look
+    /// again.
+    fn property_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        property: smithay::xwayland::xwm::WmWindowProperty,
+    ) {
+        if matches!(
+            property,
+            smithay::xwayland::xwm::WmWindowProperty::MotifHints
+        ) {
+            debug!(
+                window = window.window_id(),
+                csd = window.is_decorated(),
+                "xwayland: motif decoration hint changed"
+            );
+            self.layout.refresh_x11_decoration();
+            self.queue_redraw_all();
+        }
+    }
+
     fn configure_notify(
         &mut self,
         _xwm: XwmId,

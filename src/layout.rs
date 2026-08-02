@@ -58,6 +58,7 @@ use std::time::Instant;
 
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource as _;
+use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::with_states;
@@ -144,11 +145,6 @@ pub struct Window {
     /// output (ignoring `rect`), drops its border/corners, and draws
     /// on top. Travels with the window across workspaces.
     pub fill: FillMode,
-    /// The client asked to draw its own decorations
-    /// (`zxdg_toplevel_decoration_v1.set_mode(client_side)`), so the
-    /// compositor draws none. Its titlebar and border are the client's
-    /// own, inside its surface.
-    pub csd: bool,
     /// Hidden from the screen but still owned by its workspace: no
     /// placement, no hit-test, no focus. Anything that focuses the
     /// window restores it (see [`Layout::restore`]), which is what makes
@@ -167,7 +163,6 @@ impl Window {
             toplevel,
             rect,
             fill: FillMode::Normal,
-            csd: false,
             minimized: false,
         }
     }
@@ -399,6 +394,18 @@ pub struct Layout {
     /// How windows are arranged. Tiling descends the dwindle tree;
     /// floating never touches it.
     mode: LayoutMode,
+    /// Xdg surfaces whose client draws its own decorations.
+    ///
+    /// Kept here rather than on [`Window`] because the decoration
+    /// negotiation happens during the *initial* configure sequence —
+    /// before the surface has a buffer, so before it is mapped, so
+    /// before any `Window` exists to record it on. Storing it on the
+    /// window meant the answer was thrown away and every client got a
+    /// titlebar it had explicitly declined.
+    ///
+    /// X11 has no xdg-decoration; its equivalent is read live off the
+    /// surface (see [`window_is_csd`]).
+    csd: std::collections::HashSet<ObjectId>,
 }
 
 /// One window + its current placement, as the renderer consumes
@@ -736,6 +743,7 @@ impl Layout {
             gaps,
             deco,
             mode,
+            csd: std::collections::HashSet::new(),
         }
     }
 
@@ -747,7 +755,7 @@ impl Layout {
     /// un-maximize, which is how every stacking WM behaves) and loses it
     /// while tiling, which is the behaviour tiling has always had.
     fn deco_for(&self, w: &Window) -> Deco {
-        window_deco(self.deco, self.mode, w)
+        window_deco(self.deco, self.mode, w, &self.csd)
     }
 
     /// Record whether a client draws its own decorations, and reconfigure
@@ -757,15 +765,26 @@ impl Layout {
     /// drawing both inside its own surface, and a server-side bar on top
     /// of a client-side one is the classic double-titlebar.
     pub fn set_csd(&mut self, surface: &WlSurface, csd: bool) -> bool {
-        let Some(w) = self.window_mut(surface) else {
-            return false;
+        let changed = if csd {
+            self.csd.insert(surface.id())
+        } else {
+            self.csd.remove(&surface.id())
         };
-        if w.csd == csd {
-            return false;
+        if changed {
+            // A no-op before the window maps — there is nothing to
+            // reflow yet — and the flag is already recorded for when it
+            // does, which is the whole point of keeping it here.
+            self.recompute_and_push();
         }
-        w.csd = csd;
+        changed
+    }
+
+    /// Reflow because an X11 client changed its `_MOTIF_WM_HINTS`.
+    ///
+    /// X11 needs no record: the hint is read straight off the surface,
+    /// so this only has to make the layout look again.
+    pub fn refresh_x11_decoration(&mut self) {
         self.recompute_and_push();
-        true
     }
 
     /// Tile area of the output at `idx`: its bounds shrunk by the
@@ -876,6 +895,9 @@ impl Layout {
     /// something changed there. Silent no-op for surfaces we
     /// don't track.
     pub fn remove(&mut self, surface: &WlSurface) {
+        // Drop any decoration preference with the window, or the set
+        // grows for the compositor's whole life.
+        self.csd.remove(&surface.id());
         // A client may close while on a non-active workspace, so scan
         // every workspace of every output (index loops because
         // `normalize_output` needs `&mut self` afterwards).
@@ -1002,7 +1024,7 @@ impl Layout {
         if content.w <= 0 || content.h <= 0 {
             return false;
         }
-        let (deco, mode) = (self.deco, self.mode);
+        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
         for oi in 0..self.outputs.len() {
             // A window geometry is entirely client-chosen and validated by
             // the protocol only for positivity, so it must never reach the
@@ -1024,7 +1046,7 @@ impl Layout {
                 if w.fill != FillMode::Normal || !matches!(w.toplevel, WindowSurface::Xdg(_)) {
                     return false;
                 }
-                let grown = window_deco(deco, mode, w).cell_size_for(content);
+                let grown = window_deco(deco, mode, w, csd).cell_size_for(content);
                 let cell = Size::<i32, Physical>::from((
                     grown.w.min(full.w.max(1)),
                     grown.h.min(full.h.max(1)),
@@ -1322,7 +1344,7 @@ impl Layout {
             return;
         }
         let (inner, outer) = (self.gaps.inner, self.gaps.outer);
-        let (deco, mode) = (self.deco, self.mode);
+        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
         for op in &mut self.outputs {
             let tile_bounds = shrink_for_outer(op.bounds, outer);
             let area = op.area();
@@ -1349,7 +1371,7 @@ impl Layout {
             // workspace's clients (what `recompute_and_push` does) would
             // be pure waste.
             assign_rects(tree, tile_bounds, inner);
-            push_configures_tree(tree, deco, mode, area);
+            push_configures_tree(tree, deco, mode, csd, area);
             return;
         }
     }
@@ -1378,7 +1400,7 @@ impl Layout {
             // it either drops onto a tile cell or rejoins the
             // float stack, so configure it as such (no Tiled*
             // states, free-form resize).
-            let deco = window_deco(self.deco, self.mode, &t.window);
+            let deco = window_deco(self.deco, self.mode, &t.window, &self.csd);
             push_configure_for_floating(&t.window, deco, area);
         }
     }
@@ -1387,7 +1409,7 @@ impl Layout {
     /// ship the corresponding configure. Silent no-op for surfaces
     /// that aren't currently floating.
     pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
-        let (deco, mode) = (self.deco, self.mode);
+        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
         for op in &mut self.outputs {
             let active = op.active;
             let area = op.area();
@@ -1397,7 +1419,7 @@ impl Layout {
                 .find(|w| w.toplevel.wl_surface() == surface)
             {
                 window.rect = rect;
-                push_configure_for_floating(window, window_deco(deco, mode, window), area);
+                push_configure_for_floating(window, window_deco(deco, mode, window, csd), area);
                 return;
             }
         }
@@ -1491,7 +1513,7 @@ impl Layout {
     /// seat, not the layout, so it comes in as a parameter.
     pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<SlideSpec>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
-        let (deco, mode) = (self.deco, self.mode);
+        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
         let mut out = Vec::new();
         // Only the active workspace of each output is visible — except
         // mid workspace-switch, where the outgoing (captured) and
@@ -1535,6 +1557,7 @@ impl Layout {
                     area,
                     deco,
                     mode,
+                    csd,
                     &mut out,
                 );
                 for q in &mut out[base..] {
@@ -1547,6 +1570,7 @@ impl Layout {
                     area,
                     deco,
                     mode,
+                    csd,
                     &mut out,
                 );
             }
@@ -1644,7 +1668,7 @@ impl Layout {
     fn recompute_and_push(&mut self) {
         let inner = self.gaps.inner;
         let outer = self.gaps.outer;
-        let (deco, mode) = (self.deco, self.mode);
+        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
         // Reflow every workspace (not just the active one) so a parked
         // workspace keeps correct saved sizes — switching to it is then
         // paint-only with no reflow flash.
@@ -1660,10 +1684,10 @@ impl Layout {
             let area = op.area();
             for ws in &op.workspaces {
                 if let Some(tree) = &ws.tree {
-                    push_configures_tree(tree, deco, mode, area);
+                    push_configures_tree(tree, deco, mode, csd, area);
                 }
                 for w in &ws.floating {
-                    push_configure_for_floating(w, window_deco(deco, mode, w), area);
+                    push_configure_for_floating(w, window_deco(deco, mode, w, csd), area);
                 }
             }
         }
@@ -1994,11 +2018,11 @@ impl Layout {
     /// configure xdg-shell expects in response.
     pub fn set_fill(&mut self, surface: &WlSurface, fill: FillMode) -> bool {
         let (deco, mode) = (self.deco, self.mode);
+        let csd = self.csd.contains(&surface.id());
         let Some(w) = self.window_mut(surface) else {
             return false;
         };
         let was = w.fill;
-        let csd = w.csd;
         w.fill = fill;
         // The one transition where a decoration decision changes, and the
         // one that has been hardest to reason about from a screenshot:
@@ -2374,6 +2398,7 @@ impl Layout {
                 area,
                 self.deco,
                 self.mode,
+                &self.csd,
                 &mut from,
             );
             self.outputs[oi].transition = Some(WsTransition {
@@ -2752,6 +2777,7 @@ fn collect_placements(
     area: OutputArea,
     deco: Deco,
     mode: LayoutMode,
+    csd: &std::collections::HashSet<ObjectId>,
     out: &mut Vec<Placement>,
 ) {
     match node {
@@ -2768,13 +2794,13 @@ fn collect_placements(
                 focused: is_focused(surface),
                 fill: w.fill,
                 floating: false,
-                deco: window_deco(deco, mode, w),
+                deco: window_deco(deco, mode, w, csd),
                 slide: Point::from((0, 0)),
             });
         }
         Node::Split { first, second, .. } => {
-            collect_placements(first, is_focused, area, deco, mode, out);
-            collect_placements(second, is_focused, area, deco, mode, out);
+            collect_placements(first, is_focused, area, deco, mode, csd, out);
+            collect_placements(second, is_focused, area, deco, mode, csd, out);
         }
     }
 }
@@ -2787,10 +2813,11 @@ fn collect_workspace(
     area: OutputArea,
     deco: Deco,
     mode: LayoutMode,
+    csd: &std::collections::HashSet<ObjectId>,
     out: &mut Vec<Placement>,
 ) {
     if let Some(tree) = &ws.tree {
-        collect_placements(tree, is_focused, area, deco, mode, out);
+        collect_placements(tree, is_focused, area, deco, mode, csd, out);
     }
     for w in ws.floating.iter().filter(|w| w.visible()) {
         let surface = w.toplevel.wl_surface();
@@ -2806,7 +2833,7 @@ fn collect_workspace(
             focused: is_focused(surface),
             fill: w.fill,
             floating: true,
-            deco: window_deco(deco, mode, w),
+            deco: window_deco(deco, mode, w, csd),
             slide: Point::from((0, 0)),
         });
     }
@@ -3158,12 +3185,18 @@ fn ratio_for_divider(span: i32, origin: i32, split_px: i32, min: i32) -> f32 {
     ratio
 }
 
-fn push_configures_tree(node: &Node, deco: Deco, mode: LayoutMode, area: OutputArea) {
+fn push_configures_tree(
+    node: &Node,
+    deco: Deco,
+    mode: LayoutMode,
+    csd: &std::collections::HashSet<ObjectId>,
+    area: OutputArea,
+) {
     match node {
-        Node::Leaf(w) => push_configure_for_tile(w, window_deco(deco, mode, w), area),
+        Node::Leaf(w) => push_configure_for_tile(w, window_deco(deco, mode, w, csd), area),
         Node::Split { first, second, .. } => {
-            push_configures_tree(first, deco, mode, area);
-            push_configures_tree(second, deco, mode, area);
+            push_configures_tree(first, deco, mode, csd, area);
+            push_configures_tree(second, deco, mode, csd, area);
         }
     }
 }
@@ -3399,8 +3432,26 @@ fn drain_tree(node: Node, out: &mut Vec<Window>) {
 
 /// [`Layout::deco_for`] without the `&self` borrow, for the reflow loops
 /// that already hold `&mut self.outputs` and so cannot call a method.
-fn window_deco(deco: Deco, mode: LayoutMode, w: &Window) -> Deco {
-    deco_for_fill(deco, mode, w.fill, w.csd)
+fn window_deco(
+    deco: Deco,
+    mode: LayoutMode,
+    w: &Window,
+    csd: &std::collections::HashSet<ObjectId>,
+) -> Deco {
+    deco_for_fill(deco, mode, w.fill, window_is_csd(w, csd))
+}
+
+/// Whether this window's client draws its own decorations.
+fn window_is_csd(w: &Window, csd: &std::collections::HashSet<ObjectId>) -> bool {
+    match &w.toplevel {
+        WindowSurface::Xdg(t) => csd.contains(&t.wl_surface().id()),
+        // X11 has no xdg-decoration. The equivalent is
+        // `_MOTIF_WM_HINTS`, which is what Steam sets — and which
+        // `X11Surface::is_decorated` reads. Despite its name that
+        // returns TRUE when the client asked for *no* server
+        // decorations, i.e. when it is client-side decorated.
+        WindowSurface::X11 { surface, .. } => surface.is_decorated(),
+    }
 }
 
 fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode, csd: bool) -> Deco {

@@ -1875,11 +1875,20 @@ impl State {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
         });
-        // `set_csd` reconfigures on a change, which would double the
-        // configure we are about to send; send ours only when it didn't.
-        if !self.layout.set_csd(toplevel.wl_surface(), csd) {
-            toplevel.send_configure();
-        }
+        self.layout.set_csd(toplevel.wl_surface(), csd);
+        // Always, even though `set_csd` may also have reconfigured. This
+        // usually runs during the *initial* configure sequence, before
+        // the surface has a buffer — so before it is in the layout at
+        // all, and nothing else would answer. A client left waiting on
+        // that first configure never maps. A duplicate configure on the
+        // post-map path is harmless by comparison.
+        toplevel.send_configure();
+        debug!(
+            surface = ?toplevel.wl_surface().id(),
+            ?mode,
+            csd,
+            "xdg-decoration: mode negotiated",
+        );
         self.queue_redraw_all();
     }
 }
@@ -2125,18 +2134,29 @@ impl KdeDecorationHandler for State {
         &self.kde_decoration_state
     }
 
-    fn new_decoration(&mut self, _surface: &WlSurface, decoration: &OrgKdeKwinServerDecoration) {
+    fn new_decoration(&mut self, surface: &WlSurface, decoration: &OrgKdeKwinServerDecoration) {
         decoration.mode(KdeMode::Server);
+        self.layout.set_csd(surface, false);
     }
 
     fn request_mode(
         &mut self,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         decoration: &OrgKdeKwinServerDecoration,
-        _mode: WEnum<KdeMode>,
+        mode: WEnum<KdeMode>,
     ) {
-        // Ignore the client's preference; always server-side.
-        decoration.mode(KdeMode::Server);
+        // The older KDE decoration protocol, which some toolkits use
+        // instead of xdg-decoration. Honoured for the same reason: a
+        // server-side bar over a client-side one is a double titlebar,
+        // and the client is the one that knows.
+        let csd = matches!(mode, WEnum::Value(KdeMode::Client | KdeMode::None));
+        decoration.mode(if csd {
+            KdeMode::Client
+        } else {
+            KdeMode::Server
+        });
+        self.layout.set_csd(surface, csd);
+        self.queue_redraw_all();
     }
 }
 
