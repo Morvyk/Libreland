@@ -144,6 +144,33 @@ pub struct Window {
     /// output (ignoring `rect`), drops its border/corners, and draws
     /// on top. Travels with the window across workspaces.
     pub fill: FillMode,
+    /// Hidden from the screen but still owned by its workspace: no
+    /// placement, no hit-test, no focus. Anything that focuses the
+    /// window restores it (see [`Layout::restore`]), which is what makes
+    /// a taskbar click work with no extra protocol.
+    ///
+    /// A minimized window still keeps its workspace alive — an empty
+    /// workspace is compacted away, and compacting one out from under a
+    /// minimized window would strand it with no way back.
+    pub minimized: bool,
+}
+
+impl Window {
+    /// A freshly-mapped window at `rect`, undecorated by any state.
+    fn new(toplevel: WindowSurface, rect: Rectangle<i32, Physical>) -> Self {
+        Self {
+            toplevel,
+            rect,
+            fill: FillMode::Normal,
+            minimized: false,
+        }
+    }
+
+    /// Whether this window is currently on screen — i.e. contributes a
+    /// placement, a hit rect and a focus candidate.
+    fn visible(&self) -> bool {
+        !self.minimized
+    }
 }
 
 /// Origin of an in-flight interactive move. Decides what happens
@@ -514,6 +541,10 @@ pub struct WindowEntry {
     pub rect: Rectangle<i32, Physical>,
     pub fill: FillMode,
     pub floating: bool,
+    /// Hidden from the screen but still owned by its workspace. Reported
+    /// so a taskbar can show it as minimized — and clicking it there
+    /// focuses it, which restores it.
+    pub minimized: bool,
     pub output: String,
     pub workspace: usize,
 }
@@ -562,6 +593,47 @@ impl ResizeEdges {
             bottom: cursor.y >= rect.loc.y + rect.size.h / 2,
         }
     }
+}
+
+/// Default size of a new floating window that declares no preference,
+/// as a fraction of the work area (3/5 — big enough to be usable,
+/// small enough that the desktop behind it is still visible).
+const DEFAULT_FLOAT_NUM: i32 = 3;
+/// Denominator of [`DEFAULT_FLOAT_NUM`].
+const DEFAULT_FLOAT_DEN: i32 = 5;
+
+/// Where the `n`-th floating window on a workspace lands.
+///
+/// Centred for the first, then cascaded down-right by `step` so a stack
+/// of new windows doesn't hide behind window one. The run wraps back to
+/// the centre once the next step would push the window past the work
+/// area, so the cascade can never walk a window off screen no matter how
+/// many are opened — which is also why this takes the size: how many
+/// steps fit depends on how much room the window leaves.
+fn cascade_origin(
+    work: Rectangle<i32, Physical>,
+    size: Size<i32, Physical>,
+    n: usize,
+    step: i32,
+) -> Point<i32, Physical> {
+    let base = Point::<i32, Physical>::new(
+        work.loc.x + (work.size.w - size.w) / 2,
+        work.loc.y + (work.size.h - size.h) / 2,
+    );
+    let step = step.max(1);
+    // Travel left before the window's far edge reaches the work area's.
+    let room = (work.loc.x + work.size.w - (base.x + size.w))
+        .min(work.loc.y + work.size.h - (base.y + size.h))
+        .max(0);
+    // +1 because slot 0 is the un-offset centre position.
+    let slots = (room / step + 1).max(1);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "n % slots is bounded by slots, itself a work-area pixel count / step"
+    )]
+    let k = (n % (slots as usize)) as i32;
+    Point::new(base.x + k * step, base.y + k * step)
 }
 
 /// Smallest a cell may be squeezed to by an interactive tiled resize,
@@ -668,20 +740,53 @@ impl Layout {
         let Some(idx) = self.outpane_for_point(cursor) else {
             return;
         };
+        if self.mode == LayoutMode::Floating {
+            self.insert_floating(idx, toplevel);
+            return;
+        }
         let tile_bounds = self.tile_bounds(idx);
         let inner = self.gaps.inner;
-        let window = Window {
-            toplevel,
-            rect: tile_bounds,
-            fill: FillMode::Normal,
-        };
-        let leaf = Node::Leaf(window);
+        let leaf = Node::Leaf(Window::new(toplevel, tile_bounds));
         // Lands on the visible (active) workspace of that output.
         let ws = self.active_ws_mut(idx);
         ws.tree = Some(match ws.tree.take() {
             None => leaf,
             Some(root) => insert_at_cursor(root, leaf, tile_bounds, cursor, inner),
         });
+        self.recompute_and_push();
+    }
+
+    /// Place a new window in [`LayoutMode::Floating`]: pick a size, put
+    /// it down without overlapping the last one exactly, and push it on
+    /// top of the stack. The dwindle tree is never touched.
+    fn insert_floating(&mut self, idx: usize, toplevel: WindowSurface) {
+        let area = self.outputs[idx].area();
+        let work = area.work;
+        // A window that declares a size (a dialog, or anything pinning
+        // min == max) gets it; everything else gets a readable fraction
+        // of the work area. An xdg client that disagrees resizes itself
+        // on its first commit and `reconcile_floating_size` adopts it,
+        // which is the closest thing xdg-shell has to "you choose".
+        let mut window = Window::new(toplevel, Rectangle::default());
+        let deco = self.deco_for(&window);
+        let want = dialog_size(&window.toplevel)
+            .filter(|s| s.w > 0 && s.h > 0)
+            .map_or(
+                Size::<i32, Physical>::from((
+                    (work.size.w * DEFAULT_FLOAT_NUM) / DEFAULT_FLOAT_DEN,
+                    (work.size.h * DEFAULT_FLOAT_NUM) / DEFAULT_FLOAT_DEN,
+                )),
+                |pref| deco.cell_size_for(pref),
+            );
+        let (lmin, lmax) = self.window_limits(&window);
+        let size = Size::<i32, Physical>::from((
+            want.w.min(work.size.w).min(lmax.w).max(lmin.w).max(1),
+            want.h.min(work.size.h).min(lmax.h).max(lmin.h).max(1),
+        ));
+        let n = self.active_ws(idx).floating.len();
+        window.rect = Rectangle::new(cascade_origin(work, size, n, deco.top().max(1)), size);
+        push_configure_for_floating(&window, deco, area);
+        self.active_ws_mut(idx).floating.push(window);
         self.recompute_and_push();
     }
 
@@ -854,6 +959,16 @@ impl Layout {
     }
 
     pub fn toggle_floating(&mut self, surface: &WlSurface) -> bool {
+        // In floating mode there is no tree to toggle out of, and
+        // toggling *into* one would produce a single tiled window
+        // sharing a workspace with floats that ignore it. Nothing to do.
+        if self.mode == LayoutMode::Floating {
+            debug!(
+                surface = ?surface.id(),
+                "layout: toggle-floating ignored — every window already floats in this mode",
+            );
+            return false;
+        }
         // Toggling never crosses workspaces: the window stays on the
         // active workspace it's currently visible on.
         //
@@ -936,6 +1051,12 @@ impl Layout {
     /// window rule: it has an xdg `parent`, or it pins itself to a fixed
     /// size (`min_size == max_size`), which only non-tileable windows do.
     pub fn float_if_dialog(&mut self, surface: &WlSurface) -> bool {
+        // Nothing to rescue from the tiling when there is no tiling. The
+        // caller's fallback (`reconfigure`) finds the window in the float
+        // stack and configures it there, which is already right.
+        if self.mode == LayoutMode::Floating {
+            return false;
+        }
         // A "dialog" the size of a display is a game, not a dialog: games pin
         // min == max to their resolution, which is exactly the fixed-size
         // heuristic below. Floating one — worse, RESETTING ITS FILL — yanks a
@@ -1415,7 +1536,11 @@ impl Layout {
         if let Some(tree) = &ws.tree {
             collect_filled(tree, &mut filled);
         }
-        filled.extend(ws.floating.iter().filter(|w| w.fill != FillMode::Normal));
+        filled.extend(
+            ws.floating
+                .iter()
+                .filter(|w| w.fill != FillMode::Normal && w.visible()),
+        );
         if let Some(w) = filled
             .iter()
             .rfind(|w| w.fill == FillMode::Fullscreen)
@@ -1424,7 +1549,7 @@ impl Layout {
             return Some((w, area.fill(w.fill)));
         }
 
-        for w in ws.floating.iter().rev() {
+        for w in ws.floating.iter().rev().filter(|w| w.visible()) {
             if rect_contains(w.rect, pos) {
                 return Some((w, w.rect));
             }
@@ -1562,6 +1687,88 @@ impl Layout {
         self.recompute_and_push();
     }
 
+    /// Switch layout mode, migrating every window on every workspace.
+    ///
+    /// Windows keep the rect they are already drawn at, so the switch
+    /// reads as "the frames stayed put and changed behaviour" rather
+    /// than as everything jumping at once — and the move animation then
+    /// carries the tiling reflow, if there is one.
+    ///
+    /// Tiling → floating drains each tree into its float stack in draw
+    /// order, so the stacking order matches what was on screen.
+    /// Floating → tiling re-inserts each float into the tree bottom-up.
+    /// Returns whether the mode actually changed.
+    pub fn set_mode(&mut self, mode: LayoutMode) -> bool {
+        if self.mode == mode {
+            return false;
+        }
+        self.mode = mode;
+        let inner = self.gaps.inner;
+        let outer = self.gaps.outer;
+        for op in &mut self.outputs {
+            let tile_bounds = shrink_for_outer(op.bounds, outer);
+            for ws in &mut op.workspaces {
+                match mode {
+                    LayoutMode::Floating => {
+                        let Some(tree) = ws.tree.take() else { continue };
+                        let mut drained = Vec::new();
+                        drain_tree(tree, &mut drained);
+                        // Tiles are already laid out and never overlap,
+                        // so their current rects are a perfectly good
+                        // floating arrangement — and the least
+                        // surprising one.
+                        let floats = std::mem::take(&mut ws.floating);
+                        ws.floating = drained;
+                        // Windows that were already floating stay on top
+                        // of the ones that were tiled under them.
+                        ws.floating.extend(floats);
+                    }
+                    LayoutMode::Tiling => {
+                        for w in std::mem::take(&mut ws.floating) {
+                            let leaf = Node::Leaf(w);
+                            ws.tree = Some(match ws.tree.take() {
+                                None => leaf,
+                                // No cursor: each float splits the
+                                // deepest leaf, which is the same
+                                // fallback a spawn with no pointer takes.
+                                Some(root) => {
+                                    insert_at_cursor(root, leaf, tile_bounds, None, inner)
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.recompute_and_push();
+        true
+    }
+
+    /// Hide or reveal a window without unmapping it. Returns whether
+    /// `surface` was found *and* changed state.
+    ///
+    /// Minimizing does not move the window: it keeps its rect, its
+    /// workspace and its place in the stack, so restoring puts it back
+    /// exactly where it was.
+    pub fn set_minimized(&mut self, surface: &WlSurface, minimized: bool) -> bool {
+        let Some(w) = self.window_mut(surface) else {
+            return false;
+        };
+        if w.minimized == minimized {
+            return false;
+        }
+        w.minimized = minimized;
+        self.recompute_and_push();
+        true
+    }
+
+    /// Un-minimize `surface` if it was minimized. Called from the focus
+    /// path, which is what makes a taskbar click restore a window
+    /// without needing a protocol of its own.
+    pub fn restore(&mut self, surface: &WlSurface) -> bool {
+        self.set_minimized(surface, false)
+    }
+
     /// The decoration inset a window would carry if it is decorated —
     /// i.e. ignoring its fill. Callers that have the window in hand want
     /// [`Layout::deco_for`]; this is for the render/config side, which
@@ -1618,6 +1825,7 @@ impl Layout {
                         rect: w.rect,
                         fill: w.fill,
                         floating: true,
+                        minimized: w.minimized,
                         output: op.name.clone(),
                         workspace: index,
                     });
@@ -2387,6 +2595,7 @@ fn collect_placements(
     out: &mut Vec<Placement>,
 ) {
     match node {
+        Node::Leaf(w) if !w.visible() => {}
         Node::Leaf(w) => {
             let surface = w.toplevel.wl_surface();
             out.push(Placement {
@@ -2423,7 +2632,7 @@ fn collect_workspace(
     if let Some(tree) = &ws.tree {
         collect_placements(tree, is_focused, area, deco, mode, out);
     }
-    for w in &ws.floating {
+    for w in ws.floating.iter().filter(|w| w.visible()) {
         let surface = w.toplevel.wl_surface();
         out.push(Placement {
             surface: surface.clone(),
@@ -2467,6 +2676,7 @@ fn collect_window_entries(
             rect: w.rect,
             fill: w.fill,
             floating: false,
+            minimized: w.minimized,
             output: output.to_owned(),
             workspace,
         }),
@@ -2492,7 +2702,7 @@ fn transition_eased(t: &WsTransition, spec: AnimSpec) -> Option<f64> {
 fn leaf_at(node: &Node, pos: Point<i32, Physical>) -> Option<&Window> {
     match node {
         Node::Leaf(w) => {
-            if rect_contains(w.rect, pos) {
+            if w.visible() && rect_contains(w.rect, pos) {
                 Some(w)
             } else {
                 None
@@ -2520,7 +2730,7 @@ fn collect_windows_owned(node: Node, out: &mut Vec<Window>) {
 fn collect_filled<'a>(node: &'a Node, out: &mut Vec<&'a Window>) {
     match node {
         Node::Leaf(w) => {
-            if w.fill != FillMode::Normal {
+            if w.fill != FillMode::Normal && w.visible() {
                 out.push(w);
             }
         }
@@ -3015,6 +3225,18 @@ fn push_configure_for_floating(w: &Window, deco: Deco, area: OutputArea) {
     );
 }
 
+/// Flatten a tree into its leaves in draw order (left/top first), for
+/// the tiling → floating migration.
+fn drain_tree(node: Node, out: &mut Vec<Window>) {
+    match node {
+        Node::Leaf(w) => out.push(w),
+        Node::Split { first, second, .. } => {
+            drain_tree(*first, out);
+            drain_tree(*second, out);
+        }
+    }
+}
+
 /// [`Layout::deco_for`] without the `&self` borrow, for the reflow loops
 /// that already hold `&mut self.outputs` and so cannot call a method.
 fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode) -> Deco {
@@ -3197,6 +3419,85 @@ mod workspace_switch_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::{Point, Rectangle, Size, cascade_origin};
+
+    fn work() -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((0, 0)), Size::from((1000, 800)))
+    }
+
+    use super::Physical;
+
+    /// The first window is centred — one window on an empty desktop
+    /// should be in the middle of it, not wedged in a corner.
+    #[test]
+    fn the_first_window_is_centred() {
+        let size = Size::from((400, 300));
+        assert_eq!(
+            cascade_origin(work(), size, 0, 30),
+            Point::from((300, 250))
+        );
+    }
+
+    /// Subsequent windows step down-right so window two isn't hidden
+    /// exactly behind window one.
+    #[test]
+    fn later_windows_step_down_and_right() {
+        let size = Size::from((400, 300));
+        assert_eq!(cascade_origin(work(), size, 1, 30), Point::from((330, 280)));
+        assert_eq!(cascade_origin(work(), size, 2, 30), Point::from((360, 310)));
+    }
+
+    /// The cascade wraps rather than walking windows off the screen —
+    /// the property that matters, since nothing bounds how many windows
+    /// a user opens.
+    #[test]
+    fn the_cascade_never_leaves_the_work_area() {
+        let size = Size::from((400, 300));
+        for n in 0..500 {
+            let origin = cascade_origin(work(), size, n, 30);
+            assert!(
+                origin.x >= work().loc.x
+                    && origin.y >= work().loc.y
+                    && origin.x + size.w <= work().loc.x + work().size.w
+                    && origin.y + size.h <= work().loc.y + work().size.h,
+                "window {n} at {origin:?} escaped the work area",
+            );
+        }
+    }
+
+    /// A window that already fills the work area has nowhere to cascade
+    /// to; every slot must still be the (only) legal position rather
+    /// than a division by zero or a negative offset.
+    #[test]
+    fn a_window_filling_the_work_area_has_one_slot() {
+        let size = Size::from((1000, 800));
+        for n in 0..5 {
+            assert_eq!(cascade_origin(work(), size, n, 30), Point::from((0, 0)));
+        }
+    }
+
+    /// The work area is offset on a second monitor (and by a panel's
+    /// exclusive zone), so placement must be relative to it, not to the
+    /// output origin.
+    #[test]
+    fn placement_is_relative_to_the_work_area() {
+        let work = Rectangle::new(Point::from((1920, 40)), Size::from((1000, 800)));
+        let size = Size::from((400, 300));
+        assert_eq!(cascade_origin(work, size, 0, 30), Point::from((2220, 290)));
+    }
+
+    /// A zero step would be a division by zero in the slot count and an
+    /// infinite stack of windows at one spot; it is clamped to 1.
+    #[test]
+    fn a_zero_step_is_clamped() {
+        let size = Size::from((400, 300));
+        let origin = cascade_origin(work(), size, 3, 0);
+        assert_eq!(origin, Point::from((303, 253)));
     }
 }
 

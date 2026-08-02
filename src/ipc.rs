@@ -77,6 +77,13 @@ pub enum Request {
         #[serde(default)]
         id: Option<u64>,
     },
+    /// Hide a window without closing it. There is deliberately no
+    /// "unminimize": `focus-window` restores it, so a taskbar that can
+    /// already focus a window can already bring it back.
+    Minimize {
+        #[serde(default)]
+        id: Option<u64>,
+    },
     /// Toggle a window's fullscreen state.
     ToggleFullscreen {
         #[serde(default)]
@@ -330,6 +337,9 @@ pub struct WindowInfo {
     pub floating: bool,
     pub fullscreen: bool,
     pub maximized: bool,
+    /// Hidden but still open. Focusing it (`focus-window`) restores it,
+    /// so a taskbar needs no separate un-minimize request.
+    pub minimized: bool,
     pub focused: bool,
     /// PID of the window's Wayland client, from its socket credentials.
     /// `None` if the client has no resolvable peer pid. Lets a panel kill
@@ -833,6 +843,7 @@ mod server {
             Request::FocusWindow { .. }
                 | Request::Close { .. }
                 | Request::ToggleFloating { .. }
+                | Request::Minimize { .. }
                 | Request::ToggleFullscreen { .. }
                 | Request::ToggleMaximized { .. }
                 | Request::FocusWorkspace { .. }
@@ -856,6 +867,7 @@ mod server {
             Request::WarpCursor { id } => warp_cursor(state, id),
             Request::Close { id } => close_window(state, id),
             Request::ToggleFloating { id } => toggle(state, id, Layout::toggle_floating),
+            Request::Minimize { id } => minimize(state, id),
             Request::ToggleFullscreen { id } => toggle(state, id, Layout::toggle_fullscreen),
             Request::ToggleMaximized { id } => toggle(state, id, Layout::toggle_maximized),
             Request::FocusWorkspace { output, target } => focus_workspace(state, output, target),
@@ -1003,6 +1015,18 @@ mod server {
             Ok(Response::Handled)
         } else {
             Err("window is not managed by the tiler".to_owned())
+        }
+    }
+
+    /// Minimize a window. Refuses if it is already minimized, so a
+    /// double request is an error rather than a silent success — the
+    /// caller asked for a state change that didn't happen.
+    fn minimize(state: &mut State, id: Option<u64>) -> Reply {
+        let surface = resolve(state, id)?;
+        if state.minimize_window(&surface) {
+            Ok(Response::Handled)
+        } else {
+            Err("window is already minimized, or not managed by the tiler".to_owned())
         }
     }
 
@@ -1316,6 +1340,7 @@ mod server {
             floating: e.floating,
             fullscreen: e.fill == FillMode::Fullscreen,
             maximized: e.fill == FillMode::Maximized,
+            minimized: e.minimized,
             focused,
             pid,
         }
@@ -1583,6 +1608,8 @@ mod client {
         Close { id: Option<u64> },
         /// Toggle a window between tiled and floating.
         ToggleFloating { id: Option<u64> },
+        /// Hide a window without closing it (`focus-window` restores it).
+        Minimize { id: Option<u64> },
         /// Toggle a window's fullscreen state.
         ToggleFullscreen { id: Option<u64> },
         /// Toggle a window's maximized state.
@@ -1645,6 +1672,7 @@ mod client {
                 Command::WarpCursor { id } => Request::WarpCursor { id: *id },
                 Command::Close { id } => Request::Close { id: *id },
                 Command::ToggleFloating { id } => Request::ToggleFloating { id: *id },
+                Command::Minimize { id } => Request::Minimize { id: *id },
                 Command::ToggleFullscreen { id } => Request::ToggleFullscreen { id: *id },
                 Command::ToggleMaximized { id } => Request::ToggleMaximized { id: *id },
                 Command::FocusWorkspace { target, output } => Request::FocusWorkspace {
@@ -1929,6 +1957,9 @@ mod client {
             if w.maximized {
                 state.push("maximized");
             }
+            if w.minimized {
+                state.push("minimized");
+            }
             if w.focused {
                 state.push("focused");
             }
@@ -2061,6 +2092,7 @@ mod tests {
             floating: false,
             fullscreen: false,
             maximized: false,
+            minimized: false,
             focused: true,
             pid: None,
         };

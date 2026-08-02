@@ -1152,6 +1152,12 @@ impl State {
         let slide = self.ws_slide_spec();
         self.layout
             .switch_workspace_to(&entry.output, entry.workspace, slide);
+        // Focusing a minimized window is how it comes back — a taskbar
+        // click is already a `focus-window`, so this is the whole
+        // un-minimize path and needs no request of its own. Restoring
+        // before the workspace switch would be wrong: the window has to
+        // exist on a *visible* workspace before focus lands on it.
+        self.layout.restore(surface);
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
         }
@@ -1159,6 +1165,42 @@ impl State {
         // dispatch — same reasoning (stale pointer lock / hidden cursor).
         self.refresh_pointer_focus();
         self.queue_redraw_all();
+    }
+
+    /// Hide a window without closing it, handing focus on if it held it.
+    /// Returns whether anything changed.
+    ///
+    /// There is no un-minimize counterpart: [`State::focus_surface`]
+    /// restores whatever it focuses, so anything that can already focus
+    /// a window (a taskbar, `focus-window`, Alt+Tab) brings it back with
+    /// no extra plumbing.
+    pub(crate) fn minimize_window(&mut self, surface: &WlSurface) -> bool {
+        if !self.layout.set_minimized(surface, true) {
+            return false;
+        }
+        // Focus can't stay on a window nobody can see. Hand it to
+        // whatever is now topmost — `placements` is in draw order and
+        // already excludes minimized windows, so the last entry is the
+        // frontmost visible one. If that was the only window, focus goes
+        // nowhere, exactly as on an empty workspace.
+        let held_focus = self
+            .seat
+            .get_keyboard()
+            .is_some_and(|k| k.current_focus().as_ref() == Some(surface));
+        if held_focus {
+            let next = self
+                .layout
+                .placements(None, None)
+                .into_iter()
+                .next_back()
+                .map(|p| p.surface);
+            if let Some(kbd) = self.seat.get_keyboard() {
+                kbd.set_focus(self, next, SERIAL_COUNTER.next_serial());
+            }
+        }
+        self.refresh_pointer_focus();
+        self.queue_redraw_all();
+        true
     }
 
     /// Idle-timer tick: spawn the lock command and/or DPMS the screens off once
@@ -3787,6 +3829,13 @@ impl State {
         // resize avoids a one-frame window where a new border is drawn
         // around an old-sized buffer. Binds and focus model are read live
         // from `self.config`, so swapping it suffices. ----
+        // Mode first: it migrates windows between the tree and the float
+        // stack, and `set_appearance` reflows whatever it finds. The
+        // other order would reflow the old arrangement and then migrate,
+        // costing every client a configure it is about to be handed again.
+        if self.layout.set_mode(new.layout.mode) {
+            info!(mode = ?new.layout.mode, "layout mode changed");
+        }
         self.layout.set_appearance(
             layout::Gaps {
                 outer: new.layout.gaps_outer,
