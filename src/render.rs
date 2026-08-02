@@ -74,7 +74,7 @@ use crate::config::{
 };
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement};
-use crate::titlebar::{BarStyle, rasterize as rasterize_bar};
+use crate::titlebar::{BarState, BarStyle, rasterize as rasterize_bar};
 use crate::scanout::{DirectPlacement, ScanoutLayer, ScanoutSurface};
 
 /// A layer surface to render this frame. Pre-computed by main
@@ -1391,6 +1391,10 @@ pub struct Renderer {
     /// texture per distinct title/size/focus), and bounded — a window
     /// whose title animates would otherwise grow this without limit.
     bar_cache: HashMap<u64, GlesTexture>,
+    /// The titlebar button the pointer is currently over, if any. Set by
+    /// the input path, which already resolves the region on every motion
+    /// for the resize cursor.
+    hovered_button: Option<(ObjectId, crate::config::TitlebarButton)>,
     /// `LIBRELAND_NO_OCCLUSION=1`: disable the occluded/off-output window
     /// prune, for A/B benchmarking against the render-profile log.
     no_occlusion: bool,
@@ -1878,6 +1882,15 @@ struct DrawnState {
     /// ext-background-effect opt-in flip changes the pixels without any
     /// buffer commit, so it must damage like a focus flip does.
     blur: bool,
+    /// Identity of the titlebar drawn on it ([`bar_key`]), or `0` for a
+    /// window with no bar.
+    ///
+    /// A retitled window commits no buffer and moves no commit counter,
+    /// so without this the bar repaints only when something else happens
+    /// to damage the window — a browser whose tab changed would keep the
+    /// old title until you moved it. (Focus is already covered by
+    /// `focused`, which is the other half of the bar's identity.)
+    bar: u64,
 }
 
 /// Per-output damage tracker: diffs each frame's drawn set against the
@@ -2055,6 +2068,28 @@ enum FontState {
     Scanned(Option<Fonts>),
 }
 
+/// [`bar_key`] for a placement as it will actually be drawn this frame.
+///
+/// One definition shared by Phase A (which decides whether the cached
+/// offscreen is current) and the damage tracker (which decides whether
+/// the window is repainted at all). Two definitions that drifted would
+/// give a bar that redraws but is never damaged, or damages every frame.
+fn placement_bar_key(
+    p: &Placement,
+    wd: &WinDraw,
+    scale: f64,
+    buttons: usize,
+    state: BarState,
+) -> u64 {
+    let bar_h = scale_i(p.deco.titlebar, scale);
+    if bar_h <= 0 {
+        return 0;
+    }
+    let cell_w = scale_i(wd.effective.size.w, scale).max(1);
+    let title = window_title(&p.surface).unwrap_or_default();
+    bar_key(cell_w, bar_h, &title, wd.focus >= 0.5, buttons, state)
+}
+
 /// Cap on rasterized titlebars held at once. A bar is one small RGBA
 /// texture, so this is generous; it exists so a client whose title
 /// animates (a download percentage, a clock) can't grow the cache
@@ -2068,7 +2103,14 @@ const BAR_CACHE_MAX: usize = 64;
 /// it costs a uniform), but a bar that re-rasterized on every frame of
 /// a 220 ms crossfade would re-render the window's whole offscreen ~35
 /// times per focus change. Titlebars switch, borders fade.
-fn bar_key(width: i32, height: i32, title: &str, focused: bool, buttons: usize) -> u64 {
+fn bar_key(
+    width: i32,
+    height: i32,
+    title: &str,
+    focused: bool,
+    buttons: usize,
+    state: BarState,
+) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     width.hash(&mut h);
@@ -2076,6 +2118,17 @@ fn bar_key(width: i32, height: i32, title: &str, focused: bool, buttons: usize) 
     title.hash(&mut h);
     focused.hash(&mut h);
     buttons.hash(&mut h);
+    state.maximized.hash(&mut h);
+    // Hover is in the key, so moving onto a button re-rasterizes the bar
+    // *and* damages the window through the same value — the two can't
+    // disagree about whether the highlight is on screen.
+    match state.hovered {
+        None => 0u8,
+        Some(crate::config::TitlebarButton::Minimize) => 1,
+        Some(crate::config::TitlebarButton::Maximize) => 2,
+        Some(crate::config::TitlebarButton::Close) => 3,
+    }
+    .hash(&mut h);
     // 0 is reserved for "no titlebar", so a real bar can never collide
     // with one.
     h.finish() | 1
@@ -3326,6 +3379,7 @@ impl Renderer {
             titlebar: TitlebarConfig::default(),
             fonts: FontState::Unscanned,
             bar_cache: HashMap::new(),
+            hovered_button: None,
             no_occlusion: std::env::var_os("LIBRELAND_NO_OCCLUSION").is_some(),
             no_wintex_cache: std::env::var_os("LIBRELAND_NO_WINTEX_CACHE").is_some(),
             no_damage: std::env::var_os("LIBRELAND_NO_DAMAGE").is_some(),
@@ -4299,6 +4353,7 @@ impl Renderer {
         title: &str,
         focused: bool,
         font_px: f32,
+        state: BarState,
     ) -> Option<GlesTexture> {
         if let Some(tex) = self.bar_cache.get(&key) {
             return Some(tex.clone());
@@ -4347,6 +4402,7 @@ impl Renderer {
             BarStyle::from_border(border_rgb, focused),
             &self.titlebar.buttons,
             font_px,
+            state,
         );
         let size = Size::<i32, smithay::utils::Buffer>::from((width.max(1), height.max(1)));
         match self
@@ -4362,6 +4418,20 @@ impl Renderer {
                 None
             }
         }
+    }
+
+    /// Record which titlebar button the pointer is over, so its bar can
+    /// draw the highlight. Returns whether it changed — the caller
+    /// redraws on `true`.
+    pub fn set_hovered_button(
+        &mut self,
+        hovered: Option<(ObjectId, crate::config::TitlebarButton)>,
+    ) -> bool {
+        if self.hovered_button == hovered {
+            return false;
+        }
+        self.hovered_button = hovered;
+        true
     }
 
     /// Swap the titlebar settings (live reload). Drops the rasterized
@@ -5730,19 +5800,31 @@ impl Renderer {
         // framebuffer. We also pass `scale` to smithay so it
         // composes the client buffer at the right size for
         // fractional displays.
-        let bw_comp = border.width.max(0);
         let radius_comp = border.rounded_corners.max(0);
-        // A Normal window with a border, rounded corners and/or a
-        // titlebar is composited through an offscreen texture + the
-        // rounded mask shader (so its corners are genuinely transparent).
-        // Without any of them it's a plain rectangle drawn straight to
-        // the frame, like fullscreen/maximized.
+        // Rounded corners belong to Normal windows: a window filling the
+        // work area or the output wants square corners, which is what
+        // every desktop draws there.
+        let radius_for = |p: &Placement| {
+            if p.fill == FillMode::Normal {
+                radius_comp
+            } else {
+                0
+            }
+        };
+        // Whether this window is composited through an offscreen texture
+        // + the rounded mask shader (so its corners are genuinely
+        // transparent and its bar is clipped to them), rather than drawn
+        // as a plain rectangle straight to the frame.
         //
-        // The titlebar has to be in here: it is drawn *into* that
-        // offscreen, so a window with a bar but no border and no radius
-        // would otherwise take the direct path and lose its bar entirely.
-        let titlebar_comp = placements.iter().any(|p| p.deco.titlebar > 0);
-        let decorated = radius_comp > 0 || bw_comp > 0 || titlebar_comp;
+        // Per placement, not per config: `p.deco` is already resolved
+        // against the window's fill, so a maximized window keeps its
+        // titlebar while floating (you need it to un-maximize) and a
+        // fullscreen one carries nothing. Deciding this from
+        // `p.fill == Normal` instead — as it did before titlebars — left
+        // a maximized window configured a bar smaller than it was drawn,
+        // with no bar drawn at all.
+        let decorated_win =
+            |p: &Placement| p.deco != crate::layout::Deco::none() || radius_for(p) > 0;
         #[allow(
             clippy::type_complexity,
             reason = "one frame's worth of per-window, rescale-wrapped surface elements"
@@ -5773,7 +5855,7 @@ impl Renderer {
                     } else {
                         (0, 0)
                     };
-                    let bw_p = if p.fill == FillMode::Normal { bw_comp } else { 0 };
+                    let bw_p = p.deco.border;
                     // A decorated Normal window is rendered into a *cell-sized
                     // offscreen* (origin (0,0)) and masked in the composite, so
                     // here its surface fills the WHOLE cell — the opaque border
@@ -5784,7 +5866,7 @@ impl Renderer {
                     // inset by the border. HDR surfaces use this offscreen path
                     // too — the offscreen is fp16 and the surface is decoded
                     // into it (see Phase A), so decoration works in HDR.
-                    let offscreen = p.fill == FillMode::Normal && decorated;
+                    let offscreen = decorated_win(p);
                     // Draw the window into its *animated* rect
                     // (`wd.effective`), scaling the surface's actual
                     // content to fill it. `render_elements_from_surface_tree`'s
@@ -5801,30 +5883,18 @@ impl Renderer {
                     let fallback = p.deco.content_size(p.cell_rect.size);
                     let (content_w, content_h) = window_geometry_size(&p.surface)
                         .unwrap_or((fallback.w, fallback.h));
-                    // The titlebar is opaque and covers the cell's top
-                    // strip, so the surface has to start *below* it.
-                    // Stretching under the bar (as the surface does under
-                    // the border ring) would squash the client's content
-                    // by the bar's whole height — fine for a 2 px ring,
-                    // very much not for a 28 px bar.
-                    let tb = if p.fill == FillMode::Normal {
-                        p.deco.titlebar
-                    } else {
-                        0
-                    };
-                    // Offscreen: fill the cell below the titlebar, anchored
-                    // at the cell origin (0, titlebar). The remaining
-                    // stretch across the border ring is deliberate — it
-                    // keeps the surface opaque over the ring's inner edge,
-                    // so there's no transparent seam there. Direct: inset
-                    // by the border, anchored at the output-local cell
-                    // position.
+                    // Where the buffer actually lands inside the cell.
+                    // `paint_origin` is the single definition of that, and
+                    // the pointer hit-test reads the same one — see its
+                    // docs for why x anchors at the cell edge while y
+                    // clears the titlebar.
+                    let paint = p.deco.paint_origin();
                     let (target_w, target_h, anchor_x, anchor_y) = if offscreen {
                         (
-                            f64::from(eff.size.w.max(1)),
-                            f64::from((eff.size.h - tb).max(1)),
-                            0.0,
-                            f64::from(tb),
+                            f64::from((eff.size.w - paint.x).max(1)),
+                            f64::from((eff.size.h - paint.y).max(1)),
+                            f64::from(paint.x),
+                            f64::from(paint.y),
                         )
                     } else {
                         (
@@ -6150,7 +6220,7 @@ impl Renderer {
             .zip(win_draws.iter())
             .enumerate()
         {
-            if p.fill != FillMode::Normal || !decorated || !visible[i] {
+            if !decorated_win(p) || !visible[i] {
                 win_tex.push(None);
                 continue;
             }
@@ -6175,20 +6245,19 @@ impl Renderer {
             // *into* it, and a title or focus change moves no commit
             // counter at all.
             let bar_h = scale_i(p.deco.titlebar, scale);
-            let (bar, bar_title) = if bar_h > 0 {
-                let title = window_title(&p.surface).unwrap_or_default();
-                (
-                    bar_key(
-                        cell.size.w,
-                        bar_h,
-                        &title,
-                        wd.focus >= 0.5,
-                        self.titlebar.buttons.len(),
-                    ),
-                    title,
-                )
+            let bar_state = BarState {
+                hovered: self
+                    .hovered_button
+                    .as_ref()
+                    .filter(|(id, _)| *id == p.surface.id())
+                    .map(|(_, kind)| *kind),
+                maximized: p.fill == FillMode::Maximized,
+            };
+            let bar = placement_bar_key(p, wd, scale, self.titlebar.buttons.len(), bar_state);
+            let bar_title = if bar_h > 0 {
+                window_title(&p.surface).unwrap_or_default()
             } else {
-                (0, String::new())
+                String::new()
             };
             // Cached offscreen still current (same content, cell and
             // format)? Reuse it — an idle window costs a fingerprint walk
@@ -6247,6 +6316,7 @@ impl Renderer {
                         // offscreen is), so the point size scales with
                         // the output or the text is tiny on HiDPI.
                         bar_font_px(self.titlebar.font_size, scale),
+                        bar_state,
                     )
                 })
                 .flatten();
@@ -6364,7 +6434,7 @@ impl Renderer {
             // Phase A — format-based, so independent of `linear` (which is
             // false during the sRGB blur replay).
             let win_is_hdr = hdr && enc.is_managed(&p.surface.id());
-            if p.fill == FillMode::Normal && decorated {
+            if decorated_win(p) {
                 // An HDR window's fp16-linear offscreen can't composite into the
                 // sRGB blur pyramid, so skip it during the blur replay; it still
                 // gets its own background blur in the main pass.
@@ -6404,8 +6474,8 @@ impl Renderer {
                 // Clamp like the old frame mask: radius/border never exceed
                 // half the cell, and leave >=1px of surface for the border.
                 let max_half = (dst.size.w / 2).min(dst.size.h / 2);
-                let radius = scale_i(radius_comp, scale).min(max_half).max(0);
-                let bw = scale_i(bw_comp, scale).min((max_half - 1).max(0)).max(0);
+                let radius = scale_i(radius_for(p), scale).min(max_half).max(0);
+                let bw = scale_i(p.deco.border, scale).min((max_half - 1).max(0)).max(0);
                 let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(tex.size().to_f64());
                 #[allow(
                     clippy::cast_precision_loss,
@@ -6678,7 +6748,8 @@ impl Renderer {
                                 focused: bool,
                                 alpha: f32,
                                 animating: bool,
-                                blur: bool| {
+                                blur: bool,
+                                bar: u64| {
                     let alpha_bits = alpha.to_bits();
                     match prev.remove(&id) {
                         Some(old)
@@ -6687,6 +6758,7 @@ impl Renderer {
                                 && old.focused == focused
                                 && old.alpha_bits == alpha_bits
                                 && old.blur == blur
+                                && old.bar == bar
                                 && old.fingerprint == fingerprint => {}
                         Some(old) => {
                             damage.push(old.rect);
@@ -6702,6 +6774,7 @@ impl Renderer {
                             focused,
                             alpha_bits,
                             blur,
+                            bar,
                         },
                     );
                 };
@@ -6714,7 +6787,7 @@ impl Renderer {
                     if !visible[i] {
                         continue;
                     }
-                    let rect = if p.fill == FillMode::Normal && decorated {
+                    let rect = if decorated_win(p) {
                         cell_local(wd.effective)
                     } else {
                         match elements_bbox(&grouped[i], elem_scale) {
@@ -6734,6 +6807,20 @@ impl Renderer {
                         wd.alpha,
                         animating,
                         protocol_blur.contains(&p.surface.id()),
+                        placement_bar_key(
+                            p,
+                            wd,
+                            scale,
+                            self.titlebar.buttons.len(),
+                            BarState {
+                                hovered: self
+                                    .hovered_button
+                                    .as_ref()
+                                    .filter(|(id, _)| *id == p.surface.id())
+                                    .map(|(_, kind)| *kind),
+                                maximized: p.fill == FillMode::Maximized,
+                            },
+                        ),
                     );
                 }
                 // Layer surfaces, only the ones this frame actually draws:
@@ -6756,6 +6843,7 @@ impl Renderer {
                         1.0,
                         animating,
                         layer_blurs(l),
+                        0,
                     );
                 }
                 // Popups (always drawn).
@@ -6771,6 +6859,7 @@ impl Renderer {
                         1.0,
                         false,
                         false,
+                        0,
                     );
                 }
             }

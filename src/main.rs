@@ -1363,7 +1363,21 @@ impl State {
         if self.drag.is_some() || self.screenshot.is_some() {
             return;
         }
-        let want = match self.region_under_cursor() {
+        let region = self.region_under_cursor();
+        // Button hover highlight. Folded into the same lookup as the
+        // cursor because it is the same question asked once per motion,
+        // and because the renderer's bar key covers hover — so a change
+        // here damages the window through the value that drew it.
+        let hovered = match &region {
+            Some((surface, _, titlebar::Region::Button(kind))) => {
+                Some((surface.id(), *kind))
+            }
+            _ => None,
+        };
+        if self.renderer.set_hovered_button(hovered) {
+            self.queue_redraw_all();
+        }
+        let want = match region {
             Some((_, _, titlebar::Region::Resize(edges))) => {
                 Some(drag_cursor(DragMode::Resize, edges))
             }
@@ -1980,7 +1994,7 @@ impl State {
                     )
                 })
                 .or_else(|| {
-                    self.layout.window_at(cursor_i).map(|(w, rect)| {
+                    self.layout.hit_target(cursor_i).map(|(surface, rect, deco)| {
                         // A CSD client pads its buffer with an invisible shadow
                         // margin and reports the real content rect via
                         // set_window_geometry; the render path shifts the buffer
@@ -1992,16 +2006,24 @@ impl State {
                         // button). The shadow only exists on Normal windows;
                         // maximized/fullscreen drop it, matching `grouped` in
                         // render_output.
-                        let (gx, gy) = if w.fill == crate::layout::FillMode::Normal {
-                            crate::render::window_geometry_offset(w.toplevel.wl_surface())
+                        let (gx, gy) = if self.layout.window_ref(&surface).is_some_and(|w| {
+                            w.fill == crate::layout::FillMode::Normal
+                        }) {
+                            crate::render::window_geometry_offset(&surface)
                         } else {
                             (0, 0)
                         };
+                        // ...and the decoration shifts it again. `paint_origin`
+                        // is where the renderer actually puts the buffer, so
+                        // this is the same number both sides read; anything
+                        // else and clicks land a titlebar away from the thing
+                        // they were aimed at.
+                        let paint = deco.paint_origin();
                         (
-                            w.toplevel.wl_surface().clone(),
+                            surface,
                             Point::<f64, Logical>::from((
-                                f64::from(rect.loc.x - gx),
-                                f64::from(rect.loc.y - gy),
+                                f64::from(rect.loc.x + paint.x - gx),
+                                f64::from(rect.loc.y + paint.y - gy),
                             )),
                         )
                     })

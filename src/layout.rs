@@ -497,6 +497,26 @@ impl Deco {
         Point::from((self.border, self.top()))
     }
 
+    /// Where the client's buffer is actually *painted*, relative to the
+    /// cell origin — which is **not** [`Deco::content_offset`].
+    ///
+    /// The renderer deliberately stretches the buffer out under the
+    /// border ring on all four sides, so the ring overlays opaque pixels
+    /// and its anti-aliased inner edge can't reveal a transparent seam.
+    /// The titlebar is different: it is opaque and tens of pixels tall,
+    /// so stretching under *it* would squash the content by the bar's
+    /// whole height. Hence x anchors at the cell edge and y below the bar.
+    ///
+    /// Pointer hit-testing has to use this same origin. Using the
+    /// content offset instead puts every surface-local coordinate a
+    /// border out; using the cell origin puts them a whole titlebar out,
+    /// which is the difference between "slightly off" and "clicks land
+    /// 28 px below the thing you aimed at".
+    #[must_use]
+    pub fn paint_origin(self) -> Point<i32, Physical> {
+        Point::from((0, self.titlebar))
+    }
+
     /// Content size for a cell of `cell_size`, clamped to a minimum of
     /// `1` on each axis — a zero-size configure is one the client cannot
     /// render, so it must never be shipped even for a degenerate cell.

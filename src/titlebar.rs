@@ -15,8 +15,14 @@
 //! Button glyphs are drawn from distance fields rather than from a font.
 //! An icon font is one more thing that can be missing or have the wrong
 //! coverage, and "✕" in a UI face is not reliably the glyph anyone wants;
-//! three shapes made of line segments always look the same and are
+//! shapes made of line segments always look the same and are
 //! anti-aliased by construction.
+//!
+//! The glyph set follows Breeze: chevrons for minimize/maximize/restore
+//! and a cross for close. Chevrons rather than the more literal square
+//! outline, which at button size is indistinguishable from the box a
+//! font draws for a glyph it doesn't have — it reads as a broken icon
+//! rather than as "maximize".
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -42,10 +48,22 @@ const BUTTON_ASPECT: f32 = 1.35;
 const EDGE_PAD: f32 = 0.45;
 
 /// Glyph extent inside a button, as a multiple of bar height.
-const GLYPH: f32 = 0.34;
+const GLYPH: f32 = 0.30;
 
 /// Stroke half-width of a button glyph, in pixels at scale 1.
-const STROKE: f32 = 0.75;
+const STROKE: f32 = 0.70;
+
+/// How much lighter the top of the bar is than the bottom. Subtle on
+/// purpose: enough to give the bar a direction, not enough to read as a
+/// gradient in its own right.
+const SHEEN: f32 = 0.055;
+
+/// Tint strength of the hovered button's backing.
+const HOVER_TINT: f32 = 0.14;
+
+/// What the close button's hover tints toward. The one button worth
+/// signalling before it is released.
+const CLOSE_HOVER: [f32; 3] = [0.75, 0.18, 0.18];
 
 /// Where the pieces of a titlebar sit, in bar-local pixels.
 ///
@@ -198,28 +216,45 @@ pub struct BarStyle {
     pub text: [f32; 3],
 }
 
+/// Neutral dark the bar is mixed *towards*, so an already-dark border
+/// colour can't drag the bar to near-black. Breeze's dark titlebar sits
+/// around here.
+const SURFACE: f32 = 0.105;
+
 impl BarStyle {
     /// Derive a bar's colours from the window border's fill for the same
-    /// focus state, so the titlebar and the frame around it are the same
+    /// focus state, so the titlebar and the frame around it are one
     /// palette without a second set of config keys to keep in sync.
     ///
-    /// The border colour is *darkened* rather than used directly: a
-    /// border is a hairline and can be fully saturated, a bar is a solid
-    /// area and at that saturation would dominate the window it belongs
-    /// to. Text goes near-white when focused and grey when not, which is
-    /// the same signal the border crossfade carries.
+    /// The border colour is *mixed toward* [`SURFACE`] rather than
+    /// scaled: a border is a hairline and can be fully saturated, a bar
+    /// is a solid area and at that saturation would dominate the window
+    /// it belongs to. Scaling was the first attempt and it fails at the
+    /// other end — an already-dark inactive border (0.16 grey) scaled
+    /// down lands at 0.026, which reads as a hole in the window rather
+    /// than as chrome. Mixing keeps a floor.
     #[must_use]
     pub fn from_border(border: [f32; 3], focused: bool) -> Self {
-        let k = if focused { 0.30 } else { 0.16 };
+        let t = if focused { 0.35 } else { 0.12 };
+        let mix = |c: f32| SURFACE.mul_add(1.0 - t, c * t);
         Self {
-            background: [border[0] * k, border[1] * k, border[2] * k],
+            background: [mix(border[0]), mix(border[1]), mix(border[2])],
             text: if focused {
                 [0.94, 0.94, 0.96]
             } else {
-                [0.62, 0.62, 0.66]
+                [0.58, 0.58, 0.62]
             },
         }
     }
+}
+
+/// What a bar is showing beyond its title: which button the pointer is
+/// on, and whether the window is already maximized (so the maximize
+/// button shows *restore* instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarState {
+    pub hovered: Option<TitlebarButton>,
+    pub maximized: bool,
 }
 
 /// Rasterize a bar to premultiplied RGBA8, row-major, `width * height`.
@@ -236,26 +271,62 @@ pub fn rasterize(
     style: BarStyle,
     buttons: &[TitlebarButton],
     font_px: f32,
+    state: BarState,
 ) -> Vec<u8> {
     let (cols, rows) = (width.max(1) as usize, height.max(1) as usize);
     let mut buf = vec![0u8; cols * rows * 4];
-    let bg = [
-        (style.background[0] * 255.0).clamp(0.0, 255.0) as u8,
-        (style.background[1] * 255.0).clamp(0.0, 255.0) as u8,
-        (style.background[2] * 255.0).clamp(0.0, 255.0) as u8,
-    ];
-    // Opaque: the bar covers the client's surface underneath it, and any
-    // translucency here would show the stretched top edge of that
-    // surface rather than the backdrop.
-    for px in buf.chunks_exact_mut(4) {
-        px[0] = bg[0];
-        px[1] = bg[1];
-        px[2] = bg[2];
-        px[3] = 255;
+    // A faint top-to-bottom sheen, then a darker rule along the bottom
+    // edge so the bar reads as a distinct surface from the client's
+    // content rather than as part of it.
+    //
+    // Opaque throughout: the bar covers the client's surface underneath,
+    // and any translucency here would show the stretched top edge of
+    // that surface rather than the backdrop.
+    for y in 0..rows {
+        let t = if rows > 1 {
+            y as f32 / (rows - 1) as f32
+        } else {
+            0.0
+        };
+        let mut shade = SHEEN.mul_add(-t, SHEEN * (1.0 - t));
+        // Bottom rule: the last row (two at HiDPI) goes distinctly darker.
+        let rule = rows.saturating_sub(1 + usize::from(rows > 40));
+        if y >= rule {
+            shade -= 0.055;
+        }
+        let row = [
+            (style.background[0] + shade).clamp(0.0, 1.0),
+            (style.background[1] + shade).clamp(0.0, 1.0),
+            (style.background[2] + shade).clamp(0.0, 1.0),
+        ];
+        for x in 0..cols {
+            let i = (y * cols + x) * 4;
+            buf[i] = (row[0] * 255.0) as u8;
+            buf[i + 1] = (row[1] * 255.0) as u8;
+            buf[i + 2] = (row[2] * 255.0) as u8;
+            buf[i + 3] = 255;
+        }
     }
 
     let layout = bar_layout(width, height, buttons);
     let fg = style.text;
+
+    // Hovered button backing, under its glyph. Close gets a red so the
+    // destructive one announces itself before you commit to it.
+    if let Some(hovered) = state.hovered
+        && let Some((kind, rect)) = layout.buttons.iter().find(|(k, _)| *k == hovered)
+    {
+        let (tint, strength) = if *kind == TitlebarButton::Close {
+            (CLOSE_HOVER, 0.85)
+        } else {
+            ([1.0, 1.0, 1.0], HOVER_TINT)
+        };
+        for y in rect.loc.y.max(0)..(rect.loc.y + rect.size.h).min(rows as i32) {
+            for x in rect.loc.x.max(0)..(rect.loc.x + rect.size.w).min(cols as i32) {
+                blend(&mut buf, cols, x as usize, y as usize, tint, strength);
+            }
+        }
+    }
 
     // --- title -------------------------------------------------------
     if let Some(fonts) = fonts
@@ -268,7 +339,17 @@ pub fn rasterize(
         // bar: baseline at centre + roughly half the cap height reads
         // level, where centring the em box sits visibly low.
         let baseline = (rows as f32 / 2.0 + font_px * 0.34).round();
-        let origin = layout.title.loc.x as f32;
+        // Centred in the *bar*, Breeze-style, then pushed right if that
+        // would start it before the title area (a long title in a narrow
+        // window) or pulled left if it would run under the buttons.
+        // Centring in the title area instead would make the text drift
+        // left as buttons are added, which looks like a bug.
+        let text_w = fonts.measure(&shown, font_px, false);
+        let centred = (cols as f32 - text_w) / 2.0;
+        let origin = centred
+            .max(layout.title.loc.x as f32)
+            .min((layout.title.loc.x + layout.title.size.w) as f32 - text_w)
+            .max(layout.title.loc.x as f32);
         fonts.layout(
             &shown,
             font_px,
@@ -298,7 +379,7 @@ pub fn rasterize(
 
     // --- buttons -----------------------------------------------------
     for (kind, rect) in &layout.buttons {
-        draw_glyph(&mut buf, cols, rows, *kind, *rect, height, fg);
+        draw_glyph(&mut buf, cols, rows, *kind, *rect, height, fg, state);
     }
     buf
 }
@@ -343,24 +424,48 @@ fn draw_glyph(
     rect: Rectangle<i32, Physical>,
     bar_h: i32,
     colour: [f32; 3],
+    state: BarState,
 ) {
     let extent = (bar_h as f32 * GLYPH).max(4.0);
     let mid_x = rect.loc.x as f32 + rect.size.w as f32 / 2.0;
     let mid_y = rect.loc.y as f32 + rect.size.h as f32 / 2.0;
     let (left, right) = (mid_x - extent / 2.0, mid_x + extent / 2.0);
     let (top, bottom) = (mid_y - extent / 2.0, mid_y + extent / 2.0);
+    // Chevrons are flatter than they are wide, so they don't read as
+    // arrowheads.
+    let (chev_top, chev_bottom) = (mid_y - extent * 0.28, mid_y + extent * 0.28);
     let segments: Vec<((f32, f32), (f32, f32))> = match kind {
-        // A single rule across the middle.
-        TitlebarButton::Minimize => vec![((left, mid_y), (right, mid_y))],
-        // A square outline.
+        // Breeze: a chevron pointing down — the window goes away
+        // downwards, to the taskbar.
+        TitlebarButton::Minimize => vec![
+            ((left, chev_top), (mid_x, chev_bottom)),
+            ((mid_x, chev_bottom), (right, chev_top)),
+        ],
+        // Up to maximize, down to restore. Never a square outline: at
+        // button size that is exactly the box a font draws for a missing
+        // glyph, and it reads as a broken icon.
+        TitlebarButton::Maximize if state.maximized => vec![
+            ((left, mid_y), (mid_x, chev_bottom)),
+            ((mid_x, chev_bottom), (right, mid_y)),
+            ((left, chev_top - extent * 0.10), (mid_x, mid_y - extent * 0.10)),
+            ((mid_x, mid_y - extent * 0.10), (right, chev_top - extent * 0.10)),
+        ],
         TitlebarButton::Maximize => vec![
-            ((left, top), (right, top)),
-            ((right, top), (right, bottom)),
-            ((right, bottom), (left, bottom)),
-            ((left, bottom), (left, top)),
+            ((left, chev_bottom), (mid_x, chev_top)),
+            ((mid_x, chev_top), (right, chev_bottom)),
         ],
         // Two diagonals.
-        TitlebarButton::Close => vec![((left, top), (right, bottom)), ((right, top), (left, bottom))],
+        TitlebarButton::Close => vec![
+            ((left, top), (right, bottom)),
+            ((right, top), (left, bottom)),
+        ],
+    };
+    // The hovered close button paints its glyph white on red rather than
+    // in the bar's text colour, which would disappear into it.
+    let colour = if state.hovered == Some(kind) && kind == TitlebarButton::Close {
+        [1.0, 1.0, 1.0]
+    } else {
+        colour
     };
     // Only the glyph's own neighbourhood can be covered, so bound the
     // scan to it rather than sweeping the whole button.
@@ -390,8 +495,8 @@ fn draw_glyph(
 #[cfg(test)]
 mod tests {
     use super::{
-        BarStyle, Deco, EdgeX, EdgeY, Point, Rectangle, Region, Size, TitlebarButton, bar_layout,
-        rasterize, region_at,
+        BarState, BarStyle, Deco, EdgeX, EdgeY, Point, Rectangle, Region, Size, TitlebarButton,
+        bar_layout, rasterize, region_at,
     };
 
     /// A 2 px border with a 28 px bar — the shipped default.
@@ -489,7 +594,7 @@ mod tests {
         for (w, h) in [(0, 0), (1, 1), (10, 0), (0, 28)] {
             let bar = bar_layout(w, h, ALL);
             assert!(bar.title.size.w >= 0 && bar.title.size.h >= 0);
-            let px = rasterize(None, w, h, "x", style(), ALL, 13.0);
+            let px = rasterize(None, w, h, "x", style(), ALL, 13.0, BarState::default());
             assert_eq!(px.len(), (w.max(1) as usize) * (h.max(1) as usize) * 4);
         }
     }
@@ -515,7 +620,7 @@ mod tests {
     /// any hole would show the stretched top edge of that surface.
     #[test]
     fn the_rasterized_bar_is_fully_opaque() {
-        let px = rasterize(None, 200, 28, "title", style(), ALL, 13.0);
+        let px = rasterize(None, 200, 28, "title", style(), ALL, 13.0, BarState::default());
         assert!(px.chunks_exact(4).all(|p| p[3] == 255));
     }
 
@@ -523,8 +628,8 @@ mod tests {
     /// would otherwise look like a correctly drawn flat bar.
     #[test]
     fn button_glyphs_are_drawn() {
-        let bare = rasterize(None, 200, 28, "", style(), &[], 13.0);
-        let with = rasterize(None, 200, 28, "", style(), ALL, 13.0);
+        let bare = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default());
+        let with = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default());
         assert_ne!(bare, with, "buttons left no marks");
     }
 
@@ -636,6 +741,116 @@ mod tests {
             }
         }
         assert!(saw_other, "an oversized margin swallowed the whole window");
+    }
+
+    /// The maximize glyph must not be a square outline: at button size
+    /// that is exactly the box a font draws for a missing glyph, which
+    /// is what it was mistaken for. A chevron touches the middle row at
+    /// only one x; a square's outline spans the full width on its top
+    /// and bottom rows.
+    #[test]
+    fn the_maximize_glyph_is_a_chevron_not_a_box() {
+        let bg = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default());
+        let with = rasterize(
+            None,
+            200,
+            28,
+            "",
+            style(),
+            &[TitlebarButton::Maximize],
+            13.0,
+            BarState::default(),
+        );
+        // Rows where the glyph differs from the plain bar, and how wide
+        // that difference is on each.
+        let widths: Vec<usize> = (0..28)
+            .map(|y| {
+                (0..200)
+                    .filter(|x| {
+                        let i = (y * 200 + x) * 4;
+                        bg[i..i + 3] != with[i..i + 3]
+                    })
+                    .count()
+            })
+            .collect();
+        let marked: Vec<usize> = widths.iter().copied().filter(|&w| w > 0).collect();
+        assert!(!marked.is_empty(), "maximize drew nothing");
+        // A box outline has two rows as wide as the glyph itself; a
+        // chevron's widest row is its base and it narrows to a point.
+        let widest = *marked.iter().max().expect("non-empty");
+        let narrowest = *marked.iter().min().expect("non-empty");
+        assert!(
+            narrowest * 2 < widest,
+            "glyph never narrows ({narrowest}..{widest}) — that's a box, not a chevron"
+        );
+    }
+
+    /// Maximize and restore have to be distinguishable, or the button
+    /// gives no clue what it will do.
+    #[test]
+    fn restore_draws_differently_from_maximize() {
+        let one = |maximized| {
+            rasterize(
+                None,
+                200,
+                28,
+                "",
+                style(),
+                &[TitlebarButton::Maximize],
+                13.0,
+                BarState {
+                    hovered: None,
+                    maximized,
+                },
+            )
+        };
+        assert_ne!(one(false), one(true));
+    }
+
+    /// Hover has to be visible, and close specifically has to look
+    /// different from the others — it is the destructive one.
+    #[test]
+    fn hover_marks_the_button_and_close_is_special() {
+        let plain = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default());
+        let on = |kind| {
+            rasterize(
+                None,
+                200,
+                28,
+                "",
+                style(),
+                ALL,
+                13.0,
+                BarState {
+                    hovered: Some(kind),
+                    maximized: false,
+                },
+            )
+        };
+        assert_ne!(plain, on(TitlebarButton::Close), "close hover invisible");
+        assert_ne!(plain, on(TitlebarButton::Minimize), "hover invisible");
+        assert_ne!(
+            on(TitlebarButton::Close),
+            on(TitlebarButton::Minimize),
+            "close should not look like the others on hover"
+        );
+    }
+
+    /// An already-dark inactive border must not drag the bar to
+    /// near-black — the first attempt scaled the colour and produced a
+    /// hole in the window rather than chrome.
+    #[test]
+    fn a_dark_border_still_gives_a_visible_bar() {
+        let dark = BarStyle::from_border([0.16, 0.16, 0.20], false);
+        for c in dark.background {
+            assert!(
+                c > 0.06,
+                "unfocused bar is effectively black: {:?}",
+                dark.background
+            );
+        }
+        // ...and the text still has somewhere to sit above it.
+        assert!(dark.text[0] - dark.background[0] > 0.3);
     }
 
     /// Focus has to be visible without reading the text, so the two
