@@ -1252,9 +1252,27 @@ impl State {
         if self.popup_at(pos).is_some() {
             return None;
         }
-        let (surface, cell, deco) = self.layout.hit_target(pos)?;
-        // An undecorated window (fullscreen, or the whole tiling default)
-        // has no regions of its own: every pixel is the client's.
+        let zone = self.config.layout.resize_zone;
+        let Some((surface, cell, deco)) = self.layout.hit_target(pos) else {
+            // Nothing under the cursor — but a window's edge may be just
+            // inside it. The grab band sits *outside* the window, so it
+            // costs the client nothing and works for a client-side
+            // decorated one, which owns every pixel of its own rect.
+            //
+            // Not over a layer surface, though: a panel sitting a few
+            // pixels below a window would otherwise have its clicks
+            // eaten by that window's bottom grab band.
+            if self.layer_at(pos).is_some() {
+                return None;
+            }
+            let (surface, cell, edges) = self.layout.resize_target(pos, zone)?;
+            return Some((surface, cell, titlebar::Region::Resize(edges)));
+        };
+        // An undecorated window has no regions of its own *inside* it:
+        // every pixel belongs to the client. That is exactly right for a
+        // CSD window — taking a margin from its edge would swallow
+        // clicks on whatever it draws there, which on a text editor is
+        // the scrollbar. Its resize affordance is the outward band above.
         if deco == layout::Deco::none() {
             return Some((surface, cell, titlebar::Region::Content));
         }

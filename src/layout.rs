@@ -1898,6 +1898,66 @@ impl Layout {
             .map(|(w, rect)| (w.toplevel.wl_surface().clone(), rect, self.deco_for(w)))
     }
 
+    /// The floating window whose edge `pos` is within `margin` pixels of,
+    /// from *outside* it, with the edges that grab would move.
+    ///
+    /// This is the resize affordance for windows the compositor draws no
+    /// chrome for. A client-side-decorated window owns every pixel
+    /// inside its rect — taking a margin there would swallow clicks on
+    /// whatever it draws at its edge, which on a text editor is the
+    /// scrollbar — but the space *outside* it is the compositor's, and
+    /// for a CSD client it is where the window's own drop shadow sits.
+    /// So the grab band goes there, and costs the client nothing.
+    ///
+    /// Only consulted when nothing was hit normally, so a window that
+    /// overlaps this one's outskirts always wins.
+    pub fn resize_target(
+        &self,
+        pos: Point<i32, Physical>,
+        margin: i32,
+    ) -> Option<(WlSurface, Rectangle<i32, Physical>, ResizeEdges)> {
+        if margin <= 0 {
+            return None;
+        }
+        let i = self.outpane_at(pos)?;
+        let ws = self.active_ws(i);
+        // Topmost first, matching `window_at`'s z-order.
+        for w in ws.floating.iter().rev().filter(|w| w.visible()) {
+            // Only a normal window: a filled one owns its output, and
+            // resizing it is meaningless.
+            if w.fill != FillMode::Normal {
+                continue;
+            }
+            let r = w.rect;
+            let grown = Rectangle::new(
+                Point::new(r.loc.x - margin, r.loc.y - margin),
+                Size::from((r.size.w + 2 * margin, r.size.h + 2 * margin)),
+            );
+            if !rect_contains(grown, pos) || rect_contains(r, pos) {
+                continue;
+            }
+            let x = if pos.x < r.loc.x {
+                Some(EdgeX::Left)
+            } else if pos.x >= r.loc.x + r.size.w {
+                Some(EdgeX::Right)
+            } else {
+                None
+            };
+            let y = if pos.y < r.loc.y {
+                Some(EdgeY::Top)
+            } else if pos.y >= r.loc.y + r.size.h {
+                Some(EdgeY::Bottom)
+            } else {
+                None
+            };
+            if x.is_none() && y.is_none() {
+                continue;
+            }
+            return Some((w.toplevel.wl_surface().clone(), r, ResizeEdges { x, y }));
+        }
+        None
+    }
+
     /// Bring a floating window to the front of its workspace's stack.
     /// Returns whether it moved (`false` for a tiled window, which has
     /// no stacking order, or one already on top).
