@@ -72,6 +72,7 @@ mod config;
 mod cursor;
 mod drm;
 mod hdr;
+mod icon;
 mod ipc;
 mod keyboard;
 mod media;

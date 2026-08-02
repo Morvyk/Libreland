@@ -497,24 +497,28 @@ impl Deco {
         Point::from((self.border, self.top()))
     }
 
-    /// Where the client's buffer is actually *painted*, relative to the
-    /// cell origin — which is **not** [`Deco::content_offset`].
+    /// Where the client's buffer is painted, relative to the cell origin.
     ///
-    /// The renderer deliberately stretches the buffer out under the
-    /// border ring on all four sides, so the ring overlays opaque pixels
-    /// and its anti-aliased inner edge can't reveal a transparent seam.
-    /// The titlebar is different: it is opaque and tens of pixels tall,
-    /// so stretching under *it* would squash the content by the bar's
-    /// whole height. Hence x anchors at the cell edge and y below the bar.
+    /// The same thing as [`Deco::content_offset`], and deliberately so:
+    /// the renderer used to stretch the buffer out under the border ring
+    /// (so the ring's anti-aliased inner edge could never reveal a
+    /// transparent seam), which made the painted rect differ from the
+    /// configured content rect by the border on every side.
     ///
-    /// Pointer hit-testing has to use this same origin. Using the
-    /// content offset instead puts every surface-local coordinate a
-    /// border out; using the cell origin puts them a whole titlebar out,
-    /// which is the difference between "slightly off" and "clicks land
-    /// 28 px below the thing you aimed at".
+    /// That difference is a *scale*, and pointer hit-testing can only
+    /// express an origin — smithay derives surface-local coordinates as
+    /// `cursor - origin`, with no room for a factor. So the stretch put
+    /// every click progressively further out the further it was from the
+    /// window's top-left, and the error grew with the window. Painting
+    /// 1:1 makes the transform the identity, which is the only version
+    /// the pointer maths can represent exactly.
+    ///
+    /// The seam it was avoiding does not return: the ring is drawn over
+    /// the band the surface no longer covers, and its inner edge blends
+    /// against surface pixels that are right up against it.
     #[must_use]
     pub fn paint_origin(self) -> Point<i32, Physical> {
-        Point::from((0, self.titlebar))
+        self.content_offset()
     }
 
     /// Content size for a cell of `cell_size`, clamped to a minimum of
@@ -1941,10 +1945,26 @@ impl Layout {
     /// (even for a redundant request) so the client gets the
     /// configure xdg-shell expects in response.
     pub fn set_fill(&mut self, surface: &WlSurface, fill: FillMode) -> bool {
+        let (deco, mode) = (self.deco, self.mode);
         let Some(w) = self.window_mut(surface) else {
             return false;
         };
+        let was = w.fill;
         w.fill = fill;
+        // The one transition where a decoration decision changes, and the
+        // one that has been hardest to reason about from a screenshot:
+        // says what the window is about to be configured to and whether
+        // it keeps a bar. KDE's rule, which this follows: fullscreen
+        // drops decoration, maximized keeps it.
+        debug!(
+            surface = ?surface.id(),
+            ?was,
+            now = ?fill,
+            ?mode,
+            deco_border = deco_for_fill(deco, mode, fill).border,
+            deco_titlebar = deco_for_fill(deco, mode, fill).titlebar,
+            "layout: fill changed",
+        );
         self.recompute_and_push();
         true
     }
@@ -3669,6 +3689,41 @@ mod deco_tests {
             deco_for_fill(deco, LayoutMode::Tiling, FillMode::Maximized),
             Deco::none()
         );
+    }
+
+    /// The renderer decides whether to draw a bar from `p.deco` alone,
+    /// so these are the values that decide it. KDE's rule: fullscreen
+    /// drops decoration, maximized keeps it — you need the titlebar to
+    /// un-maximize a window.
+    #[test]
+    fn a_maximized_window_keeps_a_drawable_bar_while_floating() {
+        let deco = Deco::new(2, 28);
+        let maxed = deco_for_fill(deco, LayoutMode::Floating, FillMode::Maximized);
+        assert_ne!(
+            maxed,
+            Deco::none(),
+            "maximized must stay decorated, or the renderer draws no bar"
+        );
+        assert_eq!(maxed.titlebar, 28);
+        // ...and fullscreen must not, or a game gets a bar across it.
+        assert_eq!(
+            deco_for_fill(deco, LayoutMode::Floating, FillMode::Fullscreen),
+            Deco::none()
+        );
+    }
+
+    /// The painted rect must equal the configured rect, so the buffer is
+    /// drawn 1:1 and pointer coordinates need no scale factor — the bug
+    /// that made clicks land further out the bigger the window got.
+    #[test]
+    fn the_paint_origin_is_the_content_origin() {
+        for deco in [Deco::none(), Deco::new(2, 28), Deco::new(6, 13)] {
+            assert_eq!(
+                deco.paint_origin(),
+                deco.content_offset(),
+                "{deco:?} paints somewhere other than where it configures"
+            );
+        }
     }
 
     /// Border-only is exactly what it was before titlebars existed.

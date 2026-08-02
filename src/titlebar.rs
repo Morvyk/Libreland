@@ -29,7 +29,7 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "pixel geometry: every value here is a bar-sized non-negative pixel count, and the i32/u32/usize/f32 conversions are all well inside that range. Checked conversions at each site would be noise around arithmetic that cannot overflow."
+    reason = "pixel geometry and 8-bit colour: every value here is a bar-sized non-negative pixel count or a channel already clamped to [0, 255], and the i32/u32/usize/f32/u8 conversions are all well inside that range. Checked conversions at each site would be noise around arithmetic that cannot overflow."
 )]
 
 use libreland_text::Fonts;
@@ -49,6 +49,9 @@ const EDGE_PAD: f32 = 0.45;
 
 /// Glyph extent inside a button, as a multiple of bar height.
 const GLYPH: f32 = 0.30;
+
+/// Application-icon side, as a multiple of bar height.
+const ICON_SIDE: f32 = 0.62;
 
 /// Stroke half-width of a button glyph, in pixels at scale 1.
 const STROKE: f32 = 0.70;
@@ -75,7 +78,9 @@ pub struct BarLayout {
     /// Buttons left-to-right in draw order, each with its full clickable
     /// rect (the whole cell, not just the glyph).
     pub buttons: Vec<(TitlebarButton, Rectangle<i32, Physical>)>,
-    /// Space left for the title, between the left edge and the buttons.
+    /// Square slot at the left for the application icon.
+    pub icon: Rectangle<i32, Physical>,
+    /// Space left for the title, between the icon and the buttons.
     pub title: Rectangle<i32, Physical>,
 }
 
@@ -90,6 +95,12 @@ impl BarLayout {
             inside.then_some(*kind)
         })
     }
+}
+
+/// Side of the square application-icon slot on a bar `height` px tall.
+#[must_use]
+pub fn icon_side_for(height: i32) -> i32 {
+    ((height.max(0) as f32) * ICON_SIDE) as i32
 }
 
 /// Lay out a bar `width` x `height` pixels carrying `buttons`.
@@ -121,11 +132,19 @@ pub fn bar_layout(width: i32, height: i32, buttons: &[TitlebarButton]) -> BarLay
         right = left;
     }
     placed.reverse();
+    // Icon slot at the left, vertically centred and square.
+    let icon_side = icon_side_for(h);
+    let icon = Rectangle::new(
+        Point::from((pad, (h - icon_side) / 2)),
+        Size::from((icon_side, icon_side)),
+    );
+    let title_left = icon.loc.x + icon.size.w + pad / 2;
     let title_right = placed.first().map_or(width - pad, |(_, r)| r.loc.x);
-    let title_w = (title_right - pad).max(0);
+    let title_w = (title_right - title_left).max(0);
     BarLayout {
         buttons: placed,
-        title: Rectangle::new(Point::from((pad, 0)), Size::from((title_w, h))),
+        icon,
+        title: Rectangle::new(Point::from((title_left, 0)), Size::from((title_w, h))),
     }
 }
 
@@ -194,11 +213,15 @@ pub fn region_at(
         }
     }
     if deco.titlebar > 0 {
-        let bar_top = cell.loc.y + deco.border;
-        let bar_bottom = bar_top + deco.titlebar;
-        if pos.y >= bar_top && pos.y < bar_bottom {
-            let local = Point::from((pos.x - cell.loc.x - deco.border, pos.y - bar_top));
-            let bar = bar_layout(cell.size.w - 2 * deco.border, deco.titlebar, buttons);
+        // The bar is blitted over the cell's top strip at (0, 0), full
+        // cell width — the border ring is painted *over* it by the
+        // composite rather than the bar being inset inside it. Insetting
+        // this hit-test by the border instead put the whole button row a
+        // border away from where its glyphs actually are.
+        let bar_bottom = cell.loc.y + deco.titlebar;
+        if pos.y < bar_bottom {
+            let local = Point::from((pos.x - cell.loc.x, pos.y - cell.loc.y));
+            let bar = bar_layout(cell.size.w, deco.titlebar, buttons);
             return match bar.button_at(local) {
                 Some(kind) => Region::Button(kind),
                 None => Region::Titlebar,
@@ -272,42 +295,10 @@ pub fn rasterize(
     buttons: &[TitlebarButton],
     font_px: f32,
     state: BarState,
+    icon: Option<&crate::icon::Icon>,
 ) -> Vec<u8> {
     let (cols, rows) = (width.max(1) as usize, height.max(1) as usize);
-    let mut buf = vec![0u8; cols * rows * 4];
-    // A faint top-to-bottom sheen, then a darker rule along the bottom
-    // edge so the bar reads as a distinct surface from the client's
-    // content rather than as part of it.
-    //
-    // Opaque throughout: the bar covers the client's surface underneath,
-    // and any translucency here would show the stretched top edge of
-    // that surface rather than the backdrop.
-    for y in 0..rows {
-        let t = if rows > 1 {
-            y as f32 / (rows - 1) as f32
-        } else {
-            0.0
-        };
-        let mut shade = SHEEN.mul_add(-t, SHEEN * (1.0 - t));
-        // Bottom rule: the last row (two at HiDPI) goes distinctly darker.
-        let rule = rows.saturating_sub(1 + usize::from(rows > 40));
-        if y >= rule {
-            shade -= 0.055;
-        }
-        let row = [
-            (style.background[0] + shade).clamp(0.0, 1.0),
-            (style.background[1] + shade).clamp(0.0, 1.0),
-            (style.background[2] + shade).clamp(0.0, 1.0),
-        ];
-        for x in 0..cols {
-            let i = (y * cols + x) * 4;
-            buf[i] = (row[0] * 255.0) as u8;
-            buf[i + 1] = (row[1] * 255.0) as u8;
-            buf[i + 2] = (row[2] * 255.0) as u8;
-            buf[i + 3] = 255;
-        }
-    }
-
+    let mut buf = fill_background(cols, rows, style);
     let layout = bar_layout(width, height, buttons);
     let fg = style.text;
 
@@ -377,11 +368,79 @@ pub fn rasterize(
         );
     }
 
+    if let Some(icon) = icon {
+        draw_icon(&mut buf, cols, rows, layout.icon, icon);
+    }
+
     // --- buttons -----------------------------------------------------
     for (kind, rect) in &layout.buttons {
         draw_glyph(&mut buf, cols, rows, *kind, *rect, height, fg, state);
     }
     buf
+}
+
+/// The bar's backing: a faint top-to-bottom sheen, then a darker rule
+/// along the bottom edge so the bar reads as a surface distinct from the
+/// client's content rather than as part of it.
+///
+/// Opaque throughout — the bar covers the client's buffer underneath,
+/// and any translucency here would show *that*, not the backdrop.
+fn fill_background(cols: usize, rows: usize, style: BarStyle) -> Vec<u8> {
+    let mut buf = vec![0u8; cols * rows * 4];
+    // The last row (two at HiDPI) is the rule.
+    let rule = rows.saturating_sub(1 + usize::from(rows > 40));
+    for y in 0..rows {
+        let t = if rows > 1 {
+            y as f32 / (rows - 1) as f32
+        } else {
+            0.0
+        };
+        let mut shade = SHEEN.mul_add(-t, SHEEN * (1.0 - t));
+        if y >= rule {
+            shade -= 0.055;
+        }
+        for x in 0..cols {
+            let i = (y * cols + x) * 4;
+            for c in 0..3 {
+                buf[i + c] = ((style.background[c] + shade).clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            buf[i + 3] = 255;
+        }
+    }
+    buf
+}
+
+/// Alpha-over the application icon into its slot. Straight compositing:
+/// the icon is the one part of the bar that isn't ours to recolour.
+fn draw_icon(
+    buf: &mut [u8],
+    cols: usize,
+    rows: usize,
+    slot: Rectangle<i32, Physical>,
+    icon: &crate::icon::Icon,
+) {
+    for row in 0..icon.height.min(slot.size.h.max(0) as u32) {
+        let y = slot.loc.y + row as i32;
+        if y < 0 || y as usize >= rows {
+            continue;
+        }
+        for col in 0..icon.width.min(slot.size.w.max(0) as u32) {
+            let x = slot.loc.x + col as i32;
+            if x < 0 || x as usize >= cols {
+                continue;
+            }
+            let i = ((row * icon.width + col) as usize) * 4;
+            let a = f32::from(icon.rgba[i + 3]) / 255.0;
+            if a > 0.0 {
+                let rgb = [
+                    f32::from(icon.rgba[i]) / 255.0,
+                    f32::from(icon.rgba[i + 1]) / 255.0,
+                    f32::from(icon.rgba[i + 2]) / 255.0,
+                ];
+                blend(buf, cols, x as usize, y as usize, rgb, a);
+            }
+        }
+    }
 }
 
 /// Alpha-blend `colour` at `a` coverage over the pixel at `(x, y)`.
@@ -594,7 +653,7 @@ mod tests {
         for (w, h) in [(0, 0), (1, 1), (10, 0), (0, 28)] {
             let bar = bar_layout(w, h, ALL);
             assert!(bar.title.size.w >= 0 && bar.title.size.h >= 0);
-            let px = rasterize(None, w, h, "x", style(), ALL, 13.0, BarState::default());
+            let px = rasterize(None, w, h, "x", style(), ALL, 13.0, BarState::default(), None);
             assert_eq!(px.len(), (w.max(1) as usize) * (h.max(1) as usize) * 4);
         }
     }
@@ -620,7 +679,7 @@ mod tests {
     /// any hole would show the stretched top edge of that surface.
     #[test]
     fn the_rasterized_bar_is_fully_opaque() {
-        let px = rasterize(None, 200, 28, "title", style(), ALL, 13.0, BarState::default());
+        let px = rasterize(None, 200, 28, "title", style(), ALL, 13.0, BarState::default(), None);
         assert!(px.chunks_exact(4).all(|p| p[3] == 255));
     }
 
@@ -628,8 +687,8 @@ mod tests {
     /// would otherwise look like a correctly drawn flat bar.
     #[test]
     fn button_glyphs_are_drawn() {
-        let bare = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default());
-        let with = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default());
+        let bare = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default(), None);
+        let with = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default(), None);
         assert_ne!(bare, with, "buttons left no marks");
     }
 
@@ -750,7 +809,7 @@ mod tests {
     /// and bottom rows.
     #[test]
     fn the_maximize_glyph_is_a_chevron_not_a_box() {
-        let bg = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default());
+        let bg = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default(), None);
         let with = rasterize(
             None,
             200,
@@ -760,6 +819,7 @@ mod tests {
             &[TitlebarButton::Maximize],
             13.0,
             BarState::default(),
+            None,
         );
         // Rows where the glyph differs from the plain bar, and how wide
         // that difference is on each.
@@ -802,6 +862,7 @@ mod tests {
                     hovered: None,
                     maximized,
                 },
+                None,
             )
         };
         assert_ne!(one(false), one(true));
@@ -811,7 +872,7 @@ mod tests {
     /// different from the others — it is the destructive one.
     #[test]
     fn hover_marks_the_button_and_close_is_special() {
-        let plain = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default());
+        let plain = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default(), None);
         let on = |kind| {
             rasterize(
                 None,
@@ -825,6 +886,7 @@ mod tests {
                     hovered: Some(kind),
                     maximized: false,
                 },
+                None,
             )
         };
         assert_ne!(plain, on(TitlebarButton::Close), "close hover invisible");

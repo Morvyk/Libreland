@@ -1395,6 +1395,12 @@ pub struct Renderer {
     /// the input path, which already resolves the region on every motion
     /// for the resize cursor.
     hovered_button: Option<(ObjectId, crate::config::TitlebarButton)>,
+    /// Application icons by `(app_id, side)`, already decoded and scaled
+    /// to the slot. `None` records a lookup that found nothing, so a
+    /// window whose app ships no PNG icon doesn't rescan every icon
+    /// theme on every retitle. Cleared when the titlebar config changes,
+    /// since the slot size moves with the bar height.
+    icon_cache: HashMap<(String, u32), Option<std::sync::Arc<crate::icon::Icon>>>,
     /// `LIBRELAND_NO_OCCLUSION=1`: disable the occluded/off-output window
     /// prune, for A/B benchmarking against the render-profile log.
     no_occlusion: bool,
@@ -2087,7 +2093,23 @@ fn placement_bar_key(
     }
     let cell_w = scale_i(wd.effective.size.w, scale).max(1);
     let title = window_title(&p.surface).unwrap_or_default();
-    bar_key(cell_w, bar_h, &title, wd.focus >= 0.5, buttons, state)
+    let app_id = window_app_id(&p.surface);
+    bar_key(
+        cell_w,
+        bar_h,
+        &title,
+        app_id.as_deref(),
+        wd.focus >= 0.5,
+        buttons,
+        state,
+    )
+}
+
+/// Icon slot side for a bar `height` px tall. Mirrors `titlebar`'s own
+/// slot geometry, so the decoded icon is the size it will be drawn at
+/// and never rescaled twice.
+fn icon_side(height: i32) -> u32 {
+    u32::try_from(crate::titlebar::icon_side_for(height)).unwrap_or(1).max(1)
 }
 
 /// Cap on rasterized titlebars held at once. A bar is one small RGBA
@@ -2107,6 +2129,7 @@ fn bar_key(
     width: i32,
     height: i32,
     title: &str,
+    app_id: Option<&str>,
     focused: bool,
     buttons: usize,
     state: BarState,
@@ -2116,6 +2139,8 @@ fn bar_key(
     width.hash(&mut h);
     height.hash(&mut h);
     title.hash(&mut h);
+    // The icon is drawn from this, and two windows can share a title.
+    app_id.hash(&mut h);
     focused.hash(&mut h);
     buttons.hash(&mut h);
     state.maximized.hash(&mut h);
@@ -3380,6 +3405,7 @@ impl Renderer {
             fonts: FontState::Unscanned,
             bar_cache: HashMap::new(),
             hovered_button: None,
+            icon_cache: HashMap::new(),
             no_occlusion: std::env::var_os("LIBRELAND_NO_OCCLUSION").is_some(),
             no_wintex_cache: std::env::var_os("LIBRELAND_NO_WINTEX_CACHE").is_some(),
             no_damage: std::env::var_os("LIBRELAND_NO_DAMAGE").is_some(),
@@ -4354,6 +4380,7 @@ impl Renderer {
         focused: bool,
         font_px: f32,
         state: BarState,
+        app_id: Option<&str>,
     ) -> Option<GlesTexture> {
         if let Some(tex) = self.bar_cache.get(&key) {
             return Some(tex.clone());
@@ -4377,10 +4404,6 @@ impl Renderer {
             }
             self.fonts = FontState::Scanned(loaded);
         }
-        let fonts = match &self.fonts {
-            FontState::Scanned(f) => f.as_ref(),
-            FontState::Unscanned => None,
-        };
         // The bar's colours come from the border fill for the same focus
         // state, so the frame and the bar are one palette with no second
         // set of config keys to keep in sync. A gradient contributes its
@@ -4394,6 +4417,13 @@ impl Renderer {
             Fill::Solid(rgb) => *rgb,
             Fill::VerticalGradient { top, .. } => *top,
         };
+        // Resolved before the borrow below: this needs `&mut self` for
+        // the cache, and `fonts` holds a shared borrow across the call.
+        let icon = app_id.and_then(|id| self.app_icon(id, icon_side(height)));
+        let fonts = match &self.fonts {
+            FontState::Scanned(f) => f.as_ref(),
+            FontState::Unscanned => None,
+        };
         let rgba = rasterize_bar(
             fonts,
             width,
@@ -4403,6 +4433,7 @@ impl Renderer {
             &self.titlebar.buttons,
             font_px,
             state,
+            icon.as_deref(),
         );
         let size = Size::<i32, smithay::utils::Buffer>::from((width.max(1), height.max(1)));
         match self
@@ -4418,6 +4449,33 @@ impl Renderer {
                 None
             }
         }
+    }
+
+    /// The decoded, slot-sized icon for `app_id`, looking it up once.
+    ///
+    /// Themes that ship only SVG (Breeze is one — 19827 SVGs, no PNGs)
+    /// resolve to `None`, and the bar simply draws no icon. A
+    /// placeholder box would be worse: an empty square in a titlebar
+    /// reads as a broken icon rather than as a missing one.
+    fn app_icon(&mut self, app_id: &str, side: u32) -> Option<std::sync::Arc<crate::icon::Icon>> {
+        let key = (app_id.to_owned(), side);
+        if let Some(hit) = self.icon_cache.get(&key) {
+            return hit.clone();
+        }
+        let loaded = crate::icon::lookup(app_id, side)
+            .and_then(|path| {
+                let icon = crate::icon::load(&path);
+                if icon.is_none() {
+                    debug!(app_id, path = %path.display(), "titlebar: icon decode failed");
+                }
+                icon
+            })
+            .map(|icon| std::sync::Arc::new(crate::icon::resize(&icon, side)));
+        if loaded.is_none() {
+            debug!(app_id, side, "titlebar: no raster icon found");
+        }
+        self.icon_cache.insert(key, loaded.clone());
+        loaded
     }
 
     /// Record which titlebar button the pointer is over, so its bar can
@@ -4443,6 +4501,7 @@ impl Renderer {
         }
         self.titlebar = cfg;
         self.bar_cache.clear();
+        self.icon_cache.clear();
         // Every cached decoration offscreen has a bar drawn into it.
         self.wintex_cache.clear();
         self.invalidate_damage();
@@ -5890,9 +5949,14 @@ impl Renderer {
                     // clears the titlebar.
                     let paint = p.deco.paint_origin();
                     let (target_w, target_h, anchor_x, anchor_y) = if offscreen {
+                        // 1:1 with the size the client was configured to,
+                        // so the buffer is not scaled at all when settled
+                        // — see `Deco::paint_origin` for why that matters
+                        // to the pointer.
+                        let content = p.deco.content_size(eff.size);
                         (
-                            f64::from((eff.size.w - paint.x).max(1)),
-                            f64::from((eff.size.h - paint.y).max(1)),
+                            f64::from(content.w.max(1)),
+                            f64::from(content.h.max(1)),
                             f64::from(paint.x),
                             f64::from(paint.y),
                         )
@@ -6254,10 +6318,13 @@ impl Renderer {
                 maximized: p.fill == FillMode::Maximized,
             };
             let bar = placement_bar_key(p, wd, scale, self.titlebar.buttons.len(), bar_state);
-            let bar_title = if bar_h > 0 {
-                window_title(&p.surface).unwrap_or_default()
+            let (bar_title, bar_app_id) = if bar_h > 0 {
+                (
+                    window_title(&p.surface).unwrap_or_default(),
+                    window_app_id(&p.surface),
+                )
             } else {
-                String::new()
+                (String::new(), None)
             };
             // Cached offscreen still current (same content, cell and
             // format)? Reuse it — an idle window costs a fingerprint walk
@@ -6317,6 +6384,7 @@ impl Renderer {
                         // the output or the text is tiny on HiDPI.
                         bar_font_px(self.titlebar.font_size, scale),
                         bar_state,
+                        bar_app_id.as_deref(),
                     )
                 })
                 .flatten();
@@ -9109,6 +9177,17 @@ fn window_title(surface: &WlSurface) -> Option<String> {
             .data_map
             .get::<XdgToplevelSurfaceData>()
             .and_then(|d| d.lock().ok().and_then(|d| d.title.clone()))
+    })
+}
+
+/// A toplevel's `app_id`, which names its icon. Xdg only, like
+/// [`window_title`].
+fn window_app_id(surface: &WlSurface) -> Option<String> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().ok().and_then(|d| d.app_id.clone()))
     })
 }
 
