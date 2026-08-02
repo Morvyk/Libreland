@@ -70,7 +70,12 @@ input = {
     repeat_rate = 25,            -- repeats per second
     repeat_delay = 600,          -- ms before repeat starts
     numlock = false,
-    focus_model = "hover",       -- "hover" (follows the pointer) | "click"
+    -- "hover" (follows the pointer) | "click". Left unset it follows
+    -- `layout.mode`: hover while tiling, click while floating -- overlapping
+    -- windows and focus-follows-mouse means every window the pointer crosses
+    -- on its way somewhere takes focus in passing. Set it here to pin one
+    -- model regardless of mode.
+    -- focus_model = "hover",
     mouse_accel_profile = "adaptive",  -- "adaptive" | "flat"
     mouse_accel_speed = 0.0,     -- -1.0 .. 1.0
     -- Super+scroll switches workspace, Super+Shift+scroll moves the focused
@@ -82,9 +87,27 @@ input = {
 -- ---------------------------------------------------------------------------
 -- Layout & borders
 -- ---------------------------------------------------------------------------
+-- `mode` picks how windows are arranged:
+--
+--   "tiling"    windows are leaves in a dwindle tree and never overlap.
+--   "floating"  every window floats, stacks and carries a titlebar --
+--               conventional stacking-WM behaviour. Drag the titlebar to
+--               move, grab an edge to resize, double-click to maximize,
+--               drag to a screen edge to snap.
+--
+-- Switching to "floating" also changes two defaults that only make sense per
+-- mode -- titlebars turn on, and `input.focus_model` becomes "click" -- both
+-- of which you can still set explicitly.
 layout = {
+    mode = "tiling",
     gaps_outer = 8,   -- px between the tile area and the screen edge
     gaps_inner = 3,   -- px between neighbouring tiles
+    -- Floating mode only. How far inside an edge a press still grabs that
+    -- edge to resize (the border itself is far too thin to aim at), and how
+    -- close to a screen edge a dragged window snaps. snap_zone = 0 disables
+    -- snapping.
+    resize_zone = 8,
+    snap_zone = 20,
 }
 
 border = {
@@ -94,6 +117,21 @@ border = {
     -- 0.0 .. 1.0, not 0 .. 255.
     active   = { type = "solid", color = { 0.40, 0.60, 0.90 } },
     inactive = { type = "solid", color = { 0.25, 0.25, 0.28 } },
+}
+
+-- Server-side titlebars. Clients are pinned to server-side decoration either
+-- way, so this isn't a negotiation with them: on means a bar appears, off
+-- means the window is border-only.
+titlebar = {
+    -- Unset: on in floating mode, off in tiling. Titlebars while tiling are
+    -- legal -- they just spend a bar of every cell on a title you can usually
+    -- infer from the window.
+    -- enabled = true,
+    height = 28,
+    font_size = 13.0,
+    -- Left-to-right at the bar's right end. An empty list is a bar with a
+    -- title and nothing to click.
+    buttons = { "minimize", "maximize", "close" },
 }
 
 -- ---------------------------------------------------------------------------

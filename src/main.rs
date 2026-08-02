@@ -2048,8 +2048,10 @@ impl State {
         // focus there makes the parent dismiss the menu the user is
         // navigating.
         self.refresh_popup_grab();
-        if matches!(self.config.input.focus_model, config::FocusModel::Hover)
-            && !pointer.is_grabbed()
+        if matches!(
+            self.config.input.focus_model(self.config.layout.mode),
+            config::FocusModel::Hover
+        ) && !pointer.is_grabbed()
             && !self.focus_locked_by_layer()
             && self.popup_grab.is_none()
             && !over_popup
@@ -2291,7 +2293,10 @@ impl State {
         }
 
         if matches!(state, smithay::backend::input::ButtonState::Pressed)
-            && matches!(self.config.input.focus_model, config::FocusModel::Click)
+            && matches!(
+                self.config.input.focus_model(self.config.layout.mode),
+                config::FocusModel::Click
+            )
             && !self.focus_locked_by_layer()
         {
             let (cx, cy) = self.renderer.cursor_pos();

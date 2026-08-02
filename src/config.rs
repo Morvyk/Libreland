@@ -49,6 +49,9 @@ pub struct Config {
     pub misc: MiscConfig,
     pub layout: LayoutConfig,
     pub border: BorderConfig,
+    /// Server-side titlebars. Applied live on reload — the height is a
+    /// decoration inset, so a change reconfigures every window.
+    pub titlebar: TitlebarConfig,
     /// Window/workspace motion. Applied live on reload; the renderer
     /// reads it fresh each frame.
     pub animations: AnimationsConfig,
@@ -105,6 +108,8 @@ pub struct IdleConfig {
 
 #[derive(Debug, Clone)]
 pub struct LayoutConfig {
+    /// How new windows are arranged. See [`LayoutMode`].
+    pub mode: LayoutMode,
     /// Pixels of empty space between the tile area and each edge
     /// of the layout's bounds. Wallpaper shows through the gap.
     /// Default `8`.
@@ -113,6 +118,35 @@ pub struct LayoutConfig {
     /// Centred on each split divider — each cell gives up
     /// `inner / 2` on the dividing side. Default `3`.
     pub gaps_inner: i32,
+    /// How far inside a window's edge a press still counts as grabbing
+    /// that edge to resize, in pixels. Only consulted in
+    /// [`LayoutMode::Floating`] — tiling resizes through `Super`+RMB,
+    /// which works anywhere in the window. Default `8`.
+    ///
+    /// Bigger than the border on purpose: the border is 1–2 px, and a
+    /// 2 px grab target is a target you miss.
+    pub resize_zone: i32,
+    /// How close to a work-area edge a dragged window has to get before
+    /// it arms a quick-tile snap, in pixels. `0` disables snapping.
+    /// [`LayoutMode::Floating`] only. Default `20`.
+    pub snap_zone: i32,
+}
+
+/// How the layout arranges windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    /// Windows are leaves in a dwindle tree and fill the screen with no
+    /// overlap. The default, and what the rest of the layout module is
+    /// built around.
+    #[default]
+    Tiling,
+    /// Every window floats freely, stacks, and carries a titlebar —
+    /// conventional stacking-WM behaviour. Changes a handful of
+    /// defaults that only make sense per mode: titlebars turn on, and
+    /// `input.focus_model` resolves to `click` rather than `hover`
+    /// (focus-follows-mouse over a stack of overlapping windows hands
+    /// focus to everything the pointer crosses on the way).
+    Floating,
 }
 
 /// One animation's timing: whether it plays, how long, and its easing.
@@ -418,11 +452,13 @@ pub struct InputConfig {
     /// is the device's neutral position; with [`AccelProfile::Flat`]
     /// this also means "no extra sensitivity multiplier".
     pub mouse_accel_speed: f64,
-    /// Which surface receives keyboard focus when the pointer moves
-    /// or a button is pressed. [`FocusModel::Hover`] is the default
-    /// (focus follows the surface under the cursor on every motion
-    /// event); [`FocusModel::Click`] only refocuses on press.
-    pub focus_model: FocusModel,
+    /// Which surface receives keyboard focus when the pointer moves or
+    /// a button is pressed. `None` — the default — derives it from
+    /// [`LayoutConfig::mode`]: [`FocusModel::Hover`] while tiling,
+    /// [`FocusModel::Click`] while floating. Resolve it with
+    /// [`InputConfig::focus_model`] rather than reading the field, so
+    /// the derivation happens in exactly one place.
+    pub focus_model: Option<FocusModel>,
     /// Engage Num Lock automatically at startup (`false` by default —
     /// the traditional bare-VT state). Applied through the xkb locked-
     /// modifier state, so clients see the modifier and keyboard LEDs
@@ -444,13 +480,25 @@ pub enum AccelProfile {
     Adaptive,
 }
 
+impl InputConfig {
+    /// The focus model actually in force, resolving the derived default
+    /// (see [`InputConfig::focus_model`]) against the layout mode.
+    #[must_use]
+    pub fn focus_model(&self, mode: LayoutMode) -> FocusModel {
+        self.focus_model.unwrap_or(match mode {
+            LayoutMode::Tiling => FocusModel::Hover,
+            LayoutMode::Floating => FocusModel::Click,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusModel {
     /// Keyboard focus follows the surface under the cursor on every
-    /// pointer motion event. The default.
+    /// pointer motion event. The tiling default.
     Hover,
     /// Keyboard focus only changes when the user presses a pointer
-    /// button on a surface.
+    /// button on a surface. The floating default.
     Click,
 }
 
@@ -613,6 +661,86 @@ pub struct BorderConfig {
     pub rounded_corners: i32,
 }
 
+/// Server-side titlebars: the bar drawn above a window's content, with
+/// its title and its buttons. Sits beside [`BorderConfig`] because it is
+/// the same kind of thing — decoration the compositor draws, inside the
+/// cell, that the client never sees.
+///
+/// The compositor pins every client to `ServerSide` decoration
+/// regardless (see `XdgDecorationHandler`), so this is not a negotiation
+/// with the client: turning it on means a bar appears, turning it off
+/// means the window is border-only as it has always been.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TitlebarConfig {
+    /// Whether windows get a titlebar. `None` — the default — derives it
+    /// from [`LayoutConfig::mode`]: on while floating, off while tiling.
+    /// Resolve with [`TitlebarConfig::enabled`].
+    ///
+    /// A tiling layout with titlebars is legal and works; it just spends
+    /// a bar's worth of every cell on a title you can usually infer from
+    /// the window itself.
+    pub enabled: Option<bool>,
+    /// Bar height in compositor pixels. Default `28`.
+    pub height: i32,
+    /// Title text size in pixels. Default `13.0`.
+    pub font_size: f32,
+    /// Which buttons appear, in left-to-right order at the bar's right
+    /// end. Empty means a bar with a title and nothing to click.
+    /// Default: minimize, maximize, close.
+    pub buttons: Vec<TitlebarButton>,
+}
+
+/// One titlebar button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitlebarButton {
+    /// Hide the window until something focuses it again (the taskbar).
+    Minimize,
+    /// Toggle [`crate::layout::FillMode::Maximized`].
+    Maximize,
+    /// Ask the client to close, politely — `xdg_toplevel.close` or
+    /// `WM_DELETE_WINDOW`. Never a kill.
+    Close,
+}
+
+impl TitlebarConfig {
+    /// Whether titlebars are actually drawn, resolving the derived
+    /// default (see [`TitlebarConfig::enabled`]) against the layout mode.
+    #[must_use]
+    pub fn enabled(&self, mode: LayoutMode) -> bool {
+        self.enabled
+            .unwrap_or(matches!(mode, LayoutMode::Floating))
+    }
+
+    /// Bar height in compositor pixels, or `0` when titlebars are off —
+    /// which is what the geometry wants, since the height *is* the
+    /// window's top decoration inset.
+    #[must_use]
+    pub fn height_for(&self, mode: LayoutMode) -> i32 {
+        if self.enabled(mode) {
+            self.height.max(0)
+        } else {
+            0
+        }
+    }
+}
+
+impl Default for TitlebarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            // Tall enough for a 13 px label plus breathing room, and for
+            // a button to be a comfortable pointer target.
+            height: 28,
+            font_size: 13.0,
+            buttons: vec![
+                TitlebarButton::Minimize,
+                TitlebarButton::Maximize,
+                TitlebarButton::Close,
+            ],
+        }
+    }
+}
+
 /// A paint pattern. Used for the wallpaper background and for
 /// active / inactive window borders.
 #[derive(Debug, Clone)]
@@ -659,7 +787,9 @@ impl Default for Config {
                 keyboard_layout: String::new(),
                 mouse_accel_profile: AccelProfile::Flat,
                 mouse_accel_speed: 0.0,
-                focus_model: FocusModel::Hover,
+                // Unset: derived from the layout mode. See
+                // `InputConfig::focus_model`.
+                focus_model: None,
                 numlock: false,
                 scroll_workspaces: true,
             },
@@ -702,8 +832,11 @@ impl Default for Config {
                 tearing: TearingMode::Never,
             },
             layout: LayoutConfig {
+                mode: LayoutMode::Tiling,
                 gaps_outer: 8,
                 gaps_inner: 3,
+                resize_zone: 8,
+                snap_zone: 20,
             },
             border: BorderConfig {
                 width: 1,
@@ -727,6 +860,7 @@ impl Default for Config {
                 // bigger is taste.
                 rounded_corners: 4,
             },
+            titlebar: TitlebarConfig::default(),
             animations: AnimationsConfig::default(),
             decoration: DecorationConfig::default(),
             env: Vec::new(),
@@ -821,6 +955,9 @@ impl Config {
         }
         if let Some(t) = globals.get::<Option<Table>>("border")? {
             config.border = parse_border(&t, config.border).context("border")?;
+        }
+        if let Some(t) = globals.get::<Option<Table>>("titlebar")? {
+            config.titlebar = parse_titlebar(&t, config.titlebar).context("titlebar")?;
         }
         if let Some(t) = globals.get::<Option<Table>>("animations")? {
             config.animations = parse_animations(&t, config.animations).context("animations")?;
@@ -952,11 +1089,11 @@ fn parse_input(t: &Table, defaults: InputConfig) -> mlua::Result<InputConfig> {
         cfg.mouse_accel_speed = speed;
     }
     if let Some(model) = t.get::<Option<String>>("focus_model")? {
-        cfg.focus_model = match model.to_lowercase().as_str() {
+        cfg.focus_model = Some(match model.to_lowercase().as_str() {
             "hover" => FocusModel::Hover,
             "click" => FocusModel::Click,
             other => lua_bail!("unknown focus_model {other:?}; expected \"hover\" or \"click\""),
-        };
+        });
     }
     if let Some(v) = t.get::<Option<bool>>("scroll_workspaces")? {
         cfg.scroll_workspaces = v;
@@ -1240,6 +1377,63 @@ fn parse_layout(t: &Table, defaults: LayoutConfig) -> mlua::Result<LayoutConfig>
             lua_bail!("gaps_inner {g} out of range; expected >= 0");
         }
         cfg.gaps_inner = g;
+    }
+    if let Some(m) = t.get::<Option<String>>("mode")? {
+        cfg.mode = match m.to_lowercase().as_str() {
+            "tiling" | "tile" | "tiled" => LayoutMode::Tiling,
+            "floating" | "float" | "stacking" => LayoutMode::Floating,
+            other => lua_bail!("unknown layout mode {other:?}; expected \"tiling\" or \"floating\""),
+        };
+    }
+    if let Some(z) = t.get::<Option<i32>>("resize_zone")? {
+        if z < 0 {
+            lua_bail!("layout.resize_zone {z} out of range; expected >= 0");
+        }
+        cfg.resize_zone = z;
+    }
+    if let Some(z) = t.get::<Option<i32>>("snap_zone")? {
+        if z < 0 {
+            lua_bail!("layout.snap_zone {z} out of range; expected >= 0");
+        }
+        cfg.snap_zone = z;
+    }
+    Ok(cfg)
+}
+
+fn parse_titlebar(t: &Table, defaults: TitlebarConfig) -> mlua::Result<TitlebarConfig> {
+    let mut cfg = defaults;
+    if let Some(e) = t.get::<Option<bool>>("enabled")? {
+        cfg.enabled = Some(e);
+    }
+    if let Some(h) = t.get::<Option<i32>>("height")? {
+        if h < 0 {
+            lua_bail!("titlebar.height {h} out of range; expected >= 0");
+        }
+        cfg.height = h;
+    }
+    if let Some(s) = t.get::<Option<f32>>("font_size")? {
+        // Upper bound as well as lower: the title texture is allocated at
+        // this size, and a fat-fingered `font_size = 1300` would ask the
+        // GPU for a texture per window that dwarfs the window.
+        if !(1.0..=200.0).contains(&s) {
+            lua_bail!("titlebar.font_size {s} out of range; expected 1.0..=200.0");
+        }
+        cfg.font_size = s;
+    }
+    if let Some(list) = t.get::<Option<Table>>("buttons")? {
+        let mut buttons = Vec::new();
+        for entry in list.sequence_values::<String>() {
+            let name = entry?;
+            buttons.push(match name.to_lowercase().as_str() {
+                "minimize" | "minimise" => TitlebarButton::Minimize,
+                "maximize" | "maximise" => TitlebarButton::Maximize,
+                "close" => TitlebarButton::Close,
+                other => lua_bail!(
+                    "unknown titlebar button {other:?}; expected \"minimize\", \"maximize\", or \"close\""
+                ),
+            });
+        }
+        cfg.buttons = buttons;
     }
     Ok(cfg)
 }
@@ -1818,9 +2012,19 @@ mod example_config_tests {
         assert_eq!(c.animations.workspace_axis, SlideAxis::Vertical);
         assert_eq!(c.layout.gaps_outer, d.layout.gaps_outer);
         assert_eq!(c.layout.gaps_inner, d.layout.gaps_inner);
+        assert_eq!(c.layout.mode, d.layout.mode);
+        assert_eq!(c.layout.resize_zone, d.layout.resize_zone);
+        assert_eq!(c.layout.snap_zone, d.layout.snap_zone);
+        assert_eq!(c.titlebar, d.titlebar);
         assert_eq!(c.border.width, d.border.width);
         assert_eq!(c.input.repeat_rate, d.input.repeat_rate);
         assert_eq!(c.input.scroll_workspaces, d.input.scroll_workspaces);
+        // The two derived defaults must be *absent* from the example, not
+        // spelled out: written explicitly they'd silently override what
+        // `mode = "floating"` is supposed to imply for anyone who starts
+        // from this file and switches modes.
+        assert_eq!(c.input.focus_model, None);
+        assert_eq!(c.titlebar.enabled, None);
         assert_eq!(c.misc.tearing, d.misc.tearing);
         assert_eq!(c.xwayland, d.xwayland);
     }
@@ -1894,6 +2098,131 @@ mod tearing_tests {
         let lua = Lua::new();
         lua.load(r#"misc = { tearing = "sometimes" }"#).exec().unwrap();
         assert!(Config::populate_from_globals(&lua.globals()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod floating_mode_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Config {
+        let lua = Lua::new();
+        lua.load(src).exec().expect("lua exec");
+        Config::populate_from_globals(&lua.globals()).expect("populate")
+    }
+
+    /// Tiling stays the default: an existing config that says nothing
+    /// about `mode` must behave exactly as it did before floating mode
+    /// existed, titlebars included.
+    #[test]
+    fn tiling_is_the_default_and_carries_no_titlebar() {
+        let c = parse("");
+        assert_eq!(c.layout.mode, LayoutMode::Tiling);
+        assert!(!c.titlebar.enabled(c.layout.mode));
+        assert_eq!(c.titlebar.height_for(c.layout.mode), 0);
+    }
+
+    #[test]
+    fn mode_parses_its_spellings() {
+        for (val, want) in [
+            ("tiling", LayoutMode::Tiling),
+            ("tiled", LayoutMode::Tiling),
+            ("floating", LayoutMode::Floating),
+            ("float", LayoutMode::Floating),
+            ("stacking", LayoutMode::Floating),
+            ("Floating", LayoutMode::Floating), // case-insensitive
+        ] {
+            let c = parse(&format!(r#"layout = {{ mode = "{val}" }}"#));
+            assert_eq!(c.layout.mode, want, "mode = {val:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected() {
+        let lua = Lua::new();
+        lua.load(r#"layout = { mode = "dwindle" }"#).exec().unwrap();
+        assert!(Config::populate_from_globals(&lua.globals()).is_err());
+    }
+
+    /// The two derived defaults. Both exist so floating mode is usable
+    /// from `mode = "floating"` alone, without the user having to know
+    /// which other three settings that implies.
+    #[test]
+    fn floating_mode_derives_titlebars_and_click_focus() {
+        let c = parse(r#"layout = { mode = "floating" }"#);
+        assert!(c.titlebar.enabled(c.layout.mode));
+        assert_eq!(c.titlebar.height_for(c.layout.mode), c.titlebar.height);
+        assert_eq!(
+            c.input.focus_model(c.layout.mode),
+            FocusModel::Click,
+            "overlapping windows + focus-follows-mouse hands focus to \
+             everything the pointer crosses"
+        );
+    }
+
+    /// ...and both stay overridable, which is the point of deriving them
+    /// rather than hardcoding them to the mode.
+    #[test]
+    fn derived_defaults_yield_to_an_explicit_setting() {
+        let c = parse(
+            r#"
+            layout = { mode = "floating" }
+            titlebar = { enabled = false }
+            input = { focus_model = "hover" }
+            "#,
+        );
+        assert!(!c.titlebar.enabled(c.layout.mode));
+        assert_eq!(c.input.focus_model(c.layout.mode), FocusModel::Hover);
+
+        // The other direction: titlebars in a tiling layout are legal.
+        let c = parse(r#"titlebar = { enabled = true, height = 20 }"#);
+        assert_eq!(c.layout.mode, LayoutMode::Tiling);
+        assert_eq!(c.titlebar.height_for(c.layout.mode), 20);
+    }
+
+    /// `height_for` is the geometry's top inset, so "disabled" has to
+    /// read as zero rather than as the configured height.
+    #[test]
+    fn a_disabled_titlebar_has_no_height() {
+        let c = parse(
+            r#"
+            layout = { mode = "floating" }
+            titlebar = { enabled = false, height = 40 }
+            "#,
+        );
+        assert_eq!(c.titlebar.height, 40);
+        assert_eq!(c.titlebar.height_for(c.layout.mode), 0);
+    }
+
+    #[test]
+    fn buttons_parse_and_keep_their_order() {
+        let c = parse(r#"titlebar = { buttons = { "close", "minimise" } }"#);
+        assert_eq!(
+            c.titlebar.buttons,
+            vec![TitlebarButton::Close, TitlebarButton::Minimize]
+        );
+        // An empty list is a bar with no buttons, not "use the defaults".
+        let c = parse(r#"titlebar = { buttons = {} }"#);
+        assert!(c.titlebar.buttons.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_values_are_rejected() {
+        for src in [
+            r#"titlebar = { height = -1 }"#,
+            r#"titlebar = { font_size = 0.0 }"#,
+            r#"titlebar = { font_size = 1300.0 }"#,
+            r#"titlebar = { buttons = { "shade" } }"#,
+            r#"layout = { resize_zone = -1 }"#,
+            r#"layout = { snap_zone = -1 }"#,
+        ] {
+            let lua = Lua::new();
+            lua.load(src).exec().unwrap();
+            assert!(
+                Config::populate_from_globals(&lua.globals()).is_err(),
+                "{src} should have been rejected"
+            );
+        }
     }
 }
 
