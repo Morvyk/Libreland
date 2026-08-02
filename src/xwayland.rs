@@ -742,8 +742,10 @@ impl XwmHandler for State {
     /// server decoration and then has no other way to be resized.
     fn resize_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32, edge: ResizeEdge) {
         let Some(surface) = window.wl_surface() else {
+            debug!(window = window.window_id(), "xwayland: resize request with no surface");
             return;
         };
+        debug!(window = window.window_id(), ?edge, "xwayland: client resize request");
         // X11 names a corner or a side; a side pins the other axis, the
         // same distinction our own edge grabs make.
         let (x, y) = match edge {
@@ -769,8 +771,10 @@ impl XwmHandler for State {
     /// its own titlebar.
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
         let Some(surface) = window.wl_surface() else {
+            debug!(window = window.window_id(), "xwayland: move request with no surface");
             return;
         };
+        debug!(window = window.window_id(), "xwayland: client move request");
         self.begin_client_drag(&surface, DragMode::Move, None);
     }
 

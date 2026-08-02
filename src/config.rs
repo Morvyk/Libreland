@@ -666,10 +666,11 @@ pub struct BorderConfig {
 /// the same kind of thing — decoration the compositor draws, inside the
 /// cell, that the client never sees.
 ///
-/// The compositor pins every client to `ServerSide` decoration
-/// regardless (see `XdgDecorationHandler`), so this is not a negotiation
-/// with the client: turning it on means a bar appears, turning it off
-/// means the window is border-only as it has always been.
+/// A client that announces client-side decoration — over xdg-decoration,
+/// the KDE decoration protocol, or `_MOTIF_WM_HINTS` on X11 — is
+/// believed and gets none of this whatever the settings say. These
+/// govern everything else: on means a bar appears, off means the window
+/// is border-only as it has always been.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TitlebarConfig {
     /// Whether windows get a titlebar. `None` — the default — derives it
@@ -688,6 +689,15 @@ pub struct TitlebarConfig {
     /// end. Empty means a bar with a title and nothing to click.
     /// Default: minimize, maximize, close.
     pub buttons: Vec<TitlebarButton>,
+    /// App-ids (Wayland) or window classes (X11) that draw their own
+    /// titlebar without saying so, matched as lowercase substrings.
+    ///
+    /// A client is supposed to announce client-side decoration through
+    /// xdg-decoration or `_MOTIF_WM_HINTS`, and most do. Some draw one
+    /// anyway and tell nobody — the result is two titlebars stacked, and
+    /// nothing in either protocol lets the compositor detect it. Naming
+    /// the app is the only fix available.
+    pub exclude: Vec<String>,
 }
 
 /// One titlebar button.
@@ -737,6 +747,7 @@ impl Default for TitlebarConfig {
                 TitlebarButton::Maximize,
                 TitlebarButton::Close,
             ],
+            exclude: Vec::new(),
         }
     }
 }
@@ -1420,6 +1431,17 @@ fn parse_titlebar(t: &Table, defaults: TitlebarConfig) -> mlua::Result<TitlebarC
         }
         cfg.font_size = s;
     }
+    if let Some(list) = t.get::<Option<Table>>("exclude")? {
+        let mut out = Vec::new();
+        for entry in list.sequence_values::<String>() {
+            let name = entry?.trim().to_lowercase();
+            if name.is_empty() {
+                lua_bail!("titlebar.exclude entries must not be empty");
+            }
+            out.push(name);
+        }
+        cfg.exclude = out;
+    }
     if let Some(list) = t.get::<Option<Table>>("buttons")? {
         let mut buttons = Vec::new();
         for entry in list.sequence_values::<String>() {
@@ -2016,6 +2038,7 @@ mod example_config_tests {
         assert_eq!(c.layout.resize_zone, d.layout.resize_zone);
         assert_eq!(c.layout.snap_zone, d.layout.snap_zone);
         assert_eq!(c.titlebar, d.titlebar);
+        assert!(c.titlebar.exclude.is_empty());
         assert_eq!(c.border.width, d.border.width);
         assert_eq!(c.input.repeat_rate, d.input.repeat_rate);
         assert_eq!(c.input.scroll_workspaces, d.input.scroll_workspaces);

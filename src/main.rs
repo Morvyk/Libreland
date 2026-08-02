@@ -1197,6 +1197,16 @@ impl State {
     /// it), then move keyboard focus and repaint. No-op if the surface
     /// isn't a managed window. Shared by `xdg_activation` and the IPC
     /// `focus-window`.
+    /// Undo [`State::minimize_window`]'s X11 side. Wayland needs nothing.
+    fn unhide_x11(&mut self, surface: &WlSurface) {
+        if let Some(crate::layout::WindowSurface::X11 { surface: x11, .. }) =
+            self.layout.window_ref(surface).map(|w| &w.toplevel)
+            && let Err(err) = x11.set_hidden(false)
+        {
+            debug!(%err, "xwayland: set_hidden(false) failed");
+        }
+    }
+
     pub(crate) fn focus_surface(&mut self, surface: &WlSurface) {
         let Some(entry) = self
             .layout
@@ -1214,7 +1224,9 @@ impl State {
         // un-minimize path and needs no request of its own. Restoring
         // before the workspace switch would be wrong: the window has to
         // exist on a *visible* workspace before focus lands on it.
-        self.layout.restore(surface);
+        if self.layout.restore(surface) {
+            self.unhide_x11(surface);
+        }
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
         }
@@ -1482,6 +1494,12 @@ impl State {
         // was started deliberately, and a client asking mid-drag is
         // reacting to input it should not have seen.
         if self.drag.is_some() || self.session_locked {
+            debug!(
+                surface = ?surface.id(),
+                ?mode,
+                drag_in_flight = self.drag.is_some(),
+                "client drag refused",
+            );
             return;
         }
         // Raise + focus, exactly as pressing our own titlebar would.
@@ -1506,6 +1524,20 @@ impl State {
     pub(crate) fn minimize_window(&mut self, surface: &WlSurface) -> bool {
         if !self.layout.set_minimized(surface, true) {
             return false;
+        }
+        // X11 needs telling. Dropping the window from the scene hides it
+        // from *us*, but an X client that was never sent
+        // `_NET_WM_STATE_HIDDEN` still believes it is on screen — it
+        // keeps its WM_STATE Normal, and anything reading that (its own
+        // tray handler, a second instance deciding whether to re-raise)
+        // acts on a window nobody can see. Wayland has no equivalent:
+        // xdg-shell has no minimized state, which is why this is the
+        // only shell-specific line here.
+        if let Some(crate::layout::WindowSurface::X11 { surface: x11, .. }) =
+            self.layout.window_ref(surface).map(|w| &w.toplevel)
+            && let Err(err) = x11.set_hidden(true)
+        {
+            debug!(%err, "xwayland: set_hidden(true) failed");
         }
         // Focus can't stay on a window nobody can see. Hand it to
         // whatever is now topmost — `placements` is in draw order and
@@ -4201,6 +4233,7 @@ impl State {
         self.renderer.set_tearing_mode(new.misc.tearing);
         self.renderer.set_decoration(new.decoration.clone());
         self.renderer.set_titlebar(new.titlebar.clone());
+        self.layout.set_csd_rules(new.titlebar.exclude.clone());
         self.config = new;
         info!("config reloaded");
         self.queue_redraw_all();
@@ -5167,6 +5200,8 @@ fn main() -> Result<()> {
         ),
         config.layout.mode,
     );
+    let mut layout = layout;
+    layout.set_csd_rules(config.titlebar.exclude.clone());
     // On-demand render bookkeeping: each output already has its priming
     // flip in flight (from `render_initial` above). Start every CRTC in
     // WaitingForVblank with `dirty` set, so the first vblank runs a real

@@ -119,9 +119,9 @@ border = {
     inactive = { type = "solid", color = { 0.25, 0.25, 0.28 } },
 }
 
--- Server-side titlebars. Clients are pinned to server-side decoration either
--- way, so this isn't a negotiation with them: on means a bar appears, off
--- means the window is border-only.
+-- Server-side titlebars. A client that says it draws its own (xdg-decoration,
+-- or _MOTIF_WM_HINTS on X11) is believed and gets none of this; everything
+-- else gets a bar when this is on, and is border-only when it's off.
 titlebar = {
     -- Unset: on in floating mode, off in tiling. Titlebars while tiling are
     -- legal -- they just spend a bar of every cell on a title you can usually
@@ -132,6 +132,14 @@ titlebar = {
     -- Left-to-right at the bar's right end. An empty list is a bar with a
     -- title and nothing to click.
     buttons = { "minimize", "maximize", "close" },
+    -- Apps that draw their own titlebar without saying so. Clients are
+    -- supposed to announce that (xdg-decoration, or _MOTIF_WM_HINTS on X11)
+    -- and most do -- those need no entry here. A few draw one anyway and
+    -- tell nobody, which stacks two titlebars, and nothing in either
+    -- protocol lets the compositor spot it. Matched as lowercase
+    -- substrings against the app-id (Wayland) or class (X11); find one with
+    -- `libreland msg windows`.
+    exclude = {},
 }
 
 -- ---------------------------------------------------------------------------

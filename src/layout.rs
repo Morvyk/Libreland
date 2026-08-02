@@ -406,6 +406,14 @@ pub struct Layout {
     /// X11 has no xdg-decoration; its equivalent is read live off the
     /// surface (see [`window_is_csd`]).
     csd: std::collections::HashSet<ObjectId>,
+    /// Lowercased app-id / class fragments the user has declared
+    /// self-decorating (`titlebar.exclude`).
+    ///
+    /// Some clients draw their own titlebar and tell nobody — no
+    /// xdg-decoration object, no `_MOTIF_WM_HINTS` — and the result is
+    /// two titlebars stacked. Nothing in either protocol lets the
+    /// compositor detect that, so it needs a name.
+    csd_rules: Vec<String>,
 }
 
 /// One window + its current placement, as the renderer consumes
@@ -744,6 +752,7 @@ impl Layout {
             deco,
             mode,
             csd: std::collections::HashSet::new(),
+            csd_rules: Vec::new(),
         }
     }
 
@@ -754,8 +763,15 @@ impl Layout {
     /// keeps its decoration while floating (you need the titlebar to
     /// un-maximize, which is how every stacking WM behaves) and loses it
     /// while tiling, which is the behaviour tiling has always had.
+    fn csd_state(&self) -> CsdState<'_> {
+        CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        }
+    }
+
     fn deco_for(&self, w: &Window) -> Deco {
-        window_deco(self.deco, self.mode, w, &self.csd)
+        window_deco(self.deco, self.mode, w, &self.csd_state())
     }
 
     /// Record whether a client draws its own decorations, and reconfigure
@@ -777,6 +793,15 @@ impl Layout {
             self.recompute_and_push();
         }
         changed
+    }
+
+    /// Replace the `titlebar.exclude` rules (live reload).
+    pub fn set_csd_rules(&mut self, rules: Vec<String>) {
+        if self.csd_rules == rules {
+            return;
+        }
+        self.csd_rules = rules;
+        self.recompute_and_push();
     }
 
     /// Reflow because an X11 client changed its `_MOTIF_WM_HINTS`.
@@ -1024,7 +1049,8 @@ impl Layout {
         if content.w <= 0 || content.h <= 0 {
             return false;
         }
-        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
+        let (deco, mode) = (self.deco, self.mode);
+        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
         for oi in 0..self.outputs.len() {
             // A window geometry is entirely client-chosen and validated by
             // the protocol only for positivity, so it must never reach the
@@ -1344,7 +1370,8 @@ impl Layout {
             return;
         }
         let (inner, outer) = (self.gaps.inner, self.gaps.outer);
-        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
+        let (deco, mode) = (self.deco, self.mode);
+        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
         for op in &mut self.outputs {
             let tile_bounds = shrink_for_outer(op.bounds, outer);
             let area = op.area();
@@ -1394,13 +1421,18 @@ impl Layout {
                 },
                 Outpane::area,
             );
+        let csd = CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
+        let (deco_cfg, mode) = (self.deco, self.mode);
         if let Some(t) = &mut self.in_transit {
             t.window.rect = rect;
             // An in-transit window is conceptually floating until
             // it either drops onto a tile cell or rejoins the
             // float stack, so configure it as such (no Tiled*
             // states, free-form resize).
-            let deco = window_deco(self.deco, self.mode, &t.window, &self.csd);
+            let deco = window_deco(deco_cfg, mode, &t.window, &csd);
             push_configure_for_floating(&t.window, deco, area);
         }
     }
@@ -1409,7 +1441,8 @@ impl Layout {
     /// ship the corresponding configure. Silent no-op for surfaces
     /// that aren't currently floating.
     pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
-        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
+        let (deco, mode) = (self.deco, self.mode);
+        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
         for op in &mut self.outputs {
             let active = op.active;
             let area = op.area();
@@ -1513,7 +1546,8 @@ impl Layout {
     /// seat, not the layout, so it comes in as a parameter.
     pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<SlideSpec>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
-        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
+        let (deco, mode) = (self.deco, self.mode);
+        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
         let mut out = Vec::new();
         // Only the active workspace of each output is visible — except
         // mid workspace-switch, where the outgoing (captured) and
@@ -1668,7 +1702,8 @@ impl Layout {
     fn recompute_and_push(&mut self) {
         let inner = self.gaps.inner;
         let outer = self.gaps.outer;
-        let (deco, mode, csd) = (self.deco, self.mode, &self.csd);
+        let (deco, mode) = (self.deco, self.mode);
+        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
         // Reflow every workspace (not just the active one) so a parked
         // workspace keeps correct saved sizes — switching to it is then
         // paint-only with no reflow flash.
@@ -2398,7 +2433,7 @@ impl Layout {
                 area,
                 self.deco,
                 self.mode,
-                &self.csd,
+                &self.csd_state(),
                 &mut from,
             );
             self.outputs[oi].transition = Some(WsTransition {
@@ -2777,7 +2812,7 @@ fn collect_placements(
     area: OutputArea,
     deco: Deco,
     mode: LayoutMode,
-    csd: &std::collections::HashSet<ObjectId>,
+    csd: &CsdState<'_>,
     out: &mut Vec<Placement>,
 ) {
     match node {
@@ -2813,7 +2848,7 @@ fn collect_workspace(
     area: OutputArea,
     deco: Deco,
     mode: LayoutMode,
-    csd: &std::collections::HashSet<ObjectId>,
+    csd: &CsdState<'_>,
     out: &mut Vec<Placement>,
 ) {
     if let Some(tree) = &ws.tree {
@@ -3189,7 +3224,7 @@ fn push_configures_tree(
     node: &Node,
     deco: Deco,
     mode: LayoutMode,
-    csd: &std::collections::HashSet<ObjectId>,
+    csd: &CsdState<'_>,
     area: OutputArea,
 ) {
     match node {
@@ -3432,26 +3467,55 @@ fn drain_tree(node: Node, out: &mut Vec<Window>) {
 
 /// [`Layout::deco_for`] without the `&self` borrow, for the reflow loops
 /// that already hold `&mut self.outputs` and so cannot call a method.
-fn window_deco(
-    deco: Deco,
-    mode: LayoutMode,
-    w: &Window,
-    csd: &std::collections::HashSet<ObjectId>,
-) -> Deco {
+fn window_deco(deco: Deco, mode: LayoutMode, w: &Window, csd: &CsdState<'_>) -> Deco {
     deco_for_fill(deco, mode, w.fill, window_is_csd(w, csd))
 }
 
+/// Everything needed to decide whether a window is self-decorating: the
+/// set of surfaces that said so over a protocol, and the user's rules
+/// for the ones that don't say anything.
+#[derive(Clone, Copy)]
+struct CsdState<'a> {
+    announced: &'a std::collections::HashSet<ObjectId>,
+    rules: &'a [String],
+}
+
 /// Whether this window's client draws its own decorations.
-fn window_is_csd(w: &Window, csd: &std::collections::HashSet<ObjectId>) -> bool {
-    match &w.toplevel {
-        WindowSurface::Xdg(t) => csd.contains(&t.wl_surface().id()),
+fn window_is_csd(w: &Window, csd: &CsdState<'_>) -> bool {
+    let announced = match &w.toplevel {
+        WindowSurface::Xdg(t) => csd.announced.contains(&t.wl_surface().id()),
         // X11 has no xdg-decoration. The equivalent is
         // `_MOTIF_WM_HINTS`, which is what Steam sets — and which
         // `X11Surface::is_decorated` reads. Despite its name that
         // returns TRUE when the client asked for *no* server
         // decorations, i.e. when it is client-side decorated.
         WindowSurface::X11 { surface, .. } => surface.is_decorated(),
+    };
+    announced || matches_csd_rule(&window_identity(&w.toplevel), csd.rules)
+}
+
+/// A window's app-id (xdg) or class (X11), lowercased, for rule matching.
+fn window_identity(toplevel: &WindowSurface) -> String {
+    match toplevel {
+        WindowSurface::Xdg(t) => with_states(t.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok().and_then(|d| d.app_id.clone()))
+                .unwrap_or_default()
+        }),
+        WindowSurface::X11 { surface, .. } => surface.class(),
     }
+    .to_lowercase()
+}
+
+/// Whether `identity` matches any `titlebar.exclude` rule.
+///
+/// Substring rather than exact: an app's reported id is rarely the name
+/// a user thinks of it by (`steam_app_123`, `launcher.exe`), and asking
+/// for the exact string means finding it first.
+fn matches_csd_rule(identity: &str, rules: &[String]) -> bool {
+    !identity.is_empty() && rules.iter().any(|r| identity.contains(r.as_str()))
 }
 
 fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode, csd: bool) -> Deco {
@@ -3724,7 +3788,7 @@ mod cascade_tests {
 
 #[cfg(test)]
 mod deco_tests {
-    use super::{Deco, FillMode, LayoutMode, Point, Rectangle, Size, deco_for_fill};
+    use super::{Deco, FillMode, LayoutMode, Point, Rectangle, Size, deco_for_fill, matches_csd_rule};
 
     /// The whole point of the type: the top edge differs from the other
     /// three, and every conversion has to agree about that.
@@ -3835,6 +3899,22 @@ mod deco_tests {
                 "{deco:?} paints somewhere other than where it configures"
             );
         }
+    }
+
+    /// A client that draws its own titlebar but announces nothing over
+    /// either protocol can only be handled by name. Substring matching,
+    /// because a reported app-id is rarely the name anyone thinks of the
+    /// app by.
+    #[test]
+    fn exclude_rules_match_by_substring_and_case() {
+        let rules = vec!["launcher".to_owned(), "steam".to_owned()];
+        assert!(matches_csd_rule("bh3launcher.exe", &rules));
+        assert!(matches_csd_rule("steam", &rules));
+        assert!(!matches_csd_rule("kitty", &rules));
+        // An unidentifiable window must never match, or a single rule
+        // would strip decoration from everything that reports nothing.
+        assert!(!matches_csd_rule("", &rules));
+        assert!(!matches_csd_rule("anything", &[]));
     }
 
     /// A client drawing its own decorations gets none from us, whatever
