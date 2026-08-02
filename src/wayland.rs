@@ -1654,6 +1654,64 @@ impl XdgShellHandler for State {
         &mut self.xdg_shell_state
     }
 
+    /// `xdg_toplevel.move`: a client-side-decorated window is being
+    /// dragged by the titlebar it drew itself.
+    ///
+    /// A CSD window has no server chrome to grab, so this is its only
+    /// way to be moved. Both shells route through the same entry point;
+    /// see `State::begin_client_drag`.
+    fn move_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+    ) {
+        self.begin_client_drag(surface.wl_surface(), crate::DragMode::Move, None);
+    }
+
+    /// `xdg_toplevel.resize`: the client is dragging one of its own
+    /// resize handles.
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        _serial: smithay::utils::Serial,
+        edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge as E;
+        // A side pins the other axis; a corner takes both. `None`
+        // (the client left it unspecified) resizes from the bottom
+        // right, which is what a resize with no stated edge means
+        // everywhere else.
+        let (x, y) = match edges {
+            E::Top => (None, Some(crate::layout::EdgeY::Top)),
+            E::Bottom => (None, Some(crate::layout::EdgeY::Bottom)),
+            E::Left => (Some(crate::layout::EdgeX::Left), None),
+            E::Right => (Some(crate::layout::EdgeX::Right), None),
+            E::TopLeft => (
+                Some(crate::layout::EdgeX::Left),
+                Some(crate::layout::EdgeY::Top),
+            ),
+            E::TopRight => (
+                Some(crate::layout::EdgeX::Right),
+                Some(crate::layout::EdgeY::Top),
+            ),
+            E::BottomLeft => (
+                Some(crate::layout::EdgeX::Left),
+                Some(crate::layout::EdgeY::Bottom),
+            ),
+            E::BottomRight | E::None | _ => (
+                Some(crate::layout::EdgeX::Right),
+                Some(crate::layout::EdgeY::Bottom),
+            ),
+        };
+        self.begin_client_drag(
+            surface.wl_surface(),
+            crate::DragMode::Resize,
+            Some(crate::layout::ResizeEdges { x, y }),
+        );
+    }
+
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         info!(surface = ?surface.wl_surface().id(), "wayland: new xdg_toplevel");
         // Hand the toplevel to the tiler at the cursor's current

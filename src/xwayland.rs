@@ -70,8 +70,8 @@ use smithay::xwayland::{
 };
 use tracing::{debug, info, warn};
 
-use crate::State;
-use crate::layout::{FillMode, WindowSurface};
+use crate::layout::{self, FillMode, WindowSurface};
+use crate::{DragMode, State};
 
 /// Which selections (clipboard / primary) the X side currently owns.
 /// While a target is owned by X, Wayland-side paste requests for it are
@@ -737,13 +737,41 @@ impl XwmHandler for State {
         self.x11_fill_request(&window, FillMode::Fullscreen, false);
     }
 
-    fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _edge: ResizeEdge) {
-        // Interactive resize is compositor-driven here (Super+RMB), same
-        // as for xdg toplevels — client-initiated resize drags are ignored.
+    /// `_NET_WM_MOVERESIZE` with a resize edge: an X11 client dragging
+    /// its own frame. Steam is the case that matters — it declines
+    /// server decoration and then has no other way to be resized.
+    fn resize_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32, edge: ResizeEdge) {
+        let Some(surface) = window.wl_surface() else {
+            return;
+        };
+        // X11 names a corner or a side; a side pins the other axis, the
+        // same distinction our own edge grabs make.
+        let (x, y) = match edge {
+            ResizeEdge::Top => (None, Some(layout::EdgeY::Top)),
+            ResizeEdge::Bottom => (None, Some(layout::EdgeY::Bottom)),
+            ResizeEdge::Left => (Some(layout::EdgeX::Left), None),
+            ResizeEdge::Right => (Some(layout::EdgeX::Right), None),
+            ResizeEdge::TopLeft => (Some(layout::EdgeX::Left), Some(layout::EdgeY::Top)),
+            ResizeEdge::TopRight => (Some(layout::EdgeX::Right), Some(layout::EdgeY::Top)),
+            ResizeEdge::BottomLeft => (Some(layout::EdgeX::Left), Some(layout::EdgeY::Bottom)),
+            ResizeEdge::BottomRight => {
+                (Some(layout::EdgeX::Right), Some(layout::EdgeY::Bottom))
+            }
+        };
+        self.begin_client_drag(
+            &surface,
+            DragMode::Resize,
+            Some(layout::ResizeEdges { x, y }),
+        );
     }
 
-    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
-        // Same as resize_request: moves are compositor-driven (Super+LMB).
+    /// `_NET_WM_MOVERESIZE` with the move action: the client is dragging
+    /// its own titlebar.
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+        let Some(surface) = window.wl_surface() else {
+            return;
+        };
+        self.begin_client_drag(&surface, DragMode::Move, None);
     }
 
     /// `_NET_ACTIVE_WINDOW`: an X client asks for one of its windows to be

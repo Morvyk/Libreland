@@ -1299,7 +1299,7 @@ impl State {
         {
             return false;
         }
-        let Some((surface, cell, region)) = self.region_under_cursor() else {
+        let Some((surface, _cell, region)) = self.region_under_cursor() else {
             return false;
         };
         // Any press on a window raises it, including one that lands in
@@ -1340,12 +1340,12 @@ impl State {
                     self.queue_redraw_all();
                 } else {
                     self.last_bar_click = Some((surface.clone(), now, pos));
-                    self.begin_window_drag(&surface, DragMode::Move, cell, None);
+                    self.begin_window_drag(&surface, DragMode::Move, None);
                 }
                 true
             }
             titlebar::Region::Resize(edges) => {
-                self.begin_window_drag(&surface, DragMode::Resize, cell, Some(edges));
+                self.begin_window_drag(&surface, DragMode::Resize, Some(edges));
                 true
             }
             titlebar::Region::Content => unreachable!("returned above"),
@@ -1422,11 +1422,10 @@ impl State {
     ///
     /// `edges` is `Some` for an edge grab, which already knows which
     /// edges it took; `None` infers them from the press position.
-    fn begin_window_drag(
+    pub(crate) fn begin_window_drag(
         &mut self,
         surface: &WlSurface,
         mode: DragMode,
-        cell: smithay::utils::Rectangle<i32, Physical>,
         edges: Option<layout::ResizeEdges>,
     ) {
         let cursor = self.cursor_point();
@@ -1442,7 +1441,6 @@ impl State {
             );
             return;
         };
-        let _ = cell;
         let edges = edges.unwrap_or_else(|| layout::ResizeEdges::from_press(rect_start, cursor));
         if matches!(mode, DragMode::Resize) {
             self.renderer.set_no_anim_all(true);
@@ -1460,6 +1458,42 @@ impl State {
         });
         self.renderer
             .set_cursor_override(Some(CursorImageStatus::Named(drag_cursor(mode, edges))));
+    }
+
+    /// Start an interactive move/resize a *client* asked for.
+    ///
+    /// A client-side-decorated window has no server chrome to grab, so
+    /// this is its only way to be moved or resized: it draws its own
+    /// titlebar, sees the press itself, and asks us to take over. Both
+    /// shells route here — `xdg_toplevel.move`/`.resize` and X11's
+    /// `_NET_WM_MOVERESIZE`.
+    ///
+    /// Ignoring these was defensible while every window carried a
+    /// server titlebar, since the compositor's own chrome offered the
+    /// gesture. Once a client can decline that chrome, ignoring them
+    /// leaves the window unmovable.
+    pub(crate) fn begin_client_drag(
+        &mut self,
+        surface: &WlSurface,
+        mode: DragMode,
+        edges: Option<layout::ResizeEdges>,
+    ) {
+        // A drag already in flight wins: the compositor's own gesture
+        // was started deliberately, and a client asking mid-drag is
+        // reacting to input it should not have seen.
+        if self.drag.is_some() || self.session_locked {
+            return;
+        }
+        // Raise + focus, exactly as pressing our own titlebar would.
+        if self.layout.raise(surface) {
+            self.queue_redraw_all();
+        }
+        if let Some(kbd) = self.seat.get_keyboard()
+            && kbd.current_focus().as_ref() != Some(surface)
+        {
+            kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+        }
+        self.begin_window_drag(surface, mode, edges);
     }
 
     /// Hide a window without closing it, handing focus on if it held it.
