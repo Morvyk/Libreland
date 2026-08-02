@@ -27,8 +27,12 @@ pub mod draw;
 pub mod filechooser;
 pub mod picker;
 pub mod prompt;
-pub mod text;
 pub mod widgets;
+
+/// Font discovery + rasterization, shared with the compositor's titlebars
+/// (`libreland-text`). Re-exported under the name it had while it lived here,
+/// so `text::Fonts` keeps resolving for everything under `ui::`.
+pub use libreland_text as text;
 
 use std::os::fd::AsFd as _;
 use std::sync::{Arc, OnceLock};

@@ -908,6 +908,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ffmpeg-the-third",
+ "libreland-text",
  "mlua",
  "png",
  "serde",
@@ -951,9 +952,9 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "drm-fourcc",
- "fontdue",
  "futures-util",
  "gbm",
+ "libreland-text",
  "libspa",
  "memmap2",
  "nix",
@@ -969,6 +970,13 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "zbus",
+]
+
+[[package]]
+name = "libreland-text"
+version = "0.4.0"
+dependencies = [
+ "fontdue",
 ]
 
 [[package]]

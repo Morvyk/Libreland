@@ -46,10 +46,11 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # ── Text ──────────────────────────────────────────────────────────────────
-# Pure-Rust TTF/OTF rasterizer. We do our own font discovery (a directory
-# walk over the XDG font dirs) rather than linking fontconfig — the file
-# chooser needs real glyphs, not a bitmap grid, but not a font *system*.
-fontdue = "0.9"
+# Font discovery + glyph rasterization, shared with the compositor (whose
+# titlebars want exactly the same thing). Wraps fontdue; the discovery walk
+# is ours rather than fontconfig's — the file chooser needs real glyphs, not
+# a bitmap grid, but not a font *system*.
+libreland-text = { path = "../text" }
 
 # ── Capture ───────────────────────────────────────────────────────────────
 # PipeWire is not optional for ScreenCast: the portal API's whole payload is

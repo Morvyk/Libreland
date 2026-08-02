@@ -1,17 +1,24 @@
 //! Text: font discovery, glyph rasterization, and a coverage cache.
 //!
-//! We deliberately do not link fontconfig, pango or cairo. What the portal's
-//! dialogs actually need is "give me a UI font and draw this string", which is
-//! a directory walk plus a rasterizer — [`fontdue`] is the rasterizer, and the
-//! walk below is the discovery.
+//! Shared by the two things in this workspace that draw their own text: the
+//! portal's dialogs and the compositor's window titlebars. Both want the same
+//! narrow thing — "give me a UI font and draw this string" — and neither wants
+//! a font *system*, so we deliberately do not link fontconfig, pango or cairo.
+//! That request is a directory walk plus a rasterizer: [`fontdue`] is the
+//! rasterizer, and the walk below is the discovery.
 //!
 //! Font selection is by filename against a preference list, which is crude
 //! next to fontconfig's matching but has the property that matters here: it
 //! resolves to the same well-known families every desktop already ships, with
 //! no config, no daemon, and no failure mode where a broken fontconfig cache
-//! takes the file dialog down with it. Missing glyphs fall through a chain of
-//! whatever wide-coverage faces were found (Noto, `DejaVu`), so CJK and Cyrillic
-//! filenames render even though the primary UI face has no glyphs for them.
+//! takes the file dialog — or every titlebar on the desktop — down with it.
+//! Missing glyphs fall through a chain of whatever wide-coverage faces were
+//! found (Noto, `DejaVu`), so CJK and Cyrillic render even though the primary
+//! UI face has no glyphs for them.
+//!
+//! [`Fonts::load`] scans the font directories, so callers build **one**
+//! instance and keep it: the compositor holds it for the process lifetime and
+//! rasterizes titlebar text through it on demand.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -206,7 +213,11 @@ pub struct Fonts {
 impl Fonts {
     /// Discover and load the UI faces. `None` when the system has no usable
     /// font at all, which the callers treat as "run without text" rather than
-    /// as a fatal error — a file dialog with no labels still beats no dialog.
+    /// as a fatal error — a file dialog with no labels still beats no dialog,
+    /// and a titlebar with no title still closes and drags.
+    ///
+    /// Scans every font directory, so call it once and keep the result.
+    #[must_use]
     pub fn load() -> Option<Self> {
         let all = scan_fonts();
         let regular = load_preferred(&all, UI_CANDIDATES)

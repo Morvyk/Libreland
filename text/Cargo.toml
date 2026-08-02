@@ -1,0 +1,17 @@
+[package]
+name = "libreland-text"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97.0"
+authors = ["Morvyk <Morvyk@proton.me>"]
+license = "MIT"
+description = "Font discovery and glyph rasterization for Libreland — the shared text engine behind the portal's dialogs and the compositor's window titlebars."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure-Rust TTF/OTF rasterizer. Font *discovery* is our own directory walk
+# over the XDG font dirs rather than fontconfig — see the crate docs for why.
+fontdue = "0.9"

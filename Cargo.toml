@@ -19,11 +19,18 @@ publish = false
 #                  file chooser, settings, … — one binary replacing the
 #                  -wlr and -gtk backends)
 #
+# One member is a plain library rather than a process:
+#
+#   text           font discovery + glyph rasterization, used by the portal's
+#                  dialogs and the compositor's titlebars. It predates the
+#                  compositor's need for it (it was the portal's `ui::text`)
+#                  and moved out when titlebars wanted the same thing.
+#
 # Members share this manifest's profiles, lockfile, target dir, and the
 # lint policy below.
 [workspace]
 resolver = "3"
-members = ["output-picker", "polkit-agent", "portal"]
+members = ["output-picker", "polkit-agent", "portal", "text"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -33,6 +40,9 @@ clap = { version = "4.6.1", features = ["derive"] }
 # to RGBA frames. `the-third` is the maintained fork tracking the system
 # FFmpeg (8.1); it links the system libraries (no bundled `build` feature).
 ffmpeg-the-third = "5.0.0"
+# Font discovery + glyph rasterization for window titlebars, shared with the
+# portal (see the workspace members note above). No fontconfig, no pango.
+libreland-text = { path = "text" }
 mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
 # Pure-Rust PNG encoder for the built-in screenshot tool (no C deps).
 png = "0.18.1"
