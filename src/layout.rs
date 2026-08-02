@@ -67,7 +67,7 @@ use smithay::xwayland::X11Surface;
 use smithay::xwayland::xwm::WmWindowType;
 use tracing::debug;
 
-use crate::config::{AnimSpec, SlideAxis, SlideSpec};
+use crate::config::{AnimSpec, LayoutMode, SlideAxis, SlideSpec};
 
 /// How a window fills its output. `Maximized` and `Fullscreen` both
 /// cover the window's whole output with no border or rounded corners
@@ -355,13 +355,19 @@ pub struct Layout {
     outputs: Vec<Outpane>,
     in_transit: Option<InTransit>,
     gaps: Gaps,
-    border_width: i32,
+    /// Decoration inset for a window that carries decoration. Windows
+    /// that don't (fullscreen, and maximized while tiling) resolve to
+    /// [`Deco::none`] through [`Layout::deco_for`].
+    deco: Deco,
+    /// How windows are arranged. Tiling descends the dwindle tree;
+    /// floating never touches it.
+    mode: LayoutMode,
 }
 
 /// One window + its current placement, as the renderer consumes
 /// it. `cell_rect` is the full cell the layout allocates; the
 /// renderer paints the border in `cell_rect` and the surface
-/// inside it (`cell_rect` shrunk by `border_width`).
+/// inside it (`cell_rect` inset by [`Placement::deco`]).
 #[derive(Debug, Clone)]
 pub struct Placement {
     pub surface: WlSurface,
@@ -376,6 +382,17 @@ pub struct Placement {
     /// tiled windows blur against the base (wallpaper + lower layers),
     /// floating windows against the base *plus* the tiled windows beneath.
     pub floating: bool,
+    /// This window's decoration inset, already resolved against its fill
+    /// (see [`Layout::deco_for`]) — so a fullscreen window carries
+    /// [`Deco::none`] here and a maximized one carries the real inset
+    /// only while floating.
+    ///
+    /// Shipped per placement rather than read from the config at the
+    /// consumer, because both consumers need it *per window*: the
+    /// renderer insets the surface inside the cell, and popup
+    /// positioning needs the parent's window-geometry origin, which is
+    /// `cell_rect.loc + deco.content_offset()`.
+    pub deco: Deco,
     /// Extra vertical offset (compositor px) the renderer adds *after*
     /// per-window animation, used for the workspace slide so both the
     /// outgoing and incoming workspaces translate together without
@@ -393,6 +410,99 @@ pub struct Placement {
 pub struct Gaps {
     pub outer: i32,
     pub inner: i32,
+}
+
+/// The decoration inset between a window's **cell** (what the layout
+/// allocates, what the renderer paints into) and its **content** (what
+/// the client is configured to, what its buffer covers).
+///
+/// The border ring is symmetric; the titlebar sits above the content and
+/// inside the ring, so only the top edge differs. Every conversion
+/// between the two spaces goes through here — get one of them wrong and
+/// the stored rect stops describing the window, after which the
+/// decoration offscreen composites at the wrong scale and hit-testing
+/// uses a rect the window doesn't occupy.
+///
+/// A window that carries no decoration at the moment (fullscreen, or
+/// maximized while tiling) uses [`Deco::none`] rather than a special
+/// case at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Deco {
+    /// Border ring width, on all four sides.
+    pub border: i32,
+    /// Titlebar height, above the content and inside the ring. `0` when
+    /// titlebars are off.
+    pub titlebar: i32,
+}
+
+impl Deco {
+    /// Clamps both components non-negative, so a hostile config can't
+    /// produce a cell smaller than its own content.
+    #[must_use]
+    pub fn new(border: i32, titlebar: i32) -> Self {
+        Self {
+            border: border.max(0),
+            titlebar: titlebar.max(0),
+        }
+    }
+
+    /// No decoration at all — a fullscreen window's content *is* its cell.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            border: 0,
+            titlebar: 0,
+        }
+    }
+
+    /// Inset on the top edge: the border ring plus the titlebar under it.
+    #[must_use]
+    pub fn top(self) -> i32 {
+        self.border + self.titlebar
+    }
+
+    /// Where a window's content starts, relative to its cell origin.
+    /// This is also a popup's frame of reference: xdg positioners are
+    /// relative to the parent's *window geometry*, which is the content,
+    /// not the cell.
+    #[must_use]
+    pub fn content_offset(self) -> Point<i32, Physical> {
+        Point::from((self.border, self.top()))
+    }
+
+    /// Content size for a cell of `cell_size`, clamped to a minimum of
+    /// `1` on each axis — a zero-size configure is one the client cannot
+    /// render, so it must never be shipped even for a degenerate cell.
+    #[must_use]
+    pub fn content_size(self, cell_size: Size<i32, Physical>) -> Size<i32, Logical> {
+        Size::<i32, Logical>::from((
+            (cell_size.w - 2 * self.border).max(1),
+            (cell_size.h - self.top() - self.border).max(1),
+        ))
+    }
+
+    /// The content rect inside `cell`: the origin shifted in by the
+    /// inset, the size shrunk to match. X11 configures need the whole
+    /// positioned rect rather than just a size.
+    #[must_use]
+    pub fn content_rect(self, cell: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+        let size = self.content_size(cell.size);
+        Rectangle::new(
+            cell.loc + self.content_offset(),
+            Size::from((size.w, size.h)),
+        )
+    }
+
+    /// Inverse of [`Deco::content_size`]: the cell that would give a
+    /// client exactly `content`. Saturating, because `content` is often
+    /// client-supplied and the protocols validate only positivity.
+    #[must_use]
+    pub fn cell_size_for(self, content: Size<i32, Physical>) -> Size<i32, Physical> {
+        Size::from((
+            content.w.saturating_add(2 * self.border),
+            content.h.saturating_add(self.top() + self.border),
+        ))
+    }
 }
 
 /// One window's structural info for the IPC `windows` query. The caller
@@ -479,7 +589,8 @@ impl Layout {
     pub fn new(
         outputs: impl IntoIterator<Item = (String, Rectangle<i32, Physical>)>,
         gaps: Gaps,
-        border_width: i32,
+        deco: Deco,
+        mode: LayoutMode,
     ) -> Self {
         Self {
             outputs: outputs
@@ -488,8 +599,20 @@ impl Layout {
                 .collect(),
             in_transit: None,
             gaps,
-            border_width: border_width.max(0),
+            deco,
+            mode,
         }
+    }
+
+    /// The decoration a window carries *right now*.
+    ///
+    /// Fullscreen never has any — it owns the whole output and a bar
+    /// across the top of a game is not what anyone asked for. Maximized
+    /// keeps its decoration while floating (you need the titlebar to
+    /// un-maximize, which is how every stacking WM behaves) and loses it
+    /// while tiling, which is the behaviour tiling has always had.
+    fn deco_for(&self, w: &Window) -> Deco {
+        deco_for_fill(self.deco, self.mode, w.fill)
     }
 
     /// Tile area of the output at `idx`: its bounds shrunk by the
@@ -654,15 +777,20 @@ impl Layout {
                 surface.max_size().unwrap_or_default(),
             ),
         };
-        let b2 = self.border_width * 2;
+        // The limits are CONTENT space (what the client is configured
+        // to); the rects they constrain are CELL space, so each axis
+        // grows by that axis's decoration before it can be compared.
+        let deco = self.deco_for(w);
         // 0 means "unconstrained" on that axis, per both protocols.
+        let grow_w = |v: i32| deco.cell_size_for(Size::from((v, 0))).w;
+        let grow_h = |v: i32| deco.cell_size_for(Size::from((0, v))).h;
         let min = Size::<i32, Physical>::from((
-            if min.w > 0 { min.w.saturating_add(b2) } else { 0 },
-            if min.h > 0 { min.h.saturating_add(b2) } else { 0 },
+            if min.w > 0 { grow_w(min.w) } else { 0 },
+            if min.h > 0 { grow_h(min.h) } else { 0 },
         ));
         let max = Size::<i32, Physical>::from((
-            if max.w > 0 { max.w.saturating_add(b2) } else { i32::MAX },
-            if max.h > 0 { max.h.saturating_add(b2) } else { i32::MAX },
+            if max.w > 0 { grow_w(max.w) } else { i32::MAX },
+            if max.h > 0 { grow_h(max.h) } else { i32::MAX },
         ));
         (min, max)
     }
@@ -688,7 +816,7 @@ impl Layout {
         if content.w <= 0 || content.h <= 0 {
             return false;
         }
-        let b2 = self.border_width * 2;
+        let (deco, mode) = (self.deco, self.mode);
         for oi in 0..self.outputs.len() {
             // A window geometry is entirely client-chosen and validated by
             // the protocol only for positivity, so it must never reach the
@@ -710,9 +838,10 @@ impl Layout {
                 if w.fill != FillMode::Normal || !matches!(w.toplevel, WindowSurface::Xdg(_)) {
                     return false;
                 }
+                let grown = deco_for_fill(deco, mode, w.fill).cell_size_for(content);
                 let cell = Size::<i32, Physical>::from((
-                    content.w.saturating_add(b2).min(full.w.max(1)),
-                    content.h.saturating_add(b2).min(full.h.max(1)),
+                    grown.w.min(full.w.max(1)),
+                    grown.h.min(full.h.max(1)),
                 ));
                 if w.rect.size == cell {
                     return false;
@@ -757,7 +886,7 @@ impl Layout {
                         (prev.loc.y + (prev.size.h - new_size.h) / 2).max(area.work.loc.y),
                     );
                     window.rect = Rectangle::new(new_loc, new_size);
-                    push_configure_for_floating(&window, self.border_width, area);
+                    push_configure_for_floating(&window, self.deco_for(&window), area);
                     self.active_ws_mut(oi).floating.push(window);
                     self.recompute_and_push();
                     return true;
@@ -852,16 +981,17 @@ impl Layout {
             // border ring before comparing or storing — otherwise the
             // dialog is configured 2*border smaller than it asked for.
             let (lmin, lmax) = self.window_limits(&window);
-            let b2 = self.border_width * 2;
+            let deco = self.deco_for(&window);
+            let want = deco.cell_size_for(pref);
             let w = if pref.w > 0 {
-                pref.w.saturating_add(b2).min(work.size.w)
+                want.w.min(work.size.w)
             } else {
                 work.size.w / 3
             }
             .min(lmax.w)
             .max(lmin.w);
             let h = if pref.h > 0 {
-                pref.h.saturating_add(b2).min(work.size.h)
+                want.h.min(work.size.h)
             } else {
                 work.size.h / 3
             }
@@ -873,7 +1003,7 @@ impl Layout {
             );
             window.rect = Rectangle::new(loc, Size::<i32, Physical>::from((w, h)));
             window.fill = FillMode::Normal;
-            push_configure_for_floating(&window, self.border_width, area);
+            push_configure_for_floating(&window, deco, area);
             self.active_ws_mut(oi).floating.push(window);
             self.recompute_and_push();
             return true;
@@ -989,7 +1119,8 @@ impl Layout {
             self.set_floating_rect(surface, target);
             return;
         }
-        let (inner, outer, border) = (self.gaps.inner, self.gaps.outer, self.border_width);
+        let (inner, outer) = (self.gaps.inner, self.gaps.outer);
+        let (deco, mode) = (self.deco, self.mode);
         for op in &mut self.outputs {
             let tile_bounds = shrink_for_outer(op.bounds, outer);
             let area = op.area();
@@ -1016,7 +1147,7 @@ impl Layout {
             // workspace's clients (what `recompute_and_push` does) would
             // be pure waste.
             assign_rects(tree, tile_bounds, inner);
-            push_configures_tree(tree, border, area);
+            push_configures_tree(tree, deco, mode, area);
             return;
         }
     }
@@ -1045,7 +1176,8 @@ impl Layout {
             // it either drops onto a tile cell or rejoins the
             // float stack, so configure it as such (no Tiled*
             // states, free-form resize).
-            push_configure_for_floating(&t.window, self.border_width, area);
+            let deco = deco_for_fill(self.deco, self.mode, t.window.fill);
+            push_configure_for_floating(&t.window, deco, area);
         }
     }
 
@@ -1053,7 +1185,7 @@ impl Layout {
     /// ship the corresponding configure. Silent no-op for surfaces
     /// that aren't currently floating.
     pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
-        let border = self.border_width;
+        let (deco, mode) = (self.deco, self.mode);
         for op in &mut self.outputs {
             let active = op.active;
             let area = op.area();
@@ -1063,7 +1195,7 @@ impl Layout {
                 .find(|w| w.toplevel.wl_surface() == surface)
             {
                 window.rect = rect;
-                push_configure_for_floating(window, border, area);
+                push_configure_for_floating(window, deco_for_fill(deco, mode, window.fill), area);
                 return;
             }
         }
@@ -1100,7 +1232,7 @@ impl Layout {
             // filled windows), so the area here goes unused.
             push_configure_for_floating(
                 &t.window,
-                self.border_width,
+                self.deco_for(&t.window),
                 OutputArea {
                     full: Rectangle::default(),
                     work: Rectangle::default(),
@@ -1124,7 +1256,11 @@ impl Layout {
                 });
             }
             DragSource::Floating => {
-                push_configure_for_floating(&t.window, self.border_width, self.outputs[idx].area());
+                push_configure_for_floating(
+                    &t.window,
+                    self.deco_for(&t.window),
+                    self.outputs[idx].area(),
+                );
                 self.active_ws_mut(idx).floating.push(t.window);
             }
         }
@@ -1153,6 +1289,7 @@ impl Layout {
     /// seat, not the layout, so it comes in as a parameter.
     pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<SlideSpec>) -> Vec<Placement> {
         let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
+        let (deco, mode) = (self.deco, self.mode);
         let mut out = Vec::new();
         // Only the active workspace of each output is visible — except
         // mid workspace-switch, where the outgoing (captured) and
@@ -1190,12 +1327,26 @@ impl Layout {
                     });
                 }
                 let base = out.len();
-                collect_workspace(&op.workspaces[op.active], &is_focused, area, &mut out);
+                collect_workspace(
+                    &op.workspaces[op.active],
+                    &is_focused,
+                    area,
+                    deco,
+                    mode,
+                    &mut out,
+                );
                 for q in &mut out[base..] {
                     q.slide = off_to;
                 }
             } else {
-                collect_workspace(&op.workspaces[op.active], &is_focused, area, &mut out);
+                collect_workspace(
+                    &op.workspaces[op.active],
+                    &is_focused,
+                    area,
+                    deco,
+                    mode,
+                    &mut out,
+                );
             }
         }
         if let Some(t) = &self.in_transit {
@@ -1207,6 +1358,7 @@ impl Layout {
                 fill: t.window.fill,
                 // A window being dragged floats freely over everything.
                 floating: true,
+                deco: self.deco_for(&t.window),
                 slide: Point::from((0, 0)),
             });
         }
@@ -1286,7 +1438,7 @@ impl Layout {
     fn recompute_and_push(&mut self) {
         let inner = self.gaps.inner;
         let outer = self.gaps.outer;
-        let border = self.border_width;
+        let (deco, mode) = (self.deco, self.mode);
         // Reflow every workspace (not just the active one) so a parked
         // workspace keeps correct saved sizes — switching to it is then
         // paint-only with no reflow flash.
@@ -1302,10 +1454,10 @@ impl Layout {
             let area = op.area();
             for ws in &op.workspaces {
                 if let Some(tree) = &ws.tree {
-                    push_configures_tree(tree, border, area);
+                    push_configures_tree(tree, deco, mode, area);
                 }
                 for w in &ws.floating {
-                    push_configure_for_floating(w, border, area);
+                    push_configure_for_floating(w, deco_for_fill(deco, mode, w.fill), area);
                 }
             }
         }
@@ -1396,22 +1548,26 @@ impl Layout {
         self.recompute_and_push();
     }
 
-    /// Swap the gap + border-width settings and reflow every
-    /// workspace (for live config reload). Tiles get re-laid-out with
-    /// the new gaps and re-configured to the new inside-border size;
-    /// no-op-cheap when the values are unchanged.
-    pub fn set_appearance(&mut self, gaps: Gaps, border_width: i32) {
+    /// Swap the gap + decoration settings and reflow every workspace
+    /// (for live config reload). Tiles get re-laid-out with the new gaps
+    /// and re-configured to the new content size; no-op-cheap when the
+    /// values are unchanged.
+    ///
+    /// The layout **mode** is deliberately not settable here: switching
+    /// it has to migrate windows between the tree and the float stack,
+    /// which is [`Layout::set_mode`].
+    pub fn set_appearance(&mut self, gaps: Gaps, deco: Deco) {
         self.gaps = gaps;
-        self.border_width = border_width.max(0);
+        self.deco = deco;
         self.recompute_and_push();
     }
 
-    /// Current border width. A placement's surface buffer (0,0) is
-    /// painted at `cell_rect.loc + border_width`, so a popup parent's
-    /// window-geometry origin (which xdg popups are positioned
-    /// relative to) is `cell_rect.loc + border_width`.
-    pub fn border_width(&self) -> i32 {
-        self.border_width
+    /// The decoration inset a window would carry if it is decorated —
+    /// i.e. ignoring its fill. Callers that have the window in hand want
+    /// [`Layout::deco_for`]; this is for the render/config side, which
+    /// asks about the configuration rather than about one window.
+    pub fn deco(&self) -> Deco {
+        self.deco
     }
 
     /// Snapshot every workspace across every output for the IPC
@@ -1625,7 +1781,7 @@ impl Layout {
                 if let Some(t) = &ws.tree
                     && let Some(w) = leaf_ref(t, surface)
                 {
-                    push_configure_for_tile(w, self.border_width, area);
+                    push_configure_for_tile(w, self.deco_for(w), area);
                     return true;
                 }
                 if let Some(w) = ws
@@ -1633,7 +1789,7 @@ impl Layout {
                     .iter()
                     .find(|w| w.toplevel.wl_surface() == surface)
                 {
-                    push_configure_for_floating(w, self.border_width, area);
+                    push_configure_for_floating(w, self.deco_for(w), area);
                     return true;
                 }
             }
@@ -1848,6 +2004,8 @@ impl Layout {
                 &self.outputs[oi].workspaces[active],
                 &|_| false,
                 area,
+                self.deco,
+                self.mode,
                 &mut from,
             );
             self.outputs[oi].transition = Some(WsTransition {
@@ -2224,6 +2382,8 @@ fn collect_placements(
     node: &Node,
     is_focused: &impl Fn(&WlSurface) -> bool,
     area: OutputArea,
+    deco: Deco,
+    mode: LayoutMode,
     out: &mut Vec<Placement>,
 ) {
     match node {
@@ -2239,12 +2399,13 @@ fn collect_placements(
                 focused: is_focused(surface),
                 fill: w.fill,
                 floating: false,
+                deco: deco_for_fill(deco, mode, w.fill),
                 slide: Point::from((0, 0)),
             });
         }
         Node::Split { first, second, .. } => {
-            collect_placements(first, is_focused, area, out);
-            collect_placements(second, is_focused, area, out);
+            collect_placements(first, is_focused, area, deco, mode, out);
+            collect_placements(second, is_focused, area, deco, mode, out);
         }
     }
 }
@@ -2255,10 +2416,12 @@ fn collect_workspace(
     ws: &Workspace,
     is_focused: &impl Fn(&WlSurface) -> bool,
     area: OutputArea,
+    deco: Deco,
+    mode: LayoutMode,
     out: &mut Vec<Placement>,
 ) {
     if let Some(tree) = &ws.tree {
-        collect_placements(tree, is_focused, area, out);
+        collect_placements(tree, is_focused, area, deco, mode, out);
     }
     for w in &ws.floating {
         let surface = w.toplevel.wl_surface();
@@ -2274,6 +2437,7 @@ fn collect_workspace(
             focused: is_focused(surface),
             fill: w.fill,
             floating: true,
+            deco: deco_for_fill(deco, mode, w.fill),
             slide: Point::from((0, 0)),
         });
     }
@@ -2624,12 +2788,12 @@ fn ratio_for_divider(span: i32, origin: i32, split_px: i32, min: i32) -> f32 {
     ratio
 }
 
-fn push_configures_tree(node: &Node, border: i32, area: OutputArea) {
+fn push_configures_tree(node: &Node, deco: Deco, mode: LayoutMode, area: OutputArea) {
     match node {
-        Node::Leaf(w) => push_configure_for_tile(w, border, area),
+        Node::Leaf(w) => push_configure_for_tile(w, deco_for_fill(deco, mode, w.fill), area),
         Node::Split { first, second, .. } => {
-            push_configures_tree(first, border, area);
-            push_configures_tree(second, border, area);
+            push_configures_tree(first, deco, mode, area);
+            push_configures_tree(second, deco, mode, area);
         }
     }
 }
@@ -2742,45 +2906,20 @@ fn push_x11_configure(surface: &X11Surface, rect: Rectangle<i32, Physical>, fill
     }
 }
 
-/// The rect inside `rect`'s border ring: shifted in by `border` on
-/// both axes with the size shrunk to match (clamped like
-/// [`surface_size`]). This is where an X11 window's content goes —
-/// the X11 configure needs the full positioned rect, not just a size.
-fn inside_border(rect: Rectangle<i32, Physical>, border: i32) -> Rectangle<i32, Physical> {
-    let border = border.max(0);
-    let size = surface_size(rect.size, border);
-    Rectangle::new(
-        Point::new(rect.loc.x + border, rect.loc.y + border),
-        Size::from((size.w, size.h)),
-    )
-}
-
-/// Shrink `cell_size` by `2 * border` on each axis (clamped to a
-/// minimum of `1` so we never ship a zero-size configure, which
-/// the client can't render) and return the result as a
-/// `Logical`-typed `Size` ready for `state.size`.
-fn surface_size(cell_size: Size<i32, Physical>, border: i32) -> Size<i32, Logical> {
-    let border = border.max(0);
-    Size::<i32, Logical>::from((
-        (cell_size.w - 2 * border).max(1),
-        (cell_size.h - 2 * border).max(1),
-    ))
-}
-
-/// Configure a tiled window: send the inside-border size, and
-/// set the activated + tiled-on-all-sides state set so the
+/// Configure a tiled window: send the content size, and set the
+/// activated + tiled-on-all-sides state set so the
 /// client fills the cell exactly. Each `TiledX` flag tells the
 /// client "the X edge is shared with the compositor / another
 /// window, so don't draw a resize handle or border on that side".
 /// A tiling WM cell is tiled on every side.
-fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
+fn push_configure_for_tile(w: &Window, deco: Deco, area: OutputArea) {
     if w.fill != FillMode::Normal {
         push_configure_filled(w, area.fill(w.fill));
         return;
     }
     match &w.toplevel {
         WindowSurface::Xdg(toplevel) => {
-            let size = surface_size(w.rect.size, border);
+            let size = deco.content_size(w.rect.size);
             toplevel.with_pending_state(|state| {
                 state.size = Some(size);
                 state.states.set(xdg_toplevel::State::Activated);
@@ -2797,7 +2936,7 @@ fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
         // X11: one call carries position + size (inside the border) and
         // clears any stale maximized/fullscreen state.
         WindowSurface::X11 { surface, .. } => {
-            push_x11_configure(surface, inside_border(w.rect, border), FillMode::Normal);
+            push_x11_configure(surface, deco.content_rect(w.rect), FillMode::Normal);
         }
     }
     // Logged for BOTH shells. The X11 arm used to return early, so an X11
@@ -2811,25 +2950,36 @@ fn push_configure_for_tile(w: &Window, border: i32, area: OutputArea) {
         y = w.rect.loc.y,
         w = w.rect.size.w,
         h = w.rect.size.h,
-        border,
+        border = deco.border,
+        titlebar = deco.titlebar,
         "layout: tile configure sent",
     );
 }
 
-/// Configure a floating (or in-transit) window: send the inside-
-/// border size, clear the `Tiled*` flags so the client knows it
+/// Configure a floating (or in-transit) window: send the content
+/// size, clear the `Tiled*` flags so the client knows it
 /// can resize freely, but still set `Activated` so the focused
 /// float doesn't dim or hide its content.
-fn push_configure_for_floating(w: &Window, border: i32, area: OutputArea) {
-    if w.fill != FillMode::Normal {
+///
+/// A **maximized** window comes through here decorated while floating
+/// (`Layout::deco_for`), so its cell is the work area and its content is
+/// that minus the titlebar — which is why the fill short-circuit below
+/// only fires for a `deco`-less fill.
+fn push_configure_for_floating(w: &Window, deco: Deco, area: OutputArea) {
+    if w.fill != FillMode::Normal && deco == Deco::none() {
         push_configure_filled(w, area.fill(w.fill));
         return;
     }
-    let size = surface_size(w.rect.size, border);
+    let cell = if w.fill == FillMode::Normal {
+        w.rect
+    } else {
+        area.fill(w.fill)
+    };
+    let size = deco.content_size(cell.size);
     let toplevel = match &w.toplevel {
         WindowSurface::Xdg(toplevel) => toplevel,
         WindowSurface::X11 { surface, .. } => {
-            push_x11_configure(surface, inside_border(w.rect, border), FillMode::Normal);
+            push_x11_configure(surface, deco.content_rect(cell), w.fill);
             return;
         }
     };
@@ -2840,8 +2990,16 @@ fn push_configure_for_floating(w: &Window, border: i32, area: OutputArea) {
         state.states.unset(xdg_toplevel::State::TiledRight);
         state.states.unset(xdg_toplevel::State::TiledTop);
         state.states.unset(xdg_toplevel::State::TiledBottom);
-        // Clear any prior fill so unmaximize/unfullscreen → float works.
-        state.states.unset(xdg_toplevel::State::Maximized);
+        // A decorated maximized window still has to be *told* it is
+        // maximized — clients draw differently (and some refuse to be
+        // dragged) based on this flag, and it is the only thing
+        // distinguishing it from a float that happens to fill the work
+        // area. Anything else clears both, so unmaximize → float works.
+        if w.fill == FillMode::Maximized {
+            state.states.set(xdg_toplevel::State::Maximized);
+        } else {
+            state.states.unset(xdg_toplevel::State::Maximized);
+        }
         state.states.unset(xdg_toplevel::State::Fullscreen);
     });
     toplevel.send_configure();
@@ -2851,9 +3009,20 @@ fn push_configure_for_floating(w: &Window, border: i32, area: OutputArea) {
         y = w.rect.loc.y,
         w = w.rect.size.w,
         h = w.rect.size.h,
-        border,
+        border = deco.border,
+        titlebar = deco.titlebar,
         "layout: floating configure sent",
     );
+}
+
+/// [`Layout::deco_for`] without the `&self` borrow, for the reflow loops
+/// that already hold `&mut self.outputs` and so cannot call a method.
+fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode) -> Deco {
+    match fill {
+        FillMode::Normal => deco,
+        FillMode::Maximized if mode == LayoutMode::Floating => deco,
+        _ => Deco::none(),
+    }
 }
 
 /// Split `bounds` into `(first, second)` along `axis` at `ratio`,
@@ -3028,6 +3197,96 @@ mod workspace_switch_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deco_tests {
+    use super::{Deco, FillMode, LayoutMode, Point, Rectangle, Size, deco_for_fill};
+
+    /// The whole point of the type: the top edge differs from the other
+    /// three, and every conversion has to agree about that.
+    #[test]
+    fn the_titlebar_only_insets_the_top_edge() {
+        let deco = Deco::new(2, 28);
+        assert_eq!(deco.top(), 30);
+        assert_eq!(deco.content_offset(), Point::from((2, 30)));
+
+        let cell = Rectangle::new(Point::from((100, 200)), Size::from((500, 400)));
+        let content = deco.content_rect(cell);
+        assert_eq!(content.loc, Point::from((102, 230)));
+        // width loses 2 borders, height loses 2 borders AND the titlebar
+        assert_eq!(content.size, Size::from((496, 368)));
+    }
+
+    /// `cell_size_for` is the inverse of `content_size`, which is what
+    /// lets a client's declared size be turned into a cell and back
+    /// without drifting.
+    #[test]
+    fn cell_and_content_sizes_round_trip() {
+        for deco in [Deco::none(), Deco::new(1, 0), Deco::new(2, 28), Deco::new(6, 13)] {
+            for content in [Size::from((1, 1)), Size::from((800, 600)), Size::from((3840, 2160))] {
+                let cell = deco.cell_size_for(content);
+                let back = deco.content_size(cell);
+                assert_eq!(
+                    (back.w, back.h),
+                    (content.w, content.h),
+                    "{deco:?} lost size round-tripping {content:?} through {cell:?}"
+                );
+            }
+        }
+    }
+
+    /// A zero-size configure is one the client cannot render, so a cell
+    /// too small for its own decoration must still yield 1x1 rather than
+    /// zero or negative.
+    #[test]
+    fn a_degenerate_cell_never_configures_to_zero() {
+        let deco = Deco::new(4, 28);
+        let content = deco.content_size(Size::from((2, 2)));
+        assert_eq!((content.w, content.h), (1, 1));
+    }
+
+    /// A client can commit a window geometry near `i32::MAX`; growing it
+    /// into a cell must saturate rather than wrap into a negative rect.
+    #[test]
+    fn growing_a_huge_content_size_saturates() {
+        let deco = Deco::new(2, 28);
+        let cell = deco.cell_size_for(Size::from((i32::MAX, i32::MAX)));
+        assert_eq!(cell.w, i32::MAX);
+        assert_eq!(cell.h, i32::MAX);
+    }
+
+    /// Fullscreen owns the output, so it never carries decoration.
+    /// Maximized is the interesting one: a stacking WM keeps its
+    /// titlebar (you need it to un-maximize), a tiling one never had it.
+    #[test]
+    fn fill_decides_the_inset_per_mode() {
+        let deco = Deco::new(2, 28);
+        for mode in [LayoutMode::Tiling, LayoutMode::Floating] {
+            assert_eq!(deco_for_fill(deco, mode, FillMode::Normal), deco);
+            assert_eq!(
+                deco_for_fill(deco, mode, FillMode::Fullscreen),
+                Deco::none()
+            );
+        }
+        assert_eq!(
+            deco_for_fill(deco, LayoutMode::Floating, FillMode::Maximized),
+            deco
+        );
+        assert_eq!(
+            deco_for_fill(deco, LayoutMode::Tiling, FillMode::Maximized),
+            Deco::none()
+        );
+    }
+
+    /// Border-only is exactly what it was before titlebars existed.
+    #[test]
+    fn a_zero_titlebar_is_the_old_symmetric_border() {
+        let deco = Deco::new(3, 0);
+        let cell = Rectangle::new(Point::from((0, 0)), Size::from((100, 100)));
+        assert_eq!(deco.content_rect(cell).loc, Point::from((3, 3)));
+        assert_eq!(deco.content_rect(cell).size, Size::from((94, 94)));
     }
 }
 

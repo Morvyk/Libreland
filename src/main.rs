@@ -2593,7 +2593,6 @@ impl State {
             clamp: Option<Rectangle<i32, Physical>>,
         }
 
-        let bw = self.layout.border_width();
         let outputs = self.renderer.output_rects();
         // Output rect containing `(x, y)`; falls back to the first
         // output so a popup whose anchor sits in an inter-output gap is
@@ -2610,7 +2609,11 @@ impl State {
 
         let mut parents: Vec<Parent> = Vec::new();
         for p in placements {
-            let (gx, gy) = (p.cell_rect.loc.x + bw, p.cell_rect.loc.y + bw);
+            // The parent's window-geometry origin, which is what an xdg
+            // positioner is relative to. Per placement, not per config: a
+            // fullscreen parent carries no inset at all.
+            let off = p.deco.content_offset();
+            let (gx, gy) = (p.cell_rect.loc.x + off.x, p.cell_rect.loc.y + off.y);
             parents.push(Parent {
                 root: p.surface.clone(),
                 gx,
@@ -2831,14 +2834,17 @@ impl State {
             return positioner.get_geometry();
         };
         // Root window-geometry origin in compositor space: a tiled/floating
-        // toplevel's cell origin + border, or a layer surface's rect origin.
-        let bw = self.layout.border_width();
+        // toplevel's cell origin + its decoration inset, or a layer
+        // surface's rect origin.
         let root_origin = self
             .layout
             .placements(None, None)
             .into_iter()
             .find(|p| p.surface == root)
-            .map(|p| (p.cell_rect.loc.x + bw, p.cell_rect.loc.y + bw))
+            .map(|p| {
+                let off = p.deco.content_offset();
+                (p.cell_rect.loc.x + off.x, p.cell_rect.loc.y + off.y)
+            })
             .or_else(|| {
                 self.snapshot_layer_placements()
                     .into_iter()
@@ -3786,7 +3792,10 @@ impl State {
                 outer: new.layout.gaps_outer,
                 inner: new.layout.gaps_inner,
             },
-            new.border.width,
+            layout::Deco::new(
+                new.border.width,
+                new.titlebar.height_for(new.layout.mode),
+            ),
         );
         apply_wallpaper(&mut self.renderer, &new.misc.wallpaper, &new.border);
         self.renderer.set_animations(new.animations.clone());
@@ -4752,7 +4761,11 @@ fn main() -> Result<()> {
             outer: config.layout.gaps_outer,
             inner: config.layout.gaps_inner,
         },
-        config.border.width,
+        layout::Deco::new(
+            config.border.width,
+            config.titlebar.height_for(config.layout.mode),
+        ),
+        config.layout.mode,
     );
     // On-demand render bookkeeping: each output already has its priming
     // flip in flight (from `render_initial` above). Start every CRTC in

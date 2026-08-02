@@ -657,13 +657,18 @@ impl XwmHandler for State {
                     && entry.fill == FillMode::Normal
                     && (w.is_some() || h.is_some())
                 {
-                    let border = self.layout.border_width();
+                    // The request is CONTENT space; the stored rect is
+                    // CELL space. `fill == Normal` is checked above, so
+                    // the window is decorated and the whole inset applies
+                    // — including the titlebar, which is why this can't
+                    // just add twice a border.
+                    let deco = self.layout.deco();
                     let mut rect = entry.rect;
                     if let Some(w) = w {
-                        rect.size.w = w as i32 + 2 * border;
+                        rect.size.w = deco.cell_size_for(Size::from((w as i32, 0))).w;
                     }
                     if let Some(h) = h {
-                        rect.size.h = h as i32 + 2 * border;
+                        rect.size.h = deco.cell_size_for(Size::from((0, h as i32))).h;
                     }
                     self.layout.set_floating_rect(&wl_surface, rect);
                 }
