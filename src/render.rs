@@ -1421,7 +1421,7 @@ pub struct Renderer {
 /// behind tiled windows), 1 = base + tiled windows (behind floating
 /// windows), 2 = full backdrop (behind Top/Overlay layers). Each is the
 /// scene accumulated up to that z-band, blurred and saved.
-const BLUR_TIERS: usize = 3;
+const BLUR_TIERS: usize = 4;
 
 /// Offscreen textures backing one output's backdrop blur. `scene` is the
 /// progressive backdrop accumulator (each z-band drawn on top of the
@@ -6635,7 +6635,7 @@ impl Renderer {
             }
             Ok(())
         };
-        let draw_floating_max = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
+        let draw_floating = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
             for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
@@ -6645,12 +6645,19 @@ impl Renderer {
             {
                 draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
+            Ok(())
+        };
+        // Split out from the floating band so a *filled* window can blur
+        // against everything below it without blurring against itself —
+        // it is drawn into the stage that produces the tier the layers
+        // above it sample, one band later.
+        let draw_filled = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
             for (((p, elements), wd), tex) in placements
                 .iter()
                 .zip(grouped.iter())
                 .zip(win_draws.iter())
                 .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill == FillMode::Maximized)
+                .filter(|(((p, _), _), _)| p.fill != FillMode::Normal)
             {
                 draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
             }
@@ -6710,17 +6717,27 @@ impl Renderer {
         // game kept a full 6-pass pyramid running on every single-pass game
         // frame. No visible translucency ⇒ no pyramid.
         let passes_ok = blur.enabled && blur.passes > 0 && solo_opaque.is_none();
-        let any_normal = placements
-            .iter()
-            .enumerate()
-            .any(|(i, p)| visible[i] && p.fill == FillMode::Normal);
-        let any_protocol_window = placements
-            .iter()
-            .enumerate()
-            .any(|(i, p)| {
-                visible[i] && p.fill == FillMode::Normal && protocol_blur.contains(&p.surface.id())
-            });
-        let need_window = passes_ok && any_normal && (blur.windows || any_protocol_window);
+        // Whether a window in a given band wants a blurred backdrop.
+        // Deliberately not restricted to `fill == Normal` any more: a
+        // *translucent* maximized or fullscreen window needs its
+        // backdrop blurred exactly as much as a floating one does, and
+        // assuming filled windows are opaque is what made a maximized
+        // kitty show the sharp wallpaper straight through itself.
+        let wants_blur = |i: usize, p: &Placement| {
+            visible[i] && (blur.windows || protocol_blur.contains(&p.surface.id()))
+        };
+        let need_window = passes_ok
+            && placements
+                .iter()
+                .enumerate()
+                .any(|(i, p)| p.fill == FillMode::Normal && wants_blur(i, p));
+        // A filled window blurs against base + tiled + floating, which is
+        // one band deeper than the layer tier.
+        let need_filled = passes_ok
+            && placements
+                .iter()
+                .enumerate()
+                .any(|(i, p)| p.fill != FillMode::Normal && wants_blur(i, p));
         // Layer blur is opt-in per namespace (config `blur.layers`), so a
         // fullscreen always-mapped overlay (e.g. a launcher) doesn't frost the
         // whole screen — only the layers the user named are blurred.
@@ -6736,8 +6753,11 @@ impl Renderer {
         // `Arc`-cloned so the staging closure captures only `self.gles`.
         let mut tier_tiled: Option<GlesTexture> = None;
         let mut tier_float: Option<GlesTexture> = None;
+        let mut tier_filled: Option<GlesTexture> = None;
         let mut tier_layer: Option<GlesTexture> = None;
-        if (need_window || need_layer) && self.ensure_blur_scratch(idx, mode_size, blur.passes) {
+        if (need_window || need_filled || need_layer)
+            && self.ensure_blur_scratch(idx, mode_size, blur.passes)
+        {
             let down = self.blur_down.clone();
             let up = self.blur_up.clone();
             let passes = blur.passes as usize;
@@ -6754,23 +6774,27 @@ impl Renderer {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 0)?;
                     tier_tiled = Some(scratch.tiers[0].clone());
                 }
-                // The tiled band feeds both the floating tier and the layer tier.
-                if need_window || need_layer {
+                // Each band feeds every tier above it, so a stage runs
+                // whenever anything deeper still needs building.
+                let below_float = need_window || need_filled || need_layer;
+                if below_float {
                     render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_tiled)?;
                 }
                 if need_window {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 1)?;
                     tier_float = Some(scratch.tiers[1].clone());
                 }
-                if need_layer {
-                    render_scene_stage(
-                        &mut self.gles,
-                        &mut scratch,
-                        mode_size,
-                        &draw_floating_max,
-                    )?;
+                if need_filled || need_layer {
+                    render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_floating)?;
+                }
+                if need_filled {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 2)?;
-                    tier_layer = Some(scratch.tiers[2].clone());
+                    tier_filled = Some(scratch.tiers[2].clone());
+                }
+                if need_layer {
+                    render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_filled)?;
+                    run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 3)?;
+                    tier_layer = Some(scratch.tiers[3].clone());
                 }
                 Ok(())
             })();
@@ -6778,6 +6802,7 @@ impl Renderer {
                 warn!(error = %err, output = %output_name, "backdrop blur failed; rendering sharp");
                 tier_tiled = None;
                 tier_float = None;
+                tier_filled = None;
                 tier_layer = None;
             }
             self.blur_scratch.insert(idx, scratch);
@@ -7276,8 +7301,12 @@ impl Renderer {
                 }
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
             }
-            // Maximized windows: borderless, above normal windows but below
-            // Top/Overlay panels. Opaque — no backdrop blur.
+            // Maximized windows: above normal windows, below Top/Overlay
+            // panels, and — while floating — still decorated. They blur
+            // against base + tiled + floating (tier 2), because a
+            // translucent one is just as see-through maximized as it is
+            // at any other size. Assuming otherwise is what put the
+            // sharp wallpaper straight through a maximized kitty.
             for (_, (((p, elements), wd), tex)) in placements
                 .iter()
                 .zip(grouped.iter())
@@ -7286,6 +7315,11 @@ impl Renderer {
                 .enumerate()
                 .filter(|(i, (((p, _), _), _))| visible[*i] && p.fill == FillMode::Maximized)
             {
+                if let Some(t) = &tier_filled
+                    && (blur.windows || protocol_blur.contains(&p.surface.id()))
+                {
+                    blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
+                }
                 draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
             }
 
@@ -7331,12 +7365,23 @@ impl Renderer {
             // Top panels (a fullscreen game/video covers the bar), but BELOW
             // Overlay layers (launcher / toasts / OSDs stay visible) and below
             // popups and the cursor.
-            for (_, (p, elements)) in placements
+            for (fs_i, (p, elements)) in placements
                 .iter()
                 .zip(grouped.iter())
                 .enumerate()
                 .filter(|(i, (p, _))| visible[*i] && p.fill == FillMode::Fullscreen)
             {
+                // Same tier as a maximized window: everything below it.
+                // A fullscreen *opaque* window never gets here with a
+                // tier built — `solo_opaque` vetoes the pyramid outright
+                // — so this only costs anything for a genuinely
+                // translucent one, which is the case that needs it.
+                if let Some(t) = &tier_filled
+                    && (blur.windows || protocol_blur.contains(&p.surface.id()))
+                {
+                    let wd = &win_draws[fs_i];
+                    blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
+                }
                 // Colour-managed fullscreen surface (an HDR game): swap the
                 // frame's decode override to its encoding's decode for this
                 // draw, then restore the scene's SDR default.

@@ -83,7 +83,57 @@ const BOLD_CANDIDATES: &[&str] = &[
     "arimo-bold",
 ];
 
-/// Wide-coverage faces used to fill in glyphs the UI font lacks.
+/// Stem fragments that mark a font as likely to carry the odd glyph a
+/// UI face lacks. Used to *order* the exhaustive search below, so the
+/// symbol and icon fonts are tried before the hundreds of ordinary text
+/// faces a desktop accumulates.
+///
+/// Best first; [`Fonts::load`] reverses this into the search stack.
+const WIDE_COVERAGE_HINTS: &[&str] = &[
+    "symbols", "symbol2", "nerd", "unifont", "cjk", "emoji", "noto", "dejavu",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::{WIDE_COVERAGE_HINTS, coverage_rank};
+
+    /// The search stack is popped from the end, so the fonts most likely
+    /// to carry an unusual glyph have to sort *last*. Getting this
+    /// backwards is silent — it still finds a face eventually, just after
+    /// loading every ordinary text font on the system first.
+    #[test]
+    fn wide_coverage_fonts_sort_to_the_end_of_the_search_stack() {
+        let mut stack = vec![
+            "adwaitasans-regular".to_owned(),
+            "symbolsnerdfont-regular".to_owned(),
+            "liberationserif-italic".to_owned(),
+            "notosanssymbols2-regular".to_owned(),
+        ];
+        stack.sort_by_key(|s| (std::cmp::Reverse(coverage_rank(s)), s.clone()));
+        let last_two = &stack[stack.len() - 2..];
+        assert!(
+            last_two.iter().all(|s| s.contains("symbols") || s.contains("nerd")),
+            "symbol/nerd fonts must be popped first, got {stack:?}"
+        );
+    }
+
+    /// A font matching no hint still sorts, and behind the hinted ones.
+    #[test]
+    fn unhinted_fonts_rank_last() {
+        assert_eq!(coverage_rank("randomfont"), WIDE_COVERAGE_HINTS.len());
+        assert!(coverage_rank("notosans-regular") < WIDE_COVERAGE_HINTS.len());
+    }
+}
+
+/// How likely a font stem is to carry unusual glyphs: lower is better.
+fn coverage_rank(stem: &str) -> usize {
+    WIDE_COVERAGE_HINTS
+        .iter()
+        .position(|h| stem.contains(h))
+        .unwrap_or(WIDE_COVERAGE_HINTS.len())
+}
+
+/// Wide-coverage faces preloaded as the first fallbacks.
 const FALLBACK_CANDIDATES: &[&str] = &[
     "notosanscjk-regular",
     "notosanscjkjp-regular",
@@ -204,9 +254,24 @@ struct GlyphKey {
 /// cache is behind the same lock as the faces because rasterizing is the only
 /// thing we do with them.
 pub struct Fonts {
-    regular: Font,
-    bold: Option<Font>,
-    fallbacks: Vec<Font>,
+    regular: Arc<Font>,
+    bold: Option<Arc<Font>>,
+    fallbacks: Vec<Arc<Font>>,
+    /// Every other font file found, in search order, not yet loaded.
+    ///
+    /// Loading all of them up front would be hundreds of multi-megabyte
+    /// reads for glyphs almost nothing needs; leaving them out entirely
+    /// is what put tofu in titlebars, because the preloaded fallbacks
+    /// are chosen by name and a desktop's *actual* missing glyphs are
+    /// whatever its terminal prompt happens to use.
+    unscanned: std::sync::Mutex<Vec<Candidate>>,
+    /// Faces loaded on demand by the exhaustive search, kept so a second
+    /// character from the same font costs nothing.
+    extra: std::sync::Mutex<Vec<Arc<Font>>>,
+    /// Which face covers a character, resolved once. `None` records
+    /// "nothing on this system has it", so an un-drawable glyph doesn't
+    /// re-scan every font at every size.
+    resolved: std::sync::Mutex<HashMap<char, Option<Arc<Font>>>>,
     cache: std::sync::Mutex<HashMap<GlyphKey, Arc<Glyph>>>,
 }
 
@@ -228,24 +293,36 @@ impl Fonts {
                 sorted.sort_by(|a, b| a.stem.cmp(&b.stem));
                 sorted.iter().find_map(|c| load_font(&c.path))
             })?;
-        let bold = load_preferred(&all, BOLD_CANDIDATES);
+        let bold = load_preferred(&all, BOLD_CANDIDATES).map(Arc::new);
+        // Preload a couple of named wide-coverage faces so the common
+        // cases never touch the search below. The cap is small on
+        // purpose — the search is what provides real coverage, and it
+        // only loads a font when something actually needs it.
         let mut fallbacks = Vec::new();
         for want in FALLBACK_CANDIDATES {
             if let Some(c) = all.iter().find(|c| c.stem == *want)
                 && let Some(font) = load_font(&c.path)
             {
-                fallbacks.push(font);
-                // Three fallback faces is plenty of coverage; each one is a
-                // multi-megabyte mmap-free read we'd rather not do six times.
-                if fallbacks.len() >= 3 {
+                fallbacks.push(Arc::new(font));
+                if fallbacks.len() >= 2 {
                     break;
                 }
             }
         }
+        // Everything else, ordered so the fonts most likely to carry an
+        // unusual glyph are taken *last* — the search pops from the end.
+        let mut unscanned = all;
+        unscanned.sort_by_key(|c| {
+            // Descending rank, so `pop` yields the best candidate first.
+            (std::cmp::Reverse(coverage_rank(&c.stem)), c.stem.clone())
+        });
         Some(Self {
-            regular,
+            regular: Arc::new(regular),
             bold,
             fallbacks,
+            unscanned: std::sync::Mutex::new(unscanned),
+            extra: std::sync::Mutex::new(Vec::new()),
+            resolved: std::sync::Mutex::new(HashMap::new()),
             cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -253,21 +330,66 @@ impl Fonts {
     /// The face that actually has `ch`: the requested weight if it covers the
     /// character, else the first fallback that does, else the requested weight
     /// again (so we draw its .notdef box rather than nothing).
-    fn face_for(&self, ch: char, bold: bool) -> &Font {
+    fn face_for(&self, ch: char, bold: bool) -> Arc<Font> {
         let primary = if bold {
             self.bold.as_ref().unwrap_or(&self.regular)
         } else {
             &self.regular
         };
         if primary.lookup_glyph_index(ch) != 0 || ch == ' ' {
-            return primary;
+            return Arc::clone(primary);
         }
         for face in &self.fallbacks {
             if face.lookup_glyph_index(ch) != 0 {
-                return face;
+                return Arc::clone(face);
             }
         }
-        primary
+        if let Some(found) = self.search_for(ch) {
+            return found;
+        }
+        // Nothing on the system has it: draw the primary's .notdef box,
+        // which at least shows *something* is there.
+        Arc::clone(primary)
+    }
+
+    /// Find any installed font covering `ch`, loading candidates in
+    /// coverage-likelihood order until one does.
+    ///
+    /// This is what "the full font" means here: rather than trusting a
+    /// hardcoded list of family names — which on a real desktop resolved
+    /// to Arabic, Hebrew and Thai while the Nerd Font and symbol faces
+    /// carrying the actually-missing glyphs sat unused — ask every font
+    /// present, and remember the answer.
+    fn search_for(&self, ch: char) -> Option<Arc<Font>> {
+        if let Ok(resolved) = self.resolved.lock()
+            && let Some(hit) = resolved.get(&ch)
+        {
+            return hit.clone();
+        }
+        let mut extra = self.extra.lock().ok()?;
+        let found = extra
+            .iter()
+            .find(|f| f.lookup_glyph_index(ch) != 0)
+            .map(Arc::clone)
+            .or_else(|| {
+                let mut unscanned = self.unscanned.lock().ok()?;
+                while let Some(candidate) = unscanned.pop() {
+                    let Some(font) = load_font(&candidate.path) else {
+                        continue;
+                    };
+                    let font = Arc::new(font);
+                    let covers = font.lookup_glyph_index(ch) != 0;
+                    extra.push(Arc::clone(&font));
+                    if covers {
+                        return Some(font);
+                    }
+                }
+                None
+            });
+        if let Ok(mut resolved) = self.resolved.lock() {
+            resolved.insert(ch, found.clone());
+        }
+        found
     }
 
     fn glyph(&self, ch: char, px: f32, bold: bool) -> Arc<Glyph> {
@@ -281,7 +403,8 @@ impl Fonts {
         {
             return Arc::clone(hit);
         }
-        let (metrics, coverage) = self.face_for(ch, bold).rasterize(ch, px);
+        let face = self.face_for(ch, bold);
+        let (metrics, coverage) = face.rasterize(ch, px);
         let glyph = Arc::new(Glyph {
             width: metrics.width,
             height: metrics.height,

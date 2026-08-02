@@ -1845,31 +1845,42 @@ impl AsMut<CompositorState> for State {
 
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        // Client created a decoration object — pin us to
-        // ServerSide before the first configure so the client
-        // never starts with CSD then has to redraw without it.
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
+        // Default to server-side before the first configure, so a client
+        // that expresses no preference never starts with CSD and then has
+        // to redraw without it.
+        self.apply_decoration_mode(&toplevel, DecorationMode::ServerSide);
     }
 
-    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
-        // Client preference is ignored; tiling WM doesn't have
-        // optional decorations to negotiate over.
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_configure();
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        // The client's preference is honoured. It used to be ignored —
+        // reasonable while the compositor drew nothing but a hairline
+        // border, since a client drawing its own on top of that costs
+        // almost nothing. With a titlebar it is the double-titlebar
+        // every desktop has a bug report about, so a client that says it
+        // draws its own gets to.
+        self.apply_decoration_mode(&toplevel, mode);
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        // Client released the decoration object. Keep ServerSide
-        // pinned so it doesn't accidentally fall back to CSD.
+        // Client dropped its preference: back to the default.
+        self.apply_decoration_mode(&toplevel, DecorationMode::ServerSide);
+    }
+}
+
+impl State {
+    /// Answer a decoration negotiation and tell the layout, so the
+    /// window's cell stops reserving space for a bar we won't draw.
+    fn apply_decoration_mode(&mut self, toplevel: &ToplevelSurface, mode: DecorationMode) {
+        let csd = matches!(mode, DecorationMode::ClientSide);
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
+            state.decoration_mode = Some(mode);
         });
-        toplevel.send_configure();
+        // `set_csd` reconfigures on a change, which would double the
+        // configure we are about to send; send ours only when it didn't.
+        if !self.layout.set_csd(toplevel.wl_surface(), csd) {
+            toplevel.send_configure();
+        }
+        self.queue_redraw_all();
     }
 }
 

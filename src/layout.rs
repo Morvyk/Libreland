@@ -144,6 +144,11 @@ pub struct Window {
     /// output (ignoring `rect`), drops its border/corners, and draws
     /// on top. Travels with the window across workspaces.
     pub fill: FillMode,
+    /// The client asked to draw its own decorations
+    /// (`zxdg_toplevel_decoration_v1.set_mode(client_side)`), so the
+    /// compositor draws none. Its titlebar and border are the client's
+    /// own, inside its surface.
+    pub csd: bool,
     /// Hidden from the screen but still owned by its workspace: no
     /// placement, no hit-test, no focus. Anything that focuses the
     /// window restores it (see [`Layout::restore`]), which is what makes
@@ -162,6 +167,7 @@ impl Window {
             toplevel,
             rect,
             fill: FillMode::Normal,
+            csd: false,
             minimized: false,
         }
     }
@@ -190,6 +196,10 @@ pub enum DragSource {
 pub struct InTransit {
     pub window: Window,
     pub source: DragSource,
+    #[allow(
+        dead_code,
+        reason = "read by window_entries to report the dragged window's home output"
+    )]
     /// Output index the drag started on. The source workspace is
     /// emptied at drag start but not normalized (the drag may abort
     /// back), so `finish_move_drag` normalizes this output to reap a
@@ -737,7 +747,25 @@ impl Layout {
     /// un-maximize, which is how every stacking WM behaves) and loses it
     /// while tiling, which is the behaviour tiling has always had.
     fn deco_for(&self, w: &Window) -> Deco {
-        deco_for_fill(self.deco, self.mode, w.fill)
+        window_deco(self.deco, self.mode, w)
+    }
+
+    /// Record whether a client draws its own decorations, and reconfigure
+    /// it if that changed. Returns whether anything changed.
+    ///
+    /// A CSD window gets no border and no titlebar: it is already
+    /// drawing both inside its own surface, and a server-side bar on top
+    /// of a client-side one is the classic double-titlebar.
+    pub fn set_csd(&mut self, surface: &WlSurface, csd: bool) -> bool {
+        let Some(w) = self.window_mut(surface) else {
+            return false;
+        };
+        if w.csd == csd {
+            return false;
+        }
+        w.csd = csd;
+        self.recompute_and_push();
+        true
     }
 
     /// Tile area of the output at `idx`: its bounds shrunk by the
@@ -996,7 +1024,7 @@ impl Layout {
                 if w.fill != FillMode::Normal || !matches!(w.toplevel, WindowSurface::Xdg(_)) {
                     return false;
                 }
-                let grown = deco_for_fill(deco, mode, w.fill).cell_size_for(content);
+                let grown = window_deco(deco, mode, w).cell_size_for(content);
                 let cell = Size::<i32, Physical>::from((
                     grown.w.min(full.w.max(1)),
                     grown.h.min(full.h.max(1)),
@@ -1350,7 +1378,7 @@ impl Layout {
             // it either drops onto a tile cell or rejoins the
             // float stack, so configure it as such (no Tiled*
             // states, free-form resize).
-            let deco = deco_for_fill(self.deco, self.mode, t.window.fill);
+            let deco = window_deco(self.deco, self.mode, &t.window);
             push_configure_for_floating(&t.window, deco, area);
         }
     }
@@ -1369,7 +1397,7 @@ impl Layout {
                 .find(|w| w.toplevel.wl_surface() == surface)
             {
                 window.rect = rect;
-                push_configure_for_floating(window, deco_for_fill(deco, mode, window.fill), area);
+                push_configure_for_floating(window, window_deco(deco, mode, window), area);
                 return;
             }
         }
@@ -1635,7 +1663,7 @@ impl Layout {
                     push_configures_tree(tree, deco, mode, area);
                 }
                 for w in &ws.floating {
-                    push_configure_for_floating(w, deco_for_fill(deco, mode, w.fill), area);
+                    push_configure_for_floating(w, window_deco(deco, mode, w), area);
                 }
             }
         }
@@ -1908,6 +1936,26 @@ impl Layout {
 
     pub fn window_entries(&self) -> Vec<WindowEntry> {
         let mut out = Vec::new();
+        // A window being dragged lives in `in_transit`, owned by neither
+        // a tree nor a float stack. Omitting it made a window vanish from
+        // `libreland msg windows` — and so from any taskbar built on it —
+        // for as long as the user held the mouse button down.
+        if let Some(t) = &self.in_transit {
+            let (output, workspace) = self
+                .outputs
+                .get(t.source_output)
+                .map_or_else(|| (String::new(), 0), |op| (op.name.clone(), op.active));
+            out.push(WindowEntry {
+                surface: t.window.toplevel.wl_surface().clone(),
+                rect: t.window.rect,
+                fill: t.window.fill,
+                // In transit is conceptually floating until it lands.
+                floating: true,
+                minimized: t.window.minimized,
+                output,
+                workspace,
+            });
+        }
         for op in &self.outputs {
             for (index, ws) in op.workspaces.iter().enumerate() {
                 if let Some(tree) = &ws.tree {
@@ -1950,6 +1998,7 @@ impl Layout {
             return false;
         };
         let was = w.fill;
+        let csd = w.csd;
         w.fill = fill;
         // The one transition where a decoration decision changes, and the
         // one that has been hardest to reason about from a screenshot:
@@ -1961,8 +2010,9 @@ impl Layout {
             ?was,
             now = ?fill,
             ?mode,
-            deco_border = deco_for_fill(deco, mode, fill).border,
-            deco_titlebar = deco_for_fill(deco, mode, fill).titlebar,
+            deco_border = deco_for_fill(deco, mode, fill, csd).border,
+            deco_titlebar = deco_for_fill(deco, mode, fill, csd).titlebar,
+            csd,
             "layout: fill changed",
         );
         self.recompute_and_push();
@@ -2718,7 +2768,7 @@ fn collect_placements(
                 focused: is_focused(surface),
                 fill: w.fill,
                 floating: false,
-                deco: deco_for_fill(deco, mode, w.fill),
+                deco: window_deco(deco, mode, w),
                 slide: Point::from((0, 0)),
             });
         }
@@ -2756,7 +2806,7 @@ fn collect_workspace(
             focused: is_focused(surface),
             fill: w.fill,
             floating: true,
-            deco: deco_for_fill(deco, mode, w.fill),
+            deco: window_deco(deco, mode, w),
             slide: Point::from((0, 0)),
         });
     }
@@ -3110,7 +3160,7 @@ fn ratio_for_divider(span: i32, origin: i32, split_px: i32, min: i32) -> f32 {
 
 fn push_configures_tree(node: &Node, deco: Deco, mode: LayoutMode, area: OutputArea) {
     match node {
-        Node::Leaf(w) => push_configure_for_tile(w, deco_for_fill(deco, mode, w.fill), area),
+        Node::Leaf(w) => push_configure_for_tile(w, window_deco(deco, mode, w), area),
         Node::Split { first, second, .. } => {
             push_configures_tree(first, deco, mode, area);
             push_configures_tree(second, deco, mode, area);
@@ -3349,7 +3399,17 @@ fn drain_tree(node: Node, out: &mut Vec<Window>) {
 
 /// [`Layout::deco_for`] without the `&self` borrow, for the reflow loops
 /// that already hold `&mut self.outputs` and so cannot call a method.
-fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode) -> Deco {
+fn window_deco(deco: Deco, mode: LayoutMode, w: &Window) -> Deco {
+    deco_for_fill(deco, mode, w.fill, w.csd)
+}
+
+fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode, csd: bool) -> Deco {
+    // A client drawing its own decorations gets none from us, whatever
+    // the mode or the fill: a server-side bar over a client-side one is
+    // the double titlebar every desktop has a bug report about.
+    if csd {
+        return Deco::none();
+    }
     match fill {
         FillMode::Normal => deco,
         FillMode::Maximized if mode == LayoutMode::Floating => deco,
@@ -3675,18 +3735,18 @@ mod deco_tests {
     fn fill_decides_the_inset_per_mode() {
         let deco = Deco::new(2, 28);
         for mode in [LayoutMode::Tiling, LayoutMode::Floating] {
-            assert_eq!(deco_for_fill(deco, mode, FillMode::Normal), deco);
+            assert_eq!(deco_for_fill(deco, mode, FillMode::Normal, false), deco);
             assert_eq!(
-                deco_for_fill(deco, mode, FillMode::Fullscreen),
+                deco_for_fill(deco, mode, FillMode::Fullscreen, false),
                 Deco::none()
             );
         }
         assert_eq!(
-            deco_for_fill(deco, LayoutMode::Floating, FillMode::Maximized),
+            deco_for_fill(deco, LayoutMode::Floating, FillMode::Maximized, false),
             deco
         );
         assert_eq!(
-            deco_for_fill(deco, LayoutMode::Tiling, FillMode::Maximized),
+            deco_for_fill(deco, LayoutMode::Tiling, FillMode::Maximized, false),
             Deco::none()
         );
     }
@@ -3698,7 +3758,7 @@ mod deco_tests {
     #[test]
     fn a_maximized_window_keeps_a_drawable_bar_while_floating() {
         let deco = Deco::new(2, 28);
-        let maxed = deco_for_fill(deco, LayoutMode::Floating, FillMode::Maximized);
+        let maxed = deco_for_fill(deco, LayoutMode::Floating, FillMode::Maximized, false);
         assert_ne!(
             maxed,
             Deco::none(),
@@ -3707,7 +3767,7 @@ mod deco_tests {
         assert_eq!(maxed.titlebar, 28);
         // ...and fullscreen must not, or a game gets a bar across it.
         assert_eq!(
-            deco_for_fill(deco, LayoutMode::Floating, FillMode::Fullscreen),
+            deco_for_fill(deco, LayoutMode::Floating, FillMode::Fullscreen, false),
             Deco::none()
         );
     }
@@ -3724,6 +3784,28 @@ mod deco_tests {
                 "{deco:?} paints somewhere other than where it configures"
             );
         }
+    }
+
+    /// A client drawing its own decorations gets none from us, whatever
+    /// the mode or the fill — a server-side bar on top of a client-side
+    /// one is the double titlebar every desktop has a bug report about.
+    #[test]
+    fn a_csd_window_carries_no_decoration() {
+        let deco = Deco::new(2, 28);
+        for mode in [LayoutMode::Tiling, LayoutMode::Floating] {
+            for fill in [FillMode::Normal, FillMode::Maximized, FillMode::Fullscreen] {
+                assert_eq!(
+                    deco_for_fill(deco, mode, fill, true),
+                    Deco::none(),
+                    "csd window in {mode:?}/{fill:?} still got decoration"
+                );
+            }
+        }
+        // ...and clearing the flag restores it.
+        assert_eq!(
+            deco_for_fill(deco, LayoutMode::Floating, FillMode::Normal, false),
+            deco
+        );
     }
 
     /// Border-only is exactly what it was before titlebars existed.
