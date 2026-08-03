@@ -284,13 +284,12 @@ impl ImageCopyCaptureHandler for State {
         // against the session constraints, but renderability (blit
         // target support, notably on NVIDIA) is ours to check. Same
         // policy as screencopy.
-        if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(&frame.buffer()) {
-            use smithay::backend::allocator::Buffer as _;
-            if !self.renderer.can_render_to(dmabuf.format()) {
-                debug!("copy-capture: dmabuf not renderable; failing so the client falls back");
-                frame.fail(FailureReason::BufferConstraints);
-                return;
-            }
+        if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(&frame.buffer())
+            && !self.renderer.can_render_to(dmabuf)
+        {
+            debug!("copy-capture: dmabuf not renderable; failing so the client falls back");
+            frame.fail(FailureReason::BufferConstraints);
+            return;
         }
         let overlay_cursor = session.draw_cursor();
         // Wake the captured output; an idle on-demand output would never

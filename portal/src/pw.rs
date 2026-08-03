@@ -325,12 +325,37 @@ impl Cast {
                 .ok_or_else(|| anyhow::anyhow!("no gbm device for the dmabuf path"))?;
             let fourcc = drm_fourcc::DrmFourcc::try_from(fourcc_of(self.spec.shm_format))
                 .unwrap_or(drm_fourcc::DrmFourcc::Xrgb8888);
-            let bo = device.create_buffer_object_with_modifiers::<()>(
-                width,
-                height,
-                fourcc,
-                [drm_fourcc::DrmModifier::Linear].into_iter(),
-            )?;
+            // Let the driver pick the layout for a render target, and
+            // only ask for LINEAR if it can't.
+            //
+            // Forcing LINEAR is what this did first, on the reasoning
+            // that linear is universally *importable*. It is — but this
+            // buffer is not imported, it is rendered into, and NVIDIA's
+            // EGL exposes no linear render target at all. Every dmabuf
+            // capture on such a GPU was refused by the compositor and
+            // silently fell back to a CPU copy of a 4K frame, per frame.
+            //
+            // `RENDERING` is the flag that says so; gbm then answers with
+            // a modifier the driver will actually render into, which is
+            // the one thing the compositor needs to be true.
+            let bo = device
+                .create_buffer_object::<()>(
+                    width,
+                    height,
+                    fourcc,
+                    gbm::BufferObjectFlags::RENDERING,
+                )
+                .or_else(|_| {
+                    device.create_buffer_object_with_modifiers::<()>(
+                        width,
+                        height,
+                        fourcc,
+                        [drm_fourcc::DrmModifier::Linear].into_iter(),
+                    )
+                })?;
+            // Whatever it chose — passed through verbatim, since the
+            // compositor has to import exactly what was allocated.
+            let modifier = u64::from(bo.modifier());
             let fd = bo.fd()?;
             let bo_stride = bo.stride();
             let offset = bo.offset(0);
@@ -342,7 +367,7 @@ impl Cast {
                 fourcc: fourcc as u32,
                 stride: bo_stride,
                 offset,
-                modifier: DRM_FORMAT_MOD_LINEAR,
+                modifier,
             })?;
             Ok((
                 Slot {

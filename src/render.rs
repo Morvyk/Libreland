@@ -5859,11 +5859,23 @@ impl Renderer {
     /// blits into the client's dmabuf, so it must be render-capable;
     /// otherwise we fall back to the shm path. NVIDIA in particular has
     /// a narrower render set than texture set.
-    pub fn can_render_to(&self, format: Format) -> bool {
-        self.gles
+    pub fn can_render_to(&mut self, dmabuf: &Dmabuf) -> bool {
+        // The advertised render-format set is the fast answer, but it is
+        // not the whole truth: a driver may accept a modifier it never
+        // enumerated (an implicit one especially, which has no entry to
+        // match against). Trying the bind is authoritative — it is the
+        // very operation the capture would perform — so a format the set
+        // doesn't mention gets asked rather than assumed.
+        if self
+            .gles
             .egl_context()
             .dmabuf_render_formats()
-            .contains(&format)
+            .contains(&dmabuf.format())
+        {
+            return true;
+        }
+        let mut probe = dmabuf.clone();
+        self.gles.bind(&mut probe).is_ok()
     }
 
     /// The render `DrmNode` backing our EGL context, used as the

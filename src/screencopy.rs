@@ -267,7 +267,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, FrameData> for State {
                     let dims_ok = i32::try_from(dmabuf.width()).is_ok_and(|w| w == region.size.w)
                         && i32::try_from(dmabuf.height()).is_ok_and(|h| h == region.size.h)
                         && dmabuf.format().code == CAPTURE_FOURCC;
-                    let renderable = state.renderer.can_render_to(dmabuf.format());
+                    let renderable = state.renderer.can_render_to(dmabuf);
                     if !dims_ok || !renderable {
                         debug!(
                             dims_ok,
