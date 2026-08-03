@@ -14,6 +14,221 @@ use time::OffsetDateTime;
 use time::UtcOffset;
 use time::macros::format_description;
 
+/// Recognise the text in `region` of a captured frame and return it.
+///
+/// Runs `tesseract` over a PNG of the crop. Out of process on purpose:
+/// it keeps the compositor's build pure Rust and, more to the point,
+/// keeps a crash in a large C++ library from taking the desktop with it —
+/// an OCR failure should cost you a clipboard copy, not your session.
+///
+/// English is fixed. Recognition accuracy depends on being told the
+/// language, "whatever the locale says" is usually not what is on the
+/// screen, and one right answer beats a configurable wrong one.
+///
+/// Errors when tesseract isn't installed, which is the expected case on
+/// a machine that has never wanted this — the caller logs and moves on.
+pub(crate) fn read_text(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    region: Rectangle<i32, Physical>,
+) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::process::{Command, Stdio};
+
+    let png = encode_region(src, src_w, src_h, region)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+    // `-` for both paths: PNG in on stdin, text out on stdout, so nothing
+    // is written to disk and there is no temp file to leak or collide.
+    let mut child = Command::new("tesseract")
+        .args(["stdin", "stdout", "-l", "eng"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("running tesseract (is it installed?): {e}"),
+            )
+        })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "tesseract stdin"))?
+        .write_all(&png)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::other(format!("tesseract exited {}", out.status)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A button on the options toolbar that appears once a selection is
+/// committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tool {
+    /// Take the shot: save and/or copy per the bind.
+    Take,
+    /// Toggle freehand annotation. While on, dragging inside the
+    /// selection draws instead of moving it.
+    Draw,
+    /// Pick the annotation colour.
+    Colour(PenColour),
+    /// Run OCR over the selection and put the text on the clipboard.
+    CopyText,
+    /// Abandon the session.
+    Cancel,
+}
+
+/// The annotation palette. Deliberately short: a screenshot annotation is
+/// an arrow and a circle, not a painting, and a five-swatch row can be
+/// hit without aiming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PenColour {
+    /// The default, and the one nearly every annotation wants.
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    White,
+}
+
+impl PenColour {
+    /// Every colour, in toolbar order.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Red,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::White,
+    ];
+
+    /// Linear-ish sRGB components, chosen to stay legible on both a dark
+    /// screenshot and a light one.
+    pub(crate) fn rgb(self) -> [f32; 3] {
+        match self {
+            Self::Red => [0.91, 0.20, 0.20],
+            Self::Yellow => [0.98, 0.79, 0.19],
+            Self::Green => [0.30, 0.80, 0.35],
+            Self::Blue => [0.25, 0.62, 1.00],
+            Self::White => [0.97, 0.97, 0.97],
+        }
+    }
+}
+
+/// One button: what it does and where it is.
+pub(crate) type ToolSlot = (Tool, Rectangle<i32, Physical>);
+
+/// Toolbar metrics, in compositor pixels.
+pub(crate) const TOOL_SIZE: i32 = 32;
+pub(crate) const TOOL_PAD: i32 = 6;
+/// Gap between the selection and the toolbar.
+pub(crate) const TOOL_GAP: i32 = 10;
+
+/// The buttons, left to right.
+pub(crate) fn tools() -> Vec<Tool> {
+    let mut v = vec![Tool::Take, Tool::Draw];
+    v.extend(PenColour::ALL.map(Tool::Colour));
+    v.push(Tool::CopyText);
+    v.push(Tool::Cancel);
+    v
+}
+
+/// Where the toolbar sits for a selection of `sel` on an output of
+/// `bounds`, and where each button lands inside it.
+///
+/// Below the selection by preference, above it when there is no room
+/// below, and inside it when there is room for neither — a selection
+/// taller than the screen is rare but a toolbar you cannot reach is
+/// useless. Always clamped horizontally so the last button stays on
+/// screen.
+pub(crate) fn toolbar_layout(
+    sel: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+) -> (Rectangle<i32, Physical>, Vec<ToolSlot>) {
+    use smithay::utils::{Point, Size};
+    let tools = tools();
+    let count = i32::try_from(tools.len()).unwrap_or(1);
+    let bar_w = count * TOOL_SIZE + (count + 1) * TOOL_PAD;
+    let bar_h = TOOL_SIZE + 2 * TOOL_PAD;
+
+    let below = sel.loc.y + sel.size.h + TOOL_GAP;
+    let above = sel.loc.y - TOOL_GAP - bar_h;
+    let bar_y = if below + bar_h <= bounds.loc.y + bounds.size.h {
+        below
+    } else if above >= bounds.loc.y {
+        above
+    } else {
+        // Neither side fits: sit just inside the selection's bottom edge.
+        (sel.loc.y + sel.size.h - bar_h - TOOL_GAP).max(bounds.loc.y)
+    };
+    // Centred on the selection, then pushed back on screen.
+    let bar_x = (sel.loc.x + (sel.size.w - bar_w) / 2).clamp(
+        bounds.loc.x,
+        (bounds.loc.x + bounds.size.w - bar_w).max(bounds.loc.x),
+    );
+
+    let bar = Rectangle::new(
+        Point::from((bar_x, bar_y)),
+        Size::from((bar_w, bar_h)),
+    );
+    let mut slots = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.into_iter().enumerate() {
+        let i = i32::try_from(i).unwrap_or(0);
+        slots.push((
+            tool,
+            Rectangle::new(
+                Point::from((
+                    bar_x + TOOL_PAD + i * (TOOL_SIZE + TOOL_PAD),
+                    bar_y + TOOL_PAD,
+                )),
+                Size::from((TOOL_SIZE, TOOL_SIZE)),
+            ),
+        ));
+    }
+    (bar, slots)
+}
+
+/// The tool under `pos`, if any.
+pub(crate) fn tool_at(
+    sel: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+    pos: (f64, f64),
+) -> Option<Tool> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "cursor coords are clamped to the i32 layout bounds"
+    )]
+    let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
+    let (_, slots) = toolbar_layout(sel, bounds);
+    slots
+        .into_iter()
+        .find(|(_, r)| {
+            px >= r.loc.x && px < r.loc.x + r.size.w && py >= r.loc.y && py < r.loc.y + r.size.h
+        })
+        .map(|(t, _)| t)
+}
+
+/// Whether `pos` is anywhere on the toolbar — used to keep a press there
+/// from being read as "start a new selection".
+pub(crate) fn on_toolbar(
+    sel: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+    pos: (f64, f64),
+) -> bool {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "cursor coords are clamped to the i32 layout bounds"
+    )]
+    let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
+    let (bar, _) = toolbar_layout(sel, bounds);
+    px >= bar.loc.x
+        && px < bar.loc.x + bar.size.w
+        && py >= bar.loc.y
+        && py < bar.loc.y + bar.size.h
+}
+
 /// What a press on a committed selection is about to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectionGrab {
@@ -51,24 +266,24 @@ pub(crate) fn grab_at(
         reason = "cursor coords are clamped to the i32 layout bounds"
     )]
     let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
-    let (l, t) = (rect.loc.x, rect.loc.y);
-    let (r, b) = (l + rect.size.w, t + rect.size.h);
+    let (left, top) = (rect.loc.x, rect.loc.y);
+    let (right, bottom) = (left + rect.size.w, top + rect.size.h);
     let near = |v: i32, edge: i32| (v - edge).abs() <= handle;
     // Within the rect's span on the *other* axis, grown by the handle so
     // a corner still reads as a corner from just outside it.
-    let spans_x = px >= l - handle && px <= r + handle;
-    let spans_y = py >= t - handle && py <= b + handle;
+    let spans_x = px >= left - handle && px <= right + handle;
+    let spans_y = py >= top - handle && py <= bottom + handle;
 
-    let x = if near(px, l) && spans_y {
+    let x = if near(px, left) && spans_y {
         Some(EdgeX::Left)
-    } else if near(px, r) && spans_y {
+    } else if near(px, right) && spans_y {
         Some(EdgeX::Right)
     } else {
         None
     };
-    let y = if near(py, t) && spans_x {
+    let y = if near(py, top) && spans_x {
         Some(EdgeY::Top)
-    } else if near(py, b) && spans_x {
+    } else if near(py, bottom) && spans_x {
         Some(EdgeY::Bottom)
     } else {
         None
@@ -76,7 +291,7 @@ pub(crate) fn grab_at(
     if x.is_some() || y.is_some() {
         return Some(SelectionGrab::Resize(ResizeEdges { x, y }));
     }
-    let inside = px >= l && px < r && py >= t && py < b;
+    let inside = px >= left && px < right && py >= top && py < bottom;
     inside.then_some(SelectionGrab::Move)
 }
 
@@ -230,7 +445,7 @@ pub(crate) fn downscale_rgba(
             }
             let dst = (y * dwu + x) * 4;
             for c in 0..4 {
-                out[dst + c] = if n == 0 { 0 } else { (acc[c] / n) as u8 };
+                out[dst + c] = acc[c].checked_div(n).unwrap_or(0) as u8;
             }
         }
     }

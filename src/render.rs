@@ -783,6 +783,68 @@ void main() {
 }
 ";
 
+/// Draw anti-aliased line segments over a quad — the compositor's whole
+/// vocabulary for strokes, on the GPU.
+///
+/// Every glyph the screenshot toolbar draws (a tick, a pencil, a T, an X)
+/// is a short list of segments, and so is every freehand annotation
+/// stroke, so both go through this one program instead of a CPU
+/// rasteriser and an upload. Coordinates are in destination pixels with
+/// the origin at the quad's top-left, which keeps the caller's arithmetic
+/// in the units it already thinks in.
+///
+/// The segment count is fixed at compile time because GLES 2.0 requires
+/// constant loop bounds; `count` masks the unused tail. Longer strokes
+/// are drawn as several quads.
+const SEGMENTS_MAX: usize = 12;
+
+const SEGMENT_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform vec4 segments[12];
+uniform int count;
+uniform vec3 colour;
+uniform float thickness;
+uniform vec2 quad;
+varying vec2 v_coords;
+
+// Distance from `p` to the segment `a`-`b`, the standard projection with
+// the parameter clamped to the segment so the ends are round rather than
+// running off to infinity.
+float seg_dist(vec2 p, vec2 a, vec2 b) {
+    vec2 ab = b - a;
+    float len2 = max(dot(ab, ab), 1e-6);
+    float t = clamp(dot(p - a, ab) / len2, 0.0, 1.0);
+    return distance(p, a + t * ab);
+}
+
+void main() {
+    vec2 p = v_coords * quad;
+    float d = 1.0e9;
+    for (int i = 0; i < 12; i++) {
+        if (i >= count) { break; }
+        d = min(d, seg_dist(p, segments[i].xy, segments[i].zw));
+    }
+    // One pixel of feather either side of the stroke's half-width: enough
+    // to kill the staircase, narrow enough that a 2 px stroke still reads
+    // as 2 px rather than as a smudge.
+    float half_w = thickness * 0.5;
+    float cov = 1.0 - smoothstep(half_w - 0.5, half_w + 0.5, d);
+    // The sampler is bound to a 1x1 opaque white texture and contributes
+    // nothing. It is here because smithay's texture programs require the
+    // uniform to exist, and a driver that optimises away an unreferenced
+    // sampler makes the program fail to build.
+    cov *= texture2D(tex, v_coords).a;
+    gl_FragColor = vec4(colour * cov, cov) * alpha;
+}
+";
+
 /// Tonemap the composited linear-BT.2020 scene (the fp16 offscreen) down to
 /// an 8-bit **sRGB** image for screenshots, so a capture of an HDR output
 /// "looks like SDR". GLES can't read the fp16 scanout back as an 8-bit
@@ -1365,6 +1427,11 @@ pub struct Renderer {
     /// an HDR output (the fp16 scanout can't be read back as 8-bit). See
     /// [`SCREENSHOT_TONEMAP_SHADER`].
     screenshot_tonemap_shader: GlesTexProgram,
+    /// Anti-aliased stroke program: toolbar glyphs and annotation.
+    segment_shader: GlesTexProgram,
+    /// 1x1 opaque white, bound as the sampler for programs that draw
+    /// procedurally and never read a texture (see [`SEGMENT_SHADER`]).
+    blank_tex: GlesTexture,
     /// Decodes an SDR (sRGB/BT.709) source into the linear BT.2020 working
     /// space; the scene-frame default override for HDR outputs. See
     /// [`SDR_DECODE_SHADER`].
@@ -1785,7 +1852,7 @@ struct WinDraw {
 /// What the screenshot selection UI should draw this frame. The
 /// rectangle is in absolute compositor coords; `None` means a session is
 /// active but nothing is selected yet (just dim every output).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScreenshotOverlay {
     pub selection: Option<Rectangle<i32, Physical>>,
     /// Draw grab handles on the selection's corners and edge midpoints —
@@ -1793,6 +1860,38 @@ pub struct ScreenshotOverlay {
     /// adjusted. A rect still being dragged out shows none: there is
     /// nothing to grab while the pointer is already holding a corner.
     pub handles: bool,
+    /// The options bar, once a selection is committed.
+    pub toolbar: Option<Toolbar>,
+}
+
+/// The screenshot options bar: where it is and what is on it. Laid out by
+/// `screenshot::toolbar_layout` so the hit-testing and the drawing can't
+/// disagree about where a button is.
+#[derive(Debug, Clone)]
+pub struct Toolbar {
+    pub bar: Rectangle<i32, Physical>,
+    pub buttons: Vec<ToolButton>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolButton {
+    pub rect: Rectangle<i32, Physical>,
+    pub icon: ToolIcon,
+    /// Currently in effect — annotation is on, or this is the pen colour.
+    pub active: bool,
+    pub hovered: bool,
+}
+
+/// What a toolbar button draws. Every one is a short segment list run
+/// through [`SEGMENT_SHADER`], except a colour swatch, which is a filled
+/// square showing the colour itself.
+#[derive(Debug, Clone, Copy)]
+pub enum ToolIcon {
+    Take,
+    Draw,
+    Swatch([f32; 3]),
+    Text,
+    Cancel,
 }
 
 /// One output's render state.
@@ -3144,6 +3243,38 @@ impl Renderer {
                 ],
             )
             .context("screenshot tonemap shader compile failed")?;
+        // Anti-aliased strokes: toolbar glyphs and freehand annotation,
+        // both as segment lists. `_4f` per segment because GLES 2.0 takes
+        // a uniform array as one named element per index.
+        let segment_shader = gles
+            .compile_custom_texture_shader(
+                SEGMENT_SHADER,
+                &[
+                    UniformName::new("count", UniformType::_1i),
+                    UniformName::new("colour", UniformType::_3f),
+                    UniformName::new("thickness", UniformType::_1f),
+                    UniformName::new("quad", UniformType::_2f),
+                ],
+            )
+            .context("segment shader compile failed")?;
+        // 1x1 opaque white for the procedural programs' unused sampler.
+        let mut blank_tex = gles
+            .create_buffer(
+                Fourcc::Abgr8888,
+                Size::<i32, smithay::utils::Buffer>::from((1, 1)),
+            )
+            .context("blank texture alloc failed")?;
+        {
+            let one = Size::<i32, Physical>::from((1, 1));
+            let mut target = gles.bind(&mut blank_tex).context("blank texture bind")?;
+            let mut frame = gles
+                .render(&mut target, one, Transform::Normal)
+                .context("blank texture render")?;
+            frame
+                .clear(Color32F::new(1.0, 1.0, 1.0, 1.0), &[Rectangle::from_size(one)])
+                .context("blank texture clear")?;
+            let _ = frame.finish().context("blank texture finish")?;
+        }
         let sdr_decode_shader = gles
             .compile_custom_texture_shader(
                 SDR_DECODE_SHADER,
@@ -3461,6 +3592,8 @@ impl Renderer {
             blur_scratch: HashMap::new(),
             hdr_encode_shader,
             screenshot_tonemap_shader,
+            segment_shader,
+            blank_tex,
             sdr_decode_shader,
             sdr_to_pq_shader,
             hdr_decode_shader,
@@ -5885,7 +6018,9 @@ impl Renderer {
             // Hidden → no sprite; Surface → drawn separately below.
             _ => None,
         };
-        let screenshot_overlay = self.screenshot_overlay;
+        let screenshot_overlay = self.screenshot_overlay.clone();
+        let segment_shader = self.segment_shader.clone();
+        let blank_tex = self.blank_tex.clone();
         let snap_preview = self.snap_preview;
         // The quick-tile preview borrows the focused window's accent, so
         // the drop target reads as part of the same theme as the border
@@ -7986,6 +8121,23 @@ impl Renderer {
                     hdr_reference_white,
                     hdr_saturation,
                 )?;
+                // The options bar draws over the dim wash, as its own
+                // pass — it is chrome, not part of the selection.
+                if let Some(bar) = &overlay.toolbar {
+                    draw_toolbar(
+                        &mut frame,
+                        bar,
+                        &OverlayPaint {
+                            segment: &segment_shader,
+                            blank: &blank_tex,
+                            origin: compositor_position,
+                            scale,
+                            hdr,
+                            reference_white: hdr_reference_white,
+                            saturation: hdr_saturation,
+                        },
+                    )?;
+                }
             }
 
             // Drag-and-drop icon, just under the cursor sprite.
@@ -9625,6 +9777,173 @@ fn draw_snap_preview(
     solid(frame, x0, y0, t, h, edge)?;
     solid(frame, x1 - t, y0, t, h, edge)?;
     Ok(())
+}
+
+/// Everything the toolbar needs from the frame's colour state, bundled so
+/// the draw call doesn't take a dozen arguments.
+struct OverlayPaint<'a> {
+    segment: &'a GlesTexProgram,
+    blank: &'a GlesTexture,
+    origin: Point<i32, Physical>,
+    scale: f64,
+    hdr: bool,
+    reference_white: u32,
+    saturation: f32,
+}
+
+impl OverlayPaint<'_> {
+    /// A solid rect in output-physical pixels, converted for the HDR scene
+    /// when there is one (`draw_solid` bypasses the decode override).
+    fn fill(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        r: Rectangle<i32, Physical>,
+        colour: Color32F,
+    ) -> Result<()> {
+        if r.size.w <= 0 || r.size.h <= 0 {
+            return Ok(());
+        }
+        let colour = if self.hdr {
+            srgb_to_linear_bt2020(colour, self.reference_white, self.saturation)
+        } else {
+            colour
+        };
+        frame
+            .draw_solid(r, &[Rectangle::from_size(r.size)], colour)
+            .context("Frame::draw_solid (screenshot toolbar) failed")
+    }
+
+    /// A compositor rect in this output's physical pixels.
+    fn phys(&self, r: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+        Rectangle::new(
+            Point::from((
+                scale_i(r.loc.x - self.origin.x, self.scale),
+                scale_i(r.loc.y - self.origin.y, self.scale),
+            )),
+            Size::from((scale_i(r.size.w, self.scale), scale_i(r.size.h, self.scale))),
+        )
+    }
+
+    /// Stroke a unit-box segment list across `dst`, on the GPU.
+    fn strokes(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        dst: Rectangle<i32, Physical>,
+        segs: &[[f32; 4]],
+        colour: [f32; 3],
+        thickness: f32,
+    ) -> Result<()> {
+        if segs.is_empty() || dst.size.w <= 0 || dst.size.h <= 0 {
+            return Ok(());
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "button sizes are a few dozen pixels and the segment count is capped at SEGMENTS_MAX"
+        )]
+        let (w, h) = (dst.size.w as f32, dst.size.h as f32);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "capped at SEGMENTS_MAX (12)"
+        )]
+        let count = segs.len().min(SEGMENTS_MAX) as i32;
+        let mut uniforms = vec![
+            Uniform::new("count", count),
+            Uniform::new("colour", colour),
+            Uniform::new("thickness", thickness),
+            Uniform::new("quad", (w, h)),
+        ];
+        for (i, s) in segs.iter().take(SEGMENTS_MAX).enumerate() {
+            uniforms.push(Uniform::new(
+                format!("segments[{i}]"),
+                [s[0] * w, s[1] * h, s[2] * w, s[3] * h],
+            ));
+        }
+        let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((1.0, 1.0)));
+        frame
+            .render_texture_from_to(
+                self.blank,
+                src,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                &[],
+                Transform::Normal,
+                1.0,
+                Some(self.segment),
+                &uniforms,
+            )
+            .context("segment stroke draw failed")
+    }
+}
+
+/// Draw the options bar: a dark slab, a hover/active wash per button, and
+/// each glyph stroked straight onto the framebuffer.
+fn draw_toolbar(
+    frame: &mut GlesFrame<'_, '_>,
+    bar: &Toolbar,
+    paint: &OverlayPaint<'_>,
+) -> Result<()> {
+    const SLAB: Color32F = Color32F::new(0.09, 0.09, 0.11, 0.94);
+    const HOVER: Color32F = Color32F::new(1.0, 1.0, 1.0, 0.14);
+    const ACTIVE: Color32F = Color32F::new(0.25, 0.62, 1.0, 0.55);
+    const GLYPH: [f32; 3] = [0.93, 0.93, 0.95];
+
+    paint.fill(frame, paint.phys(bar.bar), SLAB)?;
+    for b in &bar.buttons {
+        let dst = paint.phys(b.rect);
+        if b.active {
+            paint.fill(frame, dst, ACTIVE)?;
+        } else if b.hovered {
+            paint.fill(frame, dst, HOVER)?;
+        }
+        match b.icon {
+            ToolIcon::Swatch(rgb) => {
+                // The swatch *is* the icon: inset so the active wash
+                // behind it still reads as a ring around the colour.
+                let inset = (dst.size.w / 5).max(2);
+                let sw = Rectangle::new(
+                    Point::from((dst.loc.x + inset, dst.loc.y + inset)),
+                    Size::from((dst.size.w - 2 * inset, dst.size.h - 2 * inset)),
+                );
+                paint.fill(frame, sw, Color32F::new(rgb[0], rgb[1], rgb[2], 1.0))?;
+            }
+            icon => {
+                // Stroke width tracks the button, so the glyphs stay in
+                // proportion at any output scale.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "button sizes are a few dozen pixels"
+                )]
+                let thickness = (dst.size.w as f32 / 14.0).max(1.5);
+                paint.strokes(frame, dst, tool_segments(icon), GLYPH, thickness)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The unit-square segment list for a tool glyph, in a 0..1 box. Scaled
+/// to the button at draw time so the icons stay sharp at any output
+/// scale — there is no bitmap anywhere in this path.
+fn tool_segments(icon: ToolIcon) -> &'static [[f32; 4]] {
+    match icon {
+        // A tick: down-right, then up-right and longer.
+        ToolIcon::Take => &[[0.20, 0.52, 0.42, 0.74], [0.42, 0.74, 0.80, 0.26]],
+        // A pencil: the shaft, then the two short edges of its nib.
+        ToolIcon::Draw => &[
+            [0.24, 0.76, 0.68, 0.24],
+            [0.68, 0.24, 0.80, 0.34],
+            [0.80, 0.34, 0.36, 0.84],
+            [0.36, 0.84, 0.24, 0.76],
+        ],
+        // A capital T.
+        ToolIcon::Text => &[[0.22, 0.24, 0.78, 0.24], [0.50, 0.24, 0.50, 0.78]],
+        ToolIcon::Cancel => &[[0.26, 0.26, 0.74, 0.74], [0.74, 0.26, 0.26, 0.74]],
+        // Drawn as a filled quad instead; no strokes.
+        ToolIcon::Swatch(_) => &[],
+    }
 }
 
 /// Paint the screenshot selection UI onto one output: a translucent dim

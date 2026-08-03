@@ -646,6 +646,8 @@ pub(crate) struct State {
     /// setting the selection must happen on the main thread.
     pub(crate) screenshot_clipboard_tx:
         smithay::reexports::calloop::channel::Sender<Vec<u8>>,
+    /// Recognised text on its way back from the OCR worker.
+    pub(crate) screenshot_text_tx: smithay::reexports::calloop::channel::Sender<String>,
     /// Control-IPC state: the stable window-id registry (and, later,
     /// event subscribers). The socket lives on the event loop; this is
     /// the bookkeeping its dispatch reads + writes.
@@ -672,12 +674,23 @@ pub(crate) struct ScreenshotState {
     pub(crate) region: Option<smithay::utils::Rectangle<i32, Physical>>,
     /// An in-flight move/resize of the committed selection: what was
     /// grabbed, where the cursor was, and the rect at that moment.
-    pub(crate) grab: Option<(
-        screenshot::SelectionGrab,
-        (f64, f64),
-        smithay::utils::Rectangle<i32, Physical>,
-    )>,
+    pub(crate) grab: Option<SelectionDrag>,
+    /// Annotation mode: dragging inside the selection draws instead of
+    /// moving it.
+    pub(crate) drawing: bool,
+    /// The annotation colour. Red, because that is what an annotation is
+    /// for nine times in ten.
+    pub(crate) pen: screenshot::PenColour,
 }
+
+/// An in-flight move/resize of the committed selection: what was grabbed,
+/// where the cursor was when it was, and the rect at that moment. Deltas
+/// are measured from those two so a drag can't accumulate rounding.
+pub(crate) type SelectionDrag = (
+    screenshot::SelectionGrab,
+    (f64, f64),
+    smithay::utils::Rectangle<i32, Physical>,
+);
 
 /// A frozen full-output capture kept for the duration of a freeze-mode
 /// session — the backdrop shown during selection and the source the final
@@ -4583,6 +4596,8 @@ impl State {
                     frozen: std::collections::HashMap::new(),
                     region: None,
                     grab: None,
+                    drawing: false,
+                    pen: screenshot::PenColour::Red,
                 });
                 if bind.freeze {
                     // Snapshot every output. The overlay (dim) is held back
@@ -4634,8 +4649,96 @@ impl State {
     fn update_screenshot_overlay(&mut self) {
         let selection = self.current_screenshot_selection();
         let handles = self.screenshot.as_ref().is_some_and(|s| s.region.is_some());
+        let toolbar = self.build_screenshot_toolbar();
+        self.renderer.set_screenshot_overlay(Some(render::ScreenshotOverlay {
+            selection,
+            handles,
+            toolbar,
+        }));
+    }
+
+    /// The options bar for the committed selection, laid out and marked up
+    /// with what is currently in effect and what the pointer is over.
+    ///
+    /// `None` until a selection is committed — there is nothing to offer
+    /// options about while one is still being dragged out.
+    fn build_screenshot_toolbar(&self) -> Option<render::Toolbar> {
+        let session = self.screenshot.as_ref()?;
+        let sel = session.region?;
+        let bounds = self.screenshot_output_bounds(sel)?;
+        let at = self.renderer.cursor_pos();
+        let (bar, slots) = screenshot::toolbar_layout(sel, bounds);
+        let hovered = screenshot::tool_at(sel, bounds, at);
+        let buttons = slots
+            .into_iter()
+            .map(|(tool, rect)| render::ToolButton {
+                rect,
+                icon: match tool {
+                    screenshot::Tool::Take => render::ToolIcon::Take,
+                    screenshot::Tool::Draw => render::ToolIcon::Draw,
+                    screenshot::Tool::Colour(c) => render::ToolIcon::Swatch(c.rgb()),
+                    screenshot::Tool::CopyText => render::ToolIcon::Text,
+                    screenshot::Tool::Cancel => render::ToolIcon::Cancel,
+                },
+                active: match tool {
+                    screenshot::Tool::Draw => session.drawing,
+                    screenshot::Tool::Colour(c) => c == session.pen,
+                    _ => false,
+                },
+                hovered: hovered == Some(tool),
+            })
+            .collect();
+        Some(render::Toolbar { bar, buttons })
+    }
+
+    /// The output rect a selection belongs to — the toolbar is placed
+    /// inside it, so it can't end up off the side of the screen.
+    fn screenshot_output_bounds(
+        &self,
+        sel: smithay::utils::Rectangle<i32, Physical>,
+    ) -> Option<smithay::utils::Rectangle<i32, Physical>> {
+        let center = sel.loc + Point::from((sel.size.w / 2, sel.size.h / 2));
         self.renderer
-            .set_screenshot_overlay(Some(render::ScreenshotOverlay { selection, handles }));
+            .output_at(center)
+            .or_else(|| self.renderer.output_at(sel.loc))
+            .map(|g| g.compositor)
+    }
+
+    /// Act on a toolbar button. Returns whether the press was consumed —
+    /// a press on the bar must never be read as "start a new selection".
+    fn screenshot_toolbar_press(&mut self) -> bool {
+        let at = self.renderer.cursor_pos();
+        let Some(sel) = self.screenshot.as_ref().and_then(|s| s.region) else {
+            return false;
+        };
+        let Some(bounds) = self.screenshot_output_bounds(sel) else {
+            return false;
+        };
+        if !screenshot::on_toolbar(sel, bounds, at) {
+            return false;
+        }
+        match screenshot::tool_at(sel, bounds, at) {
+            Some(screenshot::Tool::Take) => self.finalize_compositor_rect(sel),
+            Some(screenshot::Tool::Cancel) => self.cancel_screenshot(),
+            Some(screenshot::Tool::Draw) => {
+                if let Some(s) = &mut self.screenshot {
+                    s.drawing = !s.drawing;
+                }
+                self.update_screenshot_overlay();
+            }
+            Some(screenshot::Tool::Colour(c)) => {
+                if let Some(s) = &mut self.screenshot {
+                    s.pen = c;
+                    // Picking a colour is how you start annotating.
+                    s.drawing = true;
+                }
+                self.update_screenshot_overlay();
+            }
+            Some(screenshot::Tool::CopyText) => self.copy_selection_text(sel),
+            // A press on the bar's padding: consumed, but does nothing.
+            None => {}
+        }
+        true
     }
 
     /// The current selection in absolute compositor coords: the committed
@@ -4681,6 +4784,11 @@ impl State {
         };
         match mode {
             config::ScreenshotMode::Region => {
+                // The bar sits outside the selection, so a press on it
+                // would otherwise read as "start a new one".
+                if self.screenshot_toolbar_press() {
+                    return;
+                }
                 let at = self.renderer.cursor_pos();
                 if let Some(s) = &mut self.screenshot {
                     // A committed selection takes the press if it was
@@ -4878,6 +4986,77 @@ impl State {
         if let Err(err) = spawned {
             warn!(error = %err, "screenshot: failed to spawn encode thread");
         }
+    }
+
+    /// Read the text in the selection and put it on the clipboard.
+    ///
+    /// Only works in freeze mode, which is the mode this whole editing UI
+    /// assumes: the pixels have to still exist to be read, and a live
+    /// capture wouldn't arrive until after the session ended.
+    fn copy_selection_text(&mut self, sel: smithay::utils::Rectangle<i32, Physical>) {
+        let Some(geom) = self.screenshot_output_geometry(sel) else {
+            return;
+        };
+        let Some((bytes, w, h)) = self
+            .screenshot
+            .as_ref()
+            .and_then(|s| s.frozen.get(&geom.0))
+            .map(|f| (f.bytes.clone(), f.width, f.height))
+        else {
+            warn!("screenshot: text copy needs freeze mode (nothing to read)");
+            return;
+        };
+        let tx = self.screenshot_text_tx.clone();
+        let region = geom.1;
+        let spawned = std::thread::Builder::new()
+            .name("screenshot-ocr".to_owned())
+            .spawn(move || match screenshot::read_text(&bytes, w, h, region) {
+                Ok(text) if text.trim().is_empty() => {
+                    info!("screenshot: no text found in the selection");
+                }
+                Ok(text) => {
+                    let _ = tx.send(text);
+                }
+                Err(err) => warn!(error = %err, "screenshot: text recognition failed"),
+            });
+        if let Err(err) = spawned {
+            warn!(error = %err, "screenshot: failed to spawn OCR thread");
+        }
+    }
+
+    /// Resolve a selection to `(output name, region in that output's
+    /// framebuffer pixels)`.
+    fn screenshot_output_geometry(
+        &self,
+        sel: smithay::utils::Rectangle<i32, Physical>,
+    ) -> Option<(String, smithay::utils::Rectangle<i32, Physical>)> {
+        let center = sel.loc + Point::from((sel.size.w / 2, sel.size.h / 2));
+        let geom = self
+            .renderer
+            .output_at(center)
+            .or_else(|| self.renderer.output_at(sel.loc))?;
+        let clamped = sel.intersection(geom.compositor)?;
+        let phys = compositor_rect_to_physical(clamped, geom.compositor.loc, geom.scale);
+        (phys.size.w >= 1 && phys.size.h >= 1).then_some((geom.name, phys))
+    }
+
+    /// Put recognised text on the clipboard, on the main thread (where
+    /// selections have to be set).
+    pub(crate) fn set_screenshot_text_clipboard(&mut self, text: String) {
+        let mime = "text/plain;charset=utf-8".to_owned();
+        self.clipboard.set_image(
+            smithay::wayland::selection::SelectionTarget::Clipboard,
+            mime.clone(),
+            text.into_bytes(),
+        );
+        let dh = self.display_handle.clone();
+        smithay::wayland::selection::data_device::set_data_device_selection::<State>(
+            &dh,
+            &self.seat,
+            vec![mime, "text/plain".to_owned(), "UTF8_STRING".to_owned()],
+            (),
+        );
+        info!("screenshot: text copied to clipboard");
     }
 
     /// Put a finished screenshot PNG on the clipboard. Called on the main
@@ -5482,6 +5661,18 @@ fn main() -> Result<()> {
         })
         .expect("insert screenshot clipboard channel");
 
+    // Same shape for recognised text: OCR runs out of process on a worker,
+    // and the selection is set back here on the main thread.
+    let (screenshot_text_tx, screenshot_text_rx) =
+        smithay::reexports::calloop::channel::channel::<String>();
+    handle
+        .insert_source(screenshot_text_rx, |event, (), state: &mut State| {
+            if let smithay::reexports::calloop::channel::Event::Msg(text) = event {
+                state.set_screenshot_text_clipboard(text);
+            }
+        })
+        .expect("insert screenshot text channel");
+
     let mut state = State {
         session,
         loop_signal,
@@ -5586,6 +5777,7 @@ fn main() -> Result<()> {
         screenshot_pending: Vec::new(),
         local_offset,
         screenshot_clipboard_tx,
+        screenshot_text_tx,
         ipc: ipc::IpcState::default(),
     };
     // Engage Num Lock at startup when configured. Goes through the xkb
