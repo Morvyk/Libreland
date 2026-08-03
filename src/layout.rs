@@ -998,6 +998,26 @@ impl Layout {
         self.outputs.iter().position(|o| rect_contains(o.full, p))
     }
 
+    /// The output `p` is on, or — when it is on none — the nearest one.
+    ///
+    /// The cursor clamps to the *layout* bounds, which are one pixel
+    /// past the last output pixel on the right and bottom, so a pointer
+    /// pushed hard against the far edge of the far monitor belongs to no
+    /// output at all. Every ordinary hit-test wants `None` there. A
+    /// gesture aimed at a screen edge does not: giving up at exactly the
+    /// position the gesture is aimed at is the one answer that can't be
+    /// right.
+    fn outpane_near(&self, p: Point<i32, Physical>) -> Option<usize> {
+        if let Some(i) = self.outpane_at(p) {
+            return Some(i);
+        }
+        self.outputs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, o)| rect_distance_sq(o.full, p))
+            .map(|(i, _)| i)
+    }
+
     /// Pick the output a new / dropped window belongs to: the one
     /// the cursor is over, else the first output as a sensible
     /// default, else `None` when there are no outputs at all.
@@ -1416,27 +1436,44 @@ impl Layout {
         false
     }
 
-    /// Which snap a move drop at `pos` would take, if any. Floating
-    /// mode only: a tiling drop re-enters the tree at the cursor, and
-    /// two rules for one gesture is one too many.
-    pub fn snap_at(&self, pos: Point<i32, Physical>, zone: i32) -> Option<SnapTarget> {
+    /// Resolve a quick-tile for a move drop at `pos`: which output it
+    /// homes to, which snap it takes, and the rect that gives it.
+    ///
+    /// Floating mode only — a tiling drop re-enters the tree at the
+    /// cursor, and two rules for one gesture is one too many.
+    ///
+    /// You *aim* at the physical edge of the screen and the window
+    /// *lands* in the work area. Those are deliberately different rects:
+    /// arming off the work area would put the bottom trigger along the
+    /// top of your panel, where there is no edge to see and nothing
+    /// stops the pointer, while landing on the full output would tuck
+    /// the window underneath the panel.
+    fn snap_resolve(
+        &self,
+        pos: Point<i32, Physical>,
+        zone: i32,
+    ) -> Option<(usize, SnapTarget, Rectangle<i32, Physical>)> {
         if self.mode != LayoutMode::Floating {
             return None;
         }
-        let i = self.outpane_at(pos)?;
-        snap_target(self.outputs[i].area().work, pos, zone)
+        let i = self.outpane_near(pos)?;
+        let op = &self.outputs[i];
+        // Clamped so the pointer parked one pixel past the last column
+        // still reads as "hard against the right edge", which is what it
+        // looks like on screen.
+        let target = snap_target(op.full, clamp_into(op.full, pos), zone)?;
+        Some((i, target, target.rect_in(op.area().work)))
     }
 
-    /// The rect [`Self::snap_at`]'s target would give a window — what
-    /// the drag preview draws.
+    /// The rect the armed quick-tile would give a window — what the
+    /// drag preview draws, and, because it comes from the same
+    /// `snap_resolve` the drop uses, exactly where it will land.
     pub fn snap_preview(
         &self,
         pos: Point<i32, Physical>,
         zone: i32,
     ) -> Option<Rectangle<i32, Physical>> {
-        let target = self.snap_at(pos, zone)?;
-        let i = self.outpane_at(pos)?;
-        Some(target.rect_in(self.outputs[i].area().work))
+        self.snap_resolve(pos, zone).map(|(_, _, rect)| rect)
     }
 
     /// Whether picking this window up would change its geometry — it is
@@ -1725,13 +1762,13 @@ impl Layout {
     ///   tree at the cursor's drop position (same rule as spawn).
     /// - `Floating` source: window goes back into the floating
     ///   list at the top of the stack, with whatever rect it
-    ///   has now — or, if the drop is within `snap_zone` of a work-area
+    ///   has now — or, if the drop is within `snap_zone` of a screen
     ///   edge, the [`SnapTarget`] that arms (the same one the drag
     ///   preview has been showing).
     ///
     /// Silent no-op when there's no drag in flight.
     pub fn finish_move_drag(&mut self, cursor: Point<i32, Physical>, snap_zone: i32) {
-        let snap = self.snap_at(cursor, snap_zone);
+        let snap = self.snap_resolve(cursor, snap_zone);
         let Some(mut t) = self.in_transit.take() else {
             return;
         };
@@ -1740,11 +1777,14 @@ impl Layout {
             t.window.rect.loc.x + t.window.rect.size.w / 2,
             t.window.rect.loc.y + t.window.rect.size.h / 2,
         );
-        // Resolve the destination output: under the drop cursor, else
-        // under the window's centre (cursor in a monitor gap), else
-        // the first output. `None` only when there are no outputs.
-        let Some(idx) = self
-            .outpane_at(cursor)
+        // Resolve the destination output: the snap's own output when one
+        // is armed — the preview has been drawn on it, so the window must
+        // land there — else under the drop cursor, else under the
+        // window's centre (cursor in a monitor gap), else the first
+        // output. `None` only when there are no outputs.
+        let Some(idx) = snap
+            .map(|(i, _, _)| i)
+            .or_else(|| self.outpane_at(cursor))
             .or_else(|| self.outpane_at(center))
             .or_else(|| (!self.outputs.is_empty()).then_some(0))
         else {
@@ -1782,10 +1822,9 @@ impl Layout {
                 // genuinely maximized: it keeps the state its client was
                 // told about, un-maximizes from the titlebar, and leaves
                 // `rect` holding the geometry to come back to.
-                match snap {
-                    Some(SnapTarget::Maximize) => t.window.fill = FillMode::Maximized,
-                    Some(target) => {
-                        let rect = target.rect_in(self.outputs[idx].area().work);
+                match snap.map(|(_, target, rect)| (target, rect)) {
+                    Some((SnapTarget::Maximize, _)) => t.window.fill = FillMode::Maximized,
+                    Some((_, rect)) => {
                         // Only the *first* snap records where to return
                         // to; snapping left and then right must not make
                         // the left half the window's idea of "restored".
@@ -4051,6 +4090,23 @@ fn shrink_for_outer(bounds: Rectangle<i32, Physical>, outer: i32) -> Rectangle<i
     )
 }
 
+/// Squared distance from `p` to the nearest pixel of `r` — `0` when `p`
+/// is inside it. Squared because it is only ever compared, and `i64`
+/// because a coordinate difference squared leaves i32 on a wide layout.
+fn rect_distance_sq(r: Rectangle<i32, Physical>, p: Point<i32, Physical>) -> i64 {
+    let dx = i64::from((r.loc.x - p.x).max(p.x - (r.loc.x + r.size.w - 1)).max(0));
+    let dy = i64::from((r.loc.y - p.y).max(p.y - (r.loc.y + r.size.h - 1)).max(0));
+    dx * dx + dy * dy
+}
+
+/// `p` moved to the nearest pixel inside `r`.
+fn clamp_into(r: Rectangle<i32, Physical>, p: Point<i32, Physical>) -> Point<i32, Physical> {
+    Point::from((
+        p.x.clamp(r.loc.x, (r.loc.x + r.size.w - 1).max(r.loc.x)),
+        p.y.clamp(r.loc.y, (r.loc.y + r.size.h - 1).max(r.loc.y)),
+    ))
+}
+
 fn rect_contains(r: Rectangle<i32, Physical>, p: Point<i32, Physical>) -> bool {
     r.size.w > 0
         && r.size.h > 0
@@ -4233,17 +4289,19 @@ mod cascade_tests {
 
 #[cfg(test)]
 mod snap_tests {
-    use super::{Point, Rectangle, Size, SnapTarget, snap_target};
-
-    /// A 1000x600 work area at an offset, so a test that quietly assumed
-    /// the origin was (0, 0) fails.
-    fn work() -> Rectangle<i32, Physical> {
-        Rectangle::new(Point::from((100, 50)), Size::from((1000, 600)))
-    }
+    use super::{Point, Rectangle, Size, SnapTarget, clamp_into, snap_target};
     use smithay::utils::Physical;
 
+    /// A 1000x600 output at an offset, so a test that quietly assumed
+    /// the origin was (0, 0) fails. Snaps are *armed* against the whole
+    /// screen like this; the rect they produce is measured against the
+    /// work area, which is the same thing minus any panel.
+    fn screen() -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((100, 50)), Size::from((1000, 600)))
+    }
+
     fn at(x: i32, y: i32) -> Option<SnapTarget> {
-        snap_target(work(), Point::from((x, y)), 20)
+        snap_target(screen(), Point::from((x, y)), 20)
     }
 
     /// The gesture as described: left edge tiles left, top maximizes,
@@ -4268,6 +4326,27 @@ mod snap_tests {
         assert_eq!(at(1099, 50), Some(SnapTarget::TopRight));
     }
 
+    /// The pointer clamps to the layout bounds, which are one pixel
+    /// *past* the last pixel of the last output — so a drag shoved hard
+    /// against the right edge of the right-hand monitor sits on no
+    /// output at all. Clamping it back in is what makes the gesture
+    /// reach as far as the pointer visibly does.
+    #[test]
+    fn a_pointer_one_pixel_past_the_edge_still_arms_that_edge() {
+        let s = screen();
+        let past_right = Point::from((s.loc.x + s.size.w, 350));
+        assert_eq!(snap_target(s, past_right, 20), None, "un-clamped: no snap");
+        assert_eq!(
+            snap_target(s, clamp_into(s, past_right), 20),
+            Some(SnapTarget::Right)
+        );
+        let past_corner = Point::from((s.loc.x + s.size.w, s.loc.y + s.size.h));
+        assert_eq!(
+            snap_target(s, clamp_into(s, past_corner), 20),
+            Some(SnapTarget::BottomRight)
+        );
+    }
+
     /// Nothing arms away from an edge, and the bottom edge alone arms
     /// nothing anywhere along its middle — there is no "bottom half"
     /// worth having, and a preview flashing as you drag a window low
@@ -4276,19 +4355,19 @@ mod snap_tests {
     fn the_middle_and_the_bottom_edge_arm_nothing() {
         assert_eq!(at(600, 350), None);
         assert_eq!(at(600, 645), None);
-        // Outside the work area entirely (a panel's exclusive zone, or
-        // another monitor) arms nothing either.
+        // Off the screen entirely (another monitor) arms nothing here —
+        // the caller resolves which output to ask first.
         assert_eq!(at(600, 40), None);
         // A zone of zero disables snapping, which is what the config
         // documents `snap_zone = 0` as doing.
-        assert_eq!(snap_target(work(), Point::from((105, 350)), 0), None);
+        assert_eq!(snap_target(screen(), Point::from((105, 350)), 0), None);
     }
 
     /// Two snapped halves must cover the work area exactly. A rounding
     /// rule that let both round down would leave a one-pixel stripe of
     /// wallpaper down the middle of the screen.
     #[test]
-    fn halves_and_quarters_tile_the_work_area_exactly() {
+    fn halves_and_quarters_tile_the_area_exactly() {
         for w in [1000, 1001, 2559, 3840] {
             for h in [600, 601, 1439, 2160] {
                 let area = Rectangle::new(Point::from((100, 50)), Size::from((w, h)));
@@ -4307,7 +4386,7 @@ mod snap_tests {
                 assert_eq!(br.loc.y + br.size.h, area.loc.y + area.size.h);
             }
         }
-        assert_eq!(SnapTarget::Maximize.rect_in(work()), work());
+        assert_eq!(SnapTarget::Maximize.rect_in(screen()), screen());
     }
 }
 

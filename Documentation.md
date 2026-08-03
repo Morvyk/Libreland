@@ -720,7 +720,7 @@ opposite half to drag the divider it *does* share with a neighbour. Resizing a
 ### Quick-tile
 
 In **floating** mode, dragging a window to within `layout.snap_zone` of a
-work-area edge arms a snap, previewed as a tinted rect where the window will
+screen edge arms a snap, previewed as a tinted rect where the window will
 land. Release to take it; drag back out of the zone and the preview clears.
 
 | Where the cursor is | What you get |
@@ -743,8 +743,19 @@ pixels before anything moves: a click on a maximized titlebar stays a click.
 Resizing a snapped window by hand makes it an ordinary window at an ordinary
 size, with nothing left to return to.
 
-The snap area is the *work* area, so a window snapped to the left half sits
-beside your panel rather than under it.
+You aim at the **screen** edge and the window lands in the **work** area, and
+those are deliberately two different rectangles. Arming off the work area
+would put the bottom trigger along the top of your panel — an invisible line
+with nothing to stop the pointer against — while landing on the full output
+would tuck the window under the panel. So the bottom edge of the screen arms
+the bottom corners even where your panel covers it, and a window snapped to
+the left half still sits beside the panel rather than beneath it.
+
+A pointer shoved hard against the far edge of the far monitor sits, by one
+pixel, on no output at all — the cursor clamps to the layout bounds, which
+end one past the last output pixel. Ordinary hit-testing wants nothing there;
+a gesture aimed at a screen edge does, so the snap clamps back onto the
+nearest output. The zone reaches as far as the pointer visibly does.
 
 Workspaces are per-output and dynamic (niri-style): each output starts with
 one, scrolling down materializes a fresh empty workspace to move into, and

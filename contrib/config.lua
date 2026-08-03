@@ -104,7 +104,7 @@ layout = {
     gaps_inner = 3,   -- px between neighbouring tiles
     -- Floating mode only. How far outside an edge a press still grabs that
     -- edge to resize (the border itself is far too thin to aim at), and how
-    -- close to a work-area edge a dragged window quick-tiles: a side gives
+    -- close to a screen edge a dragged window quick-tiles: a side gives
     -- you a half, the end of a side a quarter, and the top maximizes.
     -- snap_zone = 0 disables snapping.
     resize_zone = 8,
