@@ -152,9 +152,11 @@ pub(crate) const PICKER_PAD: i32 = 8;
 /// Where the colour picker sits for a toolbar at `bar`, and the rects of
 /// its two parts: `(panel, plane, hue)`.
 ///
-/// Directly above the toolbar, or below it when the toolbar is high
-/// enough on screen that above would not fit. Left-aligned with the bar,
-/// then clamped, so it never hangs off the edge.
+/// Below the toolbar, which puts it *away* from the selection — the
+/// toolbar already sits under the selection, so a picker above the bar
+/// lands between the two and covers the bottom of the very thing you are
+/// drawing on. Above only when there is no room below. Left-aligned with
+/// the bar, then clamped, so it never hangs off the edge.
 pub(crate) fn picker_layout(
     bar: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
@@ -166,12 +168,15 @@ pub(crate) fn picker_layout(
     use smithay::utils::{Point, Size};
     let w = PICKER_PLANE + PICKER_PAD + PICKER_HUE_W + 2 * PICKER_PAD;
     let h = PICKER_PLANE + 2 * PICKER_PAD;
+    let below = bar.loc.y + bar.size.h + PICKER_PAD;
     let above = bar.loc.y - PICKER_PAD - h;
-    let y = if above >= bounds.loc.y {
+    let y = if below + h <= bounds.loc.y + bounds.size.h {
+        below
+    } else if above >= bounds.loc.y {
         above
     } else {
-        (bar.loc.y + bar.size.h + PICKER_PAD)
-            .min((bounds.loc.y + bounds.size.h - h).max(bounds.loc.y))
+        // Neither fits: sit inside the bottom edge rather than off it.
+        (bounds.loc.y + bounds.size.h - h).max(bounds.loc.y)
     };
     let x = bar
         .loc
