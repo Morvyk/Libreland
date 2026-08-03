@@ -187,29 +187,40 @@ impl Screen for OutputPicker {
 
 // ── Region selector ────────────────────────────────────────────────────────
 
+/// Look one output's capture up by connector name.
+fn frame_named<'a>(frames: &'a [(String, Frame)], name: &str) -> Option<&'a Frame> {
+    frames.iter().find(|(n, _)| n == name).map(|(_, f)| f)
+}
+
 /// What a region drag produced: an output and a rectangle inside it, in that
 /// output's *physical* pixels (the coordinate space captures come back in).
-#[derive(Clone, Copy, Debug)]
+///
+/// The output is named, not indexed. Two orderings meet here and they do not
+/// agree: the capture list is sorted by connector name, the overlay's
+/// surfaces by layout position. Passing an index across that boundary silently
+/// picked a different monitor whenever alphabetical order differed from
+/// left-to-right order.
+#[derive(Clone, Debug)]
 pub struct Region {
-    pub output: usize,
+    pub output: String,
     pub rect: Rect,
 }
 
 /// Drag a rectangle over a frozen capture of the desktop.
 pub struct RegionPicker {
     outputs: Vec<OutputDesc>,
-    frames: Vec<Frame>,
+    frames: Vec<(String, Frame)>,
     /// Drag start, in logical coordinates of the output it began on.
     anchor: Option<(usize, f64, f64)>,
     current: Option<(f64, f64)>,
     hovered: Option<usize>,
     pub region: Option<Region>,
-    /// True when the user clicked without dragging: take the whole output.
-    pub whole_output: Option<usize>,
+    /// Set when the user clicked without dragging: take the whole output.
+    pub whole_output: Option<String>,
 }
 
 impl RegionPicker {
-    pub fn new(frames: Vec<Frame>) -> Self {
+    pub fn new(frames: Vec<(String, Frame)>) -> Self {
         Self {
             outputs: Vec::new(),
             frames,
@@ -219,6 +230,13 @@ impl RegionPicker {
             region: None,
             whole_output: None,
         }
+    }
+
+    /// The capture belonging to overlay surface `surface`, matched by
+    /// connector name rather than by position in either list.
+    fn frame_for(&self, surface: usize) -> Option<&Frame> {
+        let name = &self.outputs.get(surface)?.name;
+        frame_named(&self.frames, name)
     }
 
     /// The in-progress selection in logical coordinates.
@@ -244,7 +262,7 @@ impl Screen for RegionPicker {
         let theme = &ctx.theme;
         let (w, h) = canvas.size();
         // The frozen desktop underneath, then a dim wash over it.
-        if let Some(frame) = self.frames.get(surface) {
+        if let Some(frame) = self.frame_for(surface) {
             canvas.blit(
                 Rect::new(0, 0, w, h),
                 &Image {
@@ -265,7 +283,7 @@ impl Screen for RegionPicker {
             && !rect.is_empty()
         {
             // Punch the selection back through to the unwashed capture.
-            if let Some(frame) = self.frames.get(surface) {
+            if let Some(frame) = self.frame_for(surface) {
                 let scale = f64::from(frame.width) / f64::from(w.max(1));
                 let src = Rect::new(
                     (f64::from(rect.x) * scale) as i32,
@@ -325,17 +343,19 @@ impl Screen for RegionPicker {
                 let Some((sel_surface, rect)) = self.selection() else {
                     return Flow::Idle;
                 };
+                let Some(name) = self.outputs.get(sel_surface).map(|o| o.name.clone()) else {
+                    return Flow::Idle;
+                };
                 // A click (or a slip of a few pixels) means the whole monitor;
                 // anything bigger is a deliberate region.
                 if rect.w < 8 || rect.h < 8 {
-                    self.whole_output = Some(sel_surface);
+                    self.whole_output = Some(name);
                     return Flow::Done;
                 }
                 // Logical → physical, using the capture's own dimensions so
                 // the region lands on the right pixels under fractional scale.
                 let scale = self
-                    .frames
-                    .get(sel_surface)
+                    .frame_for(sel_surface)
                     .zip(self.outputs.get(sel_surface))
                     .map_or(1.0, |(frame, desc)| {
                         f64::from(frame.width) / f64::from(desc.width.max(1))
@@ -347,7 +367,7 @@ impl Screen for RegionPicker {
                     (f64::from(rect.h) * scale).round() as i32,
                 );
                 self.region = Some(Region {
-                    output: sel_surface,
+                    output: name,
                     rect: physical,
                 });
                 Flow::Done
@@ -375,7 +395,7 @@ impl Screen for RegionPicker {
 /// Sample one pixel from a frozen capture, with a magnifier to aim by.
 pub struct ColorPicker {
     outputs: Vec<OutputDesc>,
-    frames: Vec<Frame>,
+    frames: Vec<(String, Frame)>,
     at: Option<(usize, f64, f64)>,
     /// The picked colour as straight RGB in 0.0–1.0, which is what the portal
     /// returns.
@@ -383,7 +403,7 @@ pub struct ColorPicker {
 }
 
 impl ColorPicker {
-    pub fn new(frames: Vec<Frame>) -> Self {
+    pub fn new(frames: Vec<(String, Frame)>) -> Self {
         Self {
             outputs: Vec::new(),
             frames,
@@ -392,10 +412,11 @@ impl ColorPicker {
         }
     }
 
-    /// The captured pixel under a logical position on `surface`.
+    /// The captured pixel under a logical position on `surface`. Matched by
+    /// connector name — see [`Region`] for why an index would not do.
     fn sample(&self, surface: usize, x: f64, y: f64) -> Option<(u8, u8, u8)> {
-        let frame = self.frames.get(surface)?;
         let desc = self.outputs.get(surface)?;
+        let frame = frame_named(&self.frames, &desc.name)?;
         let scale_x = f64::from(frame.width) / f64::from(desc.width.max(1));
         let scale_y = f64::from(frame.height) / f64::from(desc.height.max(1));
         let (px, py) = (
@@ -418,7 +439,11 @@ impl Screen for ColorPicker {
         const CELLS: i32 = 17;
         let theme = &ctx.theme;
         let (w, h) = canvas.size();
-        let Some(frame) = self.frames.get(surface) else {
+        let Some(frame) = self
+            .outputs
+            .get(surface)
+            .and_then(|d| frame_named(&self.frames, &d.name))
+        else {
             canvas.clear(Color::rgb(0x0010_1216));
             return;
         };

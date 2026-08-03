@@ -31,11 +31,13 @@ use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
@@ -109,11 +111,35 @@ pub struct Output {
     pub width: i32,
     pub height: i32,
     /// Position in the compositor's global layout, for stitching a
-    /// multi-monitor screenshot back together.
+    /// multi-monitor screenshot back together. **Logical**, so it is not
+    /// in the same space as `width`/`height` above — see `logical_width`.
     pub x: i32,
     pub y: i32,
     pub refresh_mhz: i32,
+    /// `wl_output.scale`, which is an integer and therefore rounded up on a
+    /// fractionally-scaled output (1.5 arrives as 2). Good enough to pick a
+    /// cursor size, useless for geometry — use the logical size below.
     pub scale: i32,
+    /// Size in the compositor's global layout, from `xdg_output`. This is
+    /// the space `x`/`y` are in, and it is *not* `width`/`height` unless the
+    /// output is at scale 1: a 4K at scale 1.5 is 3840x2160 physical and
+    /// 2560x1440 logical. Zero if the compositor has no `xdg_output`
+    /// support, in which case callers fall back to the physical size.
+    pub logical_width: i32,
+    pub logical_height: i32,
+}
+
+impl Output {
+    /// Logical size, falling back to the physical one when `xdg_output` is
+    /// unavailable (which is also the correct answer at scale 1).
+    #[must_use]
+    pub const fn logical_size(&self) -> (i32, i32) {
+        if self.logical_width > 0 && self.logical_height > 0 {
+            (self.logical_width, self.logical_height)
+        } else {
+            (self.width, self.height)
+        }
+    }
 }
 
 /// What the compositor is willing to give us for one output.
@@ -185,6 +211,10 @@ enum ImportState {
 struct State {
     outputs: Vec<(wl_output::WlOutput, Output)>,
     screencopy: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
+    /// Bound so each `wl_output` can be asked for its *logical* geometry.
+    /// `wl_output` alone reports a physical mode and an integer scale, which
+    /// cannot describe a fractionally-scaled output's place in the layout.
+    xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     shm: Option<wl_shm::WlShm>,
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     frame: FrameState,
@@ -213,6 +243,7 @@ impl Capturer {
         let mut state = State {
             outputs: Vec::new(),
             screencopy: None,
+            xdg_output_manager: None,
             shm: None,
             dmabuf: None,
             frame: FrameState::default(),
@@ -227,6 +258,19 @@ impl Capturer {
                 "the compositor does not implement zwlr_screencopy_v1 — screen capture is unavailable"
             );
         }
+        // Now that every `wl_output` exists, ask each for its logical
+        // geometry. Requires a third roundtrip: the request can only be made
+        // once the output object is bound, and its reply is another event.
+        if let Some(mgr) = state.xdg_output_manager.clone() {
+            for (wl, _) in &state.outputs {
+                mgr.get_xdg_output(wl, &qh, wl.id());
+            }
+            queue.roundtrip(&mut state)?;
+        } else {
+            tracing::warn!(
+                "compositor has no xdg_output_manager_v1; assuming scale 1 for screenshot layout"
+            );
+        }
         state.outputs.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         Ok(Self { queue, state })
     }
@@ -235,9 +279,21 @@ impl Capturer {
         self.state.outputs.iter().map(|(_, o)| o.clone()).collect()
     }
 
-    /// Layout positions, parallel to [`Capturer::outputs`].
-    pub fn output_positions(&self) -> Vec<(i32, i32)> {
-        self.state.outputs.iter().map(|(_, o)| (o.x, o.y)).collect()
+    /// Each output's rect in the compositor's **logical** layout —
+    /// `(x, y, width, height)` — parallel to [`Capturer::outputs`].
+    ///
+    /// Position and size come from the same space, which is the whole point:
+    /// a frame's size is *physical*, so pairing it with a logical position
+    /// silently mixes units on any fractionally-scaled output.
+    pub fn output_layout_rects(&self) -> Vec<(i32, i32, i32, i32)> {
+        self.state
+            .outputs
+            .iter()
+            .map(|(_, o)| {
+                let (w, h) = o.logical_size();
+                (o.x, o.y, w, h)
+            })
+            .collect()
     }
 
     /// Index of the output with this connector name.
@@ -542,6 +598,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 // explicit modifier; v4/v5 only add feedback we don't use.
                 state.dmabuf = Some(registry.bind(name, version.min(3), qh, ()));
             }
+            "zxdg_output_manager_v1" => {
+                // v2 is where `name` moved to wl_output; we only need
+                // logical_position/logical_size, which are v1.
+                state.xdg_output_manager = Some(registry.bind(name, version.min(3), qh, ()));
+            }
             "wl_output" => {
                 let output: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
                 state.outputs.push((
@@ -554,6 +615,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         y: 0,
                         refresh_mhz: 0,
                         scale: 1,
+                        logical_width: 0,
+                        logical_height: 0,
                     },
                 ));
             }
@@ -597,6 +660,54 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
                 info.y = y;
             }
             wl_output::Event::Scale { factor } => info.scale = factor.max(1),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        _: zxdg_output_manager_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // The manager itself emits nothing.
+    }
+}
+
+/// Keyed by the `wl_output`'s id so the reply can be matched back to the
+/// output it describes — `xdg_output` has no back-pointer of its own.
+impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ObjectId> for State {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_output_v1::ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        output_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some((_, info)) = state
+            .outputs
+            .iter_mut()
+            .find(|(wl, _)| wl.id() == *output_id)
+        else {
+            return;
+        };
+        match event {
+            // Logical geometry supersedes `wl_output.geometry`/`mode` for
+            // layout purposes: it is exact under fractional scaling, where
+            // the integer `wl_output.scale` is not.
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                info.x = x;
+                info.y = y;
+            }
+            zxdg_output_v1::Event::LogicalSize { width, height } => {
+                info.logical_width = width;
+                info.logical_height = height;
+            }
             _ => {}
         }
     }

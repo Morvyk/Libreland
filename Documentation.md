@@ -955,7 +955,7 @@ Both are hard dependencies of the package.
 | Interface | What it does here |
 | --- | --- |
 | `ScreenCast` | Screen sharing. Pick a monitor from a built-in overlay, capture via `zwlr_screencopy_v1` into a **dmabuf** (zero-copy, gbm-allocated) or shared memory, feed a PipeWire node. We drive the graph, pacing captures to the framerate the consumer negotiated. Cursor composited in or left out, per the `[screencast] cursor` setting; source choices persist when the app asks them to. |
-| `Screenshot` | Whole desktop (multi-monitor captures are stitched by layout) or interactive: drag a region over a **frozen** capture, or click a monitor for all of it. Saves a PNG under `~/Pictures/Screenshots`. |
+| `Screenshot` | Whole desktop (multi-monitor captures are stitched by layout, in logical space scaled so the sharpest monitor stays 1:1 — see below) or interactive: drag a region over a **frozen** capture, or click a monitor for all of it. Saves a PNG under `~/Pictures/Screenshots`. |
 | `Screenshot.PickColor` | Magnifier overlay over the frozen desktop; click a pixel. |
 | `FileChooser` | Open / open-multiple / select-folder / save, with places sidebar, breadcrumbs, filters, sorting, type-to-search, hidden-file toggle, and the app's `choices` combos. |
 | `AppChooser` | "Open with…", over the frontend's suggestions plus a search across every installed `.desktop`. |
@@ -970,6 +970,20 @@ Both are hard dependencies of the package.
 virtual pointer/keyboard protocols the compositor doesn't implement, and a
 backend that advertises it and then does nothing is worse than one that
 doesn't claim it.
+
+Two things a screenshot has to get right across several monitors, both of
+which are invisible with only one. A capture comes back sized in **physical**
+pixels while `wl_output` reports its position in **logical** ones, so the
+whole-desktop stitch reads `xdg_output`'s logical geometry and composes in
+that space, scaled by the largest scale factor present — the sharpest monitor
+then maps 1:1 and nothing is ever downscaled. Adding the two spaces together
+instead (which is the obvious thing to write, and what a single-output desktop
+never punishes) pastes each monitor over the previous one. And because the
+capture list is ordered by connector name while the interactive overlay orders
+its surfaces by layout position, everything crossing between them is keyed by
+connector name rather than by index — otherwise selecting a region on the left
+monitor cuts it out of the right one whenever alphabetical order and
+left-to-right order disagree.
 
 The dialogs are drawn by the portal itself — `wl_shm` surfaces, glyphs
 rasterized from a TTF found by walking the XDG font dirs. No toolkit, no
