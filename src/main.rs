@@ -681,6 +681,15 @@ pub(crate) struct ScreenshotState {
     /// The annotation colour. Red, because that is what an annotation is
     /// for nine times in ten.
     pub(crate) pen: screenshot::PenColour,
+    /// Pen width in compositor pixels.
+    pub(crate) pen_width: i32,
+    /// Finished annotation strokes, oldest first.
+    pub(crate) strokes: Vec<screenshot::Stroke>,
+    /// The stroke currently under the pointer, if one is being drawn.
+    pub(crate) stroke: Option<screenshot::Stroke>,
+    /// Dragging the width slider — set while the press is held on it, so
+    /// the width keeps following the pointer past the button's edge.
+    pub(crate) sliding: bool,
 }
 
 /// An in-flight move/resize of the committed selection: what was grabbed,
@@ -4598,6 +4607,10 @@ impl State {
                     grab: None,
                     drawing: false,
                     pen: screenshot::PenColour::Red,
+                    pen_width: screenshot::PEN_DEFAULT,
+                    strokes: Vec::new(),
+                    stroke: None,
+                    sliding: false,
                 });
                 if bind.freeze {
                     // Snapshot every output. The overlay (dim) is held back
@@ -4650,10 +4663,24 @@ impl State {
         let selection = self.current_screenshot_selection();
         let handles = self.screenshot.as_ref().is_some_and(|s| s.region.is_some());
         let toolbar = self.build_screenshot_toolbar();
+        // The in-progress stroke draws last, so it appears under the
+        // pointer as it is made rather than a frame behind.
+        let strokes = self.screenshot.as_ref().map_or_else(Vec::new, |s| {
+            s.strokes
+                .iter()
+                .chain(s.stroke.iter())
+                .map(|k| render::StrokeDraw {
+                    colour: k.colour,
+                    width: f32::from(i16::try_from(k.width).unwrap_or(4)),
+                    points: k.points.clone(),
+                })
+                .collect()
+        });
         self.renderer.set_screenshot_overlay(Some(render::ScreenshotOverlay {
             selection,
             handles,
             toolbar,
+            strokes,
         }));
     }
 
@@ -4677,6 +4704,11 @@ impl State {
                     screenshot::Tool::Take => render::ToolIcon::Take,
                     screenshot::Tool::Draw => render::ToolIcon::Draw,
                     screenshot::Tool::Colour(c) => render::ToolIcon::Swatch(c.rgb()),
+                    screenshot::Tool::Width => render::ToolIcon::Slider {
+                        frac: screenshot::pen_fraction(session.pen_width),
+                        width: f32::from(i16::try_from(session.pen_width).unwrap_or(4)),
+                        colour: session.pen.rgb(),
+                    },
                     screenshot::Tool::CopyText => render::ToolIcon::Text,
                     screenshot::Tool::Cancel => render::ToolIcon::Cancel,
                 },
@@ -4702,6 +4734,52 @@ impl State {
             .output_at(center)
             .or_else(|| self.renderer.output_at(sel.loc))
             .map(|g| g.compositor)
+    }
+
+    /// Where the pen-width slider is, if the toolbar is up.
+    fn screenshot_slider_slot(&self) -> Option<smithay::utils::Rectangle<i32, Physical>> {
+        let sel = self.screenshot.as_ref()?.region?;
+        let bounds = self.screenshot_output_bounds(sel)?;
+        screenshot::toolbar_layout(sel, bounds)
+            .1
+            .into_iter()
+            .find(|(t, _)| *t == screenshot::Tool::Width)
+            .map(|(_, r)| r)
+    }
+
+    /// Begin an annotation stroke if the pen is down and the press landed
+    /// inside the selection. Returns whether it took the press.
+    fn start_screenshot_stroke(&mut self, at: (f64, f64)) -> bool {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to the i32 layout bounds"
+        )]
+        let here = (at.0.round() as i32, at.1.round() as i32);
+        let Some(s) = &mut self.screenshot else {
+            return false;
+        };
+        if !s.drawing {
+            return false;
+        }
+        let Some(sel) = s.region else {
+            return false;
+        };
+        // Only inside the rect: the dimmed surround isn't part of the
+        // picture, so a stroke there would have nowhere to be saved.
+        let inside = here.0 >= sel.loc.x
+            && here.0 < sel.loc.x + sel.size.w
+            && here.1 >= sel.loc.y
+            && here.1 < sel.loc.y + sel.size.h;
+        if !inside {
+            return false;
+        }
+        s.stroke = Some(screenshot::Stroke {
+            colour: s.pen.rgb(),
+            width: s.pen_width,
+            points: vec![here],
+        });
+        self.update_screenshot_overlay();
+        true
     }
 
     /// Act on a toolbar button. Returns whether the press was consumed —
@@ -4734,6 +4812,25 @@ impl State {
                 }
                 self.update_screenshot_overlay();
             }
+            Some(screenshot::Tool::Width) => {
+                // Grab the slider: the width tracks the pointer until
+                // release, including past the ends of the track.
+                let slot = screenshot::toolbar_layout(sel, bounds)
+                    .1
+                    .into_iter()
+                    .find(|(t, _)| *t == screenshot::Tool::Width)
+                    .map(|(_, r)| r);
+                if let (Some(slot), Some(s)) = (slot, self.screenshot.as_mut()) {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "cursor coords are clamped to the i32 layout bounds"
+                    )]
+                    let x = at.0.round() as i32;
+                    s.pen_width = screenshot::pen_width_at(slot, x);
+                    s.sliding = true;
+                }
+                self.update_screenshot_overlay();
+            }
             Some(screenshot::Tool::CopyText) => self.copy_selection_text(sel),
             // A press on the bar's padding: consumed, but does nothing.
             None => {}
@@ -4763,6 +4860,38 @@ impl State {
     /// Pointer moved during a session — drive whatever the press started.
     fn screenshot_pointer_motion(&mut self) {
         let (cx, cy) = self.renderer.cursor_pos();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "cursor coords are clamped to the i32 layout bounds"
+        )]
+        let here = (cx.round() as i32, cy.round() as i32);
+        // The width slider keeps following the pointer once grabbed, even
+        // past the track — a slider you fall off is a slider you fight.
+        if self.screenshot.as_ref().is_some_and(|s| s.sliding) {
+            if let Some(slot) = self.screenshot_slider_slot() {
+                if let Some(s) = &mut self.screenshot {
+                    s.pen_width = screenshot::pen_width_at(slot, here.0);
+                }
+                self.update_screenshot_overlay();
+            }
+            return;
+        }
+        if let Some(s) = &mut self.screenshot
+            && let Some(stroke) = &mut s.stroke
+        {
+            // Thin as we go: a pointer at 1000 Hz would otherwise store
+            // thousands of points a second, and the segments between them
+            // are shorter than the pen is wide.
+            let far = stroke
+                .points
+                .last()
+                .is_none_or(|(lx, ly)| (here.0 - lx).abs() + (here.1 - ly).abs() >= 2);
+            if far {
+                stroke.points.push(here);
+            }
+            self.update_screenshot_overlay();
+            return;
+        }
         if let Some(s) = &mut self.screenshot
             && let Some((grab, (fx, fy), start)) = s.grab
         {
@@ -4790,6 +4919,12 @@ impl State {
                     return;
                 }
                 let at = self.renderer.cursor_pos();
+                // Annotation wins inside the selection: while the pen is
+                // up you are moving the rect, while it is down you are
+                // drawing on it, and one gesture cannot mean both.
+                if self.start_screenshot_stroke(at) {
+                    return;
+                }
                 if let Some(s) = &mut self.screenshot {
                     // A committed selection takes the press if it was
                     // aimed at one — otherwise the press starts a fresh
@@ -4826,6 +4961,16 @@ impl State {
             return;
         };
         if !matches!(s.bind.mode, config::ScreenshotMode::Region) {
+            return;
+        }
+        s.sliding = false;
+        if let Some(stroke) = s.stroke.take() {
+            // A click with no travel leaves a dot, which is a legitimate
+            // annotation; an empty one is not.
+            if !stroke.points.is_empty() {
+                s.strokes.push(stroke);
+            }
+            self.update_screenshot_overlay();
             return;
         }
         if s.grab.take().is_some() {
@@ -4928,8 +5073,15 @@ impl State {
                 .as_ref()
                 .and_then(|s| s.frozen.get(&geom.name))
                 .map(|f| (f.bytes.clone(), f.width, f.height));
+            // Annotations are baked into the crop by the encode worker,
+            // so the saved file matches what the preview showed.
+            let strokes = self
+                .screenshot
+                .as_ref()
+                .map(|s| s.strokes.clone())
+                .unwrap_or_default();
             if let Some((bytes, w, h)) = frozen {
-                self.spawn_screenshot_encode(bytes, w, h, phys, &bind);
+                self.spawn_screenshot_encode(bytes, w, h, phys, &bind, strokes);
             } else {
                 warn!(output = %geom.name, "screenshot: freeze snapshot unavailable");
             }
@@ -4955,6 +5107,7 @@ impl State {
         height: u32,
         region: smithay::utils::Rectangle<i32, Physical>,
         bind: &config::ScreenshotBind,
+        strokes: Vec<screenshot::Stroke>,
     ) {
         let dir = bind.directory.as_ref().map(|d| screenshot::expand_dir(d));
         let filename = screenshot::timestamp_filename(self.local_offset);
@@ -4963,7 +5116,8 @@ impl State {
         let spawned = std::thread::Builder::new()
             .name("screenshot-encode".to_owned())
             .spawn(move || {
-                let png = match screenshot::encode_region(&bytes, width, height, region) {
+                let png = match screenshot::encode_region(&bytes, width, height, region, &strokes)
+                {
                     Ok(png) => png,
                     Err(err) => {
                         warn!(error = %err, "screenshot: PNG encode failed");
@@ -5120,7 +5274,7 @@ impl State {
                 let full = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
                     w_i, h_i,
                 )));
-                self.spawn_screenshot_encode(bytes, width, height, full, &bind);
+                self.spawn_screenshot_encode(bytes, width, height, full, &bind, Vec::new());
             }
         }
     }

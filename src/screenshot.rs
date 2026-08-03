@@ -36,7 +36,8 @@ pub(crate) fn read_text(
     use std::io::{Error, ErrorKind, Write};
     use std::process::{Command, Stdio};
 
-    let png = encode_region(src, src_w, src_h, region)
+    // No annotations: OCR reads the screenshot, not the drawing on it.
+    let png = encode_region(src, src_w, src_h, region, &[])
         .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
     // `-` for both paths: PNG in on stdin, text out on stdout, so nothing
     // is written to disk and there is no temp file to leak or collide.
@@ -75,6 +76,8 @@ pub(crate) enum Tool {
     Draw,
     /// Pick the annotation colour.
     Colour(PenColour),
+    /// Drag to set the pen width.
+    Width,
     /// Run OCR over the selection and put the text on the clipboard.
     CopyText,
     /// Abandon the session.
@@ -120,6 +123,46 @@ impl PenColour {
 /// One button: what it does and where it is.
 pub(crate) type ToolSlot = (Tool, Rectangle<i32, Physical>);
 
+/// One freehand annotation: a polyline in **compositor** coordinates, so
+/// it survives the selection being moved or resized underneath it. Points
+/// are stored as drawn and thinned only by the input path.
+#[derive(Debug, Clone)]
+pub(crate) struct Stroke {
+    pub(crate) colour: [f32; 3],
+    pub(crate) width: i32,
+    pub(crate) points: Vec<(i32, i32)>,
+}
+
+/// Pen width bounds, in compositor pixels. The floor is 1 because a
+/// hairline is a legitimate thing to want; the ceiling is where a stroke
+/// stops annotating a screenshot and starts hiding it.
+pub(crate) const PEN_MIN: i32 = 1;
+pub(crate) const PEN_MAX: i32 = 24;
+pub(crate) const PEN_DEFAULT: i32 = 4;
+
+/// Width of the pen-width slider's slot on the toolbar.
+pub(crate) const SLIDER_W: i32 = 96;
+
+/// Where a pen width sits on the slider, as a 0..1 fraction.
+pub(crate) fn pen_fraction(width: i32) -> f32 {
+    let span = (PEN_MAX - PEN_MIN).max(1);
+    f32::from(i16::try_from(width.clamp(PEN_MIN, PEN_MAX) - PEN_MIN).unwrap_or(0))
+        / f32::from(i16::try_from(span).unwrap_or(1))
+}
+
+/// The pen width a press at `x` on a slider occupying `slot` asks for.
+/// Clamped, so dragging past either end pins rather than wrapping.
+pub(crate) fn pen_width_at(slot: Rectangle<i32, Physical>, x: i32) -> i32 {
+    let span = (slot.size.w - 1).max(1);
+    let t = f64::from((x - slot.loc.x).clamp(0, span)) / f64::from(span);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the product is bounded by PEN_MAX"
+    )]
+    let w = PEN_MIN + (t * f64::from(PEN_MAX - PEN_MIN)).round() as i32;
+    w.clamp(PEN_MIN, PEN_MAX)
+}
+
 /// Toolbar metrics, in compositor pixels.
 pub(crate) const TOOL_SIZE: i32 = 32;
 pub(crate) const TOOL_PAD: i32 = 6;
@@ -130,9 +173,21 @@ pub(crate) const TOOL_GAP: i32 = 10;
 pub(crate) fn tools() -> Vec<Tool> {
     let mut v = vec![Tool::Take, Tool::Draw];
     v.extend(PenColour::ALL.map(Tool::Colour));
+    // Next to the colours: the two things that describe the pen belong
+    // together, and the slider is the only wide item on the bar.
+    v.push(Tool::Width);
     v.push(Tool::CopyText);
     v.push(Tool::Cancel);
     v
+}
+
+/// How wide a tool's slot is. Everything is a square button except the
+/// width slider, which needs a track long enough to aim along.
+pub(crate) fn tool_width(tool: Tool) -> i32 {
+    match tool {
+        Tool::Width => SLIDER_W,
+        _ => TOOL_SIZE,
+    }
 }
 
 /// Where the toolbar sits for a selection of `sel` on an output of
@@ -150,7 +205,7 @@ pub(crate) fn toolbar_layout(
     use smithay::utils::{Point, Size};
     let tools = tools();
     let count = i32::try_from(tools.len()).unwrap_or(1);
-    let bar_w = count * TOOL_SIZE + (count + 1) * TOOL_PAD;
+    let bar_w: i32 = tools.iter().map(|t| tool_width(*t)).sum::<i32>() + (count + 1) * TOOL_PAD;
     let bar_h = TOOL_SIZE + 2 * TOOL_PAD;
 
     let below = sel.loc.y + sel.size.h + TOOL_GAP;
@@ -174,18 +229,17 @@ pub(crate) fn toolbar_layout(
         Size::from((bar_w, bar_h)),
     );
     let mut slots = Vec::with_capacity(tools.len());
-    for (i, tool) in tools.into_iter().enumerate() {
-        let i = i32::try_from(i).unwrap_or(0);
+    let mut x = bar_x + TOOL_PAD;
+    for tool in tools {
+        let w = tool_width(tool);
         slots.push((
             tool,
             Rectangle::new(
-                Point::from((
-                    bar_x + TOOL_PAD + i * (TOOL_SIZE + TOOL_PAD),
-                    bar_y + TOOL_PAD,
-                )),
-                Size::from((TOOL_SIZE, TOOL_SIZE)),
+                Point::from((x, bar_y + TOOL_PAD)),
+                Size::from((w, TOOL_SIZE)),
             ),
         ));
+        x += w + TOOL_PAD;
     }
     (bar, slots)
 }
@@ -355,6 +409,7 @@ pub(crate) fn encode_region(
     src_w: u32,
     src_h: u32,
     region: Rectangle<i32, Physical>,
+    strokes: &[Stroke],
 ) -> Result<Vec<u8>, png::EncodingError> {
     let (sw, sh) = (src_w as usize, src_h as usize);
     let src_stride = sw * 4;
@@ -376,6 +431,10 @@ pub(crate) fn encode_region(
         }
     }
 
+    for stroke in strokes {
+        paint_stroke(&mut rgb, rw, rh, stroke, region.loc);
+    }
+
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(Cursor::new(&mut out), rw as u32, rh as u32);
@@ -388,6 +447,88 @@ pub(crate) fn encode_region(
         writer.write_image_data(&rgb)?;
     } // writer dropped here — flushes IDAT/IEND into `out`
     Ok(out)
+}
+
+/// Blend one annotation stroke into a cropped RGB buffer.
+///
+/// The same distance-to-segment coverage the GPU preview uses, so what is
+/// saved matches what was on screen. Done on the CPU because it happens
+/// once, on a worker thread, after the session is over — there is no
+/// frame to keep up with.
+///
+/// `origin` is the crop's top-left in compositor coordinates, which is
+/// what turns the stroke's absolute points into image-local ones.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "crop dimensions are output-bounded pixel counts"
+)]
+fn paint_stroke(
+    rgb: &mut [u8],
+    width: usize,
+    height: usize,
+    stroke: &Stroke,
+    origin: smithay::utils::Point<i32, Physical>,
+) {
+    if stroke.points.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let pts: Vec<(f32, f32)> = stroke
+        .points
+        .iter()
+        .map(|(x, y)| ((x - origin.x) as f32, (y - origin.y) as f32))
+        .collect();
+    let half = stroke.width.max(1) as f32 * 0.5;
+    // Only the rows and columns the stroke can reach.
+    let pad = half.ceil() as i32 + 2;
+    let (mut x0, mut y0) = (i32::MAX, i32::MAX);
+    let (mut x1, mut y1) = (i32::MIN, i32::MIN);
+    for (px, py) in &pts {
+        x0 = x0.min(*px as i32);
+        y0 = y0.min(*py as i32);
+        x1 = x1.max(*px as i32);
+        y1 = y1.max(*py as i32);
+    }
+    let xs = (x0 - pad).max(0) as usize..((x1 + pad).max(0) as usize).min(width);
+    let ys = (y0 - pad).max(0) as usize..((y1 + pad).max(0) as usize).min(height);
+
+    let dist = |p: (f32, f32)| -> f32 {
+        let mut best = f32::MAX;
+        // A lone point is a dot: treated as a zero-length segment, whose
+        // clamped projection gives the same round cap the shader draws.
+        if pts.len() == 1 {
+            let d = (p.0 - pts[0].0).hypot(p.1 - pts[0].1);
+            return d;
+        }
+        for seg in pts.windows(2) {
+            let (from, to) = (seg[0], seg[1]);
+            let along = (to.0 - from.0, to.1 - from.1);
+            let len2 = along.0.mul_add(along.0, along.1 * along.1).max(1e-6);
+            let t = (((p.0 - from.0) * along.0 + (p.1 - from.1) * along.1) / len2)
+                .clamp(0.0, 1.0);
+            let near = (t.mul_add(along.0, from.0), t.mul_add(along.1, from.1));
+            best = best.min((p.0 - near.0).hypot(p.1 - near.1));
+        }
+        best
+    };
+
+    for y in ys {
+        for x in xs.clone() {
+            let d = dist((x as f32 + 0.5, y as f32 + 0.5));
+            // One pixel of feather each side, matching SEGMENT_SHADER.
+            let cov = (1.0 - ((d - (half - 0.5)) / 1.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let px = (y * width + x) * 3;
+            for c in 0..3 {
+                let src = f32::from(rgb[px + c]) / 255.0;
+                let ink = stroke.colour[c];
+                rgb[px + c] = (cov.mul_add(ink - src, src) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }
 
 /// Box-downscale a **premultiplied** RGBA image so its longest side is at
@@ -654,6 +795,92 @@ mod tests {
 
     fn sel() -> Rectangle<i32, Physical> {
         Rectangle::new(Point::from((100, 100)), Size::from((200, 150)))
+    }
+
+    /// The slider maps its full track onto the full pen range, both ends
+    /// included — a slider you cannot drag to its own maximum is a bug
+    /// people notice immediately.
+    #[test]
+    fn the_width_slider_reaches_both_ends() {
+        let slot = Rectangle::new(Point::from((100, 50)), Size::from((SLIDER_W, TOOL_SIZE)));
+        assert_eq!(pen_width_at(slot, 100), PEN_MIN);
+        assert_eq!(pen_width_at(slot, 100 + SLIDER_W - 1), PEN_MAX);
+        // Past either end pins rather than wrapping.
+        assert_eq!(pen_width_at(slot, -5000), PEN_MIN);
+        assert_eq!(pen_width_at(slot, 5000), PEN_MAX);
+        // And it is monotonic across the track.
+        let mut last = 0;
+        for x in 0..SLIDER_W {
+            let w = pen_width_at(slot, 100 + x);
+            assert!(w >= last, "width went backwards at x={x}");
+            last = w;
+        }
+    }
+
+    /// The knob's position and the width it means have to agree, or the
+    /// control lies about what it is set to.
+    #[test]
+    fn the_slider_fraction_round_trips() {
+        let slot = Rectangle::new(Point::from((0, 0)), Size::from((SLIDER_W, TOOL_SIZE)));
+        for w in [PEN_MIN, PEN_DEFAULT, 12, PEN_MAX] {
+            let frac = pen_fraction(w);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let x = (frac * f32::from(i16::try_from(SLIDER_W - 1).unwrap_or(1))).round() as i32;
+            assert_eq!(pen_width_at(slot, x), w, "width {w} moved when drawn");
+        }
+    }
+
+    /// The toolbar's slots must not overlap, and must all sit inside the
+    /// bar — the slider is a different width from the buttons, which is
+    /// exactly the kind of thing a layout loop gets wrong.
+    #[test]
+    fn toolbar_slots_tile_the_bar_without_overlapping() {
+        let sel = Rectangle::new(Point::from((300, 200)), Size::from((400, 300)));
+        let bounds = Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080)));
+        let (bar, slots) = toolbar_layout(sel, bounds);
+        assert!(!slots.is_empty());
+        let mut prev_right = bar.loc.x;
+        for (tool, r) in &slots {
+            assert!(r.loc.x >= prev_right, "slot for {tool:?} overlaps its left neighbour");
+            assert!(r.loc.y >= bar.loc.y && r.loc.y + r.size.h <= bar.loc.y + bar.size.h);
+            assert_eq!(r.size.w, tool_width(*tool));
+            prev_right = r.loc.x + r.size.w;
+        }
+        assert!(prev_right <= bar.loc.x + bar.size.w, "last slot runs off the bar");
+    }
+
+    /// A toolbar that would fall off the bottom of the screen goes above
+    /// the selection instead, and one that fits neither is still on
+    /// screen. A control you cannot reach is worse than none.
+    #[test]
+    fn the_toolbar_stays_on_screen() {
+        let bounds = Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080)));
+        for sel in [
+            // Hard against the bottom: must flip above.
+            Rectangle::new(Point::from((100, 900)), Size::from((400, 179))),
+            // Hard against the top: must stay below.
+            Rectangle::new(Point::from((100, 0)), Size::from((400, 200))),
+            // Full height: fits neither side.
+            Rectangle::new(Point::from((100, 0)), Size::from((400, 1080))),
+            // Hard against the right edge: must clamp left.
+            Rectangle::new(Point::from((1800, 400)), Size::from((119, 200))),
+        ] {
+            let (bar, _) = toolbar_layout(sel, bounds);
+            assert!(bar.loc.x >= 0, "{sel:?} pushed the bar off the left");
+            assert!(
+                bar.loc.x + bar.size.w <= bounds.size.w,
+                "{sel:?} pushed the bar off the right"
+            );
+            assert!(bar.loc.y >= 0, "{sel:?} pushed the bar off the top");
+            assert!(
+                bar.loc.y + bar.size.h <= bounds.size.h,
+                "{sel:?} pushed the bar off the bottom"
+            );
+        }
     }
 
     /// The whole selection is grabbable, and each part gives what it looks

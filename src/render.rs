@@ -1862,6 +1862,17 @@ pub struct ScreenshotOverlay {
     pub handles: bool,
     /// The options bar, once a selection is committed.
     pub toolbar: Option<Toolbar>,
+    /// Annotation strokes, in absolute compositor coords, oldest first.
+    /// The one being drawn right now is last.
+    pub strokes: Vec<StrokeDraw>,
+}
+
+/// One annotation polyline ready to draw.
+#[derive(Debug, Clone)]
+pub struct StrokeDraw {
+    pub colour: [f32; 3],
+    pub width: f32,
+    pub points: Vec<(i32, i32)>,
 }
 
 /// The screenshot options bar: where it is and what is on it. Laid out by
@@ -1890,6 +1901,10 @@ pub enum ToolIcon {
     Take,
     Draw,
     Swatch([f32; 3]),
+    /// The pen-width slider: a track, the filled part up to `frac`, and a
+    /// knob whose size *is* the width being chosen — the control shows
+    /// you the stroke rather than a number you have to imagine.
+    Slider { frac: f32, width: f32, colour: [f32; 3] },
     Text,
     Cancel,
 }
@@ -8123,6 +8138,21 @@ impl Renderer {
                 )?;
                 // The options bar draws over the dim wash, as its own
                 // pass — it is chrome, not part of the selection.
+                if !overlay.strokes.is_empty() {
+                    draw_strokes(
+                        &mut frame,
+                        &overlay.strokes,
+                        &OverlayPaint {
+                            segment: &segment_shader,
+                            blank: &blank_tex,
+                            origin: compositor_position,
+                            scale,
+                            hdr,
+                            reference_white: hdr_reference_white,
+                            saturation: hdr_saturation,
+                        },
+                    )?;
+                }
                 if let Some(bar) = &overlay.toolbar {
                     draw_toolbar(
                         &mut frame,
@@ -9878,6 +9908,85 @@ impl OverlayPaint<'_> {
     }
 }
 
+/// Draw annotation strokes straight onto the framebuffer.
+///
+/// Each polyline is cut into runs of at most [`SEGMENTS_MAX`] segments,
+/// and each run is stroked over its own bounding quad — the shader takes
+/// a fixed-size uniform array (GLES 2.0 wants constant loop bounds), and
+/// a tight quad per run also keeps the fragment work proportional to the
+/// ink rather than to the screen.
+fn draw_strokes(
+    frame: &mut GlesFrame<'_, '_>,
+    strokes: &[StrokeDraw],
+    paint: &OverlayPaint<'_>,
+) -> Result<()> {
+    for stroke in strokes {
+        if stroke.points.is_empty() {
+            continue;
+        }
+        // A single point is a dot: a zero-length segment, which the
+        // shader's clamped projection renders as a round cap.
+        let pts: Vec<(i32, i32)> = if stroke.points.len() == 1 {
+            vec![stroke.points[0], stroke.points[0]]
+        } else {
+            stroke.points.clone()
+        };
+        for run in pts.windows(2).collect::<Vec<_>>().chunks(SEGMENTS_MAX) {
+            // Bounding box of this run, grown by the stroke's half-width
+            // plus a pixel of feather so nothing is clipped at the edge.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "pen widths are bounded by PEN_MAX"
+            )]
+            let pad = (stroke.width * 0.5).ceil() as i32 + 2;
+            let (mut x0, mut y0) = (i32::MAX, i32::MAX);
+            let (mut x1, mut y1) = (i32::MIN, i32::MIN);
+            for seg in run {
+                for (px, py) in *seg {
+                    x0 = x0.min(*px);
+                    y0 = y0.min(*py);
+                    x1 = x1.max(*px);
+                    y1 = y1.max(*py);
+                }
+            }
+            let quad = Rectangle::<i32, Physical>::new(
+                Point::from((x0 - pad, y0 - pad)),
+                Size::from(((x1 - x0 + 2 * pad).max(1), (y1 - y0 + 2 * pad).max(1))),
+            );
+            let dst = paint.phys(quad);
+            if dst.size.w <= 0 || dst.size.h <= 0 {
+                continue;
+            }
+            // Segment coordinates are given to the shader as a fraction of
+            // the quad, which is what `strokes` scales by the quad size.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "screen-sized pixel counts are exact in f32 well past 4K"
+            )]
+            let segs: Vec<[f32; 4]> = run
+                .iter()
+                .map(|seg| {
+                    let f = |v: i32, lo: i32, span: i32| (v - lo) as f32 / span.max(1) as f32;
+                    [
+                        f(seg[0].0, quad.loc.x, quad.size.w),
+                        f(seg[0].1, quad.loc.y, quad.size.h),
+                        f(seg[1].0, quad.loc.x, quad.size.w),
+                        f(seg[1].1, quad.loc.y, quad.size.h),
+                    ]
+                })
+                .collect();
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_precision_loss,
+                reason = "output scale is a small positive factor"
+            )]
+            let thickness = stroke.width * paint.scale as f32;
+            paint.strokes(frame, dst, &segs, stroke.colour, thickness)?;
+        }
+    }
+    Ok(())
+}
+
 /// Draw the options bar: a dark slab, a hover/active wash per button, and
 /// each glyph stroked straight onto the framebuffer.
 fn draw_toolbar(
@@ -9899,6 +10008,54 @@ fn draw_toolbar(
             paint.fill(frame, dst, HOVER)?;
         }
         match b.icon {
+            ToolIcon::Slider { frac, width, colour } => {
+                // Track down the middle, filled to the current value.
+                let th = (dst.size.h / 8).max(2);
+                let ty = dst.loc.y + (dst.size.h - th) / 2;
+                paint.fill(
+                    frame,
+                    Rectangle::new(
+                        Point::from((dst.loc.x, ty)),
+                        Size::from((dst.size.w, th)),
+                    ),
+                    Color32F::new(1.0, 1.0, 1.0, 0.22),
+                )?;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "frac is 0..1 and the track is a few dozen pixels"
+                )]
+                let filled = (dst.size.w as f32 * frac.clamp(0.0, 1.0)) as i32;
+                paint.fill(
+                    frame,
+                    Rectangle::new(
+                        Point::from((dst.loc.x, ty)),
+                        Size::from((filled, th)),
+                    ),
+                    Color32F::new(colour[0], colour[1], colour[2], 0.95),
+                )?;
+                // The knob is drawn at the pen's actual width, so the
+                // slider is a preview of the stroke as well as a control.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "pen widths are bounded by PEN_MAX"
+                )]
+                let knob = (width.max(4.0) as i32).min(dst.size.h);
+                paint.fill(
+                    frame,
+                    Rectangle::new(
+                        Point::from((
+                            (dst.loc.x + filled - knob / 2)
+                                .clamp(dst.loc.x, dst.loc.x + dst.size.w - knob),
+                            dst.loc.y + (dst.size.h - knob) / 2,
+                        )),
+                        Size::from((knob, knob)),
+                    ),
+                    Color32F::new(colour[0], colour[1], colour[2], 1.0),
+                )?;
+            }
             ToolIcon::Swatch(rgb) => {
                 // The swatch *is* the icon: inset so the active wash
                 // behind it still reads as a ring around the colour.
@@ -9941,8 +10098,8 @@ fn tool_segments(icon: ToolIcon) -> &'static [[f32; 4]] {
         // A capital T.
         ToolIcon::Text => &[[0.22, 0.24, 0.78, 0.24], [0.50, 0.24, 0.50, 0.78]],
         ToolIcon::Cancel => &[[0.26, 0.26, 0.74, 0.74], [0.74, 0.26, 0.26, 0.74]],
-        // Drawn as a filled quad instead; no strokes.
-        ToolIcon::Swatch(_) => &[],
+        // Drawn as filled quads instead; no strokes.
+        ToolIcon::Swatch(_) | ToolIcon::Slider { .. } => &[],
     }
 }
 
