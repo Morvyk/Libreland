@@ -5488,28 +5488,64 @@ impl State {
     }
 }
 
-/// `libreland config example` — write the shipped example config to stdout.
+/// `libreland config <example|check>` — the two things you do to a config
+/// file without a compositor running.
+///
+/// `check` exists because a bad config fails *quietly*: the running
+/// compositor keeps the config it already has and writes one WARN to a log
+/// file, so the symptom is not an error but a setting that appears to do
+/// nothing. This gives that failure somewhere to show up.
 ///
 /// Anything else under `config` is a usage error rather than a silent no-op,
 /// so a typo doesn't look like it worked.
-fn print_example_config(sub: Option<&str>) -> Result<()> {
-    if sub == Some("example") {
-        use std::io::Write as _;
-        return std::io::stdout()
-            .write_all(config::EXAMPLE.as_bytes())
-            .context("writing the example config to stdout");
+fn run_config_command(sub: Option<&str>, arg: Option<&str>) -> Result<()> {
+    match sub {
+        Some("example") => {
+            use std::io::Write as _;
+            return std::io::stdout()
+                .write_all(config::EXAMPLE.as_bytes())
+                .context("writing the example config to stdout");
+        }
+        Some("check") => {
+            let path = if let Some(p) = arg {
+                std::path::PathBuf::from(p)
+            } else if let Some(p) = config::Config::path() {
+                p
+            } else {
+                eprintln!("libreland config check: no XDG config directory to look in");
+                std::process::exit(2);
+            };
+            // Report the same way the compositor does, so what you read here
+            // is what you'd have found in the log.
+            match config::Config::load_from_file(&path) {
+                Ok(_) => {
+                    println!("{}: ok", path.display());
+                    return Ok(());
+                }
+                Err(err) => {
+                    eprintln!("{}: {err:#}", path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {}
     }
     if let Some(other) = sub {
         eprintln!("libreland config: unknown subcommand {other:?}");
     }
     eprintln!(
         "usage: libreland config example
+       libreland config check [path]
 
-  Prints a commented example configuration covering every section with
-  its default value. Copy it to get started:
+  example  Prints a commented configuration covering every section with
+           its default value. Copy it to get started:
 
-    mkdir -p ~/.config/libreland
-    libreland config example > ~/.config/libreland/config.lua"
+             mkdir -p ~/.config/libreland
+             libreland config example > ~/.config/libreland/config.lua
+
+  check    Parses a config file and reports the first error, with the line
+           to go fix. Defaults to the file the compositor would load. Exits
+           non-zero on failure, so it works in a save hook."
     );
     std::process::exit(2);
 }
@@ -5525,12 +5561,16 @@ fn main() -> Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("msg")) {
         return ipc::run_client();
     }
-    // `libreland config example` prints the commented starting point. Handled
-    // here, next to `msg`, because it must not touch the socket, the log or
-    // the GPU — it is something you pipe into a file before the compositor
-    // has ever run.
+    // `libreland config …` prints the commented starting point, or checks a
+    // file. Handled here, next to `msg`, because it must not touch the
+    // socket, the log or the GPU — both are things you run against a file,
+    // possibly before the compositor has ever started.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("config")) {
-        return print_example_config(std::env::args().nth(2).as_deref());
+        let args: Vec<String> = std::env::args().skip(2).take(2).collect();
+        return run_config_command(
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str),
+        );
     }
 
     // The WorkerGuard MUST stay alive for the whole of main; dropping it

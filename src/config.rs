@@ -948,7 +948,20 @@ impl Config {
         let source = std::fs::read_to_string(path).context("failed to read config file")?;
 
         let lua = Lua::new();
+        // Name the chunk after the file. Lua puts the chunk name in front of
+        // every error it raises, and mlua's default is the *Rust* caller's
+        // location — so a mistake in the user's config reported as
+        // `src/config.rs:951:65: attempt to call a nil value`, where the only
+        // number that means anything to them (65, the line in their file) is
+        // the one that looks least like it. With the name set it reads
+        // `config.lua:65: ...`, which points at the line to go fix.
+        //
+        // The leading `@` is Lua's own convention for "this chunk name is a
+        // file path": without it Lua wraps and truncates the name as
+        // `[string "/home/very/long/pa..."]`, which hides the end of the
+        // path — the part with the file name in it.
         lua.load(&source)
+            .set_name(format!("@{}", path.display()))
             .exec()
             .map_err(|e| anyhow::anyhow!("Lua chunk execution failed: {e}"))?;
 

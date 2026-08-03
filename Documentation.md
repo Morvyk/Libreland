@@ -29,6 +29,19 @@ default. It exists so you can see what there is to set.
 - **File present and valid**: values flow into `Config` and propagate
   through the runtime.
 
+### Checking a config
+
+    libreland config check [path]
+
+Parses the file the compositor would load (or the one you name) and prints
+either `ok` or the first error, with the line to go fix. It exits non-zero
+on failure, so it drops straight into an editor save hook or a shell
+alias.
+
+Worth knowing about, because a broken config does not announce itself: a
+running compositor keeps the config it already has (see below), so the
+symptom is not an error but a setting that appears to do nothing.
+
 ### Live reload
 
 The config file is watched (its mtime is polled once a second) and
@@ -36,6 +49,12 @@ re-applied on save. A save that fails to parse is logged and
 **ignored**, leaving the running config untouched, so a typo never
 breaks your session. You can also force a reload at any time with
 `libreland msg reload`.
+
+The trade-off is that a failed reload is quiet — one `WARN config reload
+failed; keeping the running config` line in `~/.local/state/libreland/`,
+and nothing on screen. If a setting you just added seems to have no
+effect, check there or run `libreland config check` before suspecting the
+setting itself.
 
 **Applied live — effectively the whole config:**
 
