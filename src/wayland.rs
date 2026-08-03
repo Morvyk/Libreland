@@ -1915,19 +1915,9 @@ impl XdgShellHandler for State {
         self.layout.remove(surface.wl_surface());
         // Release the window's stable IPC id so it isn't reused.
         self.ipc.forget(surface.wl_surface());
-        // Clear keyboard focus only if the destroyed surface was
-        // actually focused — otherwise leave whatever is focused
-        // alone (it might be a different live toplevel). 4d.2 will
-        // pick a sensible replacement instead of dropping to None.
-        if let Some(kbd) = self.seat.get_keyboard() {
-            let was_focused = kbd
-                .current_focus()
-                .as_ref()
-                .is_some_and(|f| f == surface.wl_surface());
-            if was_focused {
-                kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
-            }
-        }
+        // Hand focus to whatever is now frontmost, if this window held it.
+        // Anything else focused is left alone.
+        self.refocus_after_losing(surface.wl_surface());
         // If the pointer was focused on (and possibly locked to) the
         // dying window — a game exiting with the cursor hidden — hand
         // pointer focus to whatever takes its cell, so the constraint

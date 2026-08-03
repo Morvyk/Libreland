@@ -1306,6 +1306,40 @@ impl State {
         self.queue_redraw_all();
     }
 
+    /// Hand keyboard focus to the frontmost remaining window, if `surface`
+    /// was the one holding it.
+    ///
+    /// Dropping to `None` instead — which the destroy paths did — leaves
+    /// the keyboard pointed at nothing: every keystroke goes into the void
+    /// until you happen to click on a window, which reads as the whole
+    /// desktop having frozen. Closing the focused window is the single
+    /// most ordinary way to reach that state.
+    ///
+    /// The frontmost is the highest z-band, ties going to the later entry
+    /// (`max_by_key` returns the last maximum, and within a band list
+    /// order *is* stack order). `placements` already excludes minimized
+    /// windows. With nothing left, focus really does go nowhere — which is
+    /// correct on an empty workspace, and is the only case that should
+    /// reach it.
+    pub(crate) fn refocus_after_losing(&mut self, surface: &WlSurface) {
+        let held = self
+            .seat
+            .get_keyboard()
+            .is_some_and(|k| k.current_focus().as_ref() == Some(surface));
+        if !held {
+            return;
+        }
+        let next = self
+            .layout
+            .placements(None, None)
+            .into_iter()
+            .max_by_key(|p| p.band)
+            .map(|p| p.surface);
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, next, SERIAL_COUNTER.next_serial());
+        }
+    }
+
     /// Re-decide whether the window that set the pointer image still gets
     /// to dictate it.
     ///
@@ -1750,28 +1784,8 @@ impl State {
         {
             debug!(%err, "xwayland: set_hidden(true) failed");
         }
-        // Focus can't stay on a window nobody can see. Hand it to
-        // whatever is now topmost — `placements` already excludes
-        // minimized windows, and the frontmost is the highest z-band,
-        // ties going to the later entry (`max_by_key` returns the last
-        // maximum, and within a band list order *is* stack order). If
-        // that was the only window, focus goes nowhere, exactly as on an
-        // empty workspace.
-        let held_focus = self
-            .seat
-            .get_keyboard()
-            .is_some_and(|k| k.current_focus().as_ref() == Some(surface));
-        if held_focus {
-            let next = self
-                .layout
-                .placements(None, None)
-                .into_iter()
-                .max_by_key(|p| p.band)
-                .map(|p| p.surface);
-            if let Some(kbd) = self.seat.get_keyboard() {
-                kbd.set_focus(self, next, SERIAL_COUNTER.next_serial());
-            }
-        }
+        // Focus can't stay on a window nobody can see.
+        self.refocus_after_losing(surface);
         self.refresh_pointer_focus();
         self.queue_redraw_all();
         true

@@ -415,12 +415,7 @@ impl State {
         self.renderer.start_close(&wl_surface);
         self.layout.remove(&wl_surface);
         self.ipc.forget(&wl_surface);
-        if let Some(kbd) = self.seat.get_keyboard() {
-            let was_focused = kbd.current_focus().as_ref() == Some(&wl_surface);
-            if was_focused {
-                kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
-            }
-        }
+        self.refocus_after_losing(&wl_surface);
         self.refresh_pointer_focus();
         self.queue_redraw_all();
     }
