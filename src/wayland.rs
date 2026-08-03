@@ -1442,7 +1442,7 @@ impl SeatHandler for State {
             }
             // Tabbing away from a game that hid the pointer has to give the
             // pointer back.
-            self.sync_cursor_hiding();
+            self.sync_cursor_owner();
             self.queue_redraw_all();
         }
         // Hand clipboard + primary-selection *focus* to the keyboard-
@@ -1481,14 +1481,21 @@ impl SeatHandler for State {
         // `Named`), or `Hidden`. The renderer draws it next frame,
         // unless a compositor grab override is active.
         //
-        // A *hidden* cursor is remembered rather than simply applied:
-        // making the pointer invisible is a thing only the window you are
-        // using gets to do. See `State::sync_cursor_hiding`.
-        self.cursor_hidden_by = matches!(image, CursorImageStatus::Hidden)
-            .then(|| self.seat.get_pointer().and_then(|p| p.current_focus()))
-            .flatten();
+        // Remembered with its owner rather than simply applied: a
+        // client's cursor is only in force while that client is the window
+        // you are using. See `State::sync_cursor_owner`.
+        //
+        // The owner is the *active window*, not the pointer focus. A game
+        // sets its cursor while it is the window you are in, and comparing
+        // against the same thing the restore compares against means the
+        // two can't disagree — pointer focus can sit on a subsurface, or
+        // on nothing at all mid-transition.
+        self.cursor_owner = self
+            .layout
+            .active_surface()
+            .map(|s| (s.clone(), image.clone()));
         self.renderer.set_cursor_status(image);
-        self.sync_cursor_hiding();
+        self.sync_cursor_owner();
         // The cursor sprite changed in place (no motion). Redraw so it
         // updates; skip fullscreen outputs (the cursor is hidden there and
         // we don't want to disturb a game's VRR).

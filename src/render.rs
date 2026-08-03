@@ -9873,6 +9873,20 @@ impl OverlayPaint<'_> {
             reason = "button sizes are a few dozen pixels and the segment count is capped at SEGMENTS_MAX"
         )]
         let (w, h) = (dst.size.w as f32, dst.size.h as f32);
+        // A custom texture program replaces the frame's decode override,
+        // so on an HDR output nothing else will convert this colour into
+        // the linear BT.2020 scene — the strokes would come out washed
+        // and far too bright. Convert here instead.
+        let colour = if self.hdr {
+            let lin = srgb_to_linear_bt2020(
+                Color32F::new(colour[0], colour[1], colour[2], 1.0),
+                self.reference_white,
+                self.saturation,
+            );
+            [lin.r(), lin.g(), lin.b()]
+        } else {
+            colour
+        };
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_possible_wrap,

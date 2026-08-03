@@ -625,12 +625,12 @@ pub(crate) struct State {
     /// while set, pointer + keyboard input drives the selection instead
     /// of reaching clients. `None` disables the screenshot UI.
     pub(crate) screenshot: Option<ScreenshotState>,
-    /// The window whose client asked for an invisible pointer, if any.
+    /// The window that last set the pointer image, and what it set.
     ///
     /// Kept so the request can be honoured *conditionally* — only while
     /// that window is the active one — instead of taken at face value and
-    /// never revisited. See [`State::sync_cursor_hiding`].
-    pub(crate) cursor_hidden_by: Option<WlSurface>,
+    /// never revisited. See [`State::sync_cursor_owner`].
+    pub(crate) cursor_owner: Option<(WlSurface, smithay::input::pointer::CursorImageStatus)>,
     /// Compositor-originated capture requests (full-output freeze
     /// snapshots and final region grabs) awaiting the next render of
     /// their output — the internal sibling of [`Self::screencopy_pending`].
@@ -1256,28 +1256,45 @@ impl State {
     /// it), then move keyboard focus and repaint. No-op if the surface
     /// isn't a managed window. Shared by `xdg_activation` and the IPC
     /// `focus-window`.
-    /// Re-decide whether the client that asked for a hidden pointer still
-    /// gets one.
+    /// Re-decide whether the window that set the pointer image still gets
+    /// to dictate it.
     ///
-    /// A client may keep the cursor invisible only while it is the *active*
-    /// window. Games hide it and never think about it again — so tabbing
-    /// out of one left the pointer invisible over the window you had just
-    /// switched to, with no way to find it short of clicking blindly back
-    /// into the game.
+    /// A client's cursor is honoured only while it is the *active* window.
+    /// Games set one and never think about it again — so tabbing out of a
+    /// game left its cursor in force over the window you had just switched
+    /// to, and when that cursor is an invisible one there is no way to
+    /// find the pointer short of clicking blindly back into the game.
     ///
-    /// This restores rather than forgets: tab back into the game and the
-    /// pointer disappears again, without the game having to re-request it
+    /// Deliberately not restricted to `CursorImageStatus::Hidden`, which
+    /// was the first attempt and could not work: `Hidden` only arrives
+    /// from `wl_pointer.set_cursor(NULL)`. An **X11** client hides its
+    /// pointer by setting a fully transparent 1x1 cursor instead, which
+    /// reaches us as an ordinary `Surface` — so every Proton game, which
+    /// is every game that matters here, went straight past a Hidden-only
+    /// test. Tracking the owner rather than the *kind* covers both, and
+    /// needs no guesses about what a surface's pixels look like.
+    ///
+    /// This restores rather than forgets: tab back into the game and its
+    /// cursor takes effect again, without the game having to re-request it
     /// (it won't — `set_cursor` fires on pointer *enter*, which a keyboard
     /// focus change doesn't cause).
-    pub(crate) fn sync_cursor_hiding(&mut self) {
+    pub(crate) fn sync_cursor_owner(&mut self) {
         use smithay::input::pointer::CursorImageStatus;
-        let Some(hider) = self.cursor_hidden_by.clone() else {
+        let Some((owner, status)) = self.cursor_owner.clone() else {
             return;
         };
-        let honour = self.layout.active_surface() == Some(&hider);
+        let honour = self.layout.active_surface() == Some(&owner);
+        debug!(
+            owner = ?owner.id(),
+            active = ?self.layout.active_surface().map(smithay::reexports::wayland_server::Resource::id),
+            honour,
+            "cursor: re-deciding whose pointer image applies"
+        );
         self.renderer.set_cursor_status(if honour {
-            CursorImageStatus::Hidden
+            status
         } else {
+            // Whatever the next window wants, it will say so on the next
+            // pointer enter. Until then, an arrow you can see.
             CursorImageStatus::default_named()
         });
         self.queue_redraw_all();
@@ -4691,8 +4708,14 @@ impl State {
     /// options about while one is still being dragged out.
     fn build_screenshot_toolbar(&self) -> Option<render::Toolbar> {
         let session = self.screenshot.as_ref()?;
-        let sel = session.region?;
-        let bounds = self.screenshot_output_bounds(sel)?;
+        let Some(sel) = session.region else {
+            debug!("screenshot: no toolbar — selection not committed yet");
+            return None;
+        };
+        let Some(bounds) = self.screenshot_output_bounds(sel) else {
+            warn!(?sel, "screenshot: no toolbar — selection is on no output");
+            return None;
+        };
         let at = self.renderer.cursor_pos();
         let (bar, slots) = screenshot::toolbar_layout(sel, bounds);
         let hovered = screenshot::tool_at(sel, bounds, at);
@@ -4983,9 +5006,17 @@ impl State {
         let sel = rect_from_corners(ax, ay, cx, cy);
         // A click with no drag is a miss, not a one-pixel screenshot.
         // Leave the session up so it can be tried again.
-        if sel.size.w >= screenshot::MIN_SELECTION && sel.size.h >= screenshot::MIN_SELECTION {
+        let big_enough =
+            sel.size.w >= screenshot::MIN_SELECTION && sel.size.h >= screenshot::MIN_SELECTION;
+        if big_enough {
             s.region = Some(sel);
         }
+        debug!(
+            ?sel,
+            big_enough,
+            min = screenshot::MIN_SELECTION,
+            "screenshot: region drag released"
+        );
         self.update_screenshot_overlay();
         self.refresh_screenshot_cursor();
     }
@@ -5927,7 +5958,7 @@ fn main() -> Result<()> {
         last_bar_click: None,
         ws_scroll_accum: 0.0,
         screenshot: None,
-        cursor_hidden_by: None,
+        cursor_owner: None,
         screenshot_pending: Vec::new(),
         local_offset,
         screenshot_clipboard_tx,
