@@ -74,8 +74,6 @@ pub(crate) enum Tool {
     /// Toggle freehand annotation. While on, dragging inside the
     /// selection draws instead of moving it.
     Draw,
-    /// Pick the annotation colour.
-    Colour(PenColour),
     /// Drag to set the pen width.
     Width,
     /// Run OCR over the selection and put the text on the clipboard.
@@ -84,39 +82,167 @@ pub(crate) enum Tool {
     Cancel,
 }
 
-/// The annotation palette. Deliberately short: a screenshot annotation is
-/// an arrow and a circle, not a painting, and a five-swatch row can be
-/// hit without aiming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PenColour {
-    /// The default, and the one nearly every annotation wants.
-    Red,
-    Yellow,
-    Green,
-    Blue,
-    White,
+/// The pen colour, held as hue/saturation/value rather than as RGB.
+///
+/// HSV because that is the space the picker is *shaped* like — a
+/// saturation/value plane under a hue strip — so the widget's geometry
+/// and the stored value are the same two numbers, with no round-trip to
+/// lose. Every component is `0.0..=1.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Hsv {
+    pub(crate) h: f32,
+    pub(crate) s: f32,
+    pub(crate) v: f32,
 }
 
-impl PenColour {
-    /// Every colour, in toolbar order.
-    pub(crate) const ALL: [Self; 5] = [
-        Self::Red,
-        Self::Yellow,
-        Self::Green,
-        Self::Blue,
-        Self::White,
-    ];
+impl Default for Hsv {
+    /// Red, which is what an annotation wants nine times in ten. Value
+    /// just under 1.0: pure #ff0000 reads as harsh against a screenshot.
+    fn default() -> Self {
+        Self { h: 0.0, s: 0.85, v: 0.95 }
+    }
+}
 
-    /// Linear-ish sRGB components, chosen to stay legible on both a dark
-    /// screenshot and a light one.
+impl Hsv {
+    /// Straight sRGB components, matching the picker's own shader so the
+    /// swatch, the stroke on screen and the ink in the saved file are all
+    /// the same colour.
     pub(crate) fn rgb(self) -> [f32; 3] {
-        match self {
-            Self::Red => [0.91, 0.20, 0.20],
-            Self::Yellow => [0.98, 0.79, 0.19],
-            Self::Green => [0.30, 0.80, 0.35],
-            Self::Blue => [0.25, 0.62, 1.00],
-            Self::White => [0.97, 0.97, 0.97],
+        // Hue in sixths: which of the six colour sectors, and how far
+        // through it. Saturation and value are plain fractions.
+        let sixths = self.h.rem_euclid(1.0) * 6.0;
+        let sat = self.s.clamp(0.0, 1.0);
+        let val = self.v.clamp(0.0, 1.0);
+        let sector = sixths.floor();
+        let frac = sixths - sector;
+        let down = val * (1.0 - sat);
+        let falling = val * frac.mul_add(-sat, 1.0);
+        let rising = val * (1.0 - frac).mul_add(-sat, 1.0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "sector is floor(h*6) with h in 0..1, so 0..=5"
+        )]
+        match sector as u32 % 6 {
+            0 => [val, rising, down],
+            1 => [falling, val, down],
+            2 => [down, val, rising],
+            3 => [down, falling, val],
+            4 => [rising, down, val],
+            _ => [val, down, falling],
         }
+    }
+}
+
+/// Which part of the colour picker a press landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerPart {
+    /// The saturation/value plane: x is saturation, y is value inverted
+    /// (bright at the top, which is the way every picker does it).
+    Plane,
+    /// The hue strip down the side.
+    Hue,
+}
+
+/// Picker metrics, in compositor pixels.
+pub(crate) const PICKER_PLANE: i32 = 148;
+pub(crate) const PICKER_HUE_W: i32 = 20;
+pub(crate) const PICKER_PAD: i32 = 8;
+
+/// Where the colour picker sits for a toolbar at `bar`, and the rects of
+/// its two parts: `(panel, plane, hue)`.
+///
+/// Directly above the toolbar, or below it when the toolbar is high
+/// enough on screen that above would not fit. Left-aligned with the bar,
+/// then clamped, so it never hangs off the edge.
+pub(crate) fn picker_layout(
+    bar: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+) -> (
+    Rectangle<i32, Physical>,
+    Rectangle<i32, Physical>,
+    Rectangle<i32, Physical>,
+) {
+    use smithay::utils::{Point, Size};
+    let w = PICKER_PLANE + PICKER_PAD + PICKER_HUE_W + 2 * PICKER_PAD;
+    let h = PICKER_PLANE + 2 * PICKER_PAD;
+    let above = bar.loc.y - PICKER_PAD - h;
+    let y = if above >= bounds.loc.y {
+        above
+    } else {
+        (bar.loc.y + bar.size.h + PICKER_PAD)
+            .min((bounds.loc.y + bounds.size.h - h).max(bounds.loc.y))
+    };
+    let x = bar
+        .loc
+        .x
+        .clamp(bounds.loc.x, (bounds.loc.x + bounds.size.w - w).max(bounds.loc.x));
+    let panel = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
+    let plane = Rectangle::new(
+        Point::from((x + PICKER_PAD, y + PICKER_PAD)),
+        Size::from((PICKER_PLANE, PICKER_PLANE)),
+    );
+    let hue = Rectangle::new(
+        Point::from((plane.loc.x + PICKER_PLANE + PICKER_PAD, y + PICKER_PAD)),
+        Size::from((PICKER_HUE_W, PICKER_PLANE)),
+    );
+    (panel, plane, hue)
+}
+
+/// Which part of the picker `pos` is over, if any.
+pub(crate) fn picker_hit(
+    bar: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+    pos: (f64, f64),
+) -> Option<PickerPart> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "cursor coords are clamped to the i32 layout bounds"
+    )]
+    let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
+    let inside = |r: Rectangle<i32, Physical>| {
+        px >= r.loc.x && px < r.loc.x + r.size.w && py >= r.loc.y && py < r.loc.y + r.size.h
+    };
+    let (panel, plane, hue) = picker_layout(bar, bounds);
+    if !inside(panel) {
+        return None;
+    }
+    if inside(plane) {
+        return Some(PickerPart::Plane);
+    }
+    inside(hue).then_some(PickerPart::Hue)
+}
+
+/// The colour a press at `pos` on `part` asks for, starting from `from`
+/// so the untouched components are carried through.
+///
+/// Clamped rather than wrapped: dragging off the top of the hue strip
+/// pins at red instead of leaping to magenta, which is what "I have gone
+/// as far as I meant to" should do.
+pub(crate) fn picker_colour(
+    bar: Rectangle<i32, Physical>,
+    bounds: Rectangle<i32, Physical>,
+    part: PickerPart,
+    pos: (f64, f64),
+    from: Hsv,
+) -> Hsv {
+    let (_, plane, hue) = picker_layout(bar, bounds);
+    let frac = |v: f64, lo: i32, span: i32| {
+        #[allow(clippy::cast_possible_truncation, reason = "a 0..1 fraction")]
+        let f = ((v - f64::from(lo)) / f64::from(span.max(1))).clamp(0.0, 1.0) as f32;
+        f
+    };
+    match part {
+        PickerPart::Plane => Hsv {
+            s: frac(pos.0, plane.loc.x, plane.size.w),
+            // Bright at the top, which is how every picker is drawn.
+            v: 1.0 - frac(pos.1, plane.loc.y, plane.size.h),
+            ..from
+        },
+        PickerPart::Hue => Hsv {
+            h: frac(pos.1, hue.loc.y, hue.size.h),
+            ..from
+        },
     }
 }
 
@@ -205,18 +331,16 @@ pub(crate) const TOOL_GAP: i32 = 10;
 
 /// The buttons, left to right.
 ///
-/// The pen's settings — the colour swatches and the width slider — are
-/// only on the bar while `drawing` is on. They were permanently visible
-/// at first, which made pressing the pen look like it did nothing at all:
-/// the picker you were waiting for had been sitting there the whole time.
-/// Revealing them *is* the feedback that the pen is down, and it keeps a
-/// bar you are not annotating with down to four buttons.
+/// The pen's settings are only on the bar while `drawing` is on — the
+/// width slider here, and the colour picker in its own panel above it.
+/// They were permanently visible at first, which made pressing the pen
+/// look like it did nothing at all. Revealing them *is* the feedback
+/// that the pen is down.
 pub(crate) fn tools(drawing: bool) -> Vec<Tool> {
     let mut v = vec![Tool::Take, Tool::Draw];
     if drawing {
-        v.extend(PenColour::ALL.map(Tool::Colour));
-        // Next to the colours: the two things that describe the pen
-        // belong together, and the slider is the only wide item here.
+        // The colour lives in the picker panel above the bar; the width
+        // is a strip, so it belongs in the row.
         v.push(Tool::Width);
     }
     v.push(Tool::CopyText);
@@ -843,6 +967,66 @@ mod tests {
         Rectangle::new(Point::from((100, 100)), Size::from((200, 150)))
     }
 
+    /// The HSV→RGB here has to match the picker shader's, or the colour
+    /// you point at, the stroke on screen and the ink in the saved file
+    /// are three different colours.
+    #[test]
+    fn hsv_hits_the_primaries_and_the_greys() {
+        let at = |h: f32, sat: f32, val: f32| Hsv { h, s: sat, v: val }.rgb();
+        let near = |got: [f32; 3], want: [f32; 3], what: &str| {
+            for i in 0..3 {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        };
+        near(at(0.0, 1.0, 1.0), [1.0, 0.0, 0.0], "red");
+        near(at(1.0 / 3.0, 1.0, 1.0), [0.0, 1.0, 0.0], "green");
+        near(at(2.0 / 3.0, 1.0, 1.0), [0.0, 0.0, 1.0], "blue");
+        // Zero saturation is grey at whatever value, whatever the hue.
+        for h in [0.0_f32, 0.25, 0.8] {
+            near(at(h, 0.0, 0.5), [0.5, 0.5, 0.5], "grey");
+        }
+        near(at(0.5, 1.0, 0.0), [0.0, 0.0, 0.0], "value 0 is black");
+        // Hue wraps rather than clamping — 1.0 is 0.0 again.
+        near(at(1.0, 1.0, 1.0), at(0.0, 1.0, 1.0), "hue wraps");
+    }
+
+    /// Every corner of the picker is reachable, and the plane is drawn
+    /// bright-at-the-top so the value axis has to be inverted.
+    #[test]
+    fn the_picker_reaches_every_corner() {
+        let bar = Rectangle::new(Point::from((200, 900)), Size::from((300, 44)));
+        let bounds = Rectangle::new(Point::from((0, 0)), Size::from((2560, 1440)));
+        let (_, plane, hue) = picker_layout(bar, bounds);
+        let from = Hsv::default();
+        let pick = |part, x: i32, y: i32| {
+            picker_colour(bar, bounds, part, (f64::from(x), f64::from(y)), from)
+        };
+
+        // Top-left of the plane: no saturation, full value — white.
+        let tl = pick(PickerPart::Plane, plane.loc.x, plane.loc.y);
+        assert!((tl.s - 0.0).abs() < 1e-3 && (tl.v - 1.0).abs() < 1e-3, "{tl:?}");
+        // Bottom-right: fully saturated, no value — black.
+        let br = pick(
+            PickerPart::Plane,
+            plane.loc.x + plane.size.w,
+            plane.loc.y + plane.size.h,
+        );
+        assert!((br.s - 1.0).abs() < 1e-3 && (br.v - 0.0).abs() < 1e-3, "{br:?}");
+        // The plane never touches the hue, and the strip never touches
+        // saturation or value — each axis is independent.
+        assert!((tl.h - from.h).abs() < 1e-6);
+        let far = pick(PickerPart::Hue, hue.loc.x, hue.loc.y + hue.size.h);
+        assert!((far.h - 1.0).abs() < 1e-3, "the far end of the strip: {far:?}");
+        assert!((far.s - from.s).abs() < 1e-6 && (far.v - from.v).abs() < 1e-6);
+
+        // Dragging past an edge pins rather than wrapping round.
+        let past = pick(PickerPart::Hue, hue.loc.x, hue.loc.y - 10_000_i32);
+        assert!((past.h - 0.0).abs() < 1e-6, "{past:?}");
+    }
+
     /// Pressing the pen has to *do* something visible. The swatches and
     /// the width slider were on the bar permanently at first, so turning
     /// the pen on changed nothing you could see and the picker looked
@@ -852,15 +1036,10 @@ mod tests {
         let up = tools(false);
         let down = tools(true);
         assert!(
-            !up.iter().any(|t| matches!(t, Tool::Colour(_) | Tool::Width)),
+            !up.contains(&Tool::Width),
             "pen up: the bar shouldn't offer pen settings"
         );
-        assert_eq!(
-            down.iter().filter(|t| matches!(t, Tool::Colour(_))).count(),
-            PenColour::ALL.len(),
-            "pen down: every colour is offered"
-        );
-        assert!(down.contains(&Tool::Width));
+        assert!(down.contains(&Tool::Width), "pen down: the width is offered");
         // The buttons that aren't about the pen never move away.
         for always in [Tool::Take, Tool::Draw, Tool::CopyText, Tool::Cancel] {
             assert!(up.contains(&always), "{always:?} vanished with the pen up");

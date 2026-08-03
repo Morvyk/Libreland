@@ -845,6 +845,63 @@ void main() {
 }
 ";
 
+/// The colour picker's two surfaces, generated per fragment: a
+/// saturation/value plane for one hue, and the hue strip beside it.
+///
+/// Sixteen million colours with no texture and no palette — the whole
+/// widget is a function of the fragment's position, which is what a GPU
+/// is for. The selection marker is drawn in the same pass, as a ring on
+/// the plane and a bar across the strip, so each surface is one draw.
+const PICKER_SHADER: &str = r"#version 100
+//_DEFINES_
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform float alpha;
+uniform int mode;        // 0 = saturation/value plane, 1 = hue strip
+uniform float hue;       // the plane's hue
+uniform vec2 marker;     // selection, normalised over the widget
+uniform vec2 quad;       // widget size in px
+varying vec2 v_coords;
+
+vec3 hsv2rgb(float h, float s, float v) {
+    vec3 p = abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return v * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), s);
+}
+
+void main() {
+    vec3 base;
+    float ring;
+    vec2 p = v_coords * quad;
+    if (mode == 0) {
+        // Saturation left to right, value bottom to top — bright at the
+        // top, the way every picker is drawn.
+        base = hsv2rgb(hue, v_coords.x, 1.0 - v_coords.y);
+        float d = distance(p, marker * quad);
+        float r = 6.0;
+        ring = 1.0 - smoothstep(1.0, 2.0, abs(d - r));
+    } else {
+        base = hsv2rgb(v_coords.y, 1.0, 1.0);
+        // A bar across the strip rather than a ring: the strip is one
+        // dimension, and a ring would imply the other one meant something.
+        ring = 1.0 - smoothstep(1.5, 2.5, abs(p.y - marker.y * quad.y));
+    }
+    // The marker is drawn light on dark colours and dark on light ones,
+    // so it stays visible across the whole plane — a single-colour
+    // marker disappears into its own half of the picker.
+    float luma = dot(base, vec3(0.2126, 0.7152, 0.0722));
+    vec3 ink = vec3(step(luma, 0.5));
+    vec3 rgb = mix(base, ink, ring);
+    // The sampler is bound to a 1x1 opaque white texture (see
+    // SEGMENT_SHADER) purely so the uniform survives compilation.
+    float a = texture2D(tex, v_coords).a;
+    gl_FragColor = vec4(rgb * a, a) * alpha;
+}
+";
+
 /// Tonemap the composited linear-BT.2020 scene (the fp16 offscreen) down to
 /// an 8-bit **sRGB** image for screenshots, so a capture of an HDR output
 /// "looks like SDR". GLES can't read the fp16 scanout back as an 8-bit
@@ -1429,6 +1486,8 @@ pub struct Renderer {
     screenshot_tonemap_shader: GlesTexProgram,
     /// Anti-aliased stroke program: toolbar glyphs and annotation.
     segment_shader: GlesTexProgram,
+    /// Procedural HSV colour picker (plane + hue strip).
+    picker_shader: GlesTexProgram,
     /// 1x1 opaque white, bound as the sampler for programs that draw
     /// procedurally and never read a texture (see [`SEGMENT_SHADER`]).
     blank_tex: GlesTexture,
@@ -1862,6 +1921,8 @@ pub struct ScreenshotOverlay {
     pub handles: bool,
     /// The options bar, once a selection is committed.
     pub toolbar: Option<Toolbar>,
+    /// The colour picker, while the pen is down.
+    pub picker: Option<Picker>,
     /// Annotation strokes, in absolute compositor coords, oldest first.
     /// The one being drawn right now is last.
     pub strokes: Vec<StrokeDraw>,
@@ -1900,13 +1961,26 @@ pub struct ToolButton {
 pub enum ToolIcon {
     Take,
     Draw,
-    Swatch([f32; 3]),
     /// The pen-width slider: a track, the filled part up to `frac`, and a
     /// knob whose size *is* the width being chosen — the control shows
     /// you the stroke rather than a number you have to imagine.
     Slider { frac: f32, width: f32, colour: [f32; 3] },
     Text,
     Cancel,
+}
+
+/// The colour picker's panel and the two surfaces on it, plus where the
+/// current colour sits on each.
+#[derive(Debug, Clone, Copy)]
+pub struct Picker {
+    pub panel: Rectangle<i32, Physical>,
+    pub plane: Rectangle<i32, Physical>,
+    pub hue: Rectangle<i32, Physical>,
+    /// Hue, 0..1 — both the plane's tint and the strip's marker.
+    pub h: f32,
+    /// Saturation and value, 0..1: the marker's place on the plane.
+    pub s: f32,
+    pub v: f32,
 }
 
 /// One output's render state.
@@ -3279,6 +3353,17 @@ impl Renderer {
         let segment_shader = gles
             .compile_custom_texture_shader(SEGMENT_SHADER, &segment_uniforms)
             .context("segment shader compile failed")?;
+        let picker_shader = gles
+            .compile_custom_texture_shader(
+                PICKER_SHADER,
+                &[
+                    UniformName::new("mode", UniformType::_1i),
+                    UniformName::new("hue", UniformType::_1f),
+                    UniformName::new("marker", UniformType::_2f),
+                    UniformName::new("quad", UniformType::_2f),
+                ],
+            )
+            .context("colour picker shader compile failed")?;
         // 1x1 opaque white for the procedural programs' unused sampler.
         let mut blank_tex = gles
             .create_buffer(
@@ -3615,6 +3700,7 @@ impl Renderer {
             hdr_encode_shader,
             screenshot_tonemap_shader,
             segment_shader,
+            picker_shader,
             blank_tex,
             sdr_decode_shader,
             sdr_to_pq_shader,
@@ -6042,6 +6128,7 @@ impl Renderer {
         };
         let screenshot_overlay = self.screenshot_overlay.clone();
         let segment_shader = self.segment_shader.clone();
+        let picker_shader = self.picker_shader.clone();
         let blank_tex = self.blank_tex.clone();
         let snap_preview = self.snap_preview;
         // The quick-tile preview borrows the focused window's accent, so
@@ -8158,6 +8245,7 @@ impl Renderer {
                         &overlay.strokes,
                         &OverlayPaint {
                             segment: &segment_shader,
+                            picker: &picker_shader,
                             blank: &blank_tex,
                             origin: compositor_position,
                             scale,
@@ -8170,12 +8258,32 @@ impl Renderer {
                         warn!(%err, "screenshot: annotation draw failed");
                     }
                 }
+                if let Some(picker) = &overlay.picker {
+                    let res = draw_picker(
+                        &mut frame,
+                        picker,
+                        &OverlayPaint {
+                            segment: &segment_shader,
+                            picker: &picker_shader,
+                            blank: &blank_tex,
+                            origin: compositor_position,
+                            scale,
+                            hdr,
+                            reference_white: hdr_reference_white,
+                            saturation: hdr_saturation,
+                        },
+                    );
+                    if let Err(err) = res {
+                        warn!(%err, "screenshot: colour picker draw failed");
+                    }
+                }
                 if let Some(bar) = &overlay.toolbar {
                     let res = draw_toolbar(
                         &mut frame,
                         bar,
                         &OverlayPaint {
                             segment: &segment_shader,
+                            picker: &picker_shader,
                             blank: &blank_tex,
                             origin: compositor_position,
                             scale,
@@ -9833,6 +9941,7 @@ fn draw_snap_preview(
 /// the draw call doesn't take a dozen arguments.
 struct OverlayPaint<'a> {
     segment: &'a GlesTexProgram,
+    picker: &'a GlesTexProgram,
     blank: &'a GlesTexture,
     origin: Point<i32, Physical>,
     scale: f64,
@@ -10021,6 +10130,60 @@ fn draw_strokes(
     Ok(())
 }
 
+/// Draw the colour picker: a slab, the saturation/value plane, and the
+/// hue strip. Both surfaces are generated in the fragment shader, so
+/// there is no palette anywhere and every one of the sixteen million
+/// colours is reachable.
+fn draw_picker(
+    frame: &mut GlesFrame<'_, '_>,
+    picker: &Picker,
+    paint: &OverlayPaint<'_>,
+) -> Result<()> {
+    const SLAB: Color32F = Color32F::new(0.09, 0.09, 0.11, 0.94);
+    paint.fill(frame, paint.phys(picker.panel), SLAB)?;
+
+    let surface = |frame: &mut GlesFrame<'_, '_>,
+                   rect: Rectangle<i32, Physical>,
+                   mode: i32,
+                   marker: (f32, f32)|
+     -> Result<()> {
+        let dst = paint.phys(rect);
+        if dst.size.w <= 0 || dst.size.h <= 0 {
+            return Ok(());
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "widget sizes are a couple of hundred pixels"
+        )]
+        let quad = (dst.size.w as f32, dst.size.h as f32);
+        let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((1.0, 1.0)));
+        frame
+            .render_texture_from_to(
+                paint.blank,
+                src,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                &[],
+                Transform::Normal,
+                1.0,
+                Some(paint.picker),
+                &[
+                    Uniform::new("mode", mode),
+                    Uniform::new("hue", picker.h),
+                    Uniform::new("marker", marker),
+                    Uniform::new("quad", quad),
+                ],
+            )
+            .context("colour picker draw failed")
+    };
+
+    // Value runs bright-at-the-top, so the marker's y is inverted to
+    // match what the shader draws.
+    surface(frame, picker.plane, 0, (picker.s, 1.0 - picker.v))?;
+    surface(frame, picker.hue, 1, (0.5, picker.h))?;
+    Ok(())
+}
+
 /// Draw the options bar: a dark slab, a hover/active wash per button, and
 /// each glyph stroked straight onto the framebuffer.
 fn draw_toolbar(
@@ -10090,16 +10253,6 @@ fn draw_toolbar(
                     Color32F::new(colour[0], colour[1], colour[2], 1.0),
                 )?;
             }
-            ToolIcon::Swatch(rgb) => {
-                // The swatch *is* the icon: inset so the active wash
-                // behind it still reads as a ring around the colour.
-                let inset = (dst.size.w / 5).max(2);
-                let sw = Rectangle::new(
-                    Point::from((dst.loc.x + inset, dst.loc.y + inset)),
-                    Size::from((dst.size.w - 2 * inset, dst.size.h - 2 * inset)),
-                );
-                paint.fill(frame, sw, Color32F::new(rgb[0], rgb[1], rgb[2], 1.0))?;
-            }
             icon => {
                 // Stroke width tracks the button, so the glyphs stay in
                 // proportion at any output scale.
@@ -10133,7 +10286,7 @@ fn tool_segments(icon: ToolIcon) -> &'static [[f32; 4]] {
         ToolIcon::Text => &[[0.22, 0.24, 0.78, 0.24], [0.50, 0.24, 0.50, 0.78]],
         ToolIcon::Cancel => &[[0.26, 0.26, 0.74, 0.74], [0.74, 0.26, 0.26, 0.74]],
         // Drawn as filled quads instead; no strokes.
-        ToolIcon::Swatch(_) | ToolIcon::Slider { .. } => &[],
+        ToolIcon::Slider { .. } => &[],
     }
 }
 

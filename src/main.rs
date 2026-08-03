@@ -678,9 +678,11 @@ pub(crate) struct ScreenshotState {
     /// Annotation mode: dragging inside the selection draws instead of
     /// moving it.
     pub(crate) drawing: bool,
-    /// The annotation colour. Red, because that is what an annotation is
-    /// for nine times in ten.
-    pub(crate) pen: screenshot::PenColour,
+    /// The annotation colour, as HSV — the space the picker is shaped
+    /// like, so the widget and the value are the same two numbers.
+    pub(crate) pen: screenshot::Hsv,
+    /// The picker surface being dragged, while a press is held on it.
+    pub(crate) picking: Option<screenshot::PickerPart>,
     /// Pen width in compositor pixels.
     pub(crate) pen_width: i32,
     /// Finished annotation strokes, oldest first.
@@ -4672,7 +4674,8 @@ impl State {
                     region: None,
                     grab: None,
                     drawing: false,
-                    pen: screenshot::PenColour::Red,
+                    pen: screenshot::Hsv::default(),
+                    picking: None,
                     pen_width: screenshot::PEN_DEFAULT,
                     strokes: Vec::new(),
                     stroke: None,
@@ -4742,10 +4745,12 @@ impl State {
                 })
                 .collect()
         });
+        let picker = self.build_screenshot_picker(toolbar.as_ref());
         self.renderer.set_screenshot_overlay(Some(render::ScreenshotOverlay {
             selection,
             handles,
             toolbar,
+            picker,
             strokes,
         }));
     }
@@ -4772,7 +4777,6 @@ impl State {
                 icon: match tool {
                     screenshot::Tool::Take => render::ToolIcon::Take,
                     screenshot::Tool::Draw => render::ToolIcon::Draw,
-                    screenshot::Tool::Colour(c) => render::ToolIcon::Swatch(c.rgb()),
                     screenshot::Tool::Width => render::ToolIcon::Slider {
                         frac: screenshot::pen_fraction(session.pen_width),
                         width: f32::from(i16::try_from(session.pen_width).unwrap_or(4)),
@@ -4781,15 +4785,31 @@ impl State {
                     screenshot::Tool::CopyText => render::ToolIcon::Text,
                     screenshot::Tool::Cancel => render::ToolIcon::Cancel,
                 },
-                active: match tool {
-                    screenshot::Tool::Draw => session.drawing,
-                    screenshot::Tool::Colour(c) => c == session.pen,
-                    _ => false,
-                },
+                active: matches!(tool, screenshot::Tool::Draw) && session.drawing,
                 hovered: hovered == Some(tool),
             })
             .collect();
         Some(render::Toolbar { bar, buttons })
+    }
+
+    /// The colour picker panel, while the pen is down. Anchored to the
+    /// toolbar, so it moves with it and can't end up somewhere else.
+    fn build_screenshot_picker(&self, toolbar: Option<&render::Toolbar>) -> Option<render::Picker> {
+        let session = self.screenshot.as_ref()?;
+        if !session.drawing {
+            return None;
+        }
+        let sel = session.region?;
+        let bounds = self.screenshot_output_bounds(sel)?;
+        let (panel, plane, hue) = screenshot::picker_layout(toolbar?.bar, bounds);
+        Some(render::Picker {
+            panel,
+            plane,
+            hue,
+            h: session.pen.h,
+            s: session.pen.s,
+            v: session.pen.v,
+        })
     }
 
     /// The output rect a selection belongs to — the toolbar is placed
@@ -4803,6 +4823,53 @@ impl State {
             .output_at(center)
             .or_else(|| self.renderer.output_at(sel.loc))
             .map(|g| g.compositor)
+    }
+
+    /// The toolbar rect and its output's bounds, which is what every
+    /// picker query is measured against.
+    fn screenshot_bar_and_bounds(
+        &self,
+    ) -> Option<(
+        smithay::utils::Rectangle<i32, Physical>,
+        smithay::utils::Rectangle<i32, Physical>,
+    )> {
+        let session = self.screenshot.as_ref()?;
+        let sel = session.region?;
+        let bounds = self.screenshot_output_bounds(sel)?;
+        let (bar, _) = screenshot::toolbar_layout(sel, bounds, session.drawing);
+        Some((bar, bounds))
+    }
+
+    /// Take a press on the colour picker. Returns whether it was consumed.
+    fn screenshot_picker_press(&mut self, at: (f64, f64)) -> bool {
+        if !self.screenshot.as_ref().is_some_and(|s| s.drawing) {
+            return false;
+        }
+        let Some((bar, bounds)) = self.screenshot_bar_and_bounds() else {
+            return false;
+        };
+        let Some(part) = screenshot::picker_hit(bar, bounds, at) else {
+            // Still inside the panel's padding? Swallow it anyway, or the
+            // press falls through and throws the selection away.
+            let (panel, _, _) = screenshot::picker_layout(bar, bounds);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor coords are clamped to the i32 layout bounds"
+            )]
+            let (px, py) = (at.0.round() as i32, at.1.round() as i32);
+            return px >= panel.loc.x
+                && px < panel.loc.x + panel.size.w
+                && py >= panel.loc.y
+                && py < panel.loc.y + panel.size.h;
+        };
+        let from = self.screenshot.as_ref().map(|s| s.pen).unwrap_or_default();
+        let picked = screenshot::picker_colour(bar, bounds, part, at, from);
+        if let Some(s) = &mut self.screenshot {
+            s.pen = picked;
+            s.picking = Some(part);
+        }
+        self.update_screenshot_overlay();
+        true
     }
 
     /// Where the pen-width slider is, if the toolbar is up.
@@ -4874,14 +4941,6 @@ impl State {
                 }
                 self.update_screenshot_overlay();
             }
-            Some(screenshot::Tool::Colour(c)) => {
-                if let Some(s) = &mut self.screenshot {
-                    s.pen = c;
-                    // Picking a colour is how you start annotating.
-                    s.drawing = true;
-                }
-                self.update_screenshot_overlay();
-            }
             Some(screenshot::Tool::Width) => {
                 // Grab the slider: the width tracks the pointer until
                 // release, including past the ends of the track.
@@ -4935,6 +4994,20 @@ impl State {
             reason = "cursor coords are clamped to the i32 layout bounds"
         )]
         let here = (cx.round() as i32, cy.round() as i32);
+        // A grabbed picker surface keeps following the pointer past its
+        // own edge, same as the width slider: you should be able to drag
+        // to fully-saturated without having to stop exactly on the line.
+        if let Some(part) = self.screenshot.as_ref().and_then(|s| s.picking) {
+            if let Some((bar, bounds)) = self.screenshot_bar_and_bounds() {
+                let from = self.screenshot.as_ref().map(|s| s.pen).unwrap_or_default();
+                let picked = screenshot::picker_colour(bar, bounds, part, (cx, cy), from);
+                if let Some(s) = &mut self.screenshot {
+                    s.pen = picked;
+                }
+                self.update_screenshot_overlay();
+            }
+            return;
+        }
         // The width slider keeps following the pointer once grabbed, even
         // past the track — a slider you fall off is a slider you fight.
         if self.screenshot.as_ref().is_some_and(|s| s.sliding) {
@@ -4989,6 +5062,12 @@ impl State {
                     return;
                 }
                 let at = self.renderer.cursor_pos();
+                // The picker floats outside the selection, so like the
+                // toolbar it has to claim its presses before they read as
+                // "start a new selection".
+                if self.screenshot_picker_press(at) {
+                    return;
+                }
                 // Annotation wins inside the selection: while the pen is
                 // up you are moving the rect, while it is down you are
                 // drawing on it, and one gesture cannot mean both.
@@ -5034,6 +5113,9 @@ impl State {
             return;
         }
         s.sliding = false;
+        if s.picking.take().is_some() {
+            return;
+        }
         if let Some(stroke) = s.stroke.take() {
             // A click with no travel leaves a dot, which is a legitimate
             // annotation; an empty one is not.
