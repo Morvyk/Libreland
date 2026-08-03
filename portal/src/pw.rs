@@ -15,10 +15,9 @@
 //!
 //! * **dmabuf** — a gbm buffer object, exported as a dma-buf fd, imported into
 //!   Wayland through `zwp_linux_dmabuf_v1` and into `PipeWire` as
-//!   `SPA_DATA_DmaBuf`. The pixels never touch the CPU. We allocate with an
-//!   explicit `LINEAR` modifier rather than negotiating a modifier list:
-//!   linear is universally importable, and the alternative is a
-//!   fixation dance whose failure mode is a black stream.
+//!   `SPA_DATA_DmaBuf`. The pixels never touch the CPU. The layout is
+//!   whichever one the driver will render into, probed once and then used
+//!   for both the offer and every allocation — see `probe_modifier`.
 //! * **memfd** — the same buffer as plain shared memory, which every consumer
 //!   accepts and no driver can refuse.
 //!
@@ -77,10 +76,6 @@ pub struct Started {
     pub height: i32,
 }
 
-/// DRM's "linear layout" modifier. Spelled out rather than pulled from a
-/// constant table so the one modifier we depend on is visible here.
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-
 /// Map a `wl_shm/DRM` 32-bit packed format to the SPA video format with the same
 /// byte order in memory.
 ///
@@ -116,6 +111,29 @@ fn to_pod(object: Object) -> Vec<u8> {
     PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(object))
         .map(|(cursor, _)| cursor.into_inner())
         .unwrap_or_default()
+}
+
+/// The modifier this driver will hand out for a render target of
+/// `spec`'s size and format — allocated, read, and thrown away.
+///
+/// The offer and the allocation have to name the *same* layout. They
+/// didn't for one release: the offer said LINEAR while the allocator
+/// asked for whatever the driver preferred, so a consumer negotiated
+/// linear, received tiled, imported it as linear and got garbage. Both
+/// OBS and Discord dropped to shared memory about three milliseconds
+/// in. Probing once and using the answer in both places makes them
+/// agree by construction rather than by matching literals.
+fn probe_modifier(device: &gbm::Device<std::fs::File>, spec: &BufferSpec) -> Option<u64> {
+    let fourcc = drm_fourcc::DrmFourcc::try_from(fourcc_of(spec.shm_format)).ok()?;
+    let bo = device
+        .create_buffer_object::<()>(
+            spec.width,
+            spec.height,
+            fourcc,
+            gbm::BufferObjectFlags::RENDERING,
+        )
+        .ok()?;
+    Some(u64::from(bo.modifier()))
 }
 
 /// One `EnumFormat` offer. With `modifier`, it advertises the dmabuf variant.
@@ -302,6 +320,9 @@ struct Cast {
     cursor: bool,
     spec: BufferSpec,
     gbm: Option<gbm::Device<std::fs::File>>,
+    /// The layout advertised to the consumer, and therefore the only one
+    /// we may allocate — see [`probe_modifier`].
+    dmabuf_modifier: Option<u64>,
     /// Set once the format is negotiated; until then we don't know which
     /// allocation path the consumer accepted.
     dmabuf: bool,
@@ -338,24 +359,20 @@ impl Cast {
             // `RENDERING` is the flag that says so; gbm then answers with
             // a modifier the driver will actually render into, which is
             // the one thing the compositor needs to be true.
-            let bo = device
-                .create_buffer_object::<()>(
-                    width,
-                    height,
-                    fourcc,
-                    gbm::BufferObjectFlags::RENDERING,
-                )
-                .or_else(|_| {
-                    device.create_buffer_object_with_modifiers::<()>(
-                        width,
-                        height,
-                        fourcc,
-                        [drm_fourcc::DrmModifier::Linear].into_iter(),
-                    )
-                })?;
-            // Whatever it chose — passed through verbatim, since the
-            // compositor has to import exactly what was allocated.
-            let modifier = u64::from(bo.modifier());
+            // Exactly the layout the consumer was offered. Asking the
+            // driver again and taking whatever it says would be the bug
+            // this replaced: the two answers only *usually* match, and a
+            // consumer that imports a tiled buffer as linear shows
+            // garbage and drops to shared memory.
+            let modifier = self
+                .dmabuf_modifier
+                .ok_or_else(|| anyhow::anyhow!("dmabuf path without a negotiated modifier"))?;
+            let bo = device.create_buffer_object_with_modifiers::<()>(
+                width,
+                height,
+                fourcc,
+                [drm_fourcc::DrmModifier::from(modifier)].into_iter(),
+            )?;
             let fd = bo.fd()?;
             let bo_stride = bo.stride();
             let offset = bo.offset(0);
@@ -500,12 +517,18 @@ fn run_inner(
     let stream = pw::stream::StreamRc::new(core, "libreland-screencast", properties)?;
 
     let gbm = open_render_node();
-    let has_gbm = gbm.is_some();
+    // Probe before offering: an offer we cannot then allocate to match
+    // is worse than no offer, because the consumer commits to it.
+    let dmabuf_modifier = gbm.as_ref().and_then(|d| probe_modifier(d, &spec));
+    if gbm.is_some() && dmabuf_modifier.is_none() {
+        tracing::warn!("no renderable dmabuf layout for this format; offering shared memory only");
+    }
     let cast = Cast {
         capturer,
         output,
         cursor: request.cursor,
         spec,
+        dmabuf_modifier,
         dmabuf: false,
         gbm,
         slots: HashMap::new(),
@@ -697,10 +720,12 @@ fn run_inner(
 
     // Offer dmabuf first (when we can allocate one) so a capable consumer
     // takes the zero-copy path, then plain memory as the always-works option.
-    let dmabuf_pod = format_pod(&spec, fps, Some(DRM_FORMAT_MOD_LINEAR));
+    let dmabuf_pod = format_pod(&spec, fps, dmabuf_modifier);
     let shm_pod = format_pod(&spec, fps, None);
     let mut params: Vec<&Pod> = Vec::new();
-    if has_gbm && let Some(pod) = Pod::from_bytes(&dmabuf_pod) {
+    if dmabuf_modifier.is_some()
+        && let Some(pod) = Pod::from_bytes(&dmabuf_pod)
+    {
         params.push(pod);
     }
     if let Some(pod) = Pod::from_bytes(&shm_pod) {
