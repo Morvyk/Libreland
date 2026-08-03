@@ -865,11 +865,38 @@ uniform int mode;        // 0 = saturation/value plane, 1 = hue strip
 uniform float hue;       // the plane's hue
 uniform vec2 marker;     // selection, normalised over the widget
 uniform vec2 quad;       // widget size in px
+// Non-zero when the scene is linear BT.2020 rather than sRGB. The colours
+// here are *generated*, not sampled, so nothing upstream can convert
+// them — this shader has to do what the SDR decode does for everything
+// else, or sRGB 0.5 lands in the scene meaning 5000 nits.
+uniform int hdr;
+uniform float reference_white;
+uniform float saturation;
 varying vec2 v_coords;
 
 vec3 hsv2rgb(float h, float s, float v) {
     vec3 p = abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
     return v * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), s);
+}
+
+// Identical maths to SDR_DECODE_SHADER, so a generated colour and a
+// client's pixel of the same value end up the same colour on screen.
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+vec3 to_scene(vec3 c) {
+    if (hdr == 0) { return c; }
+    vec3 lin = srgb_to_linear(c) * (reference_white / 10000.0);
+    mat3 bt709_to_bt2020 = mat3(
+        0.627403896, 0.069097289, 0.016391439,
+        0.329283038, 0.919540395, 0.088013308,
+        0.043313066, 0.011362316, 0.895595253
+    );
+    vec3 bt2020 = bt709_to_bt2020 * lin;
+    float luma = dot(bt2020, vec3(0.2627, 0.6780, 0.0593));
+    return max(mix(vec3(luma), bt2020, saturation), vec3(0.0));
 }
 
 void main() {
@@ -894,7 +921,9 @@ void main() {
     // marker disappears into its own half of the picker.
     float luma = dot(base, vec3(0.2126, 0.7152, 0.0722));
     vec3 ink = vec3(step(luma, 0.5));
-    vec3 rgb = mix(base, ink, ring);
+    // Mixed in sRGB, where the marker's contrast test was decided, then
+    // converted once for whatever space the scene is in.
+    vec3 rgb = to_scene(mix(base, ink, ring));
     // The sampler is bound to a 1x1 opaque white texture (see
     // SEGMENT_SHADER) purely so the uniform survives compilation.
     float a = texture2D(tex, v_coords).a;
@@ -3361,6 +3390,9 @@ impl Renderer {
                     UniformName::new("hue", UniformType::_1f),
                     UniformName::new("marker", UniformType::_2f),
                     UniformName::new("quad", UniformType::_2f),
+                    UniformName::new("hdr", UniformType::_1i),
+                    UniformName::new("reference_white", UniformType::_1f),
+                    UniformName::new("saturation", UniformType::_1f),
                 ],
             )
             .context("colour picker shader compile failed")?;
@@ -10172,6 +10204,13 @@ fn draw_picker(
                     Uniform::new("hue", picker.h),
                     Uniform::new("marker", marker),
                     Uniform::new("quad", quad),
+                    Uniform::new("hdr", i32::from(paint.hdr)),
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "reference white is a small cd/m² value, exact in f32"
+                    )]
+                    Uniform::new("reference_white", paint.reference_white as f32),
+                    Uniform::new("saturation", paint.saturation),
                 ],
             )
             .context("colour picker draw failed")

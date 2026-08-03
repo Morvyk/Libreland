@@ -331,21 +331,26 @@ pub(crate) const TOOL_GAP: i32 = 10;
 
 /// The buttons, left to right.
 ///
-/// The pen's settings are only on the bar while `drawing` is on — the
-/// width slider here, and the colour picker in its own panel above it.
-/// They were permanently visible at first, which made pressing the pen
-/// look like it did nothing at all. Revealing them *is* the feedback
-/// that the pen is down.
-pub(crate) fn tools(drawing: bool) -> Vec<Tool> {
-    let mut v = vec![Tool::Take, Tool::Draw];
-    if drawing {
-        // The colour lives in the picker panel above the bar; the width
-        // is a strip, so it belongs in the row.
-        v.push(Tool::Width);
-    }
-    v.push(Tool::CopyText);
-    v.push(Tool::Cancel);
-    v
+/// The bar's contents never change.
+///
+/// They did briefly — the pen's settings were added and removed with the
+/// pen — and that broke the pen. The bar is centred on the selection, so
+/// growing it by a slider's width slid every button half that distance
+/// sideways, and the pen you had just pressed moved out from under the
+/// pointer before you could press it again. A toggle you cannot press
+/// twice is not a toggle.
+///
+/// What appears with the pen is the colour picker, in its own panel
+/// anchored above the bar, where it can come and go without moving
+/// anything you might be about to click.
+pub(crate) fn tools() -> Vec<Tool> {
+    vec![
+        Tool::Take,
+        Tool::Draw,
+        Tool::Width,
+        Tool::CopyText,
+        Tool::Cancel,
+    ]
 }
 
 /// How wide a tool's slot is. Everything is a square button except the
@@ -368,10 +373,9 @@ pub(crate) fn tool_width(tool: Tool) -> i32 {
 pub(crate) fn toolbar_layout(
     sel: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
-    drawing: bool,
 ) -> (Rectangle<i32, Physical>, Vec<ToolSlot>) {
     use smithay::utils::{Point, Size};
-    let tools = tools(drawing);
+    let tools = tools();
     let count = i32::try_from(tools.len()).unwrap_or(1);
     let bar_w: i32 = tools.iter().map(|t| tool_width(*t)).sum::<i32>() + (count + 1) * TOOL_PAD;
     let bar_h = TOOL_SIZE + 2 * TOOL_PAD;
@@ -417,14 +421,13 @@ pub(crate) fn tool_at(
     sel: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
     pos: (f64, f64),
-    drawing: bool,
 ) -> Option<Tool> {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "cursor coords are clamped to the i32 layout bounds"
     )]
     let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
-    let (_, slots) = toolbar_layout(sel, bounds, drawing);
+    let (_, slots) = toolbar_layout(sel, bounds);
     slots
         .into_iter()
         .find(|(_, r)| {
@@ -439,14 +442,13 @@ pub(crate) fn on_toolbar(
     sel: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
     pos: (f64, f64),
-    drawing: bool,
 ) -> bool {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "cursor coords are clamped to the i32 layout bounds"
     )]
     let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
-    let (bar, _) = toolbar_layout(sel, bounds, drawing);
+    let (bar, _) = toolbar_layout(sel, bounds);
     px >= bar.loc.x
         && px < bar.loc.x + bar.size.w
         && py >= bar.loc.y
@@ -1027,23 +1029,33 @@ mod tests {
         assert!((past.h - 0.0).abs() < 1e-6, "{past:?}");
     }
 
-    /// Pressing the pen has to *do* something visible. The swatches and
-    /// the width slider were on the bar permanently at first, so turning
-    /// the pen on changed nothing you could see and the picker looked
-    /// broken — it had been sitting there the whole time.
+    /// The bar must not move when the pen is toggled. It is centred on
+    /// the selection, so anything that changes its width slides every
+    /// button sideways — and the pen sliding out from under the pointer
+    /// is exactly what made it impossible to press twice.
     #[test]
-    fn the_pen_reveals_its_settings() {
-        let up = tools(false);
-        let down = tools(true);
-        assert!(
-            !up.contains(&Tool::Width),
-            "pen up: the bar shouldn't offer pen settings"
+    fn the_toolbar_does_not_move_when_the_pen_toggles() {
+        let sel = Rectangle::new(Point::from((300, 200)), Size::from((400, 300)));
+        let bounds = Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080)));
+        let (bar, slots) = toolbar_layout(sel, bounds);
+        // The layout takes no notion of pen state at all, which is the
+        // strongest form of "it cannot move": there is nothing to vary.
+        let pen = slots
+            .iter()
+            .find(|(t, _)| *t == Tool::Draw)
+            .map(|(_, r)| *r)
+            .expect("the pen is always on the bar");
+        let (bar2, slots2) = toolbar_layout(sel, bounds);
+        assert_eq!(bar, bar2);
+        assert_eq!(
+            slots2.iter().find(|(t, _)| *t == Tool::Draw).map(|(_, r)| *r),
+            Some(pen)
         );
-        assert!(down.contains(&Tool::Width), "pen down: the width is offered");
-        // The buttons that aren't about the pen never move away.
-        for always in [Tool::Take, Tool::Draw, Tool::CopyText, Tool::Cancel] {
-            assert!(up.contains(&always), "{always:?} vanished with the pen up");
-            assert!(down.contains(&always), "{always:?} vanished with the pen down");
+        for always in tools() {
+            assert!(
+                slots.iter().any(|(t, _)| *t == always),
+                "{always:?} is missing from the bar"
+            );
         }
     }
 
@@ -1124,7 +1136,7 @@ mod tests {
     fn toolbar_slots_tile_the_bar_without_overlapping() {
         let sel = Rectangle::new(Point::from((300, 200)), Size::from((400, 300)));
         let bounds = Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080)));
-        let (bar, slots) = toolbar_layout(sel, bounds, true);
+        let (bar, slots) = toolbar_layout(sel, bounds);
         assert!(!slots.is_empty());
         let mut prev_right = bar.loc.x;
         for (tool, r) in &slots {
@@ -1152,7 +1164,7 @@ mod tests {
             // Hard against the right edge: must clamp left.
             Rectangle::new(Point::from((1800, 400)), Size::from((119, 200))),
         ] {
-            let (bar, _) = toolbar_layout(sel, bounds, true);
+            let (bar, _) = toolbar_layout(sel, bounds);
             assert!(bar.loc.x >= 0, "{sel:?} pushed the bar off the left");
             assert!(
                 bar.loc.x + bar.size.w <= bounds.size.w,
