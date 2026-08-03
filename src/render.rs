@@ -1788,6 +1788,11 @@ struct WinDraw {
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenshotOverlay {
     pub selection: Option<Rectangle<i32, Physical>>,
+    /// Draw grab handles on the selection's corners and edge midpoints —
+    /// set once it is *committed* (the drag has been released) and can be
+    /// adjusted. A rect still being dragged out shows none: there is
+    /// nothing to grab while the pointer is already holding a corner.
+    pub handles: bool,
 }
 
 /// One output's render state.
@@ -9691,6 +9696,27 @@ fn draw_screenshot_overlay(
     solid(frame, x0, y1 - t, w, t, OUTLINE)?; // bottom edge
     solid(frame, x0, y0, t, h, OUTLINE)?; // left edge
     solid(frame, x1 - t, y0, t, h, OUTLINE)?; // right edge
+
+    if overlay.handles {
+        // Eight grips: four corners, four edge midpoints. They say the
+        // rect can still be changed, which is the whole point of not
+        // taking the picture on release.
+        let g = scale_i(8, scale).max(6);
+        let half = g / 2;
+        let (mx, my) = (x0 + w / 2 - half, y0 + h / 2 - half);
+        for (gx, gy) in [
+            (x0, y0),
+            (x1 - g, y0),
+            (x0, y1 - g),
+            (x1 - g, y1 - g),
+            (mx, y0),
+            (mx, y1 - g),
+            (x0, my),
+            (x1 - g, my),
+        ] {
+            solid(frame, gx, gy, g, g, OUTLINE)?;
+        }
+    }
     Ok(())
 }
 

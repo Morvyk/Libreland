@@ -656,6 +656,21 @@ pub(crate) struct ScreenshotState {
     /// both as the displayed backdrop and as the source the final image
     /// is cropped from.
     pub(crate) frozen: std::collections::HashMap<String, FrozenFrame>,
+    /// The committed selection, once the first drag has been released.
+    ///
+    /// Releasing the mouse used to *take* the shot. It now hands you a
+    /// rectangle instead — the overwhelmingly common correction after a
+    /// region drag is "a few pixels off", and a tool that fires on release
+    /// makes you redo the whole drag for it. `None` while the first one is
+    /// still being dragged out.
+    pub(crate) region: Option<smithay::utils::Rectangle<i32, Physical>>,
+    /// An in-flight move/resize of the committed selection: what was
+    /// grabbed, where the cursor was, and the rect at that moment.
+    pub(crate) grab: Option<(
+        screenshot::SelectionGrab,
+        (f64, f64),
+        smithay::utils::Rectangle<i32, Physical>,
+    )>,
 }
 
 /// A frozen full-output capture kept for the duration of a freeze-mode
@@ -4533,6 +4548,8 @@ impl State {
                     bind: bind.clone(),
                     anchor: None,
                     frozen: std::collections::HashMap::new(),
+                    region: None,
+                    grab: None,
                 });
                 if bind.freeze {
                     // Snapshot every output. The overlay (dim) is held back
@@ -4583,21 +4600,23 @@ impl State {
     /// to the renderer for this and following frames.
     fn update_screenshot_overlay(&mut self) {
         let selection = self.current_screenshot_selection();
+        let handles = self.screenshot.as_ref().is_some_and(|s| s.region.is_some());
         self.renderer
-            .set_screenshot_overlay(Some(render::ScreenshotOverlay { selection }));
+            .set_screenshot_overlay(Some(render::ScreenshotOverlay { selection, handles }));
     }
 
-    /// The current selection in absolute compositor coords: the
-    /// anchor→cursor rect (Region, once dragging) or the hovered window
-    /// (Window). `None` dims the whole screen.
+    /// The current selection in absolute compositor coords: the committed
+    /// rect if there is one, else the anchor→cursor rect being dragged
+    /// out (Region) or the hovered window (Window). `None` dims the whole
+    /// screen.
     fn current_screenshot_selection(&self) -> Option<smithay::utils::Rectangle<i32, Physical>> {
         let session = self.screenshot.as_ref()?;
         match session.bind.mode {
-            config::ScreenshotMode::Region => {
+            config::ScreenshotMode::Region => session.region.or_else(|| {
                 let (ax, ay) = session.anchor?;
                 let (cx, cy) = self.renderer.cursor_pos();
                 Some(rect_from_corners(ax, ay, cx, cy))
-            }
+            }),
             config::ScreenshotMode::Window => {
                 self.layout.window_at(self.cursor_point()).map(|(_, r)| r)
             }
@@ -4605,9 +4624,21 @@ impl State {
         }
     }
 
-    /// Pointer moved during a session — refresh the selection UI.
+    /// Pointer moved during a session — drive whatever the press started.
     fn screenshot_pointer_motion(&mut self) {
+        let (cx, cy) = self.renderer.cursor_pos();
+        if let Some(s) = &mut self.screenshot
+            && let Some((grab, (fx, fy), start)) = s.grab
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "cursor deltas are bounded by the i32 layout bounds"
+            )]
+            let (dx, dy) = ((cx - fx) as i32, (cy - fy) as i32);
+            s.region = Some(screenshot::apply_grab(start, grab, dx, dy));
+        }
         self.update_screenshot_overlay();
+        self.refresh_screenshot_cursor();
     }
 
     /// Left-button press during a session.
@@ -4617,9 +4648,22 @@ impl State {
         };
         match mode {
             config::ScreenshotMode::Region => {
-                let corner = self.renderer.cursor_pos();
+                let at = self.renderer.cursor_pos();
                 if let Some(s) = &mut self.screenshot {
-                    s.anchor = Some(corner);
+                    // A committed selection takes the press if it was
+                    // aimed at one — otherwise the press starts a fresh
+                    // drag, discarding the old rect, which is how you
+                    // change your mind about the whole thing.
+                    let hit = s
+                        .region
+                        .and_then(|r| screenshot::grab_at(r, at, screenshot::HANDLE).zip(Some(r)));
+                    if let Some((grab, rect)) = hit {
+                        s.grab = Some((grab, at, rect));
+                    } else {
+                        s.region = None;
+                        s.grab = None;
+                        s.anchor = Some(at);
+                    }
                 }
                 self.update_screenshot_overlay();
             }
@@ -4628,14 +4672,59 @@ impl State {
         }
     }
 
-    /// Left-button release during a session — finalize a region drag.
+    /// Left-button release during a session.
+    ///
+    /// This is the change of shape: it used to take the picture. It now
+    /// *commits* the rect and leaves it on screen to be adjusted, because
+    /// the correction after a region drag is nearly always "a few pixels
+    /// off" and firing on release makes you redo the whole drag for it.
+    /// Enter takes the shot.
     fn screenshot_pointer_release(&mut self) {
-        let region_drag = self.screenshot.as_ref().is_some_and(|s| {
-            matches!(s.bind.mode, config::ScreenshotMode::Region) && s.anchor.is_some()
-        });
-        if region_drag {
-            self.finalize_region();
+        let (cx, cy) = self.renderer.cursor_pos();
+        let Some(s) = &mut self.screenshot else {
+            return;
+        };
+        if !matches!(s.bind.mode, config::ScreenshotMode::Region) {
+            return;
         }
+        if s.grab.take().is_some() {
+            self.update_screenshot_overlay();
+            return;
+        }
+        let Some((ax, ay)) = s.anchor.take() else {
+            return;
+        };
+        let sel = rect_from_corners(ax, ay, cx, cy);
+        // A click with no drag is a miss, not a one-pixel screenshot.
+        // Leave the session up so it can be tried again.
+        if sel.size.w >= screenshot::MIN_SELECTION && sel.size.h >= screenshot::MIN_SELECTION {
+            s.region = Some(sel);
+        }
+        self.update_screenshot_overlay();
+        self.refresh_screenshot_cursor();
+    }
+
+    /// Cursor shape over a committed selection: the matching resize arrow
+    /// on an edge or corner, a move cross inside, the crosshair elsewhere.
+    fn refresh_screenshot_cursor(&mut self) {
+        use smithay::input::pointer::CursorIcon;
+        let at = self.renderer.cursor_pos();
+        let grab = self
+            .screenshot
+            .as_ref()
+            .and_then(|s| s.grab.map(|(g, _, _)| g).or_else(|| {
+                s.region
+                    .and_then(|r| screenshot::grab_at(r, at, screenshot::HANDLE))
+            }));
+        let icon = match grab {
+            Some(screenshot::SelectionGrab::Move) => CursorIcon::Move,
+            Some(screenshot::SelectionGrab::Resize(edges)) => {
+                drag_cursor(DragMode::Resize, edges)
+            }
+            None => CursorIcon::Crosshair,
+        };
+        self.renderer
+            .set_cursor_override(Some(CursorImageStatus::Named(icon)));
     }
 
     /// Enter key during a session — confirm the current selection.
@@ -4643,29 +4732,16 @@ impl State {
         let Some(session) = self.screenshot.as_ref() else {
             return;
         };
-        match (session.bind.mode, session.anchor.is_some()) {
-            (config::ScreenshotMode::Region, true) => self.finalize_region(),
-            (config::ScreenshotMode::Window, _) => self.finalize_window(),
-            _ => {}
+        match session.bind.mode {
+            config::ScreenshotMode::Region => {
+                let Some(sel) = session.region else {
+                    return;
+                };
+                self.finalize_compositor_rect(sel);
+            }
+            config::ScreenshotMode::Window => self.finalize_window(),
+            config::ScreenshotMode::Output => {}
         }
-    }
-
-    /// Capture the dragged region (clamped to the output the drag started
-    /// on) and deliver it.
-    fn finalize_region(&mut self) {
-        let (cx, cy) = self.renderer.cursor_pos();
-        let Some(session) = self.screenshot.as_ref() else {
-            return;
-        };
-        let Some((ax, ay)) = session.anchor else {
-            return;
-        };
-        let sel = rect_from_corners(ax, ay, cx, cy);
-        if sel.size.w < 1 || sel.size.h < 1 {
-            self.cancel_screenshot();
-            return;
-        }
-        self.finalize_compositor_rect(sel);
     }
 
     /// Capture the window under the cursor and deliver it.

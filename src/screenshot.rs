@@ -14,6 +14,114 @@ use time::OffsetDateTime;
 use time::UtcOffset;
 use time::macros::format_description;
 
+/// What a press on a committed selection is about to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionGrab {
+    /// Slide the whole rect, size unchanged.
+    Move,
+    /// Drag the named edges. Both axes for a corner, one for an edge.
+    Resize(crate::layout::ResizeEdges),
+}
+
+/// How close to an edge a press has to land to grab it, in compositor
+/// pixels. Measured on *both* sides of the boundary: a selection is a
+/// hairline, so an inside-only band would be as hard to hit as the line.
+pub(crate) const HANDLE: i32 = 10;
+
+/// Smallest selection an interactive resize will leave you with. Small
+/// enough to crop a word, large enough that the handles don't overlap
+/// into ambiguity.
+pub(crate) const MIN_SELECTION: i32 = 16;
+
+/// Which part of `rect` a press at `pos` takes hold of.
+///
+/// Corners win over edges (they are the intersection, and a corner is
+/// what you meant if you aimed at one), edges win over the interior, and
+/// a press outside the handle band and outside the rect grabs nothing —
+/// which is what lets a press on the dimmed backdrop start a fresh
+/// selection instead of nudging the old one.
+pub(crate) fn grab_at(
+    rect: Rectangle<i32, Physical>,
+    pos: (f64, f64),
+    handle: i32,
+) -> Option<SelectionGrab> {
+    use crate::layout::{EdgeX, EdgeY, ResizeEdges};
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "cursor coords are clamped to the i32 layout bounds"
+    )]
+    let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
+    let (l, t) = (rect.loc.x, rect.loc.y);
+    let (r, b) = (l + rect.size.w, t + rect.size.h);
+    let near = |v: i32, edge: i32| (v - edge).abs() <= handle;
+    // Within the rect's span on the *other* axis, grown by the handle so
+    // a corner still reads as a corner from just outside it.
+    let spans_x = px >= l - handle && px <= r + handle;
+    let spans_y = py >= t - handle && py <= b + handle;
+
+    let x = if near(px, l) && spans_y {
+        Some(EdgeX::Left)
+    } else if near(px, r) && spans_y {
+        Some(EdgeX::Right)
+    } else {
+        None
+    };
+    let y = if near(py, t) && spans_x {
+        Some(EdgeY::Top)
+    } else if near(py, b) && spans_x {
+        Some(EdgeY::Bottom)
+    } else {
+        None
+    };
+    if x.is_some() || y.is_some() {
+        return Some(SelectionGrab::Resize(ResizeEdges { x, y }));
+    }
+    let inside = px >= l && px < r && py >= t && py < b;
+    inside.then_some(SelectionGrab::Move)
+}
+
+/// Apply a grab that started with `start` and has travelled `(dx, dy)`.
+///
+/// A resize that would invert the rect is clamped at [`MIN_SELECTION`]
+/// rather than flipped: dragging the left edge past the right one reads
+/// as "I have gone too far", not as "I meant the other side".
+pub(crate) fn apply_grab(
+    start: Rectangle<i32, Physical>,
+    grab: SelectionGrab,
+    dx: i32,
+    dy: i32,
+) -> Rectangle<i32, Physical> {
+    use crate::layout::{EdgeX, EdgeY};
+    use smithay::utils::{Point, Size};
+    let SelectionGrab::Resize(edges) = grab else {
+        return Rectangle::new(
+            Point::from((start.loc.x + dx, start.loc.y + dy)),
+            start.size,
+        );
+    };
+    let (mut x, mut w) = (start.loc.x, start.size.w);
+    match edges.x {
+        Some(EdgeX::Left) => {
+            let moved = dx.min(w - MIN_SELECTION);
+            x += moved;
+            w -= moved;
+        }
+        Some(EdgeX::Right) => w = (w + dx).max(MIN_SELECTION),
+        None => {}
+    }
+    let (mut y, mut h) = (start.loc.y, start.size.h);
+    match edges.y {
+        Some(EdgeY::Top) => {
+            let moved = dy.min(h - MIN_SELECTION);
+            y += moved;
+            h -= moved;
+        }
+        Some(EdgeY::Bottom) => h = (h + dy).max(MIN_SELECTION),
+        None => {}
+    }
+    Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+}
+
 /// Extract `region` (top-left origin, in the upright image) from a
 /// captured framebuffer read-back and encode it as a PNG (RGB, opaque).
 ///
@@ -326,6 +434,97 @@ pub(crate) fn save(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{EdgeX, EdgeY, ResizeEdges};
+    use smithay::utils::{Point, Size};
+
+    fn sel() -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((100, 100)), Size::from((200, 150)))
+    }
+
+    /// The whole selection is grabbable, and each part gives what it looks
+    /// like it gives: a corner both axes, an edge one, the middle a move.
+    #[test]
+    fn every_part_of_a_selection_grabs_what_it_looks_like() {
+        let r = sel();
+        assert_eq!(
+            grab_at(r, (100.0, 100.0), HANDLE),
+            Some(SelectionGrab::Resize(ResizeEdges {
+                x: Some(EdgeX::Left),
+                y: Some(EdgeY::Top)
+            }))
+        );
+        assert_eq!(
+            grab_at(r, (300.0, 250.0), HANDLE),
+            Some(SelectionGrab::Resize(ResizeEdges {
+                x: Some(EdgeX::Right),
+                y: Some(EdgeY::Bottom)
+            }))
+        );
+        // Mid-edge: one axis only.
+        assert_eq!(
+            grab_at(r, (100.0, 175.0), HANDLE),
+            Some(SelectionGrab::Resize(ResizeEdges {
+                x: Some(EdgeX::Left),
+                y: None
+            }))
+        );
+        assert_eq!(grab_at(r, (200.0, 175.0), HANDLE), Some(SelectionGrab::Move));
+    }
+
+    /// An edge is grabbable from *outside* it too. A selection is a
+    /// hairline; a band that only reached inwards would be as hard to hit
+    /// as the line itself.
+    #[test]
+    fn edges_grab_from_both_sides_and_the_backdrop_grabs_nothing() {
+        let r = sel();
+        assert!(matches!(
+            grab_at(r, (95.0, 175.0), HANDLE),
+            Some(SelectionGrab::Resize(_))
+        ));
+        // Well clear of the rect: nothing, which is what lets a press
+        // out there start a fresh selection.
+        assert_eq!(grab_at(r, (400.0, 400.0), HANDLE), None);
+        assert_eq!(grab_at(r, (100.0, 400.0), HANDLE), None);
+    }
+
+    /// Moving keeps the size; resizing keeps the opposite edge pinned.
+    #[test]
+    fn a_move_translates_and_a_resize_anchors() {
+        let r = sel();
+        let moved = apply_grab(r, SelectionGrab::Move, 10, -20);
+        assert_eq!(moved.loc, Point::from((110, 80)));
+        assert_eq!(moved.size, r.size);
+
+        // Dragging the left edge right shrinks the width and holds the
+        // right edge exactly where it was.
+        let left = apply_grab(
+            r,
+            SelectionGrab::Resize(ResizeEdges { x: Some(EdgeX::Left), y: None }),
+            30,
+            0,
+        );
+        assert_eq!(left.loc.x, 130);
+        assert_eq!(left.loc.x + left.size.w, r.loc.x + r.size.w);
+        assert_eq!(left.size.h, r.size.h, "an untouched axis doesn't move");
+    }
+
+    /// Dragging an edge past its opposite clamps instead of inverting the
+    /// rect. "I have gone too far" is what that gesture means; it is not
+    /// a request to select the other side of the screen.
+    #[test]
+    fn a_resize_cannot_turn_the_selection_inside_out() {
+        let r = sel();
+        for (edges, dx, dy) in [
+            (ResizeEdges { x: Some(EdgeX::Left), y: None }, 10_000, 0),
+            (ResizeEdges { x: Some(EdgeX::Right), y: None }, -10_000, 0),
+            (ResizeEdges { x: None, y: Some(EdgeY::Top) }, 0, 10_000),
+            (ResizeEdges { x: None, y: Some(EdgeY::Bottom) }, 0, -10_000),
+        ] {
+            let out = apply_grab(r, SelectionGrab::Resize(edges), dx, dy);
+            assert!(out.size.w >= MIN_SELECTION, "width collapsed: {out:?}");
+            assert!(out.size.h >= MIN_SELECTION, "height collapsed: {out:?}");
+        }
+    }
 
     /// Two captures with the same timestamped filename (same second) must
     /// both survive — the second gets a `_1` suffix instead of silently
