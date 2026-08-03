@@ -3261,16 +3261,23 @@ impl Renderer {
         // Anti-aliased strokes: toolbar glyphs and freehand annotation,
         // both as segment lists. `_4f` per segment because GLES 2.0 takes
         // a uniform array as one named element per index.
+        // Every uniform has to be declared here, the array elements
+        // included: smithay looks each one up by name when the draw is
+        // issued and rejects any it wasn't told about. Missing them made
+        // every stroke draw fail, which failed the whole frame, which
+        // meant nothing was presented at all.
+        let mut segment_uniforms = vec![
+            UniformName::new("count", UniformType::_1i),
+            UniformName::new("colour", UniformType::_3f),
+            UniformName::new("thickness", UniformType::_1f),
+            UniformName::new("quad", UniformType::_2f),
+        ];
+        segment_uniforms.extend(
+            (0..SEGMENTS_MAX)
+                .map(|i| UniformName::new(format!("segments[{i}]"), UniformType::_4f)),
+        );
         let segment_shader = gles
-            .compile_custom_texture_shader(
-                SEGMENT_SHADER,
-                &[
-                    UniformName::new("count", UniformType::_1i),
-                    UniformName::new("colour", UniformType::_3f),
-                    UniformName::new("thickness", UniformType::_1f),
-                    UniformName::new("quad", UniformType::_2f),
-                ],
-            )
+            .compile_custom_texture_shader(SEGMENT_SHADER, &segment_uniforms)
             .context("segment shader compile failed")?;
         // 1x1 opaque white for the procedural programs' unused sampler.
         let mut blank_tex = gles
@@ -4555,12 +4562,6 @@ impl Renderer {
     /// output from the next frame on. The rectangle is in absolute
     /// compositor coords; each output renders the part that falls on it.
     pub fn set_screenshot_overlay(&mut self, overlay: Option<ScreenshotOverlay>) {
-        debug!(
-            selection = ?overlay.as_ref().and_then(|o| o.selection),
-            handles = overlay.as_ref().is_some_and(|o| o.handles),
-            toolbar = ?overlay.as_ref().and_then(|o| o.toolbar.as_ref().map(|t| t.bar)),
-            "screenshot: overlay handed to the renderer"
-        );
         self.screenshot_overlay = overlay;
     }
 
@@ -8144,8 +8145,15 @@ impl Renderer {
                 )?;
                 // The options bar draws over the dim wash, as its own
                 // pass — it is chrome, not part of the selection.
+                //
+                // Failures here are logged and swallowed rather than
+                // propagated. A broken glyph is a cosmetic problem; taking
+                // the whole frame down with it means nothing is presented
+                // at all, so the screen freezes on the last good frame and
+                // every symptom points somewhere else entirely. Learned
+                // the hard way from exactly that.
                 if !overlay.strokes.is_empty() {
-                    draw_strokes(
+                    let res = draw_strokes(
                         &mut frame,
                         &overlay.strokes,
                         &OverlayPaint {
@@ -8157,10 +8165,13 @@ impl Renderer {
                             reference_white: hdr_reference_white,
                             saturation: hdr_saturation,
                         },
-                    )?;
+                    );
+                    if let Err(err) = res {
+                        warn!(%err, "screenshot: annotation draw failed");
+                    }
                 }
                 if let Some(bar) = &overlay.toolbar {
-                    draw_toolbar(
+                    let res = draw_toolbar(
                         &mut frame,
                         bar,
                         &OverlayPaint {
@@ -8172,7 +8183,10 @@ impl Renderer {
                             reference_white: hdr_reference_white,
                             saturation: hdr_saturation,
                         },
-                    )?;
+                    );
+                    if let Err(err) = res {
+                        warn!(%err, "screenshot: toolbar draw failed");
+                    }
                 }
             }
 
@@ -10019,9 +10033,7 @@ fn draw_toolbar(
     const ACTIVE: Color32F = Color32F::new(0.25, 0.62, 1.0, 0.55);
     const GLYPH: [f32; 3] = [0.93, 0.93, 0.95];
 
-    let slab = paint.phys(bar.bar);
-    debug!(?slab, buttons = bar.buttons.len(), "screenshot: drawing the toolbar");
-    paint.fill(frame, slab, SLAB)?;
+    paint.fill(frame, paint.phys(bar.bar), SLAB)?;
     for b in &bar.buttons {
         let dst = paint.phys(b.rect);
         if b.active {

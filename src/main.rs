@@ -4757,10 +4757,7 @@ impl State {
     /// options about while one is still being dragged out.
     fn build_screenshot_toolbar(&self) -> Option<render::Toolbar> {
         let session = self.screenshot.as_ref()?;
-        let Some(sel) = session.region else {
-            debug!("screenshot: no toolbar — selection not committed yet");
-            return None;
-        };
+        let sel = session.region?;
         let Some(bounds) = self.screenshot_output_bounds(sel) else {
             warn!(?sel, "screenshot: no toolbar — selection is on no output");
             return None;
@@ -5055,17 +5052,9 @@ impl State {
         let sel = rect_from_corners(ax, ay, cx, cy);
         // A click with no drag is a miss, not a one-pixel screenshot.
         // Leave the session up so it can be tried again.
-        let big_enough =
-            sel.size.w >= screenshot::MIN_SELECTION && sel.size.h >= screenshot::MIN_SELECTION;
-        if big_enough {
+        if sel.size.w >= screenshot::MIN_SELECTION && sel.size.h >= screenshot::MIN_SELECTION {
             s.region = Some(sel);
         }
-        debug!(
-            ?sel,
-            big_enough,
-            min = screenshot::MIN_SELECTION,
-            "screenshot: region drag released"
-        );
         self.update_screenshot_overlay();
         self.refresh_screenshot_cursor();
     }
