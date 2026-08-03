@@ -1427,6 +1427,21 @@ impl SeatHandler for State {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Focus raises. Every route into focus lands here — a click, a
+        // keybind, an Alt-Tab switcher calling the IPC's `focus-window` —
+        // so this is the one place that has to know, and it means the
+        // focused window is always the one on top. That invariant is what
+        // the z-banding leans on: a maximized or fullscreen window rides
+        // above the rest only while it is the active one, so a taskbar
+        // click pulls a window out from behind a borderless-windowed game
+        // and the game drops behind it. Focus landing on a panel or a
+        // launcher changes neither (see `Layout::set_active`).
+        if self.layout.set_active(focused) {
+            if let Some(surface) = focused {
+                self.layout.raise(surface);
+            }
+            self.queue_redraw_all();
+        }
         // Hand clipboard + primary-selection *focus* to the keyboard-
         // focused client. Smithay only delivers selection offers (and
         // thus enables paste) to the client holding data-device focus,

@@ -414,6 +414,48 @@ pub struct Layout {
     /// two titlebars stacked. Nothing in either protocol lets the
     /// compositor detect that, so it needs a name.
     csd_rules: Vec<String>,
+    /// The *active* window: the last toplevel to take keyboard focus.
+    ///
+    /// Deliberately not the seat's current focus. A launcher or panel
+    /// taking keyboard focus doesn't change which window is active —
+    /// otherwise opening a launcher over a fullscreen game would drop
+    /// the game out of its top z-band and shuffle the whole stack under
+    /// a popup. Set from `SeatHandler::focus_changed`, and only when the
+    /// new focus names a window this layout holds.
+    ///
+    /// A stale entry (the active window closed) is harmless: it is only
+    /// ever compared against live surfaces, so it matches nothing until
+    /// the close path hands focus to the next window.
+    active: Option<WlSurface>,
+}
+
+/// The z-band a window draws in, listed bottom-up. Every band is
+/// drawn in full before the next one starts, so a window's band beats
+/// its position in the placement list.
+///
+/// Only the *active* window (see `Layout::active`) can occupy
+/// [`ZBand::Maximized`] or [`ZBand::Fullscreen`]. A maximized or
+/// fullscreen window that isn't active falls to [`ZBand::Buried`],
+/// underneath every ordinary window — which is what makes focusing a
+/// window from a taskbar or an Alt-Tab switcher bring it out from
+/// behind a borderless-windowed game, and what puts that game back on
+/// top the moment you focus it again. KDE does the same thing, and for
+/// the same reason: a window that covers the screen has no business
+/// covering the window you just asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ZBand {
+    /// A maximized/fullscreen window that isn't active — behind everything.
+    Buried,
+    /// Ordinary tiled windows. They never overlap each other.
+    Tiled,
+    /// Ordinary floating windows, in stack order (and the drag follower).
+    Floating,
+    /// The active maximized window: above windows, below Top layers, so a
+    /// maximized window doesn't cover the panel.
+    Maximized,
+    /// The active fullscreen window: above Top layers too (a game covers
+    /// the panel), below Overlay layers, popups and the cursor.
+    Fullscreen,
 }
 
 /// One window + its current placement, as the renderer consumes
@@ -426,14 +468,13 @@ pub struct Placement {
     pub cell_rect: Rectangle<i32, Physical>,
     pub focused: bool,
     /// Fill mode — the renderer suppresses the border/rounded corners
-    /// for non-`Normal` placements and draws them in a higher z-bucket
-    /// (maximized above windows, fullscreen above panels too).
+    /// for non-`Normal` placements.
     pub fill: FillMode,
-    /// `true` for floating (and in-transit) windows, which draw above the
-    /// tiled tree. The renderer uses this to pick the blur backdrop tier:
-    /// tiled windows blur against the base (wallpaper + lower layers),
-    /// floating windows against the base *plus* the tiled windows beneath.
-    pub floating: bool,
+    /// Which z-band this window draws in. See [`ZBand`]; the renderer
+    /// walks the bands in order rather than sorting by `fill`, because a
+    /// maximized/fullscreen window only rides above the others while it
+    /// is the active one.
+    pub band: ZBand,
     /// This window's decoration inset, already resolved against its fill
     /// (see [`Layout::deco_for`]) — so a fullscreen window carries
     /// [`Deco::none`] here and a maximized one carries the real inset
@@ -753,6 +794,7 @@ impl Layout {
             mode,
             csd: std::collections::HashSet::new(),
             csd_rules: Vec::new(),
+            active: None,
         }
     }
 
@@ -1545,15 +1587,22 @@ impl Layout {
     /// `active` border colour; the focus surface is owned by the
     /// seat, not the layout, so it comes in as a parameter.
     pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<SlideSpec>) -> Vec<Placement> {
-        let is_focused = |surface: &WlSurface| focused.is_some_and(|f| f == surface);
-        let (deco, mode) = (self.deco, self.mode);
         let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let ctx_for = |area: OutputArea, ws: &Workspace| PlaceCtx {
+            area,
+            deco: self.deco,
+            mode: self.mode,
+            csd,
+            focused,
+            active: self.active.as_ref(),
+            active_here: self.workspace_has_active(ws),
+        };
         let mut out = Vec::new();
         // Only the active workspace of each output is visible — except
         // mid workspace-switch, where the outgoing (captured) and
         // incoming workspaces are both emitted, translated vertically.
         for op in &self.outputs {
-            let area = op.area();
+            let ctx = ctx_for(op.area(), &op.workspaces[op.active]);
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "slide offset = small fraction × the output's extent (i32), well within range"
@@ -1585,28 +1634,12 @@ impl Layout {
                     });
                 }
                 let base = out.len();
-                collect_workspace(
-                    &op.workspaces[op.active],
-                    &is_focused,
-                    area,
-                    deco,
-                    mode,
-                    csd,
-                    &mut out,
-                );
+                collect_workspace(&op.workspaces[op.active], &ctx, &mut out);
                 for q in &mut out[base..] {
                     q.slide = off_to;
                 }
             } else {
-                collect_workspace(
-                    &op.workspaces[op.active],
-                    &is_focused,
-                    area,
-                    deco,
-                    mode,
-                    csd,
-                    &mut out,
-                );
+                collect_workspace(&op.workspaces[op.active], &ctx, &mut out);
             }
         }
         if let Some(t) = &self.in_transit {
@@ -1614,10 +1647,10 @@ impl Layout {
             out.push(Placement {
                 surface: surface.clone(),
                 cell_rect: t.window.rect,
-                focused: is_focused(surface),
+                focused: focused == Some(surface),
                 fill: t.window.fill,
                 // A window being dragged floats freely over everything.
-                floating: true,
+                band: band_for(t.window.fill, true, self.active.as_ref() == Some(surface)),
                 deco: self.deco_for(&t.window),
                 slide: Point::from((0, 0)),
             });
@@ -1646,14 +1679,19 @@ impl Layout {
     /// maximized/fullscreen window, otherwise its cell). The rect is
     /// what the caller uses as the surface origin for pointer events.
     ///
-    /// A maximized/fullscreen window covers its whole output and draws
-    /// on top, so it captures the pointer anywhere on that output
-    /// (fullscreen beats maximized; later-drawn beats earlier). Below
-    /// that, floating windows win over tiled, and within floating the
-    /// top-of-stack (last-clicked / last-floated) wins. The in-transit
-    /// window is intentionally skipped — it tracks the cursor by
-    /// construction, so reporting it as "under the cursor" would just
-    /// defeat focus changes for the duration of the drag.
+    /// Z-order here is [`ZBand`], exactly as the renderer draws it —
+    /// the two must agree or you click one window and hit another. The
+    /// *active* maximized/fullscreen window covers its whole output and
+    /// draws on top, so it captures the pointer anywhere on that output.
+    /// Below it, floating windows win over tiled, and within floating
+    /// the top-of-stack (last-clicked / last-focused) wins. A filled
+    /// window that isn't active is buried underneath all of them, and so
+    /// is tested last — it still catches every press nothing else wanted,
+    /// which is how you click it back to the front.
+    ///
+    /// The in-transit window is intentionally skipped — it tracks the
+    /// cursor by construction, so reporting it as "under the cursor"
+    /// would just defeat focus changes for the duration of the drag.
     pub fn window_at(
         &self,
         pos: Point<i32, Physical>,
@@ -1664,10 +1702,8 @@ impl Layout {
         let area = self.outputs[i].area();
         let ws = self.active_ws(i);
 
-        // Filled windows first. Collect in draw order (tree leaves,
-        // then floating) and pick the topmost fullscreen, else the
-        // topmost maximized — `rfind` within a tier is the one drawn
-        // on top. The effective rect must match what the renderer
+        // Filled windows, collected in draw order (tree leaves, then
+        // floating). The effective rect must match what the renderer
         // draws (`area.fill`): the full output for fullscreen, the work
         // area for maximized — otherwise the surface origin handed to
         // the pointer is offset by any panel's exclusive zone.
@@ -1680,23 +1716,47 @@ impl Layout {
                 .iter()
                 .filter(|w| w.fill != FillMode::Normal && w.visible()),
         );
-        if let Some(w) = filled
+        // The filled window that owns this output, if any: the active one,
+        // or — when the active window is somewhere else entirely — the
+        // topmost of them (fullscreen beats maximized, later-drawn beats
+        // earlier), which is the whole of the old rule.
+        let owner = filled
             .iter()
-            .rfind(|w| w.fill == FillMode::Fullscreen)
-            .or_else(|| filled.iter().rfind(|w| w.fill == FillMode::Maximized))
-        {
+            .rfind(|w| self.is_active(w.toplevel.wl_surface()))
+            .or_else(|| {
+                if self.workspace_has_active(ws) {
+                    return None;
+                }
+                filled
+                    .iter()
+                    .rfind(|w| w.fill == FillMode::Fullscreen)
+                    .or_else(|| filled.iter().rfind(|w| w.fill == FillMode::Maximized))
+            });
+        if let Some(w) = owner {
             return Some((w, area.fill(w.fill)));
         }
 
-        for w in ws.floating.iter().rev().filter(|w| w.visible()) {
+        for w in ws
+            .floating
+            .iter()
+            .rev()
+            .filter(|w| w.visible() && w.fill == FillMode::Normal)
+        {
             if rect_contains(w.rect, pos) {
                 return Some((w, w.rect));
             }
         }
-        ws.tree
-            .as_ref()
-            .and_then(|t| leaf_at(t, pos))
-            .map(|w| (w, w.rect))
+        if let Some(w) = ws.tree.as_ref().and_then(|t| leaf_at(t, pos)) {
+            return Some((w, w.rect));
+        }
+        // Buried: a filled window nobody is using. Topmost of them first,
+        // and each covers its whole output, so the first visible one takes
+        // the press.
+        filled
+            .iter()
+            .rev()
+            .map(|w| (*w, area.fill(w.fill)))
+            .find(|(_, r)| rect_contains(*r, pos))
     }
 
     fn recompute_and_push(&mut self) {
@@ -1956,6 +2016,60 @@ impl Layout {
             return Some((w.toplevel.wl_surface().clone(), r, ResizeEdges { x, y }));
         }
         None
+    }
+
+    /// Record the *active* window — the one keyboard focus last landed
+    /// on. Returns whether it changed, so the caller can skip a redraw.
+    ///
+    /// Focus that isn't a window this layout holds (a panel, a launcher,
+    /// a lock screen, or nothing at all) leaves the active window where
+    /// it was: opening a launcher must not demote the game behind it.
+    /// See [`ZBand`] for what the active window buys.
+    pub fn set_active(&mut self, surface: Option<&WlSurface>) -> bool {
+        let Some(surface) = surface else {
+            return false;
+        };
+        if self.active.as_ref() == Some(surface) || self.window_ref(surface).is_none() {
+            return false;
+        }
+        self.active = Some(surface.clone());
+        true
+    }
+
+    /// Whether `surface` is the active window (see [`Self::set_active`]).
+    fn is_active(&self, surface: &WlSurface) -> bool {
+        self.active.as_ref() == Some(surface)
+    }
+
+    /// Whether the active window is one of the windows `ws` shows.
+    ///
+    /// The active window is a single global thing, but burying a filled
+    /// window is only meaningful against windows you can see *next to*
+    /// it. A fullscreen video on the second monitor has nothing to
+    /// compete with while you type on the first, so it keeps its output
+    /// — and with it its VRR and its scanout plane.
+    fn workspace_has_active(&self, ws: &Workspace) -> bool {
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        // A window under an interactive move belongs to no workspace for
+        // the duration of the drag. Counting it as present everywhere is
+        // the conservative reading: nothing gets promoted mid-drag, so a
+        // buried window can't jump back over the one you're carrying.
+        if self
+            .in_transit
+            .as_ref()
+            .is_some_and(|t| t.window.toplevel.wl_surface() == active)
+        {
+            return true;
+        }
+        ws.tree
+            .as_ref()
+            .is_some_and(|t| leaf_ref(t, active).is_some())
+            || ws
+                .floating
+                .iter()
+                .any(|w| w.toplevel.wl_surface() == active)
     }
 
     /// Bring a floating window to the front of its workspace's stack.
@@ -2325,21 +2439,31 @@ impl Layout {
         self.fullscreen_surface(name).is_some()
     }
 
-    /// The surface of the fullscreen window in output `name`'s active
-    /// workspace, if any (tiled or floating).
+    /// The surface of the fullscreen window that *owns* output `name`'s
+    /// active workspace, if any (tiled or floating).
+    ///
+    /// "Owns" is the same promotion rule the z-banding uses: a fullscreen
+    /// window that has been buried under the window you're actually using
+    /// ([`ZBand::Buried`]) neither earns the VRR/tearing treatment nor gets
+    /// to suppress the redraws of the windows now drawing above it. It
+    /// keeps the output while you work on another one, though — see
+    /// [`Self::workspace_has_active`].
     fn fullscreen_surface(&self, name: &str) -> Option<&WlSurface> {
         let op = self.outputs.iter().find(|o| o.name == name)?;
         let ws = op.workspaces.get(op.active)?;
+        let contested = self.workspace_has_active(ws);
+        let owns = |w: &Window| !contested || self.is_active(w.toplevel.wl_surface());
         if let Some(w) = ws
             .floating
             .iter()
-            .find(|w| w.fill == FillMode::Fullscreen)
+            .find(|w| w.fill == FillMode::Fullscreen && owns(w))
         {
             return Some(w.toplevel.wl_surface());
         }
         ws.tree
             .as_ref()
             .and_then(tree_fullscreen)
+            .filter(|w| owns(w))
             .map(|w| w.toplevel.wl_surface())
     }
 
@@ -2489,11 +2613,18 @@ impl Layout {
             let mut from = Vec::new();
             collect_workspace(
                 &self.outputs[oi].workspaces[active],
-                &|_| false,
-                area,
-                self.deco,
-                self.mode,
-                &self.csd_state(),
+                // The outgoing workspace draws unfocused (it is on its way
+                // off-screen), but keeps its own z-order — a fullscreen
+                // window there should slide out over its own neighbours.
+                &PlaceCtx {
+                    area,
+                    deco: self.deco,
+                    mode: self.mode,
+                    csd: &self.csd_state(),
+                    focused: None,
+                    active: self.active.as_ref(),
+                    active_here: self.workspace_has_active(&self.outputs[oi].workspaces[active]),
+                },
                 &mut from,
             );
             self.outputs[oi].transition = Some(WsTransition {
@@ -2863,74 +2994,83 @@ fn assign_rects(node: &mut Node, bounds: Rectangle<i32, Physical>, inner: i32) {
     }
 }
 
-/// Walk the tree and emit a `Placement` for every leaf. A maximized
-/// or fullscreen leaf reports `output_bounds` as its cell so it covers
-/// the whole output instead of its tiled slot.
-fn collect_placements(
-    node: &Node,
-    is_focused: &impl Fn(&WlSurface) -> bool,
+/// Everything a placement needs beyond the window itself: which output
+/// it sits on, how it is decorated, and who is focused/active. Bundled
+/// so the collectors take four arguments instead of nine.
+struct PlaceCtx<'a> {
     area: OutputArea,
     deco: Deco,
     mode: LayoutMode,
-    csd: &CsdState<'_>,
-    out: &mut Vec<Placement>,
-) {
+    csd: &'a CsdState<'a>,
+    /// Seat keyboard focus — drives the border colour only.
+    focused: Option<&'a WlSurface>,
+    /// The active window — drives the z-band (see [`ZBand`]).
+    active: Option<&'a WlSurface>,
+    /// Whether the active window is in the workspace being collected. When
+    /// it isn't, filled windows here keep their top band: there is nothing
+    /// on this output for them to be in the way of.
+    active_here: bool,
+}
+
+impl PlaceCtx<'_> {
+    /// One window's placement, tiled or floating.
+    fn place(&self, w: &Window, floating: bool) -> Placement {
+        let surface = w.toplevel.wl_surface();
+        let promoted = self.active == Some(surface) || !self.active_here;
+        Placement {
+            surface: surface.clone(),
+            // A maximized window covers the work area, a fullscreen one
+            // the whole output; both ignore their own rect.
+            cell_rect: if w.fill == FillMode::Normal {
+                w.rect
+            } else {
+                self.area.fill(w.fill)
+            },
+            focused: self.focused == Some(surface),
+            fill: w.fill,
+            band: band_for(w.fill, floating, promoted),
+            deco: window_deco(self.deco, self.mode, w, self.csd),
+            slide: Point::from((0, 0)),
+        }
+    }
+}
+
+/// Which z-band a window belongs in. The whole of the "focused windows
+/// come to the front" rule lives here. `promoted` is "this filled window
+/// still rides on top" — see `PlaceCtx::place`.
+fn band_for(fill: FillMode, floating: bool, promoted: bool) -> ZBand {
+    match fill {
+        FillMode::Normal if floating => ZBand::Floating,
+        FillMode::Normal => ZBand::Tiled,
+        // Covers the screen but isn't the window you're using.
+        _ if !promoted => ZBand::Buried,
+        FillMode::Maximized => ZBand::Maximized,
+        FillMode::Fullscreen => ZBand::Fullscreen,
+    }
+}
+
+/// Walk the tree and emit a `Placement` for every leaf.
+fn collect_placements(node: &Node, ctx: &PlaceCtx<'_>, out: &mut Vec<Placement>) {
     match node {
         Node::Leaf(w) if !w.visible() => {}
-        Node::Leaf(w) => {
-            let surface = w.toplevel.wl_surface();
-            out.push(Placement {
-                surface: surface.clone(),
-                cell_rect: if w.fill == FillMode::Normal {
-                    w.rect
-                } else {
-                    area.fill(w.fill)
-                },
-                focused: is_focused(surface),
-                fill: w.fill,
-                floating: false,
-                deco: window_deco(deco, mode, w, csd),
-                slide: Point::from((0, 0)),
-            });
-        }
+        Node::Leaf(w) => out.push(ctx.place(w, false)),
         Node::Split { first, second, .. } => {
-            collect_placements(first, is_focused, area, deco, mode, csd, out);
-            collect_placements(second, is_focused, area, deco, mode, csd, out);
+            collect_placements(first, ctx, out);
+            collect_placements(second, ctx, out);
         }
     }
 }
 
 /// Build one workspace's placements: the tiled tree, then floating
-/// windows bottom-up (drawn above the tiles they overlap).
-fn collect_workspace(
-    ws: &Workspace,
-    is_focused: &impl Fn(&WlSurface) -> bool,
-    area: OutputArea,
-    deco: Deco,
-    mode: LayoutMode,
-    csd: &CsdState<'_>,
-    out: &mut Vec<Placement>,
-) {
+/// windows bottom-up. This is *list* order, not draw order — the
+/// renderer walks [`ZBand`]s first and only uses list order within a
+/// band (where it is the floating stack's z-order).
+fn collect_workspace(ws: &Workspace, ctx: &PlaceCtx<'_>, out: &mut Vec<Placement>) {
     if let Some(tree) = &ws.tree {
-        collect_placements(tree, is_focused, area, deco, mode, csd, out);
+        collect_placements(tree, ctx, out);
     }
     for w in ws.floating.iter().filter(|w| w.visible()) {
-        let surface = w.toplevel.wl_surface();
-        out.push(Placement {
-            surface: surface.clone(),
-            // A maximized float covers the work area, a fullscreen one
-            // the whole output; both ignore the floating rect.
-            cell_rect: if w.fill == FillMode::Normal {
-                w.rect
-            } else {
-                area.fill(w.fill)
-            },
-            focused: is_focused(surface),
-            fill: w.fill,
-            floating: true,
-            deco: window_deco(deco, mode, w, csd),
-            slide: Point::from((0, 0)),
-        });
+        out.push(ctx.place(w, true));
     }
 }
 
@@ -2981,10 +3121,14 @@ fn transition_eased(t: &WsTransition, spec: AnimSpec) -> Option<f64> {
 }
 
 /// Walk the tree, find the leaf containing `pos`, return it.
+///
+/// Maximized/fullscreen leaves are skipped: their `rect` is still the
+/// tile they came from, not the output they cover, so `window_at` tests
+/// them separately against `area.fill()`.
 fn leaf_at(node: &Node, pos: Point<i32, Physical>) -> Option<&Window> {
     match node {
         Node::Leaf(w) => {
-            if w.visible() && rect_contains(w.rect, pos) {
+            if w.visible() && w.fill == FillMode::Normal && rect_contains(w.rect, pos) {
                 Some(w)
             } else {
                 None
@@ -3843,6 +3987,70 @@ mod cascade_tests {
         let size = Size::from((400, 300));
         let origin = cascade_origin(work(), size, 3, 0);
         assert_eq!(origin, Point::from((303, 253)));
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::{FillMode, ZBand, band_for};
+
+    /// An ordinary window's band is just where it lives; being the active
+    /// one changes nothing, because the float stack already put it on top.
+    #[test]
+    fn ordinary_windows_ignore_focus() {
+        for promoted in [false, true] {
+            assert_eq!(band_for(FillMode::Normal, false, promoted), ZBand::Tiled);
+            assert_eq!(band_for(FillMode::Normal, true, promoted), ZBand::Floating);
+        }
+    }
+
+    /// The rule this whole thing exists for: a window that covers the
+    /// screen rides above the rest only while you're using it. Focus
+    /// another window and it drops behind *everything* — which is what
+    /// makes an Alt-Tab switcher able to pull a window out from under a
+    /// borderless-windowed game.
+    #[test]
+    fn covering_windows_ride_on_top_only_while_promoted() {
+        for floating in [false, true] {
+            assert_eq!(
+                band_for(FillMode::Maximized, floating, true),
+                ZBand::Maximized
+            );
+            assert_eq!(
+                band_for(FillMode::Fullscreen, floating, true),
+                ZBand::Fullscreen
+            );
+            assert_eq!(band_for(FillMode::Maximized, floating, false), ZBand::Buried);
+            assert_eq!(
+                band_for(FillMode::Fullscreen, floating, false),
+                ZBand::Buried
+            );
+        }
+    }
+
+    /// The bands are ordered bottom-up, and the renderer and the
+    /// hit-tester both walk them in that order. If this ever stops
+    /// holding, clicks land on a different window than the one you see.
+    #[test]
+    fn bands_are_ordered_bottom_up() {
+        let mut bands = [
+            ZBand::Fullscreen,
+            ZBand::Tiled,
+            ZBand::Buried,
+            ZBand::Maximized,
+            ZBand::Floating,
+        ];
+        bands.sort_unstable();
+        assert_eq!(
+            bands,
+            [
+                ZBand::Buried,
+                ZBand::Tiled,
+                ZBand::Floating,
+                ZBand::Maximized,
+                ZBand::Fullscreen,
+            ]
+        );
     }
 }
 

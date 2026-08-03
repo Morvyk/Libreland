@@ -1558,10 +1558,12 @@ impl State {
             debug!(%err, "xwayland: set_hidden(true) failed");
         }
         // Focus can't stay on a window nobody can see. Hand it to
-        // whatever is now topmost — `placements` is in draw order and
-        // already excludes minimized windows, so the last entry is the
-        // frontmost visible one. If that was the only window, focus goes
-        // nowhere, exactly as on an empty workspace.
+        // whatever is now topmost — `placements` already excludes
+        // minimized windows, and the frontmost is the highest z-band,
+        // ties going to the later entry (`max_by_key` returns the last
+        // maximum, and within a band list order *is* stack order). If
+        // that was the only window, focus goes nowhere, exactly as on an
+        // empty workspace.
         let held_focus = self
             .seat
             .get_keyboard()
@@ -1571,7 +1573,7 @@ impl State {
                 .layout
                 .placements(None, None)
                 .into_iter()
-                .next_back()
+                .max_by_key(|p| p.band)
                 .map(|p| p.surface);
             if let Some(kbd) = self.seat.get_keyboard() {
                 kbd.set_focus(self, next, SERIAL_COUNTER.next_serial());

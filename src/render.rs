@@ -73,7 +73,7 @@ use crate::config::{
     ScaleMode, TearingMode, TitlebarConfig, VrrMode,
 };
 use crate::drm::DrmOutput;
-use crate::layout::{FillMode, Placement};
+use crate::layout::{FillMode, Placement, ZBand};
 use crate::titlebar::{BarState, BarStyle, rasterize as rasterize_bar};
 use crate::scanout::{DirectPlacement, ScanoutLayer, ScanoutSurface};
 
@@ -6623,45 +6623,32 @@ impl Renderer {
         };
         // Scene stages replayed into the blur accumulator (each on top of
         // the previous): the tiled band, then the floating + maximized band.
-        let draw_tiled = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
-            for (((p, elements), wd), tex) in placements
-                .iter()
-                .zip(grouped.iter())
-                .zip(win_draws.iter())
-                .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && !p.floating)
-            {
-                draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
+        // Buried windows ride along in the first stage — they are below
+        // everything, and giving an unused window its own tier would cost
+        // a full-resolution texture for a backdrop nobody looks at.
+        let draw_band = |frame: &mut GlesFrame<'_, '_>, want: &[ZBand]| -> Result<()> {
+            for band in want {
+                for (((p, elements), wd), tex) in placements
+                    .iter()
+                    .zip(grouped.iter())
+                    .zip(win_draws.iter())
+                    .zip(win_tex.iter())
+                    .filter(|(((p, _), _), _)| p.band == *band)
+                {
+                    draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
+                }
             }
             Ok(())
         };
-        let draw_floating = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
-            for (((p, elements), wd), tex) in placements
-                .iter()
-                .zip(grouped.iter())
-                .zip(win_draws.iter())
-                .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill == FillMode::Normal && p.floating)
-            {
-                draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
-            }
-            Ok(())
-        };
+        let draw_tiled =
+            |frame: &mut GlesFrame<'_, '_>| draw_band(frame, &[ZBand::Buried, ZBand::Tiled]);
+        let draw_floating = |frame: &mut GlesFrame<'_, '_>| draw_band(frame, &[ZBand::Floating]);
         // Split out from the floating band so a *filled* window can blur
         // against everything below it without blurring against itself —
         // it is drawn into the stage that produces the tier the layers
         // above it sample, one band later.
-        let draw_filled = |frame: &mut GlesFrame<'_, '_>| -> Result<()> {
-            for (((p, elements), wd), tex) in placements
-                .iter()
-                .zip(grouped.iter())
-                .zip(win_draws.iter())
-                .zip(win_tex.iter())
-                .filter(|(((p, _), _), _)| p.fill != FillMode::Normal)
-            {
-                draw_window(frame, p, elements, wd, tex.as_ref(), false, &full_damage)?;
-            }
-            Ok(())
+        let draw_filled = |frame: &mut GlesFrame<'_, '_>| {
+            draw_band(frame, &[ZBand::Maximized, ZBand::Fullscreen])
         };
 
         // Backdrop blur (Kawase dual filter). Three z-tiers, each computed
@@ -7261,26 +7248,27 @@ impl Renderer {
             if solo_opaque.is_none() {
                 draw_base(&mut frame, hdr, draw_damage)?;
             }
-            // Tiled windows blur against the base (tier 0). Occluded /
-            // off-output windows (`!visible[i]`) are skipped in every band —
-            // their element vectors are empty anyway, but the skip also
-            // avoids painting backdrop frost behind an invisible window.
-            for (_, (((p, elements), wd), tex)) in placements
-                .iter()
-                .zip(grouped.iter())
-                .zip(win_draws.iter())
-                .zip(win_tex.iter())
-                .enumerate()
-                .filter(|(i, (((p, _), _), _))| {
-                    visible[*i] && p.fill == FillMode::Normal && !p.floating
-                })
-            {
-                if let Some(t) = &tier_tiled
-                    && (blur.windows || protocol_blur.contains(&p.surface.id()))
+            // Buried windows, then tiled ones; both blur against the base
+            // (tier 0). Occluded / off-output windows (`!visible[i]`) are
+            // skipped in every band — their element vectors are empty
+            // anyway, but the skip also avoids painting backdrop frost
+            // behind an invisible window.
+            for band in [ZBand::Buried, ZBand::Tiled] {
+                for (_, (((p, elements), wd), tex)) in placements
+                    .iter()
+                    .zip(grouped.iter())
+                    .zip(win_draws.iter())
+                    .zip(win_tex.iter())
+                    .enumerate()
+                    .filter(|(i, (((p, _), _), _))| visible[*i] && p.band == band)
                 {
-                    blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
+                    if let Some(t) = &tier_tiled
+                        && (blur.windows || protocol_blur.contains(&p.surface.id()))
+                    {
+                        blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
+                    }
+                    draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
                 }
-                draw_window(&mut frame, p, elements, wd, tex.as_ref(), hdr, draw_damage)?;
             }
             // Floating windows draw above tiled and blur against base +
             // tiled (tier 1), so a float reveals the windows beneath it.
@@ -7290,9 +7278,7 @@ impl Renderer {
                 .zip(win_draws.iter())
                 .zip(win_tex.iter())
                 .enumerate()
-                .filter(|(i, (((p, _), _), _))| {
-                    visible[*i] && p.fill == FillMode::Normal && p.floating
-                })
+                .filter(|(i, (((p, _), _), _))| visible[*i] && p.band == ZBand::Floating)
             {
                 if let Some(t) = &tier_float
                     && (blur.windows || protocol_blur.contains(&p.surface.id()))
@@ -7313,7 +7299,7 @@ impl Renderer {
                 .zip(win_draws.iter())
                 .zip(win_tex.iter())
                 .enumerate()
-                .filter(|(i, (((p, _), _), _))| visible[*i] && p.fill == FillMode::Maximized)
+                .filter(|(i, (((p, _), _), _))| visible[*i] && p.band == ZBand::Maximized)
             {
                 if let Some(t) = &tier_filled
                     && (blur.windows || protocol_blur.contains(&p.surface.id()))
@@ -7369,7 +7355,7 @@ impl Renderer {
                 .iter()
                 .zip(grouped.iter())
                 .enumerate()
-                .filter(|(i, (p, _))| visible[*i] && p.fill == FillMode::Fullscreen)
+                .filter(|(i, (p, _))| visible[*i] && p.band == ZBand::Fullscreen)
             {
                 // Same tier as a maximized window: everything below it.
                 // A fullscreen *opaque* window never gets here with a
@@ -7858,7 +7844,7 @@ impl Renderer {
         // plain desktop the veto is the permanent normal case.
         let fullscreen_covers = placements
             .iter()
-            .any(|p| p.fill == FillMode::Fullscreen && p.cell_rect.overlaps(out_rect));
+            .any(|p| p.band == ZBand::Fullscreen && p.cell_rect.overlaps(out_rect));
         macro_rules! veto {
             ($reason:literal) => {{
                 if fullscreen_covers {
@@ -7948,14 +7934,20 @@ impl Renderer {
             veto!("screenshot/DnD overlay active");
         }
 
-        // Exactly one *fullscreen* placement may cover the output. Windows
-        // with any other fill draw BENEATH a fullscreen one (tiled →
+        // Exactly one placement in the *fullscreen band* may cover the
+        // output. Every other band draws BENEATH it (buried → tiled →
         // floating → maximized → Top layers → fullscreen), so tiled and
         // floating windows sharing the workspace — the Steam client behind
         // the game it launched — are invisible behind it and don't matter.
-        let mut covering = placements.iter().enumerate().filter(|(_, p)| {
-            p.fill == FillMode::Fullscreen && p.cell_rect.overlaps(out_rect)
-        });
+        //
+        // Filtering on the band and not on `fill` is load-bearing: a
+        // fullscreen window that isn't active is *buried*, with ordinary
+        // windows drawing over it, and handing it the whole scanout plane
+        // would erase them.
+        let mut covering = placements
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.band == ZBand::Fullscreen && p.cell_rect.overlaps(out_rect));
         let (i, p) = covering.next()?;
         if covering.next().is_some() {
             veto!("two fullscreen windows cover the output");

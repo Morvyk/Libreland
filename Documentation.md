@@ -735,6 +735,44 @@ The hotkey path uses xkb-resolved keysyms, so it keeps working once a future
 DRM grab disables the kernel's Ctrl+C path. Until that grab exists, Ctrl+C on the host TTY also
 exits — but treat `Super+Shift+E` as the canonical exit.
 
+## Stacking & focus
+
+**Focus raises.** Whatever hands a window the keyboard — a click, a
+keybind, or an Alt-Tab switcher calling [`focus-window`](#libreland-msg)
+over the IPC — also brings it to the front of its workspace's stack.
+There is no way to focus a window and leave it behind another one.
+
+Windows draw in *bands*, bottom to top:
+
+| Band | What's in it |
+| --- | --- |
+| Buried | Maximized/fullscreen windows that aren't the active window |
+| Tiled | Ordinary tiled windows (they never overlap each other) |
+| Floating | Ordinary floating windows, in stack order |
+| Maximized | The active maximized window — below `Top` layer surfaces, so it doesn't cover the panel |
+| Fullscreen | The active fullscreen window — above `Top` layers (a game covers the panel), below `Overlay` layers, popups and the cursor |
+
+The band beats stack position, which is what makes the top two rows
+work: a window that covers the whole screen rides above everything
+**only while you're using it**. Focus something else and it drops to
+the bottom of the pile. That is what lets a taskbar or an Alt-Tab
+switcher pull a window out from behind a borderless-windowed game, and
+what puts the game back on top the moment you focus it again — click
+anywhere on it, since a buried window still catches every press nothing
+above it wanted.
+
+"Active" here is the last *window* to take keyboard focus, which is not
+quite the same as what the seat currently focuses: a launcher, panel or
+lock surface taking the keyboard doesn't change it. Opening a launcher
+over a fullscreen game leaves the game exactly where it was.
+
+Burying is also per-output: it only happens when the window you're
+using is on the **same** output. A fullscreen video on the second
+monitor stays on top of its own screen — and keeps its VRR and its
+[direct scanout](#direct-scanout) plane — while you work on the first.
+A game that has been buried loses both, since it is no longer the thing
+being presented.
+
 ## Screenshots (built in)
 
 Libreland has its own screenshot tool — no `grim`/`slurp` needed. It's
