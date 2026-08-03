@@ -1222,7 +1222,8 @@ the full usage.
 | `layers`           | Every live layer-shell surface: namespace, layer, output, size, keyboard, exclusive zone. Use it to find names for `blur.layers`. |
 | `windows`          | Every managed window: stable id, app-id, title, output, workspace, geometry, state flags, **pid**. |
 | `focused-window`   | The keyboard-focused window (alias `focused`).                                               |
-| `capture-window <id> [--max N]` | Render a window (any workspace/output) to a PNG thumbnail and print its path. `--max` caps the longest side (default 512). |
+| `capture-window <id> [--max N]` | Render a window (any workspace/output) to a PNG thumbnail and print its path. `--max` caps the longest side (default 512). A colour-managed (HDR) window is decoded and tonemapped like a screenshot; an SDR one is copied through untouched, so the preview matches the window rather than a screenshot of it. |
+| `capture-workspace [--output NAME] [--workspace N] [--max N]` | Render a **whole workspace** to a PNG and print its path — wallpaper, panels, windows, decorations and effects, exactly as it would look if you switched to it. Works on workspaces that aren't on screen. Both selectors default to the focused workspace; `--workspace` counts from 0; `--max` caps the longest side (default: the output's full size). |
 | `binds`            | Every keybinding in effect — the configured ones, plus any registered over IPC (shown as `external:<id>`), so you can see what has claimed a key. |
 | `cursor`           | The pointer position: global logical coordinates, the output under it, and output-local coordinates. |
 

@@ -1938,6 +1938,49 @@ impl Layout {
         out
     }
 
+    /// Placements for one *named* workspace, visible or not, plus the
+    /// output it sits on — everything a capture needs to composite a
+    /// workspace nobody is currently looking at.
+    ///
+    /// `index` counts from 0. `None` for an unknown output or an index
+    /// past the end; workspaces are dynamic, so the caller can't assume
+    /// one exists.
+    ///
+    /// No slide offsets and no in-transit window: a captured workspace is
+    /// a settled thing, and a window being dragged belongs to the pointer,
+    /// not to the workspace it happens to be over.
+    pub fn workspace_placements(
+        &self,
+        output: &str,
+        index: usize,
+        focused: Option<&WlSurface>,
+    ) -> Option<Vec<Placement>> {
+        let op = self.outputs.iter().find(|o| o.name == output)?;
+        let ws = op.workspaces.get(index)?;
+        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let ctx = PlaceCtx {
+            area: op.area(),
+            deco: self.deco,
+            mode: self.mode,
+            csd,
+            focused,
+            active: self.active.as_ref(),
+            active_here: self.workspace_has_active(ws),
+        };
+        let mut out = Vec::new();
+        collect_workspace(ws, &ctx, &mut out);
+        Some(out)
+    }
+
+    /// Every output's name paired with how many workspaces it holds, so a
+    /// caller can address one by index without guessing.
+    pub fn workspace_counts(&self) -> Vec<(String, usize, usize)> {
+        self.outputs
+            .iter()
+            .map(|op| (op.name.clone(), op.workspaces.len(), op.active))
+            .collect()
+    }
+
     /// Clear workspace-switch transitions that have finished (or that
     /// can't run because the slide is disabled), freeing their captured
     /// snapshots. Call once per frame before [`Self::placements`].

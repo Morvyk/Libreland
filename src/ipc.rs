@@ -53,6 +53,20 @@ pub enum Request {
         #[serde(default)]
         max: Option<i32>,
     },
+    /// Render a whole workspace to a PNG and return its path — wallpaper,
+    /// panels, windows, decorations and effects, exactly as it would look
+    /// if you switched to it. Works on workspaces that aren't on screen.
+    /// `output` and `workspace` (0-based) default to the focused
+    /// workspace; `max` caps the longest side in pixels (downscaled only,
+    /// full output size by default).
+    CaptureWorkspace {
+        #[serde(default)]
+        output: Option<String>,
+        #[serde(default)]
+        workspace: Option<usize>,
+        #[serde(default)]
+        max: Option<i32>,
+    },
 
     // --- actions ---
     /// Focus a window by id (revealing its workspace first). With `warp`,
@@ -234,6 +248,15 @@ pub enum Response {
         path: String,
         width: i32,
         height: i32,
+    },
+    /// A workspace image was written to `path` (a PNG of `width`x`height`),
+    /// naming the workspace it shows.
+    WorkspaceCapture {
+        path: String,
+        width: i32,
+        height: i32,
+        output: String,
+        workspace: usize,
     },
     /// A bind was registered; `trigger` is the compositor's normalized
     /// spelling of it (what `libreland msg binds` will show).
@@ -863,6 +886,11 @@ mod server {
             Request::Binds => Ok(Response::Binds(binds(state))),
             Request::Cursor => cursor(state),
             Request::CaptureWindow { id, max } => capture_window(state, id, max),
+            Request::CaptureWorkspace {
+                output,
+                workspace,
+                max,
+            } => capture_workspace(state, output, workspace, max),
             Request::FocusWindow { id, warp } => focus_window(state, id, warp),
             Request::WarpCursor { id } => warp_cursor(state, id),
             Request::Close { id } => close_window(state, id),
@@ -943,12 +971,92 @@ mod server {
 
     /// `$XDG_RUNTIME_DIR/libreland-window-<id>.png` (falls back to `/tmp`).
     fn capture_path(id: u64) -> std::path::PathBuf {
+        runtime_png(&format!("window-{id}"))
+    }
+
+    /// `$XDG_RUNTIME_DIR/libreland-<name>.png` (falls back to `/tmp`).
+    fn runtime_png(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
             || std::path::PathBuf::from("/tmp"),
             std::path::PathBuf::from,
         );
-        dir.push(format!("libreland-window-{id}.png"));
+        dir.push(format!("libreland-{name}.png"));
         dir
+    }
+
+    /// Render a whole workspace to a PNG and return its path. Everything on
+    /// it — wallpaper, panels, windows, decorations, effects — composited
+    /// exactly as it would look if you switched to it, including for a
+    /// workspace that isn't on screen.
+    fn capture_workspace(
+        state: &mut State,
+        output: Option<String>,
+        workspace: Option<usize>,
+        max: Option<i32>,
+    ) -> Reply {
+        // Default to what you're looking at: the focused window's workspace,
+        // else the first output's active one.
+        let (output, index) = match (output, workspace) {
+            (Some(o), Some(w)) => (o, w),
+            (o, w) => {
+                let (def_out, def_ws) = state
+                    .seat
+                    .get_keyboard()
+                    .and_then(|k| k.current_focus())
+                    .and_then(|s| {
+                        state
+                            .layout
+                            .window_entries()
+                            .into_iter()
+                            .find(|e| e.surface == s)
+                            .map(|e| (e.output, e.workspace))
+                    })
+                    .or_else(|| {
+                        state
+                            .layout
+                            .workspace_counts()
+                            .into_iter()
+                            .next()
+                            .map(|(name, _, active)| (name, active))
+                    })
+                    .ok_or_else(|| "no outputs".to_owned())?;
+                (o.unwrap_or(def_out), w.unwrap_or(def_ws))
+            }
+        };
+
+        let focused = state.seat.get_keyboard().and_then(|k| k.current_focus());
+        let placements = state
+            .layout
+            .workspace_placements(&output, index, focused.as_ref())
+            .ok_or_else(|| format!("no workspace {index} on output {output}"))?;
+        // Panels belong to the output, not to a workspace, so they are the
+        // live set either way — a captured workspace shows the bar it would
+        // have if you switched to it.
+        let layers = state.snapshot_layer_placements();
+        let encodings = state.surface_encodings(&placements);
+        let (w, h, rgba) = state
+            .renderer
+            .capture_workspace(&output, &placements, &layers, &encodings)
+            .map_err(|e| format!("capture failed: {e}"))?;
+        // Downscale on the CPU after the fact rather than compositing small:
+        // the scene has to be rendered at output size regardless (that is
+        // what the windows are configured to), so this only decides how big
+        // the PNG is.
+        let (w, h, rgba) = match max {
+            Some(m) => crate::screenshot::downscale_rgba(&rgba, w, h, m),
+            None => (w, h, rgba),
+        };
+        let png = crate::screenshot::encode_rgba(&rgba, w, h)
+            .map_err(|e| format!("png encode failed: {e}"))?;
+        let path = runtime_png(&format!("workspace-{output}-{index}"));
+        write_atomic(&path, &png).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        Ok(Response::WorkspaceCapture {
+            path: path.to_string_lossy().into_owned(),
+            width: w,
+            height: h,
+            output,
+            workspace: index,
+        })
     }
 
     /// Write atomically (temp + rename) so a reader never sees a half-file.
@@ -1601,6 +1709,21 @@ mod client {
             #[arg(long)]
             max: Option<i32>,
         },
+        /// Render a whole workspace to a PNG and print its path: wallpaper,
+        /// panels, windows and effects, as it would look if you switched to
+        /// it. Works on workspaces that aren't on screen.
+        CaptureWorkspace {
+            /// Connector name; defaults to the focused window's output.
+            #[arg(long)]
+            output: Option<String>,
+            /// Workspace index, counting from 0; defaults to the focused one.
+            #[arg(long)]
+            workspace: Option<usize>,
+            /// Cap the longest side in pixels (downscaled only; default is
+            /// the output's full size).
+            #[arg(long)]
+            max: Option<i32>,
+        },
         /// Focus a window by id (revealing its workspace).
         FocusWindow {
             id: u64,
@@ -1674,6 +1797,15 @@ mod client {
                 Command::Binds => Request::Binds,
                 Command::Cursor => Request::Cursor,
                 Command::CaptureWindow { id, max } => Request::CaptureWindow { id: *id, max: *max },
+                Command::CaptureWorkspace {
+                    output,
+                    workspace,
+                    max,
+                } => Request::CaptureWorkspace {
+                    output: output.clone(),
+                    workspace: *workspace,
+                    max: *max,
+                },
                 Command::FocusWindow { id, warp } => Request::FocusWindow {
                     id: *id,
                     warp: *warp,
@@ -1871,6 +2003,13 @@ mod client {
             Response::WindowCapture { path, width, height } => {
                 println!("{path} ({width}x{height})");
             }
+            Response::WorkspaceCapture {
+                path,
+                width,
+                height,
+                output,
+                workspace,
+            } => println!("{path} ({width}x{height}) — {output} workspace {workspace}"),
             Response::Bind(bind) => println!("bound {}", bind.trigger),
             // Actions succeed silently (Unix convention); `--json` above
             // still prints the `"Handled"` marker for scripts that check.

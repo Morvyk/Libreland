@@ -150,6 +150,24 @@ pub enum CaptureTarget {
     Dmabuf(Dmabuf),
 }
 
+/// What a composited frame is *for*.
+///
+/// A frame is normally rendered to be shown: it ends in a page flip, and
+/// the frame callbacks, presentation feedback and adaptive-sync state that
+/// go with one. A capture-only frame is composited and read back and then
+/// thrown away — which is what lets a workspace nobody is looking at be
+/// photographed exactly as it would appear if you switched to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramePurpose {
+    /// Compose and present.
+    Present,
+    /// Compose, service the captures, and stop. Nothing is flipped, no
+    /// client is told it was displayed, and the output's damage history is
+    /// invalidated afterwards — the swapchain slot now holds a frame that
+    /// was never shown, so the next real frame has to repaint in full.
+    CaptureOnly,
+}
+
 /// One pending `zwlr_screencopy` capture for the output being
 /// rendered, in physical/buffer pixels.
 #[derive(Debug)]
@@ -3809,7 +3827,18 @@ impl Renderer {
             // Followup ignored: each output is primed once, then parks until
             // a redraw is queued (a flip is now in flight, acked on vblank).
             let _ = self
-                .render_output(idx, &[], &[], &[], false, &[], &SurfaceEncodings::default(), false, None)
+                .render_output(
+                    idx,
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                    &[],
+                    &SurfaceEncodings::default(),
+                    false,
+                    None,
+                    FramePurpose::Present,
+                )
                 .with_context(|| format!("initial render of output #{idx} failed"))?;
         }
         Ok(())
@@ -3882,6 +3911,7 @@ impl Renderer {
         enc: &SurfaceEncodings,
         compose_cursor: bool,
         output: Option<&Output>,
+        purpose: FramePurpose,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
         let idx = self
             .outputs
@@ -3898,6 +3928,7 @@ impl Renderer {
             enc,
             compose_cursor,
             output,
+            purpose,
         )
     }
 
@@ -4997,6 +5028,111 @@ impl Renderer {
         results
     }
 
+    /// Composite one workspace exactly as it would appear on `output` —
+    /// wallpaper, layer surfaces, windows, decorations, blur and all — and
+    /// read it back as premultiplied RGBA8. Nothing is presented.
+    ///
+    /// This is the real render path with `FramePurpose::CaptureOnly`, not a
+    /// second implementation of it: `placements` is already how a frame
+    /// says what to draw (the workspace slide hands it two workspaces at
+    /// once), so a workspace that isn't on screen composites the same way
+    /// the visible one does, and cannot drift from it. HDR outputs tonemap
+    /// through the same shader screenshots use.
+    ///
+    /// The cursor is left out — it belongs to wherever the pointer actually
+    /// is, not to the workspace being photographed.
+    ///
+    /// Returns `(width, height, rgba)` with rows top-down.
+    pub fn capture_workspace(
+        &mut self,
+        output: &str,
+        placements: &[Placement],
+        layers: &[LayerPlacement],
+        enc: &SurfaceEncodings,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        let idx = self
+            .outputs
+            .iter()
+            .position(|o| o.name == output)
+            .with_context(|| format!("no output named {output}"))?;
+        let mode_size = self.outputs[idx].mode_size;
+        let specs = [CaptureSpec {
+            region: Rectangle::from_size(mode_size),
+            fourcc: Fourcc::Abgr8888,
+            target: CaptureTarget::Shm,
+        }];
+        let (results, _) = self.render_output(
+            idx,
+            placements,
+            layers,
+            &[],
+            true,
+            &specs,
+            enc,
+            false,
+            None,
+            FramePurpose::CaptureOnly,
+        )?;
+        match results.into_iter().next() {
+            Some(CaptureOutcome::Shm {
+                bytes,
+                width,
+                height,
+            }) => Ok((
+                i32::try_from(width).unwrap_or(mode_size.w),
+                i32::try_from(height).unwrap_or(mode_size.h),
+                bytes,
+            )),
+            _ => anyhow::bail!("workspace capture read-back failed"),
+        }
+    }
+
+    /// Draw a colour-managed window's elements into a fresh fp16 offscreen,
+    /// decoded to linear BT.2020 — the same treatment its surface gets in an
+    /// HDR output's scene, in isolation. The caller tonemaps it down.
+    ///
+    /// fp16 rather than 8-bit because the decode's output doesn't fit in
+    /// 8 bits: an HDR highlight lands several times above diffuse white and
+    /// has to survive until the shoulder can roll it back in.
+    fn decode_to_fp16(
+        &mut self,
+        surface: &WlSurface,
+        elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+        scale: f64,
+        encoding: Encoding,
+        tex_size: Size<i32, smithay::utils::Buffer>,
+    ) -> Result<GlesTexture> {
+        let decode = match encoding {
+            Encoding::Scrgb => self.scrgb_decode_shader.clone(),
+            _ if window_buffer_rb_swapped(surface) => self.hdr_decode_swizzle_shader.clone(),
+            _ => self.hdr_decode_shader.clone(),
+        };
+        let phys = Size::<i32, Physical>::from((tex_size.w, tex_size.h));
+        let full = [Rectangle::<i32, Physical>::from_size(phys)];
+        let mut scene = self
+            .gles
+            .create_buffer(Fourcc::Abgr16161616f, tex_size)
+            .context("capture_window: create fp16 scene")?;
+        {
+            let mut target = self
+                .gles
+                .bind(&mut scene)
+                .context("capture_window: bind fp16 scene")?;
+            let mut frame = self
+                .gles
+                .render(&mut target, phys, Transform::Normal)
+                .context("capture_window: fp16 render")?;
+            frame
+                .clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full)
+                .context("capture_window: fp16 clear")?;
+            frame.override_default_tex_program(decode, Vec::new());
+            draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, &full)
+                .context("capture_window: fp16 draw")?;
+            let _ = frame.finish().context("capture_window: fp16 finish")?;
+        }
+        Ok(scene)
+    }
+
     /// The SDR reference white configured for `output`, in cd/m². Falls back
     /// to the primary output's for an unknown or absent name — a window
     /// capture is output-independent, so it may have no screen to ask.
@@ -5100,37 +5236,7 @@ impl Renderer {
         // several times above diffuse white and has to survive until the
         // shoulder can roll it back in.
         let hdr_scene = (encoding != Encoding::Sdr)
-            .then(|| {
-                let decode = match encoding {
-                    Encoding::Scrgb => self.scrgb_decode_shader.clone(),
-                    _ if window_buffer_rb_swapped(surface) => {
-                        self.hdr_decode_swizzle_shader.clone()
-                    }
-                    _ => self.hdr_decode_shader.clone(),
-                };
-                let mut scene = self
-                    .gles
-                    .create_buffer(Fourcc::Abgr16161616f, tex_size)
-                    .context("capture_window: create fp16 scene")?;
-                {
-                    let mut scene_target = self
-                        .gles
-                        .bind(&mut scene)
-                        .context("capture_window: bind fp16 scene")?;
-                    let mut frame = self
-                        .gles
-                        .render(&mut scene_target, phys, Transform::Normal)
-                        .context("capture_window: fp16 render")?;
-                    frame
-                        .clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full)
-                        .context("capture_window: fp16 clear")?;
-                    frame.override_default_tex_program(decode, Vec::new());
-                    draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
-                        .context("capture_window: fp16 draw")?;
-                    let _ = frame.finish().context("capture_window: fp16 finish")?;
-                }
-                Ok::<_, anyhow::Error>(scene)
-            })
+            .then(|| self.decode_to_fp16(surface, &elements, scale, encoding, tex_size))
             .transpose()?;
 
         let mut target = self.gles.bind(&mut texture).context("capture_window: bind")?;
@@ -5707,7 +5813,9 @@ impl Renderer {
         enc: &SurfaceEncodings,
         compose_cursor: bool,
         present_output: Option<&Output>,
+        purpose: FramePurpose,
     ) -> Result<(Vec<CaptureOutcome>, bool)> {
+        let capture_only = purpose == FramePurpose::CaptureOnly;
         // Is the cursor already on the hardware plane for this output? If so,
         // skip compositing it (the plane scans it out) — unless this frame
         // must bake the cursor into the framebuffer for a capture.
@@ -5834,7 +5942,14 @@ impl Renderer {
         // a full scene composite (`capture_direct`). That is the difference
         // between "screen-sharing a game costs nothing" and "screen-sharing a
         // game turns the fast path off for the whole session".
-        if let Some(direct) = self.direct_scanout_inputs(idx, scene.as_ref(), placements, enc) {
+        // A capture-only frame never takes this path. It ends in a flip by
+        // construction — the client's own buffer goes on the primary plane —
+        // and a capture of a workspace nobody is looking at must not put
+        // that workspace on the screen.
+        if let Some(direct) = (!capture_only)
+            .then(|| self.direct_scanout_inputs(idx, scene.as_ref(), placements, enc))
+            .flatten()
+        {
             // Two exceptions, both about the capture:
             // - HDR, because the client's buffer is PQ/BT.2020 and our capture
             //   path can only tonemap the *linear* scene;
@@ -7038,6 +7153,9 @@ impl Renderer {
         // whenever pixels can change outside the tracked inputs.
         let current_damage: Option<Vec<Rectangle<i32, Physical>>> = 'damage: {
             if self.no_damage
+                // A capture wants every pixel, not the ones that changed
+                // since a frame of some *other* workspace.
+                || capture_only
                 || self.outputs[idx].damage_tracker.force_full
                 || self.cursor_needs_composite(idx, hide_cursor, compose_cursor)
                 || !dnd_icon_elements.is_empty()
@@ -7944,6 +8062,23 @@ impl Renderer {
             t_scene,
             t_encode,
         );
+
+        // A capture-only frame stops here: the pixels have been read back
+        // and nothing else about it is real. No flip, so no adaptive-sync
+        // settle, no `wl_callback.done` (the clients in it were never
+        // displayed, and telling them otherwise would have them render
+        // frames for a screen that isn't showing them), and no presentation
+        // feedback.
+        //
+        // The swapchain slot it drew into is *not* queued, so `next_buffer`
+        // hands the same slot back next frame — with a `buffer_age` that
+        // now lies, since the slot holds a frame that was never shown.
+        // Forcing the next frame full is what squares that: age only ever
+        // feeds the damage diff, and skipping the diff makes the age moot.
+        if capture_only {
+            self.outputs[idx].damage_tracker.force_full = true;
+            return Ok((capture_results, false));
+        }
 
         // Settle this output's adaptive-sync state for the frame we're
         // about to queue. Must run before `queue_buffer` so the commit it

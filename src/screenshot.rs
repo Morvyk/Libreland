@@ -67,6 +67,68 @@ pub(crate) fn encode_region(
     Ok(out)
 }
 
+/// Box-downscale a **premultiplied** RGBA image so its longest side is at
+/// most `max`. Never enlarges; returns the input untouched when it already
+/// fits (or when `max` is nonsense).
+///
+/// Premultiplied is what makes a plain average correct here. Straight-alpha
+/// pixels would have to be weighted by their alpha first, or a transparent
+/// pixel's leftover colour bleeds into its neighbours — which is exactly
+/// how a downscaled window with rounded corners grows a dark fringe.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "pixel counts are non-negative and output-bounded; the accumulator is u32 over a bounded box"
+)]
+pub(crate) fn downscale_rgba(
+    src: &[u8],
+    width: i32,
+    height: i32,
+    max: i32,
+) -> (i32, i32, Vec<u8>) {
+    let longest = width.max(height);
+    if max <= 0 || longest <= max || width <= 0 || height <= 0 {
+        return (width, height, src.to_vec());
+    }
+    let scale = f64::from(max) / f64::from(longest);
+    let (dw, dh) = (
+        ((f64::from(width) * scale).round() as i32).max(1),
+        ((f64::from(height) * scale).round() as i32).max(1),
+    );
+    let (sw, sh) = (width as usize, height as usize);
+    let (dwu, dhu) = (dw as usize, dh as usize);
+    let mut out = vec![0u8; dwu * dhu * 4];
+    for y in 0..dhu {
+        // Source rows this destination row averages over, at least one.
+        let y0 = y * sh / dhu;
+        let y1 = (((y + 1) * sh).div_ceil(dhu)).min(sh).max(y0 + 1);
+        for x in 0..dwu {
+            let x0 = x * sw / dwu;
+            let x1 = (((x + 1) * sw).div_ceil(dwu)).min(sw).max(x0 + 1);
+            let mut acc = [0u32; 4];
+            let mut n = 0u32;
+            for sy in y0..y1 {
+                let row = sy * sw * 4;
+                for sx in x0..x1 {
+                    let px = row + sx * 4;
+                    if px + 4 > src.len() {
+                        continue;
+                    }
+                    for c in 0..4 {
+                        acc[c] += u32::from(src[px + c]);
+                    }
+                    n += 1;
+                }
+            }
+            let dst = (y * dwu + x) * 4;
+            for c in 0..4 {
+                out[dst + c] = if n == 0 { 0 } else { (acc[c] / n) as u8 };
+            }
+        }
+    }
+    (dw, dh, out)
+}
+
 /// Encode a per-window capture read-back as an RGBA PNG.
 ///
 /// `src` is `width * height * 4` bytes in **R, G, B, A** order with

@@ -2098,6 +2098,7 @@ impl State {
             &surface_encodings,
             compose_cursor,
             present_output.as_ref(),
+            render::FramePurpose::Present,
         ) {
             Ok((mut results, followup)) => {
                 // Result order mirrors the spec list: screencopy clients,
