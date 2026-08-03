@@ -364,9 +364,15 @@ pub struct WindowInfo {
     /// so a taskbar needs no separate un-minimize request.
     pub minimized: bool,
     pub focused: bool,
-    /// PID of the window's Wayland client, from its socket credentials.
-    /// `None` if the client has no resolvable peer pid. Lets a panel kill
-    /// or match audio streams to the owning process.
+    /// PID of the process that owns the window. Lets a panel kill it, or
+    /// match an audio stream to it.
+    ///
+    /// From the Wayland client's socket credentials, except for X11
+    /// windows, where those name Xwayland (or the compositor) rather than
+    /// the application — those come from `_NET_WM_PID` instead.
+    ///
+    /// `None` when neither is available: a Wayland client with no
+    /// resolvable peer, or an X11 client that never set the property.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
 }
@@ -1390,9 +1396,11 @@ mod server {
         entries
             .into_iter()
             .map(|e| {
-                let x11 = state
-                    .x11_window_for(&e.surface)
-                    .map(|w| (w.class(), w.title()));
+                let x11 = state.x11_window_for(&e.surface).map(|w| X11Info {
+                    class: w.class(),
+                    title: w.title(),
+                    pid: w.pid(),
+                });
                 window_info(&mut state.ipc, &dh, e, focus.as_ref(), x11)
             })
             .collect()
@@ -1406,25 +1414,38 @@ mod server {
             .window_entries()
             .into_iter()
             .find(|e| e.surface == focus)?;
-        let x11 = state
-            .x11_window_for(&entry.surface)
-            .map(|w| (w.class(), w.title()));
+        let x11 = state.x11_window_for(&entry.surface).map(|w| X11Info {
+            class: w.class(),
+            title: w.title(),
+            pid: w.pid(),
+        });
         Some(window_info(&mut state.ipc, &dh, entry, Some(&focus), x11))
     }
 
     /// Build a [`WindowInfo`] from a layout entry, assigning its stable
     /// id and reading title/app-id off the surface.
+    /// What an X11 window can tell us that a Wayland one tells us
+    /// through xdg-shell and its socket instead.
+    struct X11Info {
+        class: String,
+        title: String,
+        /// `_NET_WM_PID`, the only place an X client's real pid is
+        /// written down. Absent for a client that never set it.
+        pid: Option<u32>,
+    }
+
     fn window_info(
         ipc: &mut IpcState,
         dh: &DisplayHandle,
         e: WindowEntry,
         focus: Option<&WlSurface>,
-        x11: Option<(String, String)>,
+        x11: Option<X11Info>,
     ) -> WindowInfo {
         let id = ipc.assign(&e.surface);
         // X11 windows have no xdg role data; their `(class, title)` come
         // from the XWM (precomputed by the caller, which can see State).
-        let (app_id, title) = x11.map_or_else(
+        let x11_pid = x11.as_ref().map(|x| x.pid);
+        let (app_id, title) = x11.map(|x| (x.class, x.title)).map_or_else(
             || toplevel_strings(&e.surface),
             |(class, title)| {
                 (
@@ -1434,12 +1455,22 @@ mod server {
             },
         );
         let focused = focus == Some(&e.surface);
-        // Peer pid from the client's socket credentials.
-        let pid = e
-            .surface
-            .client()
-            .and_then(|c| c.get_credentials(dh).ok())
-            .map(|cred| cred.pid);
+        // An X11 window's Wayland client is *Xwayland*, so its socket
+        // credentials name Xwayland rather than the application — every
+        // X11 window otherwise reports the same, useless pid, and a panel
+        // offering to kill one would kill the X server and every other X
+        // app with it. `_NET_WM_PID` is where the real one is written.
+        //
+        // A Wayland window has no such indirection: the peer on the
+        // socket *is* the application.
+        let pid = match x11_pid {
+            Some(from_x11) => from_x11.and_then(|p| i32::try_from(p).ok()),
+            None => e
+                .surface
+                .client()
+                .and_then(|c| c.get_credentials(dh).ok())
+                .map(|cred| cred.pid),
+        };
         WindowInfo {
             id,
             app_id,
