@@ -518,6 +518,36 @@ corners are masked with the wallpaper after the border + surface
 draw, so floats over tiles show wallpaper (not the tile) at the
 rounded corners — proper shader-based rounding is later polish.
 
+### titlebar
+
+Server-side titlebars. Colours are derived from `border.active` /
+`border.inactive` — a gradient contributes its top stop — so the frame and
+the bar stay one palette with no second set of keys to keep in sync.
+
+| Field       | Default    | State | Notes                                                                                                |
+| ----------- | ---------- | ----- | ---------------------------------------------------------------------------------------------------- |
+| `enabled`   | *derived*  | ✅    | Unset follows `layout.mode`: on while floating, off while tiling. Titlebars while tiling are legal — they just spend a bar of every cell on a title you can usually infer from the window. Set explicitly to pin one answer for both modes. |
+| `height`    | `28`       | ✅    | Bar height in pixels. `>= 0`; `0` is the same as `enabled = false`.                                  |
+| `font_size` | `13.0`     | ✅    | Title text size in pixels. Fonts come from the system's fontconfig directories, with a coverage-ranked fallback chain so CJK, symbol and emoji titles render rather than showing boxes. |
+| `buttons`   | `{ "minimize", "maximize", "close" }` | ✅ | Left-to-right at the bar's right end. An empty list is a bar with a title and nothing to click. Buttons act on **release over the same button**, so a press that slides off is cancelled. |
+| `exclude`   | `{}`       | ✅    | App-ids (Wayland) or classes (X11) that draw their own titlebar without saying so — matched as lowercase substrings. See below. |
+
+A client that *announces* it draws its own decoration is believed and gets
+no bar: `zxdg_toplevel_decoration_v1` or `org_kde_kwin_server_decoration`
+on Wayland, `_MOTIF_WM_HINTS` on X11. Most clients do announce it, and
+those need no `exclude` entry.
+
+A few draw one anyway and tell nobody, which stacks two titlebars, and
+nothing in either protocol lets the compositor detect that — the window
+just looks wrong. `exclude` is the escape hatch; find the name with
+`libreland msg windows`.
+
+Maximizing keeps the titlebar in floating mode and drops it in tiling.
+That difference is deliberate rather than incidental: in floating mode the
+bar is how you un-maximize, and taking it away leaves the window with no
+affordance to come back. Fullscreen always drops it — a bar across the top
+of a game is not what anyone asked for.
+
 ### animations
 
 Window and workspace motion. All on by default with sane, brief
@@ -657,7 +687,7 @@ The `blur` sub-table:
 | ---------- | ------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`  | `true`  | ✅    | Master switch for all blur.                                                                                                                    |
 | `layers`   | `{}`    | ✅    | List of layer-shell **namespaces** to blur behind (a surface matches if its namespace *contains* any entry, so `"quickshell"` matches `"quickshell-bar"`). Empty = no layer blur. Run **`libreland msg layers`** to discover the namespaces in use (rofi → `"rofi"`, etc.). Sampled against the whole desktop beneath them. |
-| `windows`  | `false` | ✅    | Blur behind **windows**. Tiled windows blur against the base (wallpaper + lower layers); floating windows blur against the base **plus the tiled windows underneath**, so a float reveals a blurred copy of the windows it covers. |
+| `windows`  | `false` | ✅    | Blur behind **windows**. Tiled windows blur against the base (wallpaper + lower layers); floating windows blur against everything below them, **including other floating windows** — stack two translucent terminals and the upper one frosts the lower one, not the desktop they share. |
 | `passes`   | `3`     | ✅    | Dual-filter passes — each is a downsample + later upsample. More passes = a wider, softer (and costlier) blur. `0` disables. `0..=10`.          |
 | `radius`   | `5.0`   | ✅    | Per-tap sample offset in pixels; scales the blur's spread. `>= 0`.                                                                             |
 
@@ -666,6 +696,16 @@ backdrop is snapshotted per z-band (base → +tiled → +floating/maximized)
 and each band is blurred at most once, so nothing is ever double-blurred.
 Surface alpha isn't probed, so a mapped opaque panel/window still pays for
 its tier while it's up — the cost is bounded.
+
+The floating band is the exception, and has to be: one backdrop per band
+can only give one answer, so every floating window sampling the same one
+means none of them can show another through it. Floating windows are
+therefore staged **one at a time, bottom-up**, each getting a backdrop
+that includes the ones below it. A blur pass runs only for a window that
+both wants blur and has one beneath it, so a single translucent window —
+or several that don't overlap — costs exactly what it did before. Past
+six such windows the rest share the deepest backdrop built (each is a
+full-resolution texture, ~33 MB at 4K); the cap is logged, not silent.
 
 **Layer blur follows the panel's real shape.** The blurred backdrop behind
 a layer surface is alpha-masked by the panel's own buffer, so wherever the
