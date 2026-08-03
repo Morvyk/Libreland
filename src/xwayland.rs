@@ -729,6 +729,31 @@ impl XwmHandler for State {
         self.x11_fill_request(&window, FillMode::Maximized, false);
     }
 
+    /// `WM_CHANGE_STATE` → `IconicState`: an X11 client asking to be
+    /// minimized. Steam's own titlebar button is this and nothing else —
+    /// it declines server decoration, so there is no button of ours to
+    /// press, and without this handler the request was silently dropped
+    /// by smithay's no-op default and the button did nothing at all.
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else {
+            debug!(window = window.window_id(), "xwayland: minimize request with no surface");
+            return;
+        };
+        debug!(window = window.window_id(), "xwayland: client minimize request");
+        self.minimize_window(&surface);
+    }
+
+    /// The reverse: `WM_CHANGE_STATE` → `NormalState`. Focus is what
+    /// un-minimizes a window here (that is what makes a taskbar click
+    /// work), so this goes through the same door rather than a second one.
+    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else {
+            return;
+        };
+        debug!(window = window.window_id(), "xwayland: client unminimize request");
+        self.focus_surface(&surface);
+    }
+
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         self.x11_fill_request(&window, FillMode::Fullscreen, true);
     }

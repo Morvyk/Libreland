@@ -537,6 +537,13 @@ no bar: `zxdg_toplevel_decoration_v1` or `org_kde_kwin_server_decoration`
 on Wayland, `_MOTIF_WM_HINTS` on X11. Most clients do announce it, and
 those need no `exclude` entry.
 
+It still gets a **border**, though. The two are different things sharing a
+word: the border is the focus ring, and a client that drew itself a
+titlebar has not drawn itself one of those — without it, Steam and every
+other self-decorating window had no way to show whether they held the
+keyboard. It also gives them an edge to grab, which a window carrying no
+server chrome otherwise lacks.
+
 A few draw one anyway and tell nobody, which stacks two titlebars, and
 nothing in either protocol lets the compositor detect that — the window
 just looks wrong. `exclude` is the escape hatch; find the name with

@@ -4046,17 +4046,22 @@ fn matches_csd_rule(identity: &str, rules: &[String]) -> bool {
 }
 
 fn deco_for_fill(deco: Deco, mode: LayoutMode, fill: FillMode, csd: bool) -> Deco {
-    // A client drawing its own decorations gets none from us, whatever
-    // the mode or the fill: a server-side bar over a client-side one is
-    // the double titlebar every desktop has a bug report about.
-    if csd {
-        return Deco::none();
-    }
-    match fill {
+    let base = match fill {
         FillMode::Normal => deco,
         FillMode::Maximized if mode == LayoutMode::Floating => deco,
         _ => Deco::none(),
-    }
+    };
+    // A client drawing its own decorations loses the *titlebar* — a
+    // server-side bar over a client-side one is the double titlebar every
+    // desktop has a bug report about.
+    //
+    // It keeps the border, which is a different thing wearing the same
+    // word. The border is the focus ring, and a client that drew itself a
+    // titlebar has not drawn itself one of those: dropping it left Steam
+    // and every other CSD window with no way to tell whether they had the
+    // keyboard. It also gives them an edge to grab, which a window with
+    // no server chrome otherwise lacks entirely.
+    if csd { Deco::new(base.border, 0) } else { base }
 }
 
 /// Split `bounds` into `(first, second)` along `axis` at `ratio`,
@@ -4628,22 +4633,36 @@ mod deco_tests {
         assert!(!matches_csd_rule("anything", &[]));
     }
 
-    /// A client drawing its own decorations gets none from us, whatever
-    /// the mode or the fill — a server-side bar on top of a client-side
-    /// one is the double titlebar every desktop has a bug report about.
+    /// A client drawing its own decorations never gets a titlebar from us
+    /// — a server-side bar on top of a client-side one is the double
+    /// titlebar every desktop has a bug report about — but it keeps the
+    /// border wherever a server-decorated window would have one.
+    ///
+    /// The two are different things sharing a word: the border is the
+    /// focus ring, and a client that drew itself a titlebar has not drawn
+    /// itself one of those.
     #[test]
-    fn a_csd_window_carries_no_decoration() {
+    fn a_csd_window_keeps_its_border_and_loses_its_titlebar() {
         let deco = Deco::new(2, 28);
         for mode in [LayoutMode::Tiling, LayoutMode::Floating] {
             for fill in [FillMode::Normal, FillMode::Maximized, FillMode::Fullscreen] {
+                let csd = deco_for_fill(deco, mode, fill, true);
+                assert_eq!(csd.titlebar, 0, "csd window in {mode:?}/{fill:?} got a bar");
+                // The border tracks what the same window would have had
+                // without the flag, so fullscreen still has none.
                 assert_eq!(
-                    deco_for_fill(deco, mode, fill, true),
-                    Deco::none(),
-                    "csd window in {mode:?}/{fill:?} still got decoration"
+                    csd.border,
+                    deco_for_fill(deco, mode, fill, false).border,
+                    "csd window in {mode:?}/{fill:?} lost its focus ring"
                 );
             }
         }
-        // ...and clearing the flag restores it.
+        // Fullscreen is undecorated either way.
+        assert_eq!(
+            deco_for_fill(deco, LayoutMode::Floating, FillMode::Fullscreen, true),
+            Deco::none()
+        );
+        // ...and clearing the flag restores the bar.
         assert_eq!(
             deco_for_fill(deco, LayoutMode::Floating, FillMode::Normal, false),
             deco
