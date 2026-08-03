@@ -7,7 +7,7 @@
 # alongside it). The source is cloned from GitHub — no local checkout needed.
 
 pkgname=libreland-git
-pkgver=0.1.0.r213.gedd473a
+pkgver=0.1.0.r231.g6e9669e
 pkgrel=1
 pkgdesc='A Wayland compositor in pure Rust, configured in Lua (git)'
 arch=('x86_64')
@@ -52,6 +52,8 @@ optdepends=(
     'ttf-dejavu: a UI font for the portal dialogs, if none is installed yet'
     'rofi: app launcher bound to Super+Space in the default config'
     'kitty: terminal bound to Super+Return in the default config'
+    'tesseract: copy-text-from-screenshot (the T button in the screenshot toolbar)'
+    'tesseract-data-eng: the English model tesseract needs to read anything'
 )
 provides=('libreland')
 conflicts=('libreland')

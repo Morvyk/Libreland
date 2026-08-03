@@ -204,12 +204,21 @@ pub(crate) const TOOL_PAD: i32 = 6;
 pub(crate) const TOOL_GAP: i32 = 10;
 
 /// The buttons, left to right.
-pub(crate) fn tools() -> Vec<Tool> {
+///
+/// The pen's settings — the colour swatches and the width slider — are
+/// only on the bar while `drawing` is on. They were permanently visible
+/// at first, which made pressing the pen look like it did nothing at all:
+/// the picker you were waiting for had been sitting there the whole time.
+/// Revealing them *is* the feedback that the pen is down, and it keeps a
+/// bar you are not annotating with down to four buttons.
+pub(crate) fn tools(drawing: bool) -> Vec<Tool> {
     let mut v = vec![Tool::Take, Tool::Draw];
-    v.extend(PenColour::ALL.map(Tool::Colour));
-    // Next to the colours: the two things that describe the pen belong
-    // together, and the slider is the only wide item on the bar.
-    v.push(Tool::Width);
+    if drawing {
+        v.extend(PenColour::ALL.map(Tool::Colour));
+        // Next to the colours: the two things that describe the pen
+        // belong together, and the slider is the only wide item here.
+        v.push(Tool::Width);
+    }
     v.push(Tool::CopyText);
     v.push(Tool::Cancel);
     v
@@ -235,9 +244,10 @@ pub(crate) fn tool_width(tool: Tool) -> i32 {
 pub(crate) fn toolbar_layout(
     sel: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
+    drawing: bool,
 ) -> (Rectangle<i32, Physical>, Vec<ToolSlot>) {
     use smithay::utils::{Point, Size};
-    let tools = tools();
+    let tools = tools(drawing);
     let count = i32::try_from(tools.len()).unwrap_or(1);
     let bar_w: i32 = tools.iter().map(|t| tool_width(*t)).sum::<i32>() + (count + 1) * TOOL_PAD;
     let bar_h = TOOL_SIZE + 2 * TOOL_PAD;
@@ -283,13 +293,14 @@ pub(crate) fn tool_at(
     sel: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
     pos: (f64, f64),
+    drawing: bool,
 ) -> Option<Tool> {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "cursor coords are clamped to the i32 layout bounds"
     )]
     let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
-    let (_, slots) = toolbar_layout(sel, bounds);
+    let (_, slots) = toolbar_layout(sel, bounds, drawing);
     slots
         .into_iter()
         .find(|(_, r)| {
@@ -304,13 +315,14 @@ pub(crate) fn on_toolbar(
     sel: Rectangle<i32, Physical>,
     bounds: Rectangle<i32, Physical>,
     pos: (f64, f64),
+    drawing: bool,
 ) -> bool {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "cursor coords are clamped to the i32 layout bounds"
     )]
     let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
-    let (bar, _) = toolbar_layout(sel, bounds);
+    let (bar, _) = toolbar_layout(sel, bounds, drawing);
     px >= bar.loc.x
         && px < bar.loc.x + bar.size.w
         && py >= bar.loc.y
@@ -831,6 +843,31 @@ mod tests {
         Rectangle::new(Point::from((100, 100)), Size::from((200, 150)))
     }
 
+    /// Pressing the pen has to *do* something visible. The swatches and
+    /// the width slider were on the bar permanently at first, so turning
+    /// the pen on changed nothing you could see and the picker looked
+    /// broken — it had been sitting there the whole time.
+    #[test]
+    fn the_pen_reveals_its_settings() {
+        let up = tools(false);
+        let down = tools(true);
+        assert!(
+            !up.iter().any(|t| matches!(t, Tool::Colour(_) | Tool::Width)),
+            "pen up: the bar shouldn't offer pen settings"
+        );
+        assert_eq!(
+            down.iter().filter(|t| matches!(t, Tool::Colour(_))).count(),
+            PenColour::ALL.len(),
+            "pen down: every colour is offered"
+        );
+        assert!(down.contains(&Tool::Width));
+        // The buttons that aren't about the pen never move away.
+        for always in [Tool::Take, Tool::Draw, Tool::CopyText, Tool::Cancel] {
+            assert!(up.contains(&always), "{always:?} vanished with the pen up");
+            assert!(down.contains(&always), "{always:?} vanished with the pen down");
+        }
+    }
+
     /// Strokes live in compositor coordinates and are painted into a
     /// *physical* crop, so they have to be converted — both the offset
     /// from the output origin and the scale. Missing the scale put every
@@ -908,7 +945,7 @@ mod tests {
     fn toolbar_slots_tile_the_bar_without_overlapping() {
         let sel = Rectangle::new(Point::from((300, 200)), Size::from((400, 300)));
         let bounds = Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080)));
-        let (bar, slots) = toolbar_layout(sel, bounds);
+        let (bar, slots) = toolbar_layout(sel, bounds, true);
         assert!(!slots.is_empty());
         let mut prev_right = bar.loc.x;
         for (tool, r) in &slots {
@@ -936,7 +973,7 @@ mod tests {
             // Hard against the right edge: must clamp left.
             Rectangle::new(Point::from((1800, 400)), Size::from((119, 200))),
         ] {
-            let (bar, _) = toolbar_layout(sel, bounds);
+            let (bar, _) = toolbar_layout(sel, bounds, true);
             assert!(bar.loc.x >= 0, "{sel:?} pushed the bar off the left");
             assert!(
                 bar.loc.x + bar.size.w <= bounds.size.w,

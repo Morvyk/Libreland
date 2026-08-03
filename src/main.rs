@@ -4763,8 +4763,8 @@ impl State {
             return None;
         };
         let at = self.renderer.cursor_pos();
-        let (bar, slots) = screenshot::toolbar_layout(sel, bounds);
-        let hovered = screenshot::tool_at(sel, bounds, at);
+        let (bar, slots) = screenshot::toolbar_layout(sel, bounds, session.drawing);
+        let hovered = screenshot::tool_at(sel, bounds, at, session.drawing);
         let buttons = slots
             .into_iter()
             .map(|(tool, rect)| render::ToolButton {
@@ -4809,7 +4809,7 @@ impl State {
     fn screenshot_slider_slot(&self) -> Option<smithay::utils::Rectangle<i32, Physical>> {
         let sel = self.screenshot.as_ref()?.region?;
         let bounds = self.screenshot_output_bounds(sel)?;
-        screenshot::toolbar_layout(sel, bounds)
+        screenshot::toolbar_layout(sel, bounds, true)
             .1
             .into_iter()
             .find(|(t, _)| *t == screenshot::Tool::Width)
@@ -4861,10 +4861,11 @@ impl State {
         let Some(bounds) = self.screenshot_output_bounds(sel) else {
             return false;
         };
-        if !screenshot::on_toolbar(sel, bounds, at) {
+        let drawing = self.screenshot.as_ref().is_some_and(|s| s.drawing);
+        if !screenshot::on_toolbar(sel, bounds, at, drawing) {
             return false;
         }
-        match screenshot::tool_at(sel, bounds, at) {
+        match screenshot::tool_at(sel, bounds, at, drawing) {
             Some(screenshot::Tool::Take) => self.finalize_compositor_rect(sel),
             Some(screenshot::Tool::Cancel) => self.cancel_screenshot(),
             Some(screenshot::Tool::Draw) => {
@@ -4884,7 +4885,7 @@ impl State {
             Some(screenshot::Tool::Width) => {
                 // Grab the slider: the width tracks the pointer until
                 // release, including past the ends of the track.
-                let slot = screenshot::toolbar_layout(sel, bounds)
+                let slot = screenshot::toolbar_layout(sel, bounds, drawing)
                     .1
                     .into_iter()
                     .find(|(t, _)| *t == screenshot::Tool::Width)
