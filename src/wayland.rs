@@ -1440,9 +1440,10 @@ impl SeatHandler for State {
             if let Some(surface) = focused {
                 self.layout.raise(surface);
             }
-            // Tabbing away from a game that hid the pointer has to give the
-            // pointer back.
+            // Tabbing away from a game has to give the pointer back — both
+            // halves of it.
             self.sync_cursor_owner();
+            self.sync_pointer_lock();
             self.queue_redraw_all();
         }
         // Hand clipboard + primary-selection *focus* to the keyboard-
@@ -1517,11 +1518,14 @@ impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // A constraint is created inactive; the compositor decides when
         // to honour it. Activate immediately if the pointer is already
-        // over this surface (the common case — a game requests the lock
-        // while focused); otherwise it activates on the next motion into
-        // the surface (see the motion path in main.rs). Smithay
-        // deactivates automatically when the surface loses pointer focus.
-        if pointer.current_focus().as_ref() == Some(surface) {
+        // over this surface *and* it is the window in use (the common
+        // case — a game requests the lock while focused); otherwise it
+        // activates on the next motion into the surface while active (see
+        // the motion path in main.rs). Smithay deactivates automatically
+        // when the surface loses pointer focus, but not when it merely
+        // stops being the active window — see `State::sync_pointer_lock`.
+        let active = self.layout.active_surface() == Some(surface);
+        if active && pointer.current_focus().as_ref() == Some(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {
                     constraint.activate();

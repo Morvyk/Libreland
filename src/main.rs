@@ -1256,6 +1256,50 @@ impl State {
     /// it), then move keyboard focus and repaint. No-op if the surface
     /// isn't a managed window. Shared by `xdg_activation` and the IPC
     /// `focus-window`.
+    /// Release a pointer lock held by a window that is no longer the one
+    /// you are using, and restore it when that window comes back.
+    ///
+    /// This is the other half of "tab out of a game and get your pointer
+    /// back", and it turned out to be the half that mattered. The
+    /// renderer hides the cursor outright while a lock is active
+    /// (`hide_cursor` keys off `pointer_locked`), so no amount of fixing
+    /// the *cursor image* could ever have made the pointer reappear —
+    /// which is exactly what two previous attempts discovered the hard
+    /// way.
+    ///
+    /// Smithay deactivates a constraint when its surface loses **pointer**
+    /// focus. Alt-Tab doesn't touch pointer focus: the pointer is locked,
+    /// so it hasn't moved, so it is still over the game. Keyboard focus is
+    /// the thing that changed, and nothing was listening for it.
+    pub(crate) fn sync_pointer_lock(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let Some(under) = pointer.current_focus() else {
+            return;
+        };
+        // The lock belongs to whatever the pointer is over; it is honoured
+        // only while that is also the active window.
+        let honour = self.layout.active_surface() == Some(&under);
+        with_pointer_constraint(&under, &pointer, |constraint| {
+            let Some(constraint) = constraint else {
+                return;
+            };
+            match (honour, constraint.is_active()) {
+                (false, true) => {
+                    debug!(surface = ?under.id(), "pointer: releasing a lock held by an inactive window");
+                    constraint.deactivate();
+                }
+                (true, false) => {
+                    debug!(surface = ?under.id(), "pointer: restoring the lock of the active window");
+                    constraint.activate();
+                }
+                _ => {}
+            }
+        });
+        self.queue_redraw_all();
+    }
+
     /// Re-decide whether the window that set the pointer image still gets
     /// to dictate it.
     ///
@@ -2753,8 +2797,13 @@ impl State {
                 (location.x - origin.x) as i32,
                 (location.y - origin.y) as i32,
             ));
+            // Only for the window you are actually using: re-activating a
+            // lock the moment the pointer crossed an *inactive* game would
+            // undo `sync_pointer_lock` on the very next motion event.
+            let active = self.layout.active_surface() == Some(surface);
             with_pointer_constraint(surface, &pointer, |constraint| {
                 if let Some(constraint) = constraint
+                    && active
                     && !constraint.is_active()
                     && constraint.region().is_none_or(|r| r.contains(local))
                 {
