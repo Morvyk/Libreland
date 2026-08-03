@@ -3329,10 +3329,56 @@ fn remove_from_tree(node: Node, surface: &WlSurface) -> (Option<Node>, Option<Wi
     }
 }
 
+/// Whether any leaf under `node` is on screen. A subtree that is
+/// entirely minimized takes no space in the layout.
+fn tree_visible(node: &Node) -> bool {
+    match node {
+        Node::Leaf(w) => w.visible(),
+        Node::Split { first, second, .. } => tree_visible(first) || tree_visible(second),
+    }
+}
+
+/// What each side of a split gets from its cell: `None` for a side that
+/// takes no space at all. See [`split_share`].
+type SplitShare = (
+    Option<Rectangle<i32, Physical>>,
+    Option<Rectangle<i32, Physical>>,
+);
+
+/// How a split's cell divides between its two children, given whether
+/// each side has anything on screen. `None` means "leave that side's
+/// rects alone" — it is entirely minimized, so it takes no space and
+/// keeps whatever geometry it had when it was last visible.
+///
+/// A side with nothing visible in it hands the *whole* cell to its
+/// sibling. Without that, minimizing a tile leaves its cell reserved and
+/// empty: the layout goes on tiling a window that isn't there.
+fn split_share(
+    bounds: Rectangle<i32, Physical>,
+    axis: SplitAxis,
+    ratio: f32,
+    inner: i32,
+    first_visible: bool,
+    second_visible: bool,
+) -> SplitShare {
+    match (first_visible, second_visible) {
+        (true, false) => (Some(bounds), None),
+        (false, true) => (None, Some(bounds)),
+        // Both visible is the ordinary case; neither visible means the
+        // split is off screen entirely and the ratio is as good a guess
+        // as any for where it lands when it comes back.
+        _ => {
+            let (b1, b2) = split_bounds(bounds, axis, ratio, inner);
+            (Some(b1), Some(b2))
+        }
+    }
+}
+
 /// Reassign every leaf's rect by walking the tree top-down. Each
 /// `Split` shrinks its children by `inner` along the split axis
 /// (centred on the divider) so adjacent cells get visible space
-/// between them.
+/// between them — except where [`split_share`] collapses a minimized
+/// side away.
 fn assign_rects(node: &mut Node, bounds: Rectangle<i32, Physical>, inner: i32) {
     match node {
         Node::Leaf(w) => w.rect = bounds,
@@ -3342,9 +3388,20 @@ fn assign_rects(node: &mut Node, bounds: Rectangle<i32, Physical>, inner: i32) {
             first,
             second,
         } => {
-            let (b1, b2) = split_bounds(bounds, *axis, *ratio, inner);
-            assign_rects(first, b1, inner);
-            assign_rects(second, b2, inner);
+            let (b1, b2) = split_share(
+                bounds,
+                *axis,
+                *ratio,
+                inner,
+                tree_visible(first),
+                tree_visible(second),
+            );
+            if let Some(b) = b1 {
+                assign_rects(first, b, inner);
+            }
+            if let Some(b) = b2 {
+                assign_rects(second, b, inner);
+            }
         }
     }
 }
@@ -4776,5 +4833,49 @@ mod resize_tests {
         assert_eq!(edges(150, 150), both(EdgeX::Left, EdgeY::Top));
         assert_eq!(edges(450, 150), both(EdgeX::Right, EdgeY::Top));
         assert_eq!(edges(150, 250), both(EdgeX::Left, EdgeY::Bottom));
+    }
+}
+
+#[cfg(test)]
+mod minimize_tests {
+    use super::{Point, Rectangle, Size, SplitAxis, split_share};
+
+    fn cell() -> Rectangle<i32, super::Physical> {
+        Rectangle::new(Point::new(0, 0), Size::new(1000, 500))
+    }
+
+    /// Both tiles on screen: the ordinary split, with the inner gap
+    /// taken out of the middle.
+    #[test]
+    fn a_visible_pair_splits_normally() {
+        let (a, b) = split_share(cell(), SplitAxis::LeftRight, 0.5, 10, true, true);
+        assert_eq!(a.unwrap().size.w, 495);
+        assert_eq!(b.unwrap().size.w, 495);
+        assert_eq!(b.unwrap().loc.x, 505);
+    }
+
+    /// The bug this exists for: minimizing one tile must not leave its
+    /// cell reserved. The survivor takes the whole thing — full width,
+    /// no gap — and the hidden side is left untouched rather than being
+    /// configured to a size nobody can see.
+    #[test]
+    fn a_minimized_sibling_yields_its_whole_cell() {
+        let (a, b) = split_share(cell(), SplitAxis::LeftRight, 0.5, 10, true, false);
+        assert_eq!(a, Some(cell()));
+        assert_eq!(b, None);
+
+        let (a, b) = split_share(cell(), SplitAxis::TopBottom, 0.3, 10, false, true);
+        assert_eq!(a, None);
+        assert_eq!(b, Some(cell()));
+    }
+
+    /// A split with nothing visible on either side is off screen as a
+    /// whole, so it keeps splitting by its ratio — the geometry it will
+    /// want back when one of them is restored.
+    #[test]
+    fn a_fully_minimized_split_keeps_its_ratio() {
+        let (a, b) = split_share(cell(), SplitAxis::LeftRight, 0.5, 0, false, false);
+        assert_eq!(a.unwrap().size.w, 500);
+        assert_eq!(b.unwrap().size.w, 500);
     }
 }
