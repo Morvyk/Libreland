@@ -1455,6 +1455,17 @@ pub struct Renderer {
 /// scene accumulated up to that z-band, blurred and saved.
 const BLUR_TIERS: usize = 4;
 
+/// How many *extra* tiers may be handed out to individual floating
+/// windows, so a translucent window frosts the translucent window beneath
+/// it rather than the desktop they both sit on.
+///
+/// Capped because each tier is a full-resolution texture — ~33 MB at 4K —
+/// and because each one costs its own pyramid. Past the cap the remaining
+/// windows share the deepest tier built, which is what every window did
+/// before this existed. Allocated on demand: a desktop that never
+/// overlaps two translucent windows never pays for any of them.
+const MAX_WINDOW_TIERS: usize = 6;
+
 /// Offscreen textures backing one output's backdrop blur. `scene` is the
 /// progressive backdrop accumulator (each z-band drawn on top of the
 /// previous, no clear); `levels` is the dual-filter mip working chain
@@ -6992,7 +7003,19 @@ impl Renderer {
         };
         let draw_tiled =
             |frame: &mut GlesFrame<'_, '_>| draw_band(frame, &[ZBand::Buried, ZBand::Tiled]);
-        let draw_floating = |frame: &mut GlesFrame<'_, '_>| draw_band(frame, &[ZBand::Floating]);
+        // One floating window, by placement index — the unit the per-window
+        // backdrop tiers are built around (see the staging loop below).
+        let draw_float_one = |frame: &mut GlesFrame<'_, '_>, i: usize| -> Result<()> {
+            draw_window(
+                frame,
+                &placements[i],
+                &grouped[i],
+                &win_draws[i],
+                win_tex[i].as_ref(),
+                false,
+                &full_damage,
+            )
+        };
         // Split out from the floating band so a *filled* window can blur
         // against everything below it without blurring against itself —
         // it is drawn into the stage that produces the tier the layers
@@ -7092,6 +7115,22 @@ impl Renderer {
         let mut tier_float: Option<GlesTexture> = None;
         let mut tier_filled: Option<GlesTexture> = None;
         let mut tier_layer: Option<GlesTexture> = None;
+        // Backdrops handed to individual floating windows, keyed by surface.
+        // A window not in here falls back to `tier_float` — the whole band's
+        // shared backdrop, which is right for the bottom-most one and for
+        // any window past `MAX_WINDOW_TIERS`.
+        let mut win_tiers: HashMap<ObjectId, GlesTexture> = HashMap::new();
+        // The deepest backdrop built so far while walking the floating band.
+        let mut newest_tier: Option<GlesTexture> = None;
+        // Floating windows bottom-up: placement order *is* stack order, and
+        // the staging loop has to walk it the same way the draw loop does or
+        // a window would frost something drawn above it.
+        let float_order: Vec<usize> = placements
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| visible[*i] && p.band == ZBand::Floating)
+            .map(|(i, _)| i)
+            .collect();
         if (need_window || need_filled || need_layer)
             && self.ensure_blur_scratch(idx, mode_size, blur.passes)
         {
@@ -7121,8 +7160,47 @@ impl Renderer {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 1)?;
                     tier_float = Some(scratch.tiers[1].clone());
                 }
-                if need_filled || need_layer {
-                    render_scene_stage(&mut self.gles, &mut scratch, mode_size, &draw_floating)?;
+                // The floating band, one window at a time and bottom-up, so
+                // a translucent window frosts the translucent window beneath
+                // it instead of the desktop they are both sitting on. A
+                // single pyramid over the whole band — what this used to do
+                // — can't: it has one answer for every window in it.
+                //
+                // A pyramid runs only when a blur-eligible window has
+                // something new underneath it since the last one, so the
+                // common cases (one translucent window, or several that
+                // don't overlap anything translucent) cost exactly what they
+                // did before.
+                if need_filled || need_layer || need_window {
+                    for (n, &i) in float_order.iter().enumerate() {
+                        // The bottom-most window (`n == 0`) already has its
+                        // backdrop: `tier_float` is the scene under the whole
+                        // band. Every later one needs a fresh pyramid, since
+                        // the window below it has just been drawn into the
+                        // scene and has to show through.
+                        if need_window && n > 0 && wants_blur(i, &placements[i]) {
+                            let slot = BLUR_TIERS + win_tiers.len();
+                            if win_tiers.len() >= MAX_WINDOW_TIERS {
+                                debug!(
+                                    cap = MAX_WINDOW_TIERS,
+                                    "blur: per-window tier cap reached; deeper windows share the last backdrop"
+                                );
+                            } else if ensure_tier_slot(&mut self.gles, &mut scratch, slot) {
+                                run_pyramid(
+                                    &mut self.gles, &mut scratch, passes, radius, &down, &up, slot,
+                                )?;
+                                newest_tier = Some(scratch.tiers[slot].clone());
+                            }
+                            // `None` only before the first tier is built, i.e.
+                            // for a window that falls back to `tier_float`.
+                            if let Some(t) = &newest_tier {
+                                win_tiers.insert(placements[i].surface.id(), t.clone());
+                            }
+                        }
+                        render_scene_stage(&mut self.gles, &mut scratch, mode_size, &|f| {
+                            draw_float_one(f, i)
+                        })?;
+                    }
                 }
                 if need_filled {
                     run_pyramid(&mut self.gles, &mut scratch, passes, radius, &down, &up, 2)?;
@@ -7634,7 +7712,10 @@ impl Renderer {
                 .enumerate()
                 .filter(|(i, (((p, _), _), _))| visible[*i] && p.band == ZBand::Floating)
             {
-                if let Some(t) = &tier_float
+                // This window's own backdrop if it got one — which includes
+                // the translucent windows below it — else the band's shared
+                // one, which is the wallpaper and the tiles.
+                if let Some(t) = win_tiers.get(&p.surface.id()).or(tier_float.as_ref())
                     && (blur.windows || protocol_blur.contains(&p.surface.id()))
                 {
                     blur_rect(&mut frame, t, cell_local(wd.effective), None, draw_damage)?;
@@ -9094,6 +9175,24 @@ fn capture_dmabuf(
 /// on top of whatever earlier bands already painted (GLES `render` never
 /// clears). The first band's wallpaper fill covers the whole output, so
 /// no explicit clear is needed before it.
+/// Ensure `scratch` has a tier buffer at `slot`, allocating on demand.
+///
+/// The four band tiers exist from the start; the per-window ones
+/// ([`MAX_WINDOW_TIERS`]) are only built when a frame actually stacks that
+/// many translucent windows, so an ordinary desktop pays for none of them.
+fn ensure_tier_slot(gles: &mut GlesRenderer, scratch: &mut BlurScratch, slot: usize) -> bool {
+    while scratch.tiers.len() <= slot {
+        match gles.create_buffer(Fourcc::Abgr8888, scratch.size) {
+            Ok(t) => scratch.tiers.push(t),
+            Err(err) => {
+                warn!(error = %err, slot, "blur: per-window tier alloc failed");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn render_scene_stage(
     gles: &mut GlesRenderer,
     scratch: &mut BlurScratch,
