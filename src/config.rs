@@ -182,6 +182,12 @@ pub struct AnimationsConfig {
     /// A window disappearing (unmap/close): fade + scale-out of a
     /// snapshot taken just before it goes.
     pub window_close: AnimSpec,
+    /// A window being minimized: the same snapshot as a close, but
+    /// shrinking harder and sinking as it fades, so being put away doesn't
+    /// look like being destroyed. Restoring reverses it, on
+    /// [`Self::window_open`]'s timing — arriving and leaving usually want
+    /// different curves, and a restore is an arrival.
+    pub window_minimize: AnimSpec,
     /// A window's tile changing *position* — reflow on open/close,
     /// interactive move, fullscreen toggles: slide to the new location.
     pub window_move: AnimSpec,
@@ -252,6 +258,14 @@ impl Default for AnimationsConfig {
             window_close: AnimSpec {
                 enabled: true,
                 duration: Duration::from_millis(200),
+                curve: Curve::EaseIn,
+            },
+            // A touch slower than a close. Both are the window leaving, but
+            // a minimize is reversible and the eye is meant to follow where
+            // it went; a close is over and wants to be out of the way.
+            window_minimize: AnimSpec {
+                enabled: true,
+                duration: Duration::from_millis(220),
                 curve: Curve::EaseIn,
             },
             window_move: AnimSpec {
@@ -1542,6 +1556,7 @@ fn parse_animations(t: &Table, defaults: AnimationsConfig) -> mlua::Result<Anima
     };
     cfg.window_open = parse_anim_spec(t, "window_open", base(cfg.window_open)?)?;
     cfg.window_close = parse_anim_spec(t, "window_close", base(cfg.window_close)?)?;
+    cfg.window_minimize = parse_anim_spec(t, "window_minimize", base(cfg.window_minimize)?)?;
     cfg.window_move = parse_anim_spec(t, "window_move", base(cfg.window_move)?)?;
     // `window_resize` inherits from the resolved `window_move` rather than
     // its own default, so setting just `window_move` still moves both — the
@@ -1877,6 +1892,7 @@ mod animation_tests {
         for s in [
             c.animations.window_open,
             c.animations.window_close,
+            c.animations.window_minimize,
             c.animations.window_move,
             c.animations.workspace,
         ] {
@@ -2025,6 +2041,8 @@ mod example_config_tests {
         let c = parse_example();
         let d = Config::default();
         assert_eq!(c.animations.window_open, d.animations.window_open);
+        assert_eq!(c.animations.window_close, d.animations.window_close);
+        assert_eq!(c.animations.window_minimize, d.animations.window_minimize);
         assert_eq!(c.animations.window_move, d.animations.window_move);
         assert_eq!(c.animations.window_resize, d.animations.window_resize);
         assert_eq!(c.animations.layer_open, d.animations.layer_open);

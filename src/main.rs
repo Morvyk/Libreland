@@ -1242,6 +1242,8 @@ impl State {
         // exist on a *visible* workspace before focus lands on it.
         if self.layout.restore(surface) {
             self.unhide_x11(surface);
+            // Reverse the minimize: rise into place rather than appearing.
+            self.renderer.mark_restore(surface);
         }
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
@@ -1585,6 +1587,17 @@ impl State {
     /// a window (a taskbar, `focus-window`, Alt+Tab) brings it back with
     /// no extra plumbing.
     pub(crate) fn minimize_window(&mut self, surface: &WlSurface) -> bool {
+        // Snapshot before the layout hides it: once it is minimized it has
+        // no placement, and on X11 no buffer either. Guarded on the same
+        // condition `set_minimized` is about to answer, so a redundant
+        // request doesn't leave a ghost fading over nothing.
+        if self
+            .layout
+            .window_ref(surface)
+            .is_some_and(|w| !w.minimized)
+        {
+            self.renderer.start_minimize(surface);
+        }
         if !self.layout.set_minimized(surface, true) {
             return false;
         }

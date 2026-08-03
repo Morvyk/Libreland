@@ -171,6 +171,9 @@ animations = {
 
     window_open   = { duration = 250, curve = "ease-out"    },
     window_close  = { duration = 200, curve = "ease-in"     },
+    -- Minimize shrinks the window and drops it away; restoring rises back
+    -- on `window_open`'s timing, since a restore is an arrival.
+    window_minimize = { duration = 220, curve = "ease-in"   },
     -- Position and size animate separately. `window_resize` inherits from
     -- `window_move` when you don't set it, so setting only `window_move`
     -- still moves both.

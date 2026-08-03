@@ -1290,7 +1290,11 @@ pub struct Renderer {
     /// an open animation the next time they appear in a frame's
     /// placements. Keyed separately from `win_anims` so a workspace switch
     /// (which surfaces a window without a fresh map) never triggers it.
-    pending_open: HashSet<ObjectId>,
+    ///
+    /// The flag is "this is a *restore*, so rise into place" (see
+    /// [`Self::mark_restore`]); a plain map is `false` and scales in where
+    /// it stands.
+    pending_open: HashMap<ObjectId, bool>,
     /// Which windows skip the move animation while an interactive drag
     /// is in flight (see [`NoAnim`]). Cleared on drop, which lets them
     /// animate into their final tiles again.
@@ -1481,11 +1485,30 @@ struct ClosingWindow {
     rect: Rectangle<i32, Physical>,
     /// The fade/shrink-out timeline.
     anim: Animation,
+    /// Fraction of full size the ghost shrinks to.
+    scale_to: f64,
+    /// How far it sinks on the way out, in compositor pixels. `0` for a
+    /// close, which goes nowhere; a minimize drops as it shrinks.
+    sink: i32,
 }
 
 /// Fraction of full size a window starts at when it opens (and shrinks to
 /// when it closes): a subtle pop, not a dramatic zoom.
 const OPEN_SCALE_FROM: f64 = 0.90;
+
+/// Fraction of full size a *minimizing* window shrinks to. Harder than a
+/// close's [`OPEN_SCALE_FROM`] on purpose: the two use the same ghost, and
+/// a window being put away should not look like a window being destroyed.
+const MINIMIZE_SCALE_TO: f64 = 0.62;
+
+/// How far a minimizing window sinks as it goes, as a fraction of its own
+/// height — and how far a restoring one rises back from.
+///
+/// Downward because that is where a taskbar nearly always is. It is a
+/// *direction*, not a destination: the compositor has no idea where in a
+/// shell's bar a given window's entry sits, and a wrong destination reads
+/// far worse than an honest "away, that way".
+const MINIMIZE_SINK_FRAC: f64 = 0.30;
 
 /// How far a layer surface slides in from its anchored edge, as a fraction
 /// of its own size along that axis. A short travel: a bar should look like
@@ -1589,6 +1612,10 @@ struct WindowAnim {
     resize_anim: Option<Animation>,
     /// In-flight open (fade + scale-in) animation, if any.
     open_anim: Option<Animation>,
+    /// How far below its rect the open animation starts, in compositor
+    /// pixels. Non-zero only for a restore from minimize, which rises the
+    /// distance the minimize sank; a plain map scales in where it stands.
+    open_rise: i32,
     /// Focus state as of the last frame, to notice the flip.
     focused: bool,
     /// In-flight border crossfade, if any.
@@ -3383,7 +3410,7 @@ impl Renderer {
             animations: AnimationsConfig::default(),
             decoration: DecorationConfig::default(),
             win_anims: HashMap::new(),
-            pending_open: HashSet::new(),
+            pending_open: HashMap::new(),
             tearing: TearingMode::default(),
             tearing_hints: HashSet::new(),
             no_anim: NoAnim::None,
@@ -4677,7 +4704,19 @@ impl Renderer {
     }
 
     pub fn mark_open(&mut self, surface: &WlSurface) {
-        self.pending_open.insert(surface.id());
+        self.pending_open.insert(surface.id(), false);
+    }
+
+    /// Like [`Self::mark_open`], but for a window coming back from being
+    /// minimized: it rises into place instead of just scaling up, mirroring
+    /// the sink it left on.
+    ///
+    /// The arrival runs on `window_open`'s timing rather than
+    /// `window_minimize`'s. They are the same gesture reversed, but not the
+    /// same *feel*: leaving wants to be brief and arriving wants to be seen,
+    /// which is exactly the split those two specs already encode.
+    pub fn mark_restore(&mut self, surface: &WlSurface) {
+        self.pending_open.insert(surface.id(), true);
     }
 
     /// Set (`Some`) or clear (`None`) the window being interactively
@@ -4708,8 +4747,34 @@ impl Renderer {
         reason = "physical pixel sizes derived from output-bounded rects are small non-negative values"
     )]
     pub fn start_close(&mut self, surface: &WlSurface) {
+        self.start_ghost(surface, false);
+    }
+
+    /// Begin a minimize animation: the same snapshot ghost as a close, but
+    /// shrinking harder and sinking as it fades, so being put away doesn't
+    /// look like being destroyed. Must run *before* the layout hides the
+    /// window, while its buffer and its last drawn rect are still around.
+    pub fn start_minimize(&mut self, surface: &WlSurface) {
+        self.start_ghost(surface, true);
+    }
+
+    /// Snapshot `surface` where it sits and register the fading ghost that
+    /// plays out after it is gone. A no-op (instant close/minimize) if the
+    /// animation is disabled, the window isn't tracked, or its buffer has
+    /// already gone.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "physical pixel sizes derived from output-bounded rects are small non-negative values"
+    )]
+    fn start_ghost(&mut self, surface: &WlSurface, minimizing: bool) {
         let cfg = self.animations.clone();
-        if !(cfg.enabled && cfg.window_close.enabled) {
+        let spec = if minimizing {
+            cfg.window_minimize
+        } else {
+            cfg.window_close
+        };
+        if !(cfg.enabled && spec.enabled) {
             return;
         }
         let id = surface.id();
@@ -4739,11 +4804,17 @@ impl Renderer {
         self.closing.push(ClosingWindow {
             texture,
             rect: inner,
-            anim: Animation::start(
-                now,
-                cfg.window_close.duration_secs(),
-                cfg.window_close.curve,
-            ),
+            anim: Animation::start(now, spec.duration_secs(), spec.curve),
+            scale_to: if minimizing {
+                MINIMIZE_SCALE_TO
+            } else {
+                OPEN_SCALE_FROM
+            },
+            sink: if minimizing {
+                (f64::from(inner.size.h) * MINIMIZE_SINK_FRAC) as i32
+            } else {
+                0
+            },
         });
     }
 
@@ -5141,6 +5212,7 @@ impl Renderer {
                 move_anim: None,
                 resize_anim: None,
                 open_anim: None,
+                open_rise: 0,
                 // Seeded to the window's current focus so the very first
                 // frame doesn't fade in from "unfocused".
                 focused: p.focused,
@@ -5159,12 +5231,22 @@ impl Renderer {
             // A just-mapped window starts opening the first frame it's
             // here. Consume the mark regardless so a disabled open
             // animation doesn't leave it pending forever.
-            if self.pending_open.remove(&id) && open_enabled {
+            if let Some(restoring) = self.pending_open.remove(&id)
+                && open_enabled
+            {
                 entry.open_anim = Some(Animation::start(
                     now,
                     cfg.window_open.duration_secs(),
                     cfg.window_open.curve,
                 ));
+                // Coming back from a minimize: rise the same distance it
+                // sank, so the two halves of the gesture mirror.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "a fraction of a window height — small, non-negative"
+                )]
+                let rise = (f64::from(target.size.h) * MINIMIZE_SINK_FRAC) as i32;
+                entry.open_rise = if restoring { rise } else { 0 };
             }
 
             entry.advance_geometry(now);
@@ -5181,8 +5263,19 @@ impl Renderer {
                 // popping a window a touch past full size and settling back
                 // is the whole point of using one.
                 effective = scale_rect_about_center(entry.displayed, lerp(OPEN_SCALE_FROM, 1.0, v));
+                // A restore starts low and rises to nothing. `open_rise` is
+                // 0 for an ordinary map, so this is inert there — including
+                // under an overshooting curve, where `v > 1` would otherwise
+                // lift the window past its own rect.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "a fraction of a window height — small, non-negative"
+                )]
+                let rise = ((1.0 - v).max(0.0) * f64::from(entry.open_rise)) as i32;
+                effective.loc.y += rise;
                 if a.done(now) {
                     entry.open_anim = None;
+                    entry.open_rise = 0;
                 }
             }
             // Workspace slide: a uniform vertical offset applied *after*
@@ -6325,11 +6418,18 @@ impl Renderer {
                 }
                 let v = c.anim.value(now);
                 let alpha = 1.0 - c.anim.alpha(now);
-                let eff = scale_rect_about_center(c.rect, lerp(1.0, OPEN_SCALE_FROM, v));
+                let eff = scale_rect_about_center(c.rect, lerp(1.0, c.scale_to, v));
+                // A minimize sinks as it shrinks; a close has `sink == 0`
+                // and goes nowhere.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "sink is a fraction of a window height — small, non-negative"
+                )]
+                let sunk = (v * f64::from(c.sink)) as i32;
                 let dest = Rectangle::<i32, Physical>::new(
                     Point::from((
                         scale_i(eff.loc.x - compositor_position.x, scale),
-                        scale_i(eff.loc.y - compositor_position.y, scale),
+                        scale_i(eff.loc.y + sunk - compositor_position.y, scale),
                     )),
                     Size::from((scale_i(eff.size.w, scale), scale_i(eff.size.h, scale))),
                 );
@@ -8118,7 +8218,7 @@ impl Renderer {
         if draw.effective != out_rect || draw.alpha < 1.0 {
             veto!("window not settled at 1:1 opaque");
         }
-        if self.pending_open.contains(&p.surface.id())
+        if self.pending_open.contains_key(&p.surface.id())
             || self
                 .win_anims
                 .get(&p.surface.id())
