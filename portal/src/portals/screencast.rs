@@ -191,7 +191,19 @@ impl ScreenCast {
         let persist_mode = opt_u32(&options, "persist_mode").unwrap_or(PERSIST_NONE);
         let restored = parse_restore(&options);
         let policy = CursorPolicy::read();
-        tracing::info!(app = %app_id, cursor_mode, persist_mode, "select sources");
+        // Whether a restore token came back is the whole question when an
+        // app re-prompts: `offered` false means the app (or the frontend)
+        // never sent one and the second prompt is theirs, not ours;
+        // `offered` true with `usable` false means we wrote something we
+        // could not read back, which would be ours.
+        tracing::info!(
+            app = %app_id,
+            cursor_mode,
+            persist_mode,
+            offered = options.contains_key("restore_data"),
+            usable = restored.is_some(),
+            "select sources"
+        );
 
         let sessions = Arc::clone(&self.sessions);
         let key = session_handle.as_str().to_string();
@@ -201,6 +213,11 @@ impl ScreenCast {
             // A restored choice skips the picker entirely — that's the point
             // of persistence: the second call doesn't interrupt the user.
             // It's only honoured if the monitor is still there.
+            if let Some((output, _)) = &restored
+                && !output_exists(output).await
+            {
+                tracing::info!(%output, "a restored source names a monitor that is gone; asking again");
+            }
             if let Some((output, cursor)) = restored
                 && output_exists(&output).await
             {
