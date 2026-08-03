@@ -916,9 +916,18 @@ mod server {
             .surface_of(id)
             .filter(IsAlive::alive)
             .ok_or_else(|| format!("no window with id {id}"))?;
+        // A colour-managed window (an HDR game or video) needs its buffer
+        // decoded and tonemapped, not sampled as sRGB; the renderer can't
+        // work either out from the surface alone.
+        let (encoding, output) = state.window_capture_context(&surface);
         let (w, h, rgba) = state
             .renderer
-            .capture_window(&surface, max.unwrap_or(512).clamp(16, 8192))
+            .capture_window(
+                &surface,
+                max.unwrap_or(512).clamp(16, 8192),
+                encoding,
+                output.as_deref(),
+            )
             .map_err(|e| format!("capture failed: {e}"))?;
         let png = crate::screenshot::encode_rgba(&rgba, w, h)
             .map_err(|e| format!("png encode failed: {e}"))?;

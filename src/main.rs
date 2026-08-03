@@ -1818,6 +1818,52 @@ impl State {
     /// PQ and scRGB are kept apart because they are not interchangeable: PQ
     /// pixels can be passed through to a PQ output untouched (direct scanout /
     /// single-pass), while scRGB is linear light that must be converted first.
+    /// The decode one window's tree needs, and the output it is on — what
+    /// the IPC thumbnail path needs to reproduce a colour-managed window
+    /// faithfully, for a caller holding a surface rather than a frame's
+    /// worth of placements.
+    ///
+    /// Same subsurface rule as [`Self::surface_encodings`]: a client may
+    /// tag its swapchain rather than its toplevel, so the whole tree is
+    /// searched and PQ wins a tree carrying both.
+    pub(crate) fn window_capture_context(
+        &self,
+        surface: &WlSurface,
+    ) -> (crate::color_management::Encoding, Option<String>) {
+        use crate::color_management::Encoding;
+
+        let (mut pq, mut scrgb) = (false, false);
+        smithay::wayland::compositor::with_surface_tree_downward(
+            surface,
+            (),
+            |_, _, ()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+            |s, _, ()| match self
+                .color_surfaces
+                .get(&s.id())
+                .map(|c| c.image_description.encoding())
+            {
+                Some(Encoding::Pq) => pq = true,
+                Some(Encoding::Scrgb) => scrgb = true,
+                Some(Encoding::Sdr) | None => {}
+            },
+            |_, _, ()| true,
+        );
+        let encoding = if pq {
+            Encoding::Pq
+        } else if scrgb {
+            Encoding::Scrgb
+        } else {
+            Encoding::Sdr
+        };
+        let output = self
+            .layout
+            .window_entries()
+            .into_iter()
+            .find(|e| &e.surface == surface)
+            .map(|e| e.output);
+        (encoding, output)
+    }
+
     fn surface_encodings(&self, placements: &[layout::Placement]) -> render::SurfaceEncodings {
         use crate::color_management::Encoding;
 

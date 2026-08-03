@@ -72,6 +72,7 @@ use crate::config::{
     AnimSpec, AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig,
     ScaleMode, TearingMode, TitlebarConfig, VrrMode,
 };
+use crate::color_management::Encoding;
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement, ZBand};
 use crate::titlebar::{BarState, BarStyle, rasterize as rasterize_bar};
@@ -844,7 +845,12 @@ void main() {
     float peak = max(max(lin.r, lin.g), lin.b);
     lin *= mix(1.0, shoulder(peak, knee) / max(peak, 1e-5), step(knee, peak));
 
-    gl_FragColor = vec4(linear_to_srgb(clamp(lin, 0.0, 1.0)), 1.0) * alpha;
+    // Re-premultiply and keep the source alpha. An output capture is opaque
+    // everywhere (the wallpaper fill covers it), so this is the identity
+    // there; a *window* capture has transparent pixels outside the client's
+    // own shape, and forcing them to 1.0 would fill the thumbnail's corners.
+    vec3 srgb = linear_to_srgb(clamp(lin, 0.0, 1.0));
+    gl_FragColor = vec4(srgb * premult.a, premult.a) * alpha;
 }
 ";
 
@@ -4920,6 +4926,16 @@ impl Renderer {
         results
     }
 
+    /// The SDR reference white configured for `output`, in cd/m². Falls back
+    /// to the primary output's for an unknown or absent name — a window
+    /// capture is output-independent, so it may have no screen to ask.
+    fn reference_white_for(&self, output: Option<&str>) -> u32 {
+        output
+            .and_then(|name| self.outputs.iter().find(|o| o.name == name))
+            .or_else(|| self.outputs.get(self.primary_idx))
+            .map_or(203, |o| o.hdr_reference_white)
+    }
+
     /// Render `surface`'s current surface tree into an offscreen and read it
     /// back as premultiplied-RGBA8 bytes — an on-demand per-window thumbnail
     /// for the IPC. Independent of any output: a window on another workspace
@@ -4927,10 +4943,29 @@ impl Renderer {
     /// other windows, no cursor). The longest side is capped at `max`
     /// (downscaled, never upscaled). Returns `(width, height, rgba)` —
     /// premultiplied RGBA8, bottom-up (the encoder flips it upright).
+    ///
+    /// `encoding` is the decode the window's buffer needs (see
+    /// `State::window_encoding`). A colour-managed one — an HDR game or
+    /// video — holds PQ/BT.2100 or scRGB pixels, and sampling those with the
+    /// sRGB default reads encoded values as if they were display colours:
+    /// wrong transfer curve, wrong primaries, not subtly. Those go through
+    /// the same decode → linear BT.2020 → tonemap the on-screen path and the
+    /// screenshots use, so an HDR window's thumbnail matches its screenshot.
+    ///
+    /// SDR windows are copied through untouched, and deliberately *don't*
+    /// get the screenshot's highlight roll-off: a thumbnail is displayed
+    /// back on the desktop, where it is re-encoded from sRGB like any other
+    /// SDR content, so tone-mapping it here would render every preview
+    /// dimmer than the window it depicts.
+    ///
+    /// `output` names the screen whose reference white the tonemap uses;
+    /// unknown or `None` falls back to the primary output's.
     pub fn capture_window(
         &mut self,
         surface: &WlSurface,
         max: i32,
+        encoding: Encoding,
+        output: Option<&str>,
     ) -> Result<(i32, i32, Vec<u8>)> {
         // Visible window rect (excludes the CSD shadow); fall back to the full
         // surface-tree bbox when the client set no window geometry (e.g. some
@@ -4970,6 +5005,14 @@ impl Renderer {
 
         let tw = scale_f(f64::from(gw), scale).max(1);
         let th = scale_f(f64::from(gh), scale).max(1);
+        // Cloned out (both are Arc-backed / Copy) before the `self.gles`
+        // borrows below, which would otherwise conflict with reading `self`.
+        let tonemap = self.screenshot_tonemap_shader.clone();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "reference white is a small cd/m² value, exact in f32"
+        )]
+        let reference_white = self.reference_white_for(output) as f32;
         let tex_size = Size::<i32, smithay::utils::Buffer>::from((tw, th));
         let phys = Size::<i32, Physical>::from((tw, th));
         let full = [Rectangle::<i32, Physical>::from_size(phys)];
@@ -4978,6 +5021,47 @@ impl Renderer {
             .gles
             .create_buffer(Fourcc::Abgr8888, tex_size)
             .context("capture_window: create_buffer")?;
+
+        // A colour-managed window is composited into an fp16 linear-BT.2020
+        // scene of its own first, exactly as it would be on an HDR output,
+        // then tonemapped down into the 8-bit buffer. Two passes, because
+        // the decode's output doesn't fit in 8 bits: an HDR highlight lands
+        // several times above diffuse white and has to survive until the
+        // shoulder can roll it back in.
+        let hdr_scene = (encoding != Encoding::Sdr)
+            .then(|| {
+                let decode = match encoding {
+                    Encoding::Scrgb => self.scrgb_decode_shader.clone(),
+                    _ if window_buffer_rb_swapped(surface) => {
+                        self.hdr_decode_swizzle_shader.clone()
+                    }
+                    _ => self.hdr_decode_shader.clone(),
+                };
+                let mut scene = self
+                    .gles
+                    .create_buffer(Fourcc::Abgr16161616f, tex_size)
+                    .context("capture_window: create fp16 scene")?;
+                {
+                    let mut scene_target = self
+                        .gles
+                        .bind(&mut scene)
+                        .context("capture_window: bind fp16 scene")?;
+                    let mut frame = self
+                        .gles
+                        .render(&mut scene_target, phys, Transform::Normal)
+                        .context("capture_window: fp16 render")?;
+                    frame
+                        .clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full)
+                        .context("capture_window: fp16 clear")?;
+                    frame.override_default_tex_program(decode, Vec::new());
+                    draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
+                        .context("capture_window: fp16 draw")?;
+                    let _ = frame.finish().context("capture_window: fp16 finish")?;
+                }
+                Ok::<_, anyhow::Error>(scene)
+            })
+            .transpose()?;
+
         let mut target = self.gles.bind(&mut texture).context("capture_window: bind")?;
         {
             let mut frame = self
@@ -4987,8 +5071,31 @@ impl Renderer {
             frame
                 .clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full)
                 .context("capture_window: clear")?;
-            draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
-                .context("capture_window: draw")?;
+            if let Some(scene) = &hdr_scene {
+                let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                    f64::from(tw),
+                    f64::from(th),
+                )));
+                frame
+                    .render_texture_from_to(
+                        scene,
+                        src,
+                        Rectangle::from_size(phys),
+                        &full,
+                        &full,
+                        Transform::Normal,
+                        1.0,
+                        Some(&tonemap),
+                        &[
+                            Uniform::new("reference_white", reference_white),
+                            Uniform::new("knee", SCREENSHOT_TONEMAP_KNEE),
+                        ],
+                    )
+                    .context("capture_window: tonemap")?;
+            } else {
+                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, &elements, &full)
+                    .context("capture_window: draw")?;
+            }
             // Same-context sequential GL: the copy_framebuffer below is ordered
             // after these writes, so the fence can be dropped.
             let _ = frame.finish().context("capture_window: finish")?;
