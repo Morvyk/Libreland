@@ -97,7 +97,16 @@ impl Screen for OutputPicker {
             13.0,
             false,
             if hovered { theme.accent } else { theme.dim },
-            "Click to share this monitor · Esc to cancel",
+            // Enter takes the only monitor without aiming at it (see
+            // `input`), which is no use to anyone who can't see that it
+            // is there. With a choice to make, Enter needs a hover to
+            // act on, so it is only worth advertising once there is
+            // exactly one thing it could mean.
+            if self.outputs.len() == 1 {
+                "Press Enter or click to share · Esc to cancel"
+            } else {
+                "Click to share this monitor · Esc to cancel"
+            },
         );
 
         if self.offer_cursor_toggle {
