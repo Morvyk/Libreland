@@ -1440,6 +1440,9 @@ impl SeatHandler for State {
             if let Some(surface) = focused {
                 self.layout.raise(surface);
             }
+            // Tabbing away from a game that hid the pointer has to give the
+            // pointer back.
+            self.sync_cursor_hiding();
             self.queue_redraw_all();
         }
         // Hand clipboard + primary-selection *focus* to the keyboard-
@@ -1477,7 +1480,15 @@ impl SeatHandler for State {
         // (`wp_cursor_shape_v1`, which smithay funnels here as
         // `Named`), or `Hidden`. The renderer draws it next frame,
         // unless a compositor grab override is active.
+        //
+        // A *hidden* cursor is remembered rather than simply applied:
+        // making the pointer invisible is a thing only the window you are
+        // using gets to do. See `State::sync_cursor_hiding`.
+        self.cursor_hidden_by = matches!(image, CursorImageStatus::Hidden)
+            .then(|| self.seat.get_pointer().and_then(|p| p.current_focus()))
+            .flatten();
         self.renderer.set_cursor_status(image);
+        self.sync_cursor_hiding();
         // The cursor sprite changed in place (no motion). Redraw so it
         // updates; skip fullscreen outputs (the cursor is hidden there and
         // we don't want to disturb a game's VRR).

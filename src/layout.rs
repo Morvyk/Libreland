@@ -2359,6 +2359,12 @@ impl Layout {
         true
     }
 
+    /// The active window's surface — the last toplevel to take keyboard
+    /// focus (see [`Self::set_active`]).
+    pub fn active_surface(&self) -> Option<&WlSurface> {
+        self.active.as_ref()
+    }
+
     /// Whether `surface` is the active window (see [`Self::set_active`]).
     fn is_active(&self, surface: &WlSurface) -> bool {
         self.active.as_ref() == Some(surface)

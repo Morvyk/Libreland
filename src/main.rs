@@ -625,6 +625,12 @@ pub(crate) struct State {
     /// while set, pointer + keyboard input drives the selection instead
     /// of reaching clients. `None` disables the screenshot UI.
     pub(crate) screenshot: Option<ScreenshotState>,
+    /// The window whose client asked for an invisible pointer, if any.
+    ///
+    /// Kept so the request can be honoured *conditionally* — only while
+    /// that window is the active one — instead of taken at face value and
+    /// never revisited. See [`State::sync_cursor_hiding`].
+    pub(crate) cursor_hidden_by: Option<WlSurface>,
     /// Compositor-originated capture requests (full-output freeze
     /// snapshots and final region grabs) awaiting the next render of
     /// their output — the internal sibling of [`Self::screencopy_pending`].
@@ -1228,6 +1234,33 @@ impl State {
     /// it), then move keyboard focus and repaint. No-op if the surface
     /// isn't a managed window. Shared by `xdg_activation` and the IPC
     /// `focus-window`.
+    /// Re-decide whether the client that asked for a hidden pointer still
+    /// gets one.
+    ///
+    /// A client may keep the cursor invisible only while it is the *active*
+    /// window. Games hide it and never think about it again — so tabbing
+    /// out of one left the pointer invisible over the window you had just
+    /// switched to, with no way to find it short of clicking blindly back
+    /// into the game.
+    ///
+    /// This restores rather than forgets: tab back into the game and the
+    /// pointer disappears again, without the game having to re-request it
+    /// (it won't — `set_cursor` fires on pointer *enter*, which a keyboard
+    /// focus change doesn't cause).
+    pub(crate) fn sync_cursor_hiding(&mut self) {
+        use smithay::input::pointer::CursorImageStatus;
+        let Some(hider) = self.cursor_hidden_by.clone() else {
+            return;
+        };
+        let honour = self.layout.active_surface() == Some(&hider);
+        self.renderer.set_cursor_status(if honour {
+            CursorImageStatus::Hidden
+        } else {
+            CursorImageStatus::default_named()
+        });
+        self.queue_redraw_all();
+    }
+
     /// Undo [`State::minimize_window`]'s X11 side. Wayland needs nothing.
     fn unhide_x11(&mut self, surface: &WlSurface) {
         if let Some(crate::layout::WindowSurface::X11 { surface: x11, .. }) =
@@ -5549,6 +5582,7 @@ fn main() -> Result<()> {
         last_bar_click: None,
         ws_scroll_accum: 0.0,
         screenshot: None,
+        cursor_hidden_by: None,
         screenshot_pending: Vec::new(),
         local_offset,
         screenshot_clipboard_tx,
