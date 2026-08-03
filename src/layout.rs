@@ -154,6 +154,13 @@ pub struct Window {
     /// workspace is compacted away, and compacting one out from under a
     /// minimized window would strand it with no way back.
     pub minimized: bool,
+    /// Geometry from before a quick-tile snap, restored when the window
+    /// is picked up again. Without it, snapping a window to half the
+    /// screen is a one-way trip that permanently shrinks it.
+    ///
+    /// Maximizing needs no equivalent: it leaves `rect` alone and fills
+    /// from the output, so un-maximizing already lands back where it was.
+    pub restore: Option<Rectangle<i32, Physical>>,
 }
 
 impl Window {
@@ -164,6 +171,7 @@ impl Window {
             rect,
             fill: FillMode::Normal,
             minimized: false,
+            restore: None,
         }
     }
 
@@ -456,6 +464,111 @@ pub enum ZBand {
     /// The active fullscreen window: above Top layers too (a game covers
     /// the panel), below Overlay layers, popups and the cursor.
     Fullscreen,
+}
+
+/// Where a window dropped near a screen edge lands. Floating mode
+/// only — a tiling drop already has a meaning (it re-enters the tree
+/// at the cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapTarget {
+    /// Top edge: fill the work area properly, as a maximize.
+    Maximize,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl SnapTarget {
+    /// The rect this snap puts a window in, inside `work` (the output
+    /// minus any panel's exclusive zone).
+    ///
+    /// Halves round *down*, so the right and bottom pieces take the odd
+    /// pixel back and two snapped windows cover the work area exactly
+    /// — no one-pixel seam showing the wallpaper down the middle.
+    pub fn rect_in(self, work: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+        let (w, h) = (work.size.w, work.size.h);
+        let (half_w, half_h) = (w / 2, h / 2);
+        let (x, y) = (work.loc.x, work.loc.y);
+        let (mid_x, mid_y) = (x + half_w, y + half_h);
+        let at = |x: i32, y: i32, w: i32, h: i32| {
+            Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+        };
+        match self {
+            Self::Maximize => work,
+            Self::Left => at(x, y, half_w, h),
+            Self::Right => at(mid_x, y, w - half_w, h),
+            Self::TopLeft => at(x, y, half_w, half_h),
+            Self::TopRight => at(mid_x, y, w - half_w, half_h),
+            Self::BottomLeft => at(x, mid_y, half_w, h - half_h),
+            Self::BottomRight => at(mid_x, mid_y, w - half_w, h - half_h),
+        }
+    }
+}
+
+/// Which snap a cursor at `pos` arms, if any.
+///
+/// An edge is armed when the cursor is within `zone` of it. *Which*
+/// snap that edge gives depends on where along it you are: the outer
+/// quarter at each end is the corner, and the middle half is the edge
+/// proper. A 20 px corner box (the two zones overlapping) would be
+/// almost impossible to hit on purpose; a quarter of the screen's
+/// height is not.
+///
+/// The bottom edge alone arms nothing. There is no sensible "bottom
+/// half" to want, and reserving it means dragging a window low on the
+/// screen doesn't keep flashing a preview at you.
+fn snap_target(
+    work: Rectangle<i32, Physical>,
+    pos: Point<i32, Physical>,
+    zone: i32,
+) -> Option<SnapTarget> {
+    if zone <= 0 || work.size.w <= 0 || work.size.h <= 0 || !rect_contains(work, pos) {
+        return None;
+    }
+    let (left, top) = (work.loc.x, work.loc.y);
+    let (right, bottom) = (left + work.size.w, top + work.size.h);
+    let near_left = pos.x - left < zone;
+    let near_right = right - pos.x <= zone;
+    let near_top = pos.y - top < zone;
+    if !(near_left || near_right || near_top) {
+        return None;
+    }
+    // Which quarter of each axis the cursor is in.
+    let upper = pos.y < top + work.size.h / 4;
+    let lower = pos.y >= bottom - work.size.h / 4;
+    let leftish = pos.x < left + work.size.w / 4;
+    let rightish = pos.x >= right - work.size.w / 4;
+
+    // A vertical edge decides from the vertical band, so the corners of
+    // the two rules agree: the top-left pixel is `TopLeft` either way.
+    if near_left {
+        return Some(if upper {
+            SnapTarget::TopLeft
+        } else if lower {
+            SnapTarget::BottomLeft
+        } else {
+            SnapTarget::Left
+        });
+    }
+    if near_right {
+        return Some(if upper {
+            SnapTarget::TopRight
+        } else if lower {
+            SnapTarget::BottomRight
+        } else {
+            SnapTarget::Right
+        });
+    }
+    Some(if leftish {
+        SnapTarget::TopLeft
+    } else if rightish {
+        SnapTarget::TopRight
+    } else {
+        SnapTarget::Maximize
+    })
 }
 
 /// One window + its current placement, as the renderer consumes
@@ -1303,22 +1416,124 @@ impl Layout {
         false
     }
 
+    /// Which snap a move drop at `pos` would take, if any. Floating
+    /// mode only: a tiling drop re-enters the tree at the cursor, and
+    /// two rules for one gesture is one too many.
+    pub fn snap_at(&self, pos: Point<i32, Physical>, zone: i32) -> Option<SnapTarget> {
+        if self.mode != LayoutMode::Floating {
+            return None;
+        }
+        let i = self.outpane_at(pos)?;
+        snap_target(self.outputs[i].area().work, pos, zone)
+    }
+
+    /// The rect [`Self::snap_at`]'s target would give a window — what
+    /// the drag preview draws.
+    pub fn snap_preview(
+        &self,
+        pos: Point<i32, Physical>,
+        zone: i32,
+    ) -> Option<Rectangle<i32, Physical>> {
+        let target = self.snap_at(pos, zone)?;
+        let i = self.outpane_at(pos)?;
+        Some(target.rect_in(self.outputs[i].area().work))
+    }
+
+    /// Whether picking this window up would change its geometry — it is
+    /// maximized, or sitting in a quick-tile it would leave.
+    ///
+    /// The caller uses this to wait for real pointer travel before
+    /// starting the drag: a click on a maximized titlebar is a click,
+    /// and must not restore the window.
+    pub fn drag_would_unfill(&self, surface: &WlSurface) -> bool {
+        self.window_ref(surface)
+            .is_some_and(|w| w.fill == FillMode::Maximized || w.restore.is_some())
+    }
+
+    /// Undo a maximize or a quick-tile so the window can be carried
+    /// freely, keeping the cursor's relative place along its width.
+    ///
+    /// Picking a window up is how you un-maximize it everywhere else,
+    /// and a quick-tiled window that stayed half-screen once you dragged
+    /// it away would have no way back to the size it started at. Both
+    /// return to their free geometry here.
+    ///
+    /// The cursor is on the window (you grabbed its titlebar), so the
+    /// output under the cursor is the window's output.
+    fn unfill_for_drag(&mut self, surface: &WlSurface, cursor: Point<i32, Physical>) {
+        let Some(oi) = self.outpane_at(cursor) else {
+            return;
+        };
+        let area = self.outputs[oi].area();
+        let Some(w) = self.window_mut(surface) else {
+            return;
+        };
+        // What is under the cursor right now, and what it becomes: a
+        // filled window keeps its free rect in `rect`, a quick-tiled one
+        // in `restore`.
+        let shown = if w.fill == FillMode::Normal {
+            w.rect
+        } else {
+            area.fill(w.fill)
+        };
+        let size = match (w.fill, w.restore) {
+            // Nothing to undo: an ordinary window follows the cursor at
+            // the size it already has.
+            (FillMode::Normal, None) => return,
+            // A quick-tile remembers the free size explicitly. It
+            // outranks `rect` even for a window maximized *from* a
+            // snap, where `rect` is only the half it was tiled to.
+            (_, Some(r)) => r.size,
+            (_, None) => w.rect.size,
+        };
+        w.fill = FillMode::Normal;
+        w.restore = None;
+        // Same fraction across the width, same distance below the top —
+        // so the titlebar stays under the pointer and the window doesn't
+        // jump out from under the grab.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "window widths are screen-sized; the product is far inside i32"
+        )]
+        let dx = if shown.size.w > 0 {
+            ((f64::from(cursor.x - shown.loc.x) / f64::from(shown.size.w)) * f64::from(size.w))
+                .round() as i32
+        } else {
+            size.w / 2
+        };
+        let dy = (cursor.y - shown.loc.y).clamp(0, (size.h - 1).max(0));
+        w.rect = Rectangle::new(Point::from((cursor.x - dx, cursor.y - dy)), size);
+    }
+
     /// Start an interactive *move* drag. Pulls the matched window
     /// out of the tree (with a reflow) or the floating list and
     /// stores it as `in_transit`; returns its rect at the moment
     /// the drag started so the caller can record it for drag-math.
     /// Returns `None` if `surface` isn't tracked or another drag
     /// is already in flight.
-    pub fn start_move_drag(&mut self, surface: &WlSurface) -> Option<Rectangle<i32, Physical>> {
+    ///
+    /// A maximized or quick-tiled window returns to its free geometry
+    /// under the cursor first (see [`Self::unfill_for_drag`]), which is
+    /// why the returned rect can differ from the one on screen.
+    pub fn start_move_drag(
+        &mut self,
+        surface: &WlSurface,
+        cursor: Point<i32, Physical>,
+    ) -> Option<Rectangle<i32, Physical>> {
         if self.in_transit.is_some() {
             return None;
         }
-        // A maximized/fullscreen window owns its whole output; moving
-        // it is meaningless (and would desync its filled configure), so
-        // refuse the drag — the user unmaximizes first.
-        if self.is_filled(surface) {
+        // A fullscreen window owns its whole output and has no titlebar
+        // to grab; moving it is meaningless (and would desync its filled
+        // configure), so refuse. Maximized is picked up and un-maximized.
+        if self
+            .window_ref(surface)
+            .is_some_and(|w| w.fill == FillMode::Fullscreen)
+        {
             return None;
         }
+        self.unfill_for_drag(surface, cursor);
         // Only a visible window can be dragged, so scan active
         // workspaces only. We don't normalize the emptied source
         // workspace here (the drag may abort back); finish_move_drag
@@ -1494,6 +1709,10 @@ impl Layout {
                 .find(|w| w.toplevel.wl_surface() == surface)
             {
                 window.rect = rect;
+                // Resizing a quick-tiled window by hand makes it an
+                // ordinary window at an ordinary size; there is no longer
+                // a snap to come back from.
+                window.restore = None;
                 push_configure_for_floating(window, window_deco(deco, mode, window, csd), area);
                 return;
             }
@@ -1506,11 +1725,14 @@ impl Layout {
     ///   tree at the cursor's drop position (same rule as spawn).
     /// - `Floating` source: window goes back into the floating
     ///   list at the top of the stack, with whatever rect it
-    ///   has now.
+    ///   has now — or, if the drop is within `snap_zone` of a work-area
+    ///   edge, the [`SnapTarget`] that arms (the same one the drag
+    ///   preview has been showing).
     ///
     /// Silent no-op when there's no drag in flight.
-    pub fn finish_move_drag(&mut self, cursor: Point<i32, Physical>) {
-        let Some(t) = self.in_transit.take() else {
+    pub fn finish_move_drag(&mut self, cursor: Point<i32, Physical>, snap_zone: i32) {
+        let snap = self.snap_at(cursor, snap_zone);
+        let Some(mut t) = self.in_transit.take() else {
             return;
         };
         let source_output = t.source_output;
@@ -1555,6 +1777,25 @@ impl Layout {
                 });
             }
             DragSource::Floating => {
+                // Quick-tile. `Maximize` goes through the fill machinery
+                // rather than a work-area-sized rect, so the window is
+                // genuinely maximized: it keeps the state its client was
+                // told about, un-maximizes from the titlebar, and leaves
+                // `rect` holding the geometry to come back to.
+                match snap {
+                    Some(SnapTarget::Maximize) => t.window.fill = FillMode::Maximized,
+                    Some(target) => {
+                        let rect = target.rect_in(self.outputs[idx].area().work);
+                        // Only the *first* snap records where to return
+                        // to; snapping left and then right must not make
+                        // the left half the window's idea of "restored".
+                        // (A window picked up from a snap has already had
+                        // this cleared — see `unfill_for_drag`.)
+                        t.window.restore.get_or_insert(t.window.rect);
+                        t.window.rect = rect;
+                    }
+                    None => {}
+                }
                 push_configure_for_floating(
                     &t.window,
                     self.deco_for(&t.window),
@@ -3987,6 +4228,86 @@ mod cascade_tests {
         let size = Size::from((400, 300));
         let origin = cascade_origin(work(), size, 3, 0);
         assert_eq!(origin, Point::from((303, 253)));
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::{Point, Rectangle, Size, SnapTarget, snap_target};
+
+    /// A 1000x600 work area at an offset, so a test that quietly assumed
+    /// the origin was (0, 0) fails.
+    fn work() -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((100, 50)), Size::from((1000, 600)))
+    }
+    use smithay::utils::Physical;
+
+    fn at(x: i32, y: i32) -> Option<SnapTarget> {
+        snap_target(work(), Point::from((x, y)), 20)
+    }
+
+    /// The gesture as described: left edge tiles left, top maximizes,
+    /// and the ends of an edge give you the corner.
+    #[test]
+    fn edges_and_corners_arm_what_they_look_like() {
+        assert_eq!(at(105, 350), Some(SnapTarget::Left));
+        assert_eq!(at(1095, 350), Some(SnapTarget::Right));
+        assert_eq!(at(600, 55), Some(SnapTarget::Maximize));
+        assert_eq!(at(105, 60), Some(SnapTarget::TopLeft));
+        assert_eq!(at(1095, 60), Some(SnapTarget::TopRight));
+        assert_eq!(at(105, 640), Some(SnapTarget::BottomLeft));
+        assert_eq!(at(1095, 640), Some(SnapTarget::BottomRight));
+    }
+
+    /// The two rules that decide a corner — "near the left edge, high
+    /// up" and "near the top edge, far left" — have to agree, or the
+    /// corner pixel itself would arm something different from both.
+    #[test]
+    fn the_corner_pixel_agrees_with_both_edges() {
+        assert_eq!(at(100, 50), Some(SnapTarget::TopLeft));
+        assert_eq!(at(1099, 50), Some(SnapTarget::TopRight));
+    }
+
+    /// Nothing arms away from an edge, and the bottom edge alone arms
+    /// nothing anywhere along its middle — there is no "bottom half"
+    /// worth having, and a preview flashing as you drag a window low
+    /// across the screen would just be noise.
+    #[test]
+    fn the_middle_and_the_bottom_edge_arm_nothing() {
+        assert_eq!(at(600, 350), None);
+        assert_eq!(at(600, 645), None);
+        // Outside the work area entirely (a panel's exclusive zone, or
+        // another monitor) arms nothing either.
+        assert_eq!(at(600, 40), None);
+        // A zone of zero disables snapping, which is what the config
+        // documents `snap_zone = 0` as doing.
+        assert_eq!(snap_target(work(), Point::from((105, 350)), 0), None);
+    }
+
+    /// Two snapped halves must cover the work area exactly. A rounding
+    /// rule that let both round down would leave a one-pixel stripe of
+    /// wallpaper down the middle of the screen.
+    #[test]
+    fn halves_and_quarters_tile_the_work_area_exactly() {
+        for w in [1000, 1001, 2559, 3840] {
+            for h in [600, 601, 1439, 2160] {
+                let area = Rectangle::new(Point::from((100, 50)), Size::from((w, h)));
+                let left = SnapTarget::Left.rect_in(area);
+                let right = SnapTarget::Right.rect_in(area);
+                assert_eq!(left.loc, area.loc);
+                assert_eq!(left.loc.x + left.size.w, right.loc.x, "no seam, no overlap");
+                assert_eq!(right.loc.x + right.size.w, area.loc.x + area.size.w);
+                assert_eq!(left.size.h, area.size.h);
+
+                let tl = SnapTarget::TopLeft.rect_in(area);
+                let br = SnapTarget::BottomRight.rect_in(area);
+                assert_eq!(tl.loc, area.loc);
+                assert_eq!(tl.loc.y + tl.size.h, br.loc.y);
+                assert_eq!(br.loc.x + br.size.w, area.loc.x + area.size.w);
+                assert_eq!(br.loc.y + br.size.h, area.loc.y + area.size.h);
+            }
+        }
+        assert_eq!(SnapTarget::Maximize.rect_in(work()), work());
     }
 }
 

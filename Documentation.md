@@ -495,10 +495,13 @@ the wheel never move you by accident.
 
 ### layout
 
-| Field         | Default | State | Notes                                                                                                |
-| ------------- | ------- | ----- | ---------------------------------------------------------------------------------------------------- |
-| `gaps_outer`  | `8`     | ✅    | Pixels of empty space between the tile area and the screen edge. Wallpaper shows through. `>= 0`.    |
-| `gaps_inner`  | `3`     | ✅    | Pixels of empty space between adjacent tile cells. Centred on each split divider. `>= 0`.            |
+| Field         | Default    | State | Notes                                                                                                |
+| ------------- | ---------- | ----- | ---------------------------------------------------------------------------------------------------- |
+| `mode`        | `"tiling"` | ✅    | `"tiling"` puts every window in a dwindle tree where they never overlap. `"floating"` gives every window a titlebar and a free position — conventional stacking-WM behaviour. Switching also flips two derived defaults: titlebars turn on, and `input.focus_model` becomes `"click"`. |
+| `gaps_outer`  | `8`        | ✅    | Pixels of empty space between the tile area and the screen edge. Wallpaper shows through. `>= 0`. Tiling only — a floating window is wherever you put it. |
+| `gaps_inner`  | `3`        | ✅    | Pixels of empty space between adjacent tile cells. Centred on each split divider. `>= 0`.            |
+| `resize_zone` | `8`        | ✅    | How far **outside** a floating window's edge a press still grabs that edge to resize. The band sits outside so it costs a client-side-decorated window nothing — it owns every pixel inside its own rect, and outside is where its drop shadow already sits. `>= 0`. |
+| `snap_zone`   | `20`       | ✅    | How close to a work-area edge a dragged window has to come to quick-tile there. `0` disables snapping. Floating mode only. |
 
 ### border
 
@@ -701,6 +704,8 @@ in `src/main.rs`.
 | `Super+C`       | Close the focused window (`xdg_toplevel.close`).    |
 | `Super+LMB`-drag | Interactively move the window under the cursor (auto-floats it if tiled; drop on another monitor to move it there). |
 | `Super+RMB`-drag | Interactively resize the window under the cursor. Works on tiled and floating windows alike; the edges that follow the cursor are the ones nearest where you pressed, so press the right half to drag the right edge, the top-left quadrant to drag that corner, and so on. Not available on maximized/fullscreen windows (they own the whole output — un-fill first). |
+| Titlebar drag    | Move a floating window. Double-click the titlebar to maximize and back. Drag near a work-area edge to quick-tile (below). |
+| Window edge drag | Resize a floating window. The grab band is `layout.resize_zone` wide on both sides of the edge, so a client that draws its own decoration is still resizable from just outside it. |
 | `Super`+scroll down / up | Switch to the next / previous workspace on the output **under the cursor**. Disable with `input.scroll_workspaces = false`. |
 | `Super+Shift`+scroll down / up | Move the focused window to the next / previous workspace on **its** output and follow it there. Same toggle. |
 
@@ -711,6 +716,35 @@ window keeps the ratio you set. An edge that has no divider (the outer edge of
 the last cell, which is the screen edge) simply doesn't move; grab the window's
 opposite half to drag the divider it *does* share with a neighbour. Resizing a
 **floating** window just moves its own edges.
+
+### Quick-tile
+
+In **floating** mode, dragging a window to within `layout.snap_zone` of a
+work-area edge arms a snap, previewed as a tinted rect where the window will
+land. Release to take it; drag back out of the zone and the preview clears.
+
+| Where the cursor is | What you get |
+| --- | --- |
+| Left or right edge, middle half | That half of the screen |
+| Either end of a side edge | That quarter |
+| Top edge | Maximized — a real maximize, so the titlebar un-maximizes it |
+| Bottom edge | Nothing. There's no "bottom half" worth having, and reserving it keeps the preview from flashing while you drag a window low across the screen |
+
+Two snapped halves cover the work area exactly, with no seam of wallpaper
+between them; the right and bottom pieces take the odd pixel on a screen with
+an odd dimension.
+
+Picking a quick-tiled window up again returns it to the size it had before
+the snap, positioned so the cursor keeps its place along the titlebar — so
+quick-tiling isn't a one-way trip that permanently shrinks a window. The same
+happens to a maximized window you drag. Because that means a press can change
+the window's shape, those two cases wait for the pointer to travel a few
+pixels before anything moves: a click on a maximized titlebar stays a click.
+Resizing a snapped window by hand makes it an ordinary window at an ordinary
+size, with nothing left to return to.
+
+The snap area is the *work* area, so a window snapped to the left half sits
+beside your panel rather than under it.
 
 Workspaces are per-output and dynamic (niri-style): each output starts with
 one, scrolling down materializes a fresh empty workspace to move into, and

@@ -1260,6 +1260,10 @@ pub struct Renderer {
     /// Active screenshot selection overlay (dim wash + highlighted rect),
     /// in absolute compositor coords. `None` when no session is running.
     screenshot_overlay: Option<ScreenshotOverlay>,
+    /// Where a window under an interactive move would land if dropped
+    /// now (quick-tile), in absolute compositor coords. `None` when no
+    /// snap is armed — which is most of any drag.
+    snap_preview: Option<Rectangle<i32, Physical>>,
     /// Drag-and-drop icon surface (role `dnd_icon`) to composite at the
     /// cursor while a client drag is in progress; `None` otherwise. Set by
     /// the `ClientDndGrabHandler`. Its buffer is read fresh each frame.
@@ -3368,6 +3372,7 @@ impl Renderer {
             start: Instant::now(),
             freeze_textures: HashMap::new(),
             screenshot_overlay: None,
+            snap_preview: None,
             dnd_icon: None,
             animations: AnimationsConfig::default(),
             decoration: DecorationConfig::default(),
@@ -4323,6 +4328,20 @@ impl Renderer {
     /// compositor coords; each output renders the part that falls on it.
     pub fn set_screenshot_overlay(&mut self, overlay: Option<ScreenshotOverlay>) {
         self.screenshot_overlay = overlay;
+    }
+
+    /// Set (or clear) the quick-tile preview — the rect a dragged window
+    /// would snap to on release, in absolute compositor coords.
+    ///
+    /// Returns whether it *changed*, so the caller can redraw only then:
+    /// this is set from every pointer motion during a drag, and the
+    /// answer is the same for most of them.
+    pub fn set_snap_preview(&mut self, rect: Option<Rectangle<i32, Physical>>) -> bool {
+        if self.snap_preview == rect {
+            return false;
+        }
+        self.snap_preview = rect;
+        true
     }
 
     /// Upload a captured frame as the frozen backdrop for `output` (used
@@ -5543,6 +5562,15 @@ impl Renderer {
             _ => None,
         };
         let screenshot_overlay = self.screenshot_overlay;
+        let snap_preview = self.snap_preview;
+        // The quick-tile preview borrows the focused window's accent, so
+        // the drop target reads as part of the same theme as the border
+        // and titlebar. A gradient contributes its top stop, matching
+        // what the titlebar does with it.
+        let accent = match &self.border.active {
+            Fill::Solid(rgb) => *rgb,
+            Fill::VerticalGradient { top, .. } => *top,
+        };
         let dnd_icon = self.dnd_icon.clone();
         // Advance window animations and resolve each placement's on-screen
         // rect + opacity for this frame (before the immutable `outputs`
@@ -6807,6 +6835,7 @@ impl Renderer {
                 || self.cursor_needs_composite(idx, hide_cursor, compose_cursor)
                 || !dnd_icon_elements.is_empty()
                 || self.screenshot_overlay.is_some()
+                || self.snap_preview.is_some()
                 || freeze_texture.is_some()
                 // A media wallpaper's texture is refreshed out-of-band
                 // (refresh_wallpaper) — untracked, so full unless occluded.
@@ -7517,6 +7546,24 @@ impl Renderer {
                     )
                     .context("render_texture_from_to (freeze) failed")?;
             }
+            // Quick-tile preview: where the window being dragged would
+            // land. Drawn over the scene (including the dragged window
+            // itself) rather than under it — a wash this light reads
+            // fine through, and drawing it below would hide it behind
+            // every window it overlaps, which is most of them.
+            if let Some(rect) = snap_preview {
+                draw_snap_preview(
+                    &mut frame,
+                    rect,
+                    accent,
+                    compositor_position,
+                    mode_size,
+                    scale,
+                    hdr,
+                    hdr_reference_white,
+                    hdr_saturation,
+                )?;
+            }
             if let Some(overlay) = screenshot_overlay {
                 draw_screenshot_overlay(
                     &mut frame,
@@ -7928,10 +7975,11 @@ impl Renderer {
             veto!("layer surface animating");
         }
         if self.screenshot_overlay.is_some()
+            || self.snap_preview.is_some()
             || self.dnd_icon.is_some()
             || self.freeze_textures.contains_key(&output.name)
         {
-            veto!("screenshot/DnD overlay active");
+            veto!("screenshot/DnD/snap overlay active");
         }
 
         // Exactly one placement in the *fullscreen band* may cover the
@@ -9071,6 +9119,66 @@ fn scale_i(v: i32, scale: f64) -> i32 {
 )]
 fn scale_f(v: f64, scale: f64) -> i32 {
     (v * scale).round() as i32
+}
+
+/// Draw the quick-tile preview: a tinted wash where the dragged window
+/// would land, framed so its edges read against a busy desktop.
+///
+/// `rect` is in absolute compositor coords and is clipped to this
+/// output, so a preview on another monitor simply draws nothing here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site; the alternative is a struct that exists only to be destructured back into these"
+)]
+fn draw_snap_preview(
+    frame: &mut GlesFrame<'_, '_>,
+    rect: Rectangle<i32, Physical>,
+    accent: [f32; 3],
+    compositor_position: Point<i32, Physical>,
+    mode_size: Size<i32, Physical>,
+    scale: f64,
+    hdr: bool,
+    reference_white: u32,
+    saturation: f32,
+) -> Result<()> {
+    // Light enough to read the window and the desktop through, strong
+    // enough to be unmistakable at a glance.
+    let wash = Color32F::new(accent[0], accent[1], accent[2], 0.22);
+    let edge = Color32F::new(accent[0], accent[1], accent[2], 0.85);
+
+    let solid = |frame: &mut GlesFrame<'_, '_>, x: i32, y: i32, w: i32, h: i32, color: Color32F| {
+        if w <= 0 || h <= 0 {
+            return Ok(());
+        }
+        // draw_solid bypasses the decode override → convert for the HDR scene.
+        let color = if hdr {
+            srgb_to_linear_bt2020(color, reference_white, saturation)
+        } else {
+            color
+        };
+        let r = Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, h)));
+        frame
+            .draw_solid(r, &[Rectangle::from_size(r.size)], color)
+            .context("Frame::draw_solid (snap preview) failed")
+    };
+
+    let x0 = scale_i(rect.loc.x - compositor_position.x, scale).clamp(0, mode_size.w);
+    let y0 = scale_i(rect.loc.y - compositor_position.y, scale).clamp(0, mode_size.h);
+    let x1 = (scale_i(rect.loc.x - compositor_position.x, scale) + scale_i(rect.size.w, scale))
+        .clamp(0, mode_size.w);
+    let y1 = (scale_i(rect.loc.y - compositor_position.y, scale) + scale_i(rect.size.h, scale))
+        .clamp(0, mode_size.h);
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w <= 0 || h <= 0 {
+        return Ok(());
+    }
+    solid(frame, x0, y0, w, h, wash)?;
+    let t = scale_i(2, scale).max(2);
+    solid(frame, x0, y0, w, t, edge)?;
+    solid(frame, x0, y1 - t, w, t, edge)?;
+    solid(frame, x0, y0, t, h, edge)?;
+    solid(frame, x1 - t, y0, t, h, edge)?;
+    Ok(())
 }
 
 /// Paint the screenshot selection UI onto one output: a translucent dim

@@ -738,6 +738,14 @@ pub(crate) struct DragState {
         smithay::utils::Size<i32, smithay::utils::Physical>,
         smithay::utils::Size<i32, smithay::utils::Physical>,
     ),
+    /// A move that has taken the grab but hasn't yet pulled its window
+    /// out of the layout, because doing so would change its geometry:
+    /// it is maximized, or quick-tiled and would return to its free
+    /// size. Clicking a maximized titlebar must not restore the window,
+    /// so that waits for the pointer to travel [`DRAG_THRESHOLD`].
+    /// Always `false` for resizes, and for a window that would simply
+    /// follow the cursor at the size it already has.
+    pub(crate) armed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -801,6 +809,14 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// double-click, in compositor pixels. Without a bound, a click, a drag
 /// across the bar and a click back would count as one.
 const DOUBLE_CLICK_SLOP: i32 = 6;
+
+/// How far the pointer must travel before a press on a maximized or
+/// quick-tiled window is treated as a drag rather than a click. Only
+/// that case waits — a window that would simply follow the cursor at
+/// the size it already has starts moving immediately, as before — but
+/// there it decides between "restore this window" and "click its
+/// titlebar", so a shaky hand must not restore a maximized window.
+const DRAG_THRESHOLD: i32 = 4;
 
 /// Lower bound a drag-resize will clamp the floating rect to so
 /// the window can't be resized into a slice too small to grab
@@ -1236,6 +1252,23 @@ impl State {
         self.queue_redraw_all();
     }
 
+    /// Place the in-transit window at `rect` and refresh the quick-tile
+    /// preview for the drop that would follow. The preview comes from
+    /// the same `snap_at` the drop uses, so what you see is what you get.
+    fn drag_move_to(
+        &mut self,
+        rect: smithay::utils::Rectangle<i32, Physical>,
+        cursor: Point<i32, Physical>,
+    ) {
+        self.layout.update_in_transit_rect(rect);
+        let preview = self
+            .layout
+            .snap_preview(cursor, self.config.layout.snap_zone);
+        if self.renderer.set_snap_preview(preview) {
+            self.queue_redraw_all();
+        }
+    }
+
     /// Which part of which window the cursor is over, if any.
     ///
     /// `None` when the pointer is over a popup — a menu overhanging its
@@ -1459,9 +1492,20 @@ impl State {
         edges: Option<layout::ResizeEdges>,
     ) {
         let cursor = self.cursor_point();
-        let rect_start = match mode {
-            DragMode::Move => self.layout.start_move_drag(surface),
-            DragMode::Resize => self.layout.start_resize_drag(surface),
+        // A maximized or quick-tiled window changes shape the moment it
+        // is picked up, so the grab is only *armed* here and the window
+        // stays put until the pointer travels (see `DragState::armed`).
+        let armed = matches!(mode, DragMode::Move) && self.layout.drag_would_unfill(surface);
+        let rect_start = if armed {
+            // Placeholder: the real baseline is taken when the drag
+            // starts for real, since that is when the window's size and
+            // position are decided.
+            self.layout.window_ref(surface).map(|w| w.rect)
+        } else {
+            match mode {
+                DragMode::Move => self.layout.start_move_drag(surface, cursor),
+                DragMode::Resize => self.layout.start_resize_drag(surface),
+            }
         };
         let Some(rect_start) = rect_start else {
             debug!(
@@ -1485,6 +1529,7 @@ impl State {
             rect_start,
             edges,
             size_limits: self.layout.client_size_limits(surface),
+            armed,
         });
         self.renderer
             .set_cursor_override(Some(CursorImageStatus::Named(drag_cursor(mode, edges))));
@@ -2317,6 +2362,35 @@ impl State {
             let delta_y = (cy - drag.cursor_start.1) as i32;
             match drag.mode {
                 DragMode::Move => {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
+                    )]
+                    let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
+                    if drag.armed {
+                        // Still deciding whether this is a click or a
+                        // drag. Under the threshold it stays a click and
+                        // the window hasn't moved at all.
+                        if delta_x.abs() < DRAG_THRESHOLD && delta_y.abs() < DRAG_THRESHOLD {
+                            return;
+                        }
+                        // Travelled: pick the window up for real. It
+                        // leaves its maximize or quick-tile and lands
+                        // under the cursor at its free size, so both
+                        // baselines restart from here.
+                        let Some(rect) = self.layout.start_move_drag(&drag.surface, cursor_i)
+                        else {
+                            self.drag = None;
+                            return;
+                        };
+                        if let Some(d) = self.drag.as_mut() {
+                            d.armed = false;
+                            d.rect_start = rect;
+                            d.cursor_start = (cx, cy);
+                        }
+                        self.drag_move_to(rect, cursor_i);
+                        return;
+                    }
                     let new_rect = smithay::utils::Rectangle::new(
                         Point::<i32, Physical>::new(
                             drag.rect_start.loc.x + delta_x,
@@ -2324,7 +2398,7 @@ impl State {
                         ),
                         drag.rect_start.size,
                     );
-                    self.layout.update_in_transit_rect(new_rect);
+                    self.drag_move_to(new_rect, cursor_i);
                 }
                 DragMode::Resize => {
                     // Only the pressed-nearest edge on each axis moves;
@@ -2604,8 +2678,11 @@ impl State {
                         reason = "cursor coords are clamped to layout_bounds (i32) in Renderer::on_pointer_motion"
                     )]
                     let cursor_i = Point::<i32, Physical>::from((cx as i32, cy as i32));
-                    self.layout.finish_move_drag(cursor_i);
+                    self.layout
+                        .finish_move_drag(cursor_i, self.config.layout.snap_zone);
                 }
+                // The preview belongs to the drag; drop it either way.
+                self.renderer.set_snap_preview(None);
                 // Drop the gesture-cursor override; the client under the
                 // pointer drives the cursor again from here. Clearing our
                 // own record too, or the next hover over the same margin
@@ -2681,43 +2758,17 @@ impl State {
                     {
                         kbd.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
                     }
-                    let rect_start = match mode {
-                        DragMode::Move => self.layout.start_move_drag(&surface),
-                        DragMode::Resize => self.layout.start_resize_drag(&surface),
-                    };
-                    if let Some(rect_start) = rect_start {
-                        // The press half fixes which edges follow the
-                        // cursor for the whole drag.
-                        let edges = layout::ResizeEdges::from_press(rect_start, cursor_i);
-                        let size_limits = self.layout.client_size_limits(&surface);
+                    // The same gesture the titlebar and edge grabs use,
+                    // including the animation suppression, the cursor
+                    // override, and waiting for real pointer travel
+                    // before a maximized window leaves its fill.
+                    self.begin_window_drag(&surface, mode, None);
+                    if self.drag.is_some() {
                         info!(
                             ?mode,
                             surface = ?surface.id(),
                             "drag start"
                         );
-                        // Draw the dragged window 1:1 with the cursor
-                        // (no move-animation lag); it animates into place
-                        // on drop when the override is cleared. A resize
-                        // suppresses the animation for *every* window: a
-                        // tiled resize reflows the neighbours too, and
-                        // animating them would let the shared edge lag
-                        // behind the divider being dragged.
-                        if matches!(mode, DragMode::Resize) {
-                            self.renderer.set_no_anim_all(true);
-                        } else {
-                            self.renderer.set_no_anim_move(Some(&surface));
-                        }
-                        self.drag = Some(DragState {
-                            surface,
-                            mode,
-                            cursor_start: (cx, cy),
-                            rect_start,
-                            edges,
-                            size_limits,
-                        });
-                        self.renderer.set_cursor_override(Some(
-                            CursorImageStatus::Named(drag_cursor(mode, edges)),
-                        ));
                     } else if matches!(mode, DragMode::Resize) {
                         warn!(
                             surface = ?surface.id(),
