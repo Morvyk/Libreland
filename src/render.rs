@@ -4555,6 +4555,12 @@ impl Renderer {
     /// output from the next frame on. The rectangle is in absolute
     /// compositor coords; each output renders the part that falls on it.
     pub fn set_screenshot_overlay(&mut self, overlay: Option<ScreenshotOverlay>) {
+        debug!(
+            selection = ?overlay.as_ref().and_then(|o| o.selection),
+            handles = overlay.as_ref().is_some_and(|o| o.handles),
+            toolbar = ?overlay.as_ref().and_then(|o| o.toolbar.as_ref().map(|t| t.bar)),
+            "screenshot: overlay handed to the renderer"
+        );
         self.screenshot_overlay = overlay;
     }
 
@@ -10013,7 +10019,9 @@ fn draw_toolbar(
     const ACTIVE: Color32F = Color32F::new(0.25, 0.62, 1.0, 0.55);
     const GLYPH: [f32; 3] = [0.93, 0.93, 0.95];
 
-    paint.fill(frame, paint.phys(bar.bar), SLAB)?;
+    let slab = paint.phys(bar.bar);
+    debug!(?slab, buttons = bar.buttons.len(), "screenshot: drawing the toolbar");
+    paint.fill(frame, slab, SLAB)?;
     for b in &bar.buttons {
         let dst = paint.phys(b.rect);
         if b.active {
