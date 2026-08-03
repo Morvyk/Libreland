@@ -1364,8 +1364,12 @@ mod server {
             .map(|ls| {
                 let surface = ls.wl_surface();
                 let cached = crate::wayland::layer_cached_state(surface);
-                let (width, height) =
-                    crate::wayland::layer_size(state.layer_output_rect(surface), &cached);
+                // No output connected ⇒ no area to size against; report
+                // 0x0 rather than dropping the surface from the listing,
+                // so a shell can still see what exists.
+                let (width, height) = state
+                    .layer_output_rect(surface)
+                    .map_or((0, 0), |area| crate::wayland::layer_size(area, &cached));
                 LayerInfo {
                     namespace: state
                         .layer_namespaces

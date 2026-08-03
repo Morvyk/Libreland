@@ -1364,9 +1364,16 @@ pub struct Renderer {
     /// in DRM enumeration order.
     primary_idx: usize,
     /// Bounding box of the virtual layout in **compositor** (= logical)
-    /// pixels, anchored at `(0, 0)`. Used to clamp the cursor across
-    /// the full multi-output area.
-    layout_bounds: Size<i32, Physical>,
+    /// pixels — the union of every output's rect, *including* its origin,
+    /// which is not necessarily `(0, 0)`: a monitor pinned to a negative
+    /// `position` (the natural way to place one left of or above the
+    /// primary) puts the union's corner in negative space.
+    ///
+    /// Reported to the log and used as the outer bound on cursor
+    /// coordinates. It is not itself the clamp — the union of N outputs is
+    /// not a rectangle, so being inside this box does not mean being over
+    /// a monitor. See [`Renderer::snap_cursor_onto_output`].
+    layout_bounds: Rectangle<i32, Physical>,
     /// Cursor hotspot in **absolute compositor** coordinates (logical
     /// pixels). Each per-output render translates to that output's
     /// local logical, then scales to physical via `OutputRender::scale`.
@@ -2167,6 +2174,13 @@ struct OutputRender {
     prev_layer_masks: HashMap<ObjectId, GlesTexture>,
 }
 
+impl OutputRender {
+    /// This output's rect in absolute compositor (= logical) coordinates.
+    fn rect(&self) -> Rectangle<i32, Physical> {
+        Rectangle::new(self.compositor_position, self.compositor_size)
+    }
+}
+
 /// What one drawn thing (window / layer / popup) looked like last frame,
 /// for damage diffing: its content identity, where it was drawn, and the
 /// non-content inputs that change its pixels (focus flips the border
@@ -2820,6 +2834,86 @@ mod opaque_region_tests {
 }
 
 #[cfg(test)]
+mod cursor_bounds_tests {
+    use super::{Physical, Point, Rectangle, Size, bounds_of, snap_onto_rects};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::new(x, y), Size::new(w, h))
+    }
+
+    /// The author's own likely second-monitor pairing: a 4K at scale 1.5
+    /// (2560x1440 logical) beside a 1080p at scale 1.0. The union is an L,
+    /// and the notch under the shorter panel must not be reachable — a
+    /// cursor there is both invisible and un-clickable.
+    #[test]
+    fn the_notch_under_a_shorter_monitor_is_not_reachable() {
+        let outs = [rect(0, 0, 2560, 1440), rect(2560, 0, 1920, 1080)];
+        // Straight into the notch: y is pulled up onto the 1080p panel,
+        // x is left alone because it is already over it.
+        assert_eq!(snap_onto_rects(outs, 3000.0, 1200.0), (3000.0, 1079.0));
+        // Points genuinely on either monitor are untouched.
+        assert_eq!(snap_onto_rects(outs, 100.0, 1300.0), (100.0, 1300.0));
+        assert_eq!(snap_onto_rects(outs, 3000.0, 500.0), (3000.0, 500.0));
+    }
+
+    /// Crossing the shared edge stays on a monitor the whole way, and the
+    /// far outer edges hold instead of stepping off into nothing.
+    #[test]
+    fn edges_hold_and_the_seam_is_crossable() {
+        let outs = [rect(0, 0, 2560, 1440), rect(2560, 0, 1920, 1080)];
+        assert_eq!(snap_onto_rects(outs, 2560.0, 500.0), (2560.0, 500.0));
+        // Past the right end of everything, and past the left of everything.
+        assert_eq!(snap_onto_rects(outs, 9999.0, 500.0), (4479.0, 500.0));
+        assert_eq!(snap_onto_rects(outs, -50.0, 500.0), (0.0, 500.0));
+    }
+
+    /// A single output's far edge: the old clamp allowed exactly
+    /// `loc + size`, which the exclusive containment test then read as
+    /// off-output — the documented one-pixel case where the cursor
+    /// disappears. Projection lands it inside instead.
+    #[test]
+    fn the_far_edge_of_one_output_stays_on_it() {
+        let outs = [rect(0, 0, 2560, 1440)];
+        assert_eq!(snap_onto_rects(outs, 2560.0, 700.0), (2559.0, 700.0));
+        assert_eq!(snap_onto_rects(outs, 700.0, 1440.0), (700.0, 1439.0));
+        assert_eq!(snap_onto_rects(outs, 2559.5, 700.0), (2559.5, 700.0));
+    }
+
+    /// A monitor pinned left of the primary sits at a negative x — the
+    /// natural xrandr-shaped config. It has to be reachable, which a
+    /// clamp anchored at zero never allowed.
+    #[test]
+    fn a_negatively_positioned_output_is_reachable() {
+        let outs = [rect(-1920, 0, 1920, 1080), rect(0, 0, 1920, 1080)];
+        assert_eq!(snap_onto_rects(outs, -500.0, 500.0), (-500.0, 500.0));
+        assert_eq!(snap_onto_rects(outs, -9999.0, 500.0), (-1920.0, 500.0));
+        assert_eq!(bounds_of(outs), rect(-1920, 0, 3840, 1080));
+    }
+
+    /// No outputs at all — the last monitor was just unplugged. Nothing to
+    /// project onto, so the hotspot is left where it is rather than
+    /// invented at the origin.
+    #[test]
+    fn no_outputs_leaves_the_point_alone() {
+        assert_eq!(snap_onto_rects([], 42.0, 17.0), (42.0, 17.0));
+        assert_eq!(bounds_of([]), rect(0, 0, 0, 0));
+    }
+
+    /// Vertically stacked monitors of different widths: the same notch
+    /// problem rotated, and the nearest-rect rule has to pick the one
+    /// actually closer rather than the first in the list.
+    #[test]
+    fn nearest_wins_on_a_vertical_stack() {
+        let outs = [rect(0, 0, 3840, 2160), rect(0, 2160, 1920, 1080)];
+        // Bottom-right dead corner: closer to the wide top panel's bottom
+        // edge (60 px) than to the narrow bottom panel's right edge (100).
+        assert_eq!(snap_onto_rects(outs, 2020.0, 2220.0), (2020.0, 2159.0));
+        // Further down, the bottom panel's right edge is nearer.
+        assert_eq!(snap_onto_rects(outs, 2020.0, 2600.0), (1919.0, 2600.0));
+    }
+}
+
+#[cfg(test)]
 mod client_scale_tests {
     use super::{client_scale_for, output_compositor_size};
     use smithay::utils::{Physical, Size};
@@ -2973,6 +3067,81 @@ fn place_outputs(
         }
     }
     positions
+}
+
+/// Whether `(x, y)` is inside `r`. The far edges are exclusive, so two
+/// adjacent outputs never both claim a point on their shared edge.
+fn rect_contains_f64(r: Rectangle<i32, Physical>, x: f64, y: f64) -> bool {
+    x >= f64::from(r.loc.x)
+        && y >= f64::from(r.loc.y)
+        && x < f64::from(r.loc.x + r.size.w)
+        && y < f64::from(r.loc.y + r.size.h)
+}
+
+/// Bounding box of every output's compositor rect, origin included.
+///
+/// The origin matters: `place_outputs` honours a configured `position`
+/// verbatim, so a monitor pinned to the left of the primary legitimately
+/// sits at a negative x. Deriving the box from maxima alone — and so
+/// implicitly anchoring it at `(0, 0)` — would put half the desktop
+/// outside the bounds meant to contain the cursor.
+fn layout_bounds_of(outputs: &[OutputRender]) -> Rectangle<i32, Physical> {
+    bounds_of(outputs.iter().map(OutputRender::rect))
+}
+
+/// Bounding box of a set of rects, or the zero rect if there are none.
+fn bounds_of(
+    rects: impl IntoIterator<Item = Rectangle<i32, Physical>>,
+) -> Rectangle<i32, Physical> {
+    let mut bounds: Option<Rectangle<i32, Physical>> = None;
+    for r in rects {
+        bounds = Some(bounds.map_or(r, |b| b.merge(r)));
+    }
+    bounds.unwrap_or_default()
+}
+
+/// Pull a point onto a real pixel: returned unchanged if it is already
+/// inside one of `rects`, otherwise projected onto the nearest one.
+///
+/// This is what bounds the cursor, in place of a clamp to the layout's
+/// bounding box. A clamp is only correct when the outputs tile that box
+/// exactly. Two monitors of different *logical* height — which mixed
+/// scales guarantee, e.g. a 4K at scale 1.5 (1440 tall) beside a 1080p at
+/// scale 1.0 — leave a band that is inside the box and over nothing. A
+/// cursor there is invisible (the hardware plane is disabled and the
+/// composite fallback draws nothing) *and* inert (`outpane_at` resolves to
+/// no output, so clicks hit-test to nothing), with no cue on screen about
+/// where it went.
+///
+/// Projecting instead makes the pointer slide along the shared edge, which
+/// is what the gap looks like it should do. It also fixes the far-edge
+/// case on a *single* output: a clamp permits exactly `loc + size`, which
+/// [`rect_contains_f64`]'s exclusive test then reads as off-output.
+///
+/// Returns the point unchanged when `rects` is empty — the last monitor
+/// just went away, and there is nowhere to put it until one comes back.
+fn snap_onto_rects(
+    rects: impl IntoIterator<Item = Rectangle<i32, Physical>>,
+    x: f64,
+    y: f64,
+) -> (f64, f64) {
+    let mut best: Option<((f64, f64), f64)> = None;
+    for r in rects {
+        if rect_contains_f64(r, x, y) {
+            return (x, y);
+        }
+        // `- 1.0` keeps the projection inside the exclusive far edge;
+        // `.max(lo)` keeps `clamp` from panicking on a degenerate rect.
+        let (lo_x, lo_y) = (f64::from(r.loc.x), f64::from(r.loc.y));
+        let hi_x = (f64::from(r.loc.x + r.size.w) - 1.0).max(lo_x);
+        let hi_y = (f64::from(r.loc.y + r.size.h) - 1.0).max(lo_y);
+        let p = (x.clamp(lo_x, hi_x), y.clamp(lo_y, hi_y));
+        let d = (p.0 - x).powi(2) + (p.1 - y).powi(2);
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((p, d));
+        }
+    }
+    best.map_or((x, y), |(p, _)| p)
 }
 
 /// A cursor theme image uploaded to a GLES texture, plus the geometry
@@ -3702,16 +3871,7 @@ impl Renderer {
             });
         }
 
-        // Compositor-space union of every output's rect. Used by
-        // `on_pointer_motion` to clamp the cursor — it can roam
-        // anywhere a real pixel exists.
-        let mut layout_w: i32 = 0;
-        let mut layout_h: i32 = 0;
-        for o in &outputs {
-            layout_w = layout_w.max(o.compositor_position.x + o.compositor_size.w);
-            layout_h = layout_h.max(o.compositor_position.y + o.compositor_size.h);
-        }
-        let layout_bounds = Size::<i32, Physical>::new(layout_w, layout_h);
+        let layout_bounds = layout_bounds_of(&outputs);
 
         let primary_idx = monitors
             .primary
@@ -3722,8 +3882,10 @@ impl Renderer {
         info!(
             outputs = outputs.len(),
             primary = %outputs[primary_idx].name,
-            layout_w = layout_bounds.w,
-            layout_h = layout_bounds.h,
+            layout_x = layout_bounds.loc.x,
+            layout_y = layout_bounds.loc.y,
+            layout_w = layout_bounds.size.w,
+            layout_h = layout_bounds.size.h,
             "render layout finalised"
         );
 
@@ -3940,13 +4102,14 @@ impl Renderer {
     /// Index of the output whose compositor rect contains the cursor hotspot.
     fn cursor_output_idx(&self) -> Option<usize> {
         let (cx, cy) = (self.cursor_x, self.cursor_y);
-        self.outputs.iter().position(|o| {
-            let r = Rectangle::new(o.compositor_position, o.compositor_size);
-            cx >= f64::from(r.loc.x)
-                && cy >= f64::from(r.loc.y)
-                && cx < f64::from(r.loc.x + r.size.w)
-                && cy < f64::from(r.loc.y + r.size.h)
-        })
+        self.outputs
+            .iter()
+            .position(|o| rect_contains_f64(o.rect(), cx, cy))
+    }
+
+    /// Pull a cursor position onto a real pixel — see [`snap_onto_rects`].
+    fn snap_cursor_onto_output(&self, x: f64, y: f64) -> (f64, f64) {
+        snap_onto_rects(self.outputs.iter().map(OutputRender::rect), x, y)
     }
 
     /// Resolve a named cursor to a raw image for the hardware plane, caching
@@ -4548,13 +4711,7 @@ impl Renderer {
             }
         }
 
-        let mut layout_w: i32 = 0;
-        let mut layout_h: i32 = 0;
-        for o in &self.outputs {
-            layout_w = layout_w.max(o.compositor_position.x + o.compositor_size.w);
-            layout_h = layout_h.max(o.compositor_position.y + o.compositor_size.h);
-        }
-        self.layout_bounds = Size::<i32, Physical>::new(layout_w, layout_h);
+        self.layout_bounds = layout_bounds_of(&self.outputs);
 
         self.primary_idx = monitors
             .primary
@@ -4563,10 +4720,11 @@ impl Renderer {
             .unwrap_or(0)
             .min(self.outputs.len().saturating_sub(1));
 
-        // The cursor may now sit beyond the shrunken union (an output to
-        // its right vanished); pull it back onto a real pixel.
-        self.cursor_x = self.cursor_x.clamp(0.0, f64::from(layout_w));
-        self.cursor_y = self.cursor_y.clamp(0.0, f64::from(layout_h));
+        // The cursor may no longer be over anything (an output moved, or the
+        // one it was on vanished); pull it back onto a real pixel.
+        let (cx, cy) = self.snap_cursor_onto_output(self.cursor_x, self.cursor_y);
+        self.cursor_x = cx;
+        self.cursor_y = cy;
 
         self.output_descriptors()
     }
@@ -4581,13 +4739,12 @@ impl Renderer {
         self.outputs.iter().find(|o| o.name == name).map(|o| o.crtc)
     }
 
-    /// Advance the cursor hotspot by libinput-reported deltas, clamped
-    /// to the virtual layout's bounding box.
+    /// Advance the cursor hotspot by libinput-reported deltas, keeping it
+    /// over a real pixel (see [`Renderer::snap_cursor_onto_output`]).
     pub fn on_pointer_motion(&mut self, dx: f64, dy: f64) {
-        let max_x = f64::from(self.layout_bounds.w);
-        let max_y = f64::from(self.layout_bounds.h);
-        self.cursor_x = (self.cursor_x + dx).clamp(0.0, max_x);
-        self.cursor_y = (self.cursor_y + dy).clamp(0.0, max_y);
+        let (x, y) = self.snap_cursor_onto_output(self.cursor_x + dx, self.cursor_y + dy);
+        self.cursor_x = x;
+        self.cursor_y = y;
     }
 
     /// Current cursor hotspot in absolute virtual-layout coordinates.
@@ -4600,12 +4757,16 @@ impl Renderer {
     /// Rectangle of the configured primary output in absolute
     /// **compositor** (= logical) coordinates. Used by the tiling
     /// layer to bound its initial workspace before per-output
-    /// workspaces exist. `primary_idx` is set in `new()` from
-    /// `monitors.primary` (falling back to the first connected),
-    /// so the indexing is always safe.
-    pub fn primary_output_rect(&self) -> Rectangle<i32, Physical> {
-        let o = &self.outputs[self.primary_idx];
-        Rectangle::new(o.compositor_position, o.compositor_size)
+    /// workspaces exist.
+    ///
+    /// `None` when nothing is connected. `new()` refuses to start without
+    /// an output, but unplugging the *last* monitor empties the list at
+    /// runtime — and a layer surface can still commit in that state, so
+    /// this used to index an empty `Vec` and take the compositor down with
+    /// the monitor.
+    pub fn primary_output_rect(&self) -> Option<Rectangle<i32, Physical>> {
+        let o = self.outputs.get(self.primary_idx)?;
+        Some(Rectangle::new(o.compositor_position, o.compositor_size))
     }
 
     /// Every output's `(connector name, compositor rect)` in absolute

@@ -1356,12 +1356,17 @@ fn maybe_handle_layer_commit(state: &mut State, surface: &WlSurface) {
     // renders at the right size instead of the full output. Re-configure
     // only on an actual size change, or every commit would send a configure
     // and loop with the client's re-render.
+    //
+    // With no output connected there is no area to size against, so the
+    // configure waits for one to come back — `reflow_outputs` re-runs this
+    // for every layer surface on hotplug.
     if let Some(layer) = state
         .layer_shell_state
         .layer_surfaces()
         .find(|l| l.wl_surface() == surface)
+        && let Some(area) = state.layer_output_rect(surface)
     {
-        let (w, h) = layer_size(state.layer_output_rect(surface), &cached);
+        let (w, h) = layer_size(area, &cached);
         let new_size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from(
             (w, h),
         ));
@@ -2305,8 +2310,13 @@ impl WlrLayerShellHandler for State {
         // up in `snapshot_layer_placements`: smithay removes the entry from
         // its known-layers list before calling us, so the lookup found
         // nothing and every close animation was silently skipped.
-        let rect = self.layer_placement_of(surface.wl_surface()).rect;
-        self.renderer.mark_layer_closing(surface.wl_surface(), rect);
+        //
+        // No placement at all means no output is connected, so there is
+        // nowhere to play a close animation either — just skip it.
+        if let Some(p) = self.layer_placement_of(surface.wl_surface()) {
+            self.renderer
+                .mark_layer_closing(surface.wl_surface(), p.rect);
+        }
         self.layer_outputs.remove(surface.wl_surface());
         self.layer_namespaces.remove(surface.wl_surface());
         self.mapped_layers.remove(surface.wl_surface());
@@ -2381,7 +2391,13 @@ pub(crate) fn layer_size(
     } else {
         area.size.h
     };
-    (width.clamp(1, area.size.w), height.clamp(1, area.size.h))
+    // `.max(1)` on the upper bound keeps it >= the lower bound, so `clamp`
+    // can't panic on a degenerate area — a zero-sized output rect, or an
+    // axis whose exclusive zones have eaten everything.
+    (
+        width.clamp(1, area.size.w.max(1)),
+        height.clamp(1, area.size.h.max(1)),
+    )
 }
 
 impl FractionalScaleHandler for State {

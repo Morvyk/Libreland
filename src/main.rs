@@ -3194,14 +3194,20 @@ impl State {
     /// The compositor rect of the output a layer surface is bound to —
     /// the one it named at creation (recorded in [`Self::layer_outputs`]),
     /// or the primary output when it named none or the output is gone.
+    ///
+    /// `None` only when *nothing* is connected: a surface can still commit
+    /// between unplugging the last monitor and plugging one back in, and
+    /// there is no rect to answer with. Callers skip the surface rather
+    /// than inventing an empty one — a zero-sized area would reach
+    /// [`crate::wayland::layer_size`]'s `clamp(1, 0)` and panic anyway.
     pub(crate) fn layer_output_rect(
         &self,
         surface: &WlSurface,
-    ) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+    ) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Physical>> {
         self.layer_outputs
             .get(surface)
             .and_then(|name| self.renderer.output_rect(name))
-            .unwrap_or_else(|| self.renderer.primary_output_rect())
+            .or_else(|| self.renderer.primary_output_rect())
     }
 
     /// Build one `LayerPlacement` per live layer surface for this
@@ -3221,7 +3227,7 @@ impl State {
     pub(crate) fn snapshot_layer_placements(&self) -> Vec<render::LayerPlacement> {
         self.layer_shell_state
             .layer_surfaces()
-            .map(|l| self.layer_placement_of(l.wl_surface()))
+            .filter_map(|l| self.layer_placement_of(l.wl_surface()))
             .collect()
     }
 
@@ -3232,9 +3238,12 @@ impl State {
     /// smithay removes the entry before calling `layer_destroyed`, so looking
     /// the surface back up there finds nothing. Only the `wl_surface` is
     /// needed, and that outlives the callback.
-    pub(crate) fn layer_placement_of(&self, surface: &WlSurface) -> render::LayerPlacement {
+    ///
+    /// `None` when there is no output to place it against — see
+    /// [`Self::layer_output_rect`].
+    pub(crate) fn layer_placement_of(&self, surface: &WlSurface) -> Option<render::LayerPlacement> {
         use smithay::wayland::shell::wlr_layer::{Anchor, Layer};
-        let area = self.layer_output_rect(surface);
+        let area = self.layer_output_rect(surface)?;
         let cached = crate::wayland::layer_cached_state(surface);
         let anchor = cached.anchor;
         // Size honours anchors/stretch/margins, shared with the
@@ -3263,7 +3272,7 @@ impl State {
             Layer::Top => render::LayerBucket::Top,
             Layer::Overlay => render::LayerBucket::Overlay,
         };
-        render::LayerPlacement {
+        Some(render::LayerPlacement {
             surface: surface.clone(),
             rect: smithay::utils::Rectangle::new(
                 smithay::utils::Point::new(x, y),
@@ -3275,7 +3284,7 @@ impl State {
                 .get(surface)
                 .cloned()
                 .unwrap_or_default(),
-        }
+        })
     }
 
     /// Snapshot every live `xdg_popup` (menus, submenus, combo

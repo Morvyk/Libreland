@@ -818,11 +818,18 @@ would tuck the window under the panel. So the bottom edge of the screen arms
 the bottom corners even where your panel covers it, and a window snapped to
 the left half still sits beside the panel rather than beneath it.
 
-A pointer shoved hard against the far edge of the far monitor sits, by one
-pixel, on no output at all — the cursor clamps to the layout bounds, which
-end one past the last output pixel. Ordinary hit-testing wants nothing there;
-a gesture aimed at a screen edge does, so the snap clamps back onto the
-nearest output. The zone reaches as far as the pointer visibly does.
+The pointer is kept **on an output**, not merely inside the layout's
+bounding box. The distinction only shows up with more than one monitor: the
+union of two screens is a rectangle only when they are flush and equally
+tall in *logical* pixels, which differing scales rule out. A 4K at scale 1.5
+(2560x1440 logical) beside a 1080p at scale 1.0 leaves an L-shaped notch
+that is inside the bounding box and over nothing, and a pointer in there
+would be invisible *and* inert — no hardware cursor, no composited one, and
+hit-testing that resolves to no output. So a position that lands off every
+screen is projected onto the nearest one, which reads as sliding along the
+shared edge. The same rule keeps the far edge of a single output reachable,
+and makes a monitor pinned to a negative `position` — the natural way to
+place one left of or above the primary — reachable at all.
 
 Workspaces are per-output and dynamic (niri-style): each output starts with
 one, scrolling down materializes a fresh empty workspace to move into, and
