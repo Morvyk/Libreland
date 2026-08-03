@@ -242,20 +242,18 @@ impl TextField {
     }
 
     /// Draw the field. `placeholder` shows when it's empty.
-    pub fn render(
-        &mut self,
-        canvas: &mut Canvas<'_>,
-        ctx: &Ctx,
-        rect: Rect,
-        placeholder: &str,
-    ) {
+    pub fn render(&mut self, canvas: &mut Canvas<'_>, ctx: &Ctx, rect: Rect, placeholder: &str) {
         let theme = &ctx.theme;
         canvas.fill_rounded(rect, 6, theme.surface);
         canvas.stroke_rounded(
             rect,
             6,
             1,
-            if self.focused { theme.accent } else { theme.border },
+            if self.focused {
+                theme.accent
+            } else {
+                theme.border
+            },
         );
         let inner = Rect::new(rect.x + 10, rect.y, rect.w - 20, rect.h);
         let baseline = inner.y as f32 + f32::midpoint(inner.h as f32, 13.0 * 0.72);

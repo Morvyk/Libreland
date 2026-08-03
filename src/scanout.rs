@@ -40,9 +40,7 @@ use smithay::backend::allocator::dmabuf::{AsDmabuf as _, Dmabuf};
 use smithay::backend::allocator::format::get_opaque;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmDevice};
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier, Slot, Swapchain};
-use smithay::backend::drm::gbm::{
-    GbmFramebuffer, framebuffer_from_bo, framebuffer_from_dmabuf,
-};
+use smithay::backend::drm::gbm::{GbmFramebuffer, framebuffer_from_bo, framebuffer_from_dmabuf};
 use smithay::backend::drm::{
     DrmDeviceFd, DrmSurface, PlaneClaim, PlaneConfig, PlaneDamageClips, PlaneInfo, PlaneState,
     VrrSupport,
@@ -52,8 +50,8 @@ use smithay::backend::renderer::utils::Buffer as ClientBuffer;
 use smithay::reexports::drm::Device as _;
 use smithay::reexports::drm::DriverCapability;
 use smithay::reexports::drm::control::{Device as ControlDevice, connector, framebuffer, plane};
-use smithay::reexports::wayland_server::Weak;
 use smithay::reexports::wayland_server::Resource as _;
+use smithay::reexports::wayland_server::Weak;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::utils::{Physical, Rectangle, Transform};
 use tracing::{debug, warn};
@@ -95,7 +93,10 @@ enum Hold {
     /// A client buffer, with the framebuffer we imported for it (shared with
     /// [`ScanoutSurface::fb_cache`]; `rmfb` on last drop).
     Client {
-        #[allow(dead_code, reason = "kept alive to gate wl_buffer.release until replaced")]
+        #[allow(
+            dead_code,
+            reason = "kept alive to gate wl_buffer.release until replaced"
+        )]
         buffer: ClientBuffer,
         fb: Arc<GbmFramebuffer>,
     },
@@ -258,7 +259,10 @@ struct ProbeLayer {
 /// use for as long as the surface lives.
 struct OverlayPlane {
     info: PlaneInfo,
-    #[allow(dead_code, reason = "the claim's lifetime is the point; it is never read")]
+    #[allow(
+        dead_code,
+        reason = "the claim's lifetime is the point; it is never read"
+    )]
     claim: PlaneClaim,
 }
 
@@ -416,11 +420,17 @@ impl ScanoutSurface {
         // an implicit modifier so allocation still works (likely linear).
         let force_implicit = (plane_formats.len() == 1
             && plane_formats[0].modifier == Modifier::Invalid
-            && renderer_formats.iter().all(|x| x.modifier != Modifier::Invalid)
-            && renderer_formats.iter().any(|x| x.modifier == Modifier::Linear))
+            && renderer_formats
+                .iter()
+                .all(|x| x.modifier != Modifier::Invalid)
+            && renderer_formats
+                .iter()
+                .any(|x| x.modifier == Modifier::Linear))
             || (renderer_formats.len() == 1
                 && renderer_formats[0].modifier == Modifier::Invalid
-                && plane_formats.iter().all(|x| x.modifier != Modifier::Invalid)
+                && plane_formats
+                    .iter()
+                    .all(|x| x.modifier != Modifier::Invalid)
                 && plane_formats.iter().any(|x| x.modifier == Modifier::Linear));
 
         let modifiers: Vec<Modifier> = if force_implicit {
@@ -436,8 +446,7 @@ impl ScanoutSurface {
         debug!(?code, ?modifiers, "negotiated scanout modifiers");
 
         let (w, h) = drm.pending_mode().size();
-        let mut swapchain =
-            Swapchain::new(allocator, u32::from(w), u32::from(h), code, modifiers);
+        let mut swapchain = Swapchain::new(allocator, u32::from(w), u32::from(h), code, modifiers);
 
         // Allocate one buffer and prove the whole pipeline: dmabuf export,
         // framebuffer creation, and a KMS test commit with it on the plane.
@@ -509,7 +518,10 @@ impl ScanoutSurface {
         }
 
         let slot = self.next_fb.as_ref().expect("next_fb just set");
-        Ok((slot.export().context("export buffer as dmabuf")?, slot.age()))
+        Ok((
+            slot.export().context("export buffer as dmabuf")?,
+            slot.age(),
+        ))
     }
 
     /// Queue the composite buffer last returned by [`Self::next_buffer`] for
@@ -603,7 +615,12 @@ impl ScanoutSurface {
         // Build every layer before touching any state, so a rejection part
         // way through leaves nothing half-applied.
         let planes: Vec<plane::Handle> = std::iter::once(self.drm.plane())
-            .chain(self.overlays.iter().take(overlays.len()).map(|o| o.info.handle))
+            .chain(
+                self.overlays
+                    .iter()
+                    .take(overlays.len())
+                    .map(|o| o.info.handle),
+            )
             .collect();
         let mut built = Vec::with_capacity(planes.len());
         for (plane, layer) in planes.iter().zip(std::iter::once(primary).chain(overlays)) {
@@ -828,8 +845,10 @@ impl ScanoutSurface {
     /// a full `commit` (modeset) when state is pending (first frame,
     /// mode/VRR/HDR change), otherwise a plain `page_flip`.
     fn submit(&mut self) -> Result<()> {
-        let QueuedFrame { frame, sync } =
-            self.queued.take().expect("submit called with a queued frame");
+        let QueuedFrame { frame, sync } = self
+            .queued
+            .take()
+            .expect("submit called with a queued frame");
 
         // Damage blobs have to outlive the plane states that borrow them, so
         // they are built up front, one per layer in `frame.layers()` order.

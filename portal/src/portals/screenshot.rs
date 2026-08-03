@@ -92,7 +92,12 @@ fn stitch(frames: &[Frame], positions: &[(i32, i32)]) -> Option<Frame> {
         |acc, (frame, (x, y))| {
             let rect = (*x, *y, x + frame.width, y + frame.height);
             Some(acc.map_or(rect, |(x0, y0, x1, y1)| {
-                (x0.min(rect.0), y0.min(rect.1), x1.max(rect.2), y1.max(rect.3))
+                (
+                    x0.min(rect.0),
+                    y0.min(rect.1),
+                    x1.max(rect.2),
+                    y1.max(rect.3),
+                )
             }))
         },
     )?;

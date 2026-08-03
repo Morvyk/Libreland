@@ -195,7 +195,11 @@ pub(crate) fn spawn_xwayland(
 impl State {
     /// Xwayland reported ready: attach the X11 window manager, publish
     /// XSETTINGS (DPI + cursor theme), and install the root cursor.
-    pub(crate) fn on_xwayland_ready(&mut self, x11_socket: std::os::unix::net::UnixStream, client: Client) {
+    pub(crate) fn on_xwayland_ready(
+        &mut self,
+        x11_socket: std::os::unix::net::UnixStream,
+        client: Client,
+    ) {
         let mut xwm = match X11Wm::start_wm(
             self.loop_handle.clone(),
             &self.display_handle,
@@ -283,11 +287,7 @@ impl State {
         if let Some(xwm) = &mut self.xwm {
             apply_xsettings(xwm, scale);
         }
-        let surfaces: Vec<WlSurface> = self
-            .x11_windows
-            .iter()
-            .map(|(_, wl)| wl.clone())
-            .collect();
+        let surfaces: Vec<WlSurface> = self.x11_windows.iter().map(|(_, wl)| wl.clone()).collect();
         for wl_surface in surfaces {
             self.layout.reconfigure(&wl_surface);
         }
@@ -379,7 +379,10 @@ impl State {
         {
             return;
         }
-        debug!(window = window.window_id(), "xwayland: override-redirect mapped");
+        debug!(
+            window = window.window_id(),
+            "xwayland: override-redirect mapped"
+        );
         self.x11_or_windows.push((window.clone(), wl_surface));
         self.queue_redraw_all();
     }
@@ -509,7 +512,10 @@ fn apply_xsettings(xwm: &mut X11Wm, scale: f64) {
         ("Gtk/CursorThemeSize".to_owned(), Value::Integer(cursor_px)),
     ];
     if let Some(theme) = &theme {
-        settings.push(("Gtk/CursorThemeName".to_owned(), Value::String(theme.clone())));
+        settings.push((
+            "Gtk/CursorThemeName".to_owned(),
+            Value::String(theme.clone()),
+        ));
     }
     if let Err(err) = xwm.set_xsettings(settings.into_iter()) {
         warn!(error = %err, "failed to publish XSETTINGS (X apps fall back to 96 DPI)");
@@ -601,7 +607,10 @@ impl XwmHandler for State {
         _reorder: Option<Reorder>,
     ) {
         let id = window.window_id();
-        let managed = self.x11_windows.iter().find(|(win, _)| win.window_id() == id);
+        let managed = self
+            .x11_windows
+            .iter()
+            .find(|(win, _)| win.window_id() == id);
         // The geometry an X client asks for, in COMPOSITOR-logical pixels
         // (smithay has already divided out the Xwayland client scale).
         // Logged because a client whose own idea of its size disagrees
@@ -736,10 +745,16 @@ impl XwmHandler for State {
     /// by smithay's no-op default and the button did nothing at all.
     fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let Some(surface) = window.wl_surface() else {
-            debug!(window = window.window_id(), "xwayland: minimize request with no surface");
+            debug!(
+                window = window.window_id(),
+                "xwayland: minimize request with no surface"
+            );
             return;
         };
-        debug!(window = window.window_id(), "xwayland: client minimize request");
+        debug!(
+            window = window.window_id(),
+            "xwayland: client minimize request"
+        );
         self.minimize_window(&surface);
     }
 
@@ -750,7 +765,10 @@ impl XwmHandler for State {
         let Some(surface) = window.wl_surface() else {
             return;
         };
-        debug!(window = window.window_id(), "xwayland: client unminimize request");
+        debug!(
+            window = window.window_id(),
+            "xwayland: client unminimize request"
+        );
         self.focus_surface(&surface);
     }
 
@@ -767,10 +785,17 @@ impl XwmHandler for State {
     /// server decoration and then has no other way to be resized.
     fn resize_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32, edge: ResizeEdge) {
         let Some(surface) = window.wl_surface() else {
-            debug!(window = window.window_id(), "xwayland: resize request with no surface");
+            debug!(
+                window = window.window_id(),
+                "xwayland: resize request with no surface"
+            );
             return;
         };
-        debug!(window = window.window_id(), ?edge, "xwayland: client resize request");
+        debug!(
+            window = window.window_id(),
+            ?edge,
+            "xwayland: client resize request"
+        );
         // X11 names a corner or a side; a side pins the other axis, the
         // same distinction our own edge grabs make.
         let (x, y) = match edge {
@@ -781,9 +806,7 @@ impl XwmHandler for State {
             ResizeEdge::TopLeft => (Some(layout::EdgeX::Left), Some(layout::EdgeY::Top)),
             ResizeEdge::TopRight => (Some(layout::EdgeX::Right), Some(layout::EdgeY::Top)),
             ResizeEdge::BottomLeft => (Some(layout::EdgeX::Left), Some(layout::EdgeY::Bottom)),
-            ResizeEdge::BottomRight => {
-                (Some(layout::EdgeX::Right), Some(layout::EdgeY::Bottom))
-            }
+            ResizeEdge::BottomRight => (Some(layout::EdgeX::Right), Some(layout::EdgeY::Bottom)),
         };
         self.begin_client_drag(
             &surface,
@@ -796,7 +819,10 @@ impl XwmHandler for State {
     /// its own titlebar.
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
         let Some(surface) = window.wl_surface() else {
-            debug!(window = window.window_id(), "xwayland: move request with no surface");
+            debug!(
+                window = window.window_id(),
+                "xwayland: move request with no surface"
+            );
             return;
         };
         debug!(window = window.window_id(), "xwayland: client move request");
@@ -824,10 +850,16 @@ impl XwmHandler for State {
             .find(|(w, _)| w == &window)
             .map(|(_, s)| s.clone())
         else {
-            debug!(window = window.window_id(), "xwayland: _NET_ACTIVE_WINDOW for an untracked window; ignored");
+            debug!(
+                window = window.window_id(),
+                "xwayland: _NET_ACTIVE_WINDOW for an untracked window; ignored"
+            );
             return;
         };
-        info!(window = window.window_id(), "xwayland: _NET_ACTIVE_WINDOW → focusing");
+        info!(
+            window = window.window_id(),
+            "xwayland: _NET_ACTIVE_WINDOW → focusing"
+        );
         self.focus_surface(&surface);
     }
 
@@ -855,7 +887,11 @@ impl XwmHandler for State {
         // Wayland-side owner offering the X mime types; Wayland pastes
         // are routed back through the XWM by the flag (see
         // `SelectionHandler::send_selection` in wayland.rs).
-        debug!(?selection, ?mime_types, "xwayland: X client took the selection");
+        debug!(
+            ?selection,
+            ?mime_types,
+            "xwayland: X client took the selection"
+        );
         crate::clipboard::on_new_selection(self, selection, None);
         self.x11_owns_selection.set(selection, true);
         let dh = self.display_handle.clone();
@@ -1018,7 +1054,10 @@ impl State {
                 );
                 return want;
             }
-            info!(window, "xwayland: fill-storm latch released (client settled)");
+            info!(
+                window,
+                "xwayland: fill-storm latch released (client settled)"
+            );
             guard.latched_until = None;
             guard.since = now;
             guard.flips = 0;
@@ -1041,4 +1080,3 @@ impl State {
         want
     }
 }
-

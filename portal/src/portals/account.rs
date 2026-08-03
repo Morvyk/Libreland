@@ -114,10 +114,7 @@ impl Account {
                     // of saying "no avatar".
                     results.insert(
                         "image".to_string(),
-                        ov(avatar
-                            .map(|p| path_to_uri(&p))
-                            .unwrap_or_default()
-                            .as_str()),
+                        ov(avatar.map(|p| path_to_uri(&p)).unwrap_or_default().as_str()),
                     );
                     (SUCCESS, results)
                 }

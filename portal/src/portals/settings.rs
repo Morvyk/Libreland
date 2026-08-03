@@ -175,11 +175,12 @@ fn typed(namespace: &str, key: &str, raw: &str) -> OwnedValue {
             raw.to_ascii_lowercase().as_str(),
             "high" | "1"
         ))),
-        (APPEARANCE, "accent-color") => parse_accent(raw)
-            .map_or_else(|| ov(raw), |rgb| ov(Value::from(Structure::from(rgb)))),
-        (GNOME_INTERFACE, "cursor-size" | "text-scaling-factor") => raw
-            .parse::<i32>()
-            .map_or_else(|_| ov(raw), ov),
+        (APPEARANCE, "accent-color") => {
+            parse_accent(raw).map_or_else(|| ov(raw), |rgb| ov(Value::from(Structure::from(rgb))))
+        }
+        (GNOME_INTERFACE, "cursor-size" | "text-scaling-factor") => {
+            raw.parse::<i32>().map_or_else(|_| ov(raw), ov)
+        }
         _ => ov(raw),
     }
 }
@@ -244,7 +245,9 @@ fn load() -> Namespaces {
     if let Ok(size) = std::env::var("XCURSOR_SIZE")
         && let Ok(size) = size.parse::<i32>()
     {
-        gnome.entry("cursor-size".to_string()).or_insert_with(|| ov(size));
+        gnome
+            .entry("cursor-size".to_string())
+            .or_insert_with(|| ov(size));
     }
     out
 }
@@ -372,9 +375,9 @@ pub fn spawn_watcher(conn: Connection) {
             let Ok(events) = inotify.read_events() else {
                 return;
             };
-            let touched = events.iter().any(|e| {
-                e.name.as_ref().map(std::ffi::OsString::from) == want
-            });
+            let touched = events
+                .iter()
+                .any(|e| e.name.as_ref().map(std::ffi::OsString::from) == want);
             if touched && tx.send(()).is_err() {
                 return;
             }
@@ -415,8 +418,8 @@ pub fn spawn_watcher(conn: Connection) {
             };
             for (namespace, key, value) in changed {
                 tracing::info!(%namespace, %key, "settings changed");
-                let _ = Settings::setting_changed(&emitter, &namespace, &key, Value::from(value))
-                    .await;
+                let _ =
+                    Settings::setting_changed(&emitter, &namespace, &key, Value::from(value)).await;
             }
         }
     });

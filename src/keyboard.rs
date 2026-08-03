@@ -186,7 +186,6 @@ impl Keyboard {
         }
     }
 
-
     /// Bundle the four modifiers we care about into a single
     /// bitmask. `STATE_MODS_EFFECTIVE` rolls depressed + latched +
     /// locked into one query, which is what hotkey matching wants.
@@ -282,8 +281,8 @@ pub fn format_trigger(mods: u32, keysym: Keysym) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyResult, Keysym, MOD_SHIFT, MOD_SUPER, fold_keysym, format_trigger,
-        is_modifier_keysym, matches_key, parse_trigger,
+        KeyResult, Keysym, MOD_SHIFT, MOD_SUPER, fold_keysym, format_trigger, is_modifier_keysym,
+        matches_key, parse_trigger,
     };
 
     fn ev(produced: Keysym, base: Keysym) -> KeyResult {
@@ -320,7 +319,10 @@ mod tests {
     #[test]
     fn the_fix_is_layout_agnostic() {
         assert!(matches_key(&ev(Keysym::eacute, Keysym::_2), Keysym::_2));
-        assert!(matches_key(&ev(Keysym::periodcentered, Keysym::_3), Keysym::_3));
+        assert!(matches_key(
+            &ev(Keysym::periodcentered, Keysym::_3),
+            Keysym::_3
+        ));
     }
 
     /// A bind written for the *shifted* symbol still matches it directly, so
@@ -409,7 +411,10 @@ mod tests {
             Keysym::space,
             Keysym::Print,
         ] {
-            assert!(!is_modifier_keysym(k), "{k:?} should not be a held modifier");
+            assert!(
+                !is_modifier_keysym(k),
+                "{k:?} should not be a held modifier"
+            );
         }
     }
 

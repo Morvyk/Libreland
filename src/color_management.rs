@@ -629,8 +629,9 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, WlSurface> for State {
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        if let wp_color_management_surface_feedback_v1::Request::GetPreferred { image_description } =
-            request
+        if let wp_color_management_surface_feedback_v1::Request::GetPreferred {
+            image_description,
+        } = request
         {
             let desc = state.preferred_image_description();
             let identity = state.color_management.identity_for(&desc);
@@ -677,7 +678,9 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsBuilder> for State {
                         params.tf = Some(v);
                         params.tf_set = true;
                     }
-                    WEnum::Unknown(_) => obj.post_error(Error::InvalidTf, "unknown transfer function"),
+                    WEnum::Unknown(_) => {
+                        obj.post_error(Error::InvalidTf, "unknown transfer function");
+                    }
                 }
             }
             Request::SetTfPower { .. } => {

@@ -241,7 +241,11 @@ impl Screen for Prompt {
         }
 
         // Buttons pin to the bottom, however the body wrapped.
-        let deny_label = self.spec.deny_label.clone().unwrap_or_else(|| "Deny".into());
+        let deny_label = self
+            .spec
+            .deny_label
+            .clone()
+            .unwrap_or_else(|| "Deny".into());
         let accept_label = self
             .spec
             .accept_label

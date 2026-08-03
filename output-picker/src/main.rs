@@ -41,10 +41,7 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{
-        Shm, ShmHandler,
-        slot::SlotPool,
-    },
+    shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use wayland_client::{
     Connection, QueueHandle,
@@ -133,7 +130,15 @@ fn draw_border(buf: &mut [u8], stride: usize, width: usize, height: usize, thick
 }
 
 /// Blit one `font8x8` glyph scaled `k`× with its top-left at `(gx, gy)`.
-fn draw_glyph(buf: &mut [u8], stride: usize, ch: char, gx: usize, gy: usize, k: usize, px: [u8; 4]) {
+fn draw_glyph(
+    buf: &mut [u8],
+    stride: usize,
+    ch: char,
+    gx: usize,
+    gy: usize,
+    k: usize,
+    px: [u8; 4],
+) {
     let rows = BASIC_FONTS.get(ch).unwrap_or([0; GLYPH]);
     for (row_idx, row) in rows.iter().enumerate() {
         for col in 0..GLYPH {
@@ -249,7 +254,10 @@ impl Picker {
             let Some(info) = self.output_state.info(&output) else {
                 continue;
             };
-            let name = info.name.clone().unwrap_or_else(|| format!("output-{}", info.id));
+            let name = info
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("output-{}", info.id));
             let surface = self.compositor.create_surface(qh);
             let layer = self.layer_shell.create_layer_surface(
                 qh,

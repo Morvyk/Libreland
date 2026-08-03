@@ -14,8 +14,8 @@
 //! draw the cursor only when the hotspot falls within that output's
 //! rectangle.
 
-use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -68,15 +68,15 @@ use tracing::{debug, info, warn};
 use crate::anim::{Animation, lerp};
 use libreland_text::Fonts;
 
+use crate::color_management::Encoding;
 use crate::config::{
     AnimSpec, AnimationsConfig, BlurConfig, BorderConfig, DecorationConfig, Fill, MonitorsConfig,
     ScaleMode, TearingMode, TitlebarConfig, VrrMode,
 };
-use crate::color_management::Encoding;
 use crate::drm::DrmOutput;
 use crate::layout::{FillMode, Placement, ZBand};
-use crate::titlebar::{BarState, BarStyle, rasterize as rasterize_bar};
 use crate::scanout::{DirectPlacement, ScanoutLayer, ScanoutSurface};
+use crate::titlebar::{BarState, BarStyle, rasterize as rasterize_bar};
 
 /// A layer surface to render this frame. Pre-computed by main
 /// before calling `render_for_crtc` so the renderer doesn't need
@@ -1741,8 +1741,7 @@ impl LayerEdge {
         // A few pixels of slack: bars are commonly placed with a small gap.
         const SLACK: i32 = 8;
         let touches_top = rect.loc.y - output.loc.y <= SLACK;
-        let touches_bottom =
-            (output.loc.y + output.size.h) - (rect.loc.y + rect.size.h) <= SLACK;
+        let touches_bottom = (output.loc.y + output.size.h) - (rect.loc.y + rect.size.h) <= SLACK;
         let touches_left = rect.loc.x - output.loc.x <= SLACK;
         let touches_right = (output.loc.x + output.size.w) - (rect.loc.x + rect.size.w) <= SLACK;
 
@@ -1849,8 +1848,7 @@ impl WindowAnim {
             self.move_from = self.displayed;
         }
         if moved {
-            self.move_anim =
-                move_cfg.map(|c| Animation::start(now, c.duration_secs(), c.curve));
+            self.move_anim = move_cfg.map(|c| Animation::start(now, c.duration_secs(), c.curve));
         }
         if resized {
             self.resize_anim =
@@ -1864,7 +1862,9 @@ impl WindowAnim {
     /// snaps straight to the target.
     fn advance_geometry(&mut self, now: f64) {
         let loc = match self.move_anim {
-            Some(a) if !a.done(now) => lerp_point(self.move_from.loc, self.target.loc, a.value(now)),
+            Some(a) if !a.done(now) => {
+                lerp_point(self.move_from.loc, self.target.loc, a.value(now))
+            }
             Some(_) => {
                 self.move_anim = None;
                 self.target.loc
@@ -1993,7 +1993,11 @@ pub enum ToolIcon {
     /// The pen-width slider: a track, the filled part up to `frac`, and a
     /// knob whose size *is* the width being chosen — the control shows
     /// you the stroke rather than a number you have to imagine.
-    Slider { frac: f32, width: f32, colour: [f32; 3] },
+    Slider {
+        frac: f32,
+        width: f32,
+        colour: [f32; 3],
+    },
     Text,
     Cancel,
 }
@@ -2255,7 +2259,8 @@ impl DamageTracker {
         current: Option<Vec<Rectangle<i32, Physical>>>,
         full: Rectangle<i32, Physical>,
     ) {
-        self.history.push_back(current.unwrap_or_else(|| vec![full]));
+        self.history
+            .push_back(current.unwrap_or_else(|| vec![full]));
         if self.history.len() > DAMAGE_HISTORY {
             self.history.pop_front();
         }
@@ -2322,11 +2327,10 @@ fn damage_rel(
     damage
         .iter()
         .filter_map(|d| {
-            d.intersection(dst)
-                .map(|mut r| {
-                    r.loc -= dst.loc;
-                    r
-                })
+            d.intersection(dst).map(|mut r| {
+                r.loc -= dst.loc;
+                r
+            })
         })
         .collect()
 }
@@ -2359,7 +2363,25 @@ struct WinTexCache {
 /// every font directory for every bar it draws.
 enum FontState {
     Unscanned,
-    Scanned(Option<Fonts>),
+    /// Boxed: `Fonts` carries its whole fallback chain inline, so an
+    /// unboxed variant makes every `FontState` — including `Unscanned`,
+    /// which is most of them — that size.
+    Scanned(Option<Box<Fonts>>),
+}
+
+/// One titlebar to fetch or rasterize, cache key included. Grouped
+/// because it is one description of one bar — the same reason
+/// [`crate::titlebar::BarSpec`] exists, of which this is the
+/// renderer-side half (it still has to resolve the palette and the icon).
+struct BarRequest<'a> {
+    key: u64,
+    width: i32,
+    height: i32,
+    title: &'a str,
+    focused: bool,
+    font_px: f32,
+    state: BarState,
+    app_id: Option<&'a str>,
 }
 
 /// [`bar_key`] for a placement as it will actually be drawn this frame.
@@ -2397,7 +2419,9 @@ fn placement_bar_key(
 /// slot geometry, so the decoded icon is the size it will be drawn at
 /// and never rescaled twice.
 fn icon_side(height: i32) -> u32 {
-    u32::try_from(crate::titlebar::icon_side_for(height)).unwrap_or(1).max(1)
+    u32::try_from(crate::titlebar::icon_side_for(height))
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Cap on rasterized titlebars held at once. A bar is one small RGBA
@@ -2622,7 +2646,9 @@ mod damage_tests {
     /// one means the renderer draws that pixel more than once, which blends
     /// a translucent draw repeatedly.
     fn hits(set: &[Rectangle<i32, Physical>], x: i32, y: i32) -> usize {
-        set.iter().filter(|d| d.contains(Point::from((x, y)))).count()
+        set.iter()
+            .filter(|d| d.contains(Point::from((x, y))))
+            .count()
     }
 
     /// The frosted-panel flicker: damage is assembled from sources that
@@ -2639,7 +2665,12 @@ mod damage_tests {
             r(300, 0, 400, 300),
         ]);
         for (x, y) in [(120, 10), (350, 10), (450, 20), (600, 200), (150, 100)] {
-            assert_eq!(hits(&out, x, y), 1, "pixel ({x},{y}) drawn {} times", hits(&out, x, y));
+            assert_eq!(
+                hits(&out, x, y),
+                1,
+                "pixel ({x},{y}) drawn {} times",
+                hits(&out, x, y)
+            );
         }
     }
 
@@ -2672,7 +2703,7 @@ mod damage_tests {
     /// after it — and the bbox fallback is itself a single, disjoint rect.
     #[test]
     fn split_still_respects_the_cap() {
-        let many: Vec<_> = (0..DAMAGE_MAX_RECTS as i32 + 8)
+        let many: Vec<_> = (0..i32::try_from(DAMAGE_MAX_RECTS).unwrap_or(i32::MAX - 8) + 8)
             .map(|i| r(i * 4, 0, 200, 200))
             .collect();
         let out = coalesce_damage(many);
@@ -2723,37 +2754,49 @@ mod opaque_region_tests {
     #[test]
     fn tiled_rects_that_together_cover_do_count() {
         // Two halves, split horizontally.
-        assert!(covers(&[rect(0, 0, 100, 50), rect(0, 50, 100, 50)], size(100, 100)
+        assert!(covers(
+            &[rect(0, 0, 100, 50), rect(0, 50, 100, 50)],
+            size(100, 100)
         ));
         // Two halves, split vertically.
-        assert!(covers(&[rect(0, 0, 50, 100), rect(50, 0, 50, 100)], size(100, 100)
+        assert!(covers(
+            &[rect(0, 0, 50, 100), rect(50, 0, 50, 100)],
+            size(100, 100)
         ));
         // Four quadrants, out of order, with overlap.
-        assert!(covers(&[
+        assert!(covers(
+            &[
                 rect(50, 50, 50, 50),
                 rect(0, 0, 60, 60),
                 rect(50, 0, 50, 50),
                 rect(0, 50, 50, 50),
-            ], size(100, 100)
+            ],
+            size(100, 100)
         ));
     }
 
     #[test]
     fn tiled_rects_with_a_gap_do_not_cover() {
         // A one-pixel column missed between the two halves.
-        assert!(!covers(&[rect(0, 0, 49, 100), rect(50, 0, 50, 100)], size(100, 100)
+        assert!(!covers(
+            &[rect(0, 0, 49, 100), rect(50, 0, 50, 100)],
+            size(100, 100)
         ));
         // Full-width bands that don't reach the bottom.
-        assert!(!covers(&[rect(0, 0, 100, 40), rect(0, 40, 100, 40)], size(100, 100)
+        assert!(!covers(
+            &[rect(0, 0, 100, 40), rect(0, 40, 100, 40)],
+            size(100, 100)
         ));
         // A hole in the middle: bands cover top and bottom, sides cover the
         // middle band only partially.
-        assert!(!covers(&[
+        assert!(!covers(
+            &[
                 rect(0, 0, 100, 30),
                 rect(0, 70, 100, 30),
                 rect(0, 30, 40, 40),
                 rect(60, 30, 40, 40),
-            ], size(100, 100)
+            ],
+            size(100, 100)
         ));
     }
 
@@ -2879,7 +2922,9 @@ fn place_outputs(
         })
         .collect();
     configured.sort_by(|(na, _, pa), (nb, _, pb)| {
-        pa.0.cmp(&pb.0).then(pa.1.cmp(&pb.1)).then_with(|| na.cmp(nb))
+        pa.0.cmp(&pb.0)
+            .then(pa.1.cmp(&pb.1))
+            .then_with(|| na.cmp(nb))
     });
 
     for (name, size, (req_x, req_y)) in configured {
@@ -2917,7 +2962,12 @@ fn place_outputs(
     // set (auto_x is the rightmost configured edge, so they can't overlap
     // any configured output).
     for (name, size) in sizes {
-        if monitors.outputs.get(name).and_then(|c| c.position).is_none() {
+        if monitors
+            .outputs
+            .get(name)
+            .and_then(|c| c.position)
+            .is_none()
+        {
             positions.insert(name.clone(), Point::from((auto_x, 0)));
             auto_x = auto_x.saturating_add(size.w);
         }
@@ -3061,8 +3111,12 @@ impl CursorPlane {
     /// the caller keeps the software cursor) if the device reports no cursor
     /// dimensions or the allocation fails.
     fn new(fd: &DrmDeviceFd, gbm: &GbmDevice<DrmDeviceFd>) -> Option<Self> {
-        let w = fd.get_driver_capability(DriverCapability::CursorWidth).ok()?;
-        let h = fd.get_driver_capability(DriverCapability::CursorHeight).ok()?;
+        let w = fd
+            .get_driver_capability(DriverCapability::CursorWidth)
+            .ok()?;
+        let h = fd
+            .get_driver_capability(DriverCapability::CursorHeight)
+            .ok()?;
         #[allow(
             clippy::cast_possible_truncation,
             reason = "cursor cap dims are small (<=256 on real hardware)"
@@ -3127,7 +3181,13 @@ impl CursorPlane {
         clippy::many_single_char_names,
         reason = "cursor dims/scale are small positive values; r/g/b/a are pixel channels"
     )]
-    fn program(&mut self, crtc: crtc::Handle, factor: f64, hdr: bool, reference_white: u32) -> bool {
+    fn program(
+        &mut self,
+        crtc: crtc::Handle,
+        factor: f64,
+        hdr: bool,
+        reference_white: u32,
+    ) -> bool {
         let Some(image) = self.image.clone() else {
             return false;
         };
@@ -3376,8 +3436,7 @@ impl Renderer {
             UniformName::new("quad", UniformType::_2f),
         ];
         segment_uniforms.extend(
-            (0..SEGMENTS_MAX)
-                .map(|i| UniformName::new(format!("segments[{i}]"), UniformType::_4f)),
+            (0..SEGMENTS_MAX).map(|i| UniformName::new(format!("segments[{i}]"), UniformType::_4f)),
         );
         let segment_shader = gles
             .compile_custom_texture_shader(SEGMENT_SHADER, &segment_uniforms)
@@ -3410,7 +3469,10 @@ impl Renderer {
                 .render(&mut target, one, Transform::Normal)
                 .context("blank texture render")?;
             frame
-                .clear(Color32F::new(1.0, 1.0, 1.0, 1.0), &[Rectangle::from_size(one)])
+                .clear(
+                    Color32F::new(1.0, 1.0, 1.0, 1.0),
+                    &[Rectangle::from_size(one)],
+                )
                 .context("blank texture clear")?;
             let _ = frame.finish().context("blank texture finish")?;
         }
@@ -3861,8 +3923,8 @@ impl Renderer {
         match status {
             CursorImageStatus::Hidden => false,
             CursorImageStatus::Surface(surface) => {
-                let mapped = with_renderer_surface_state(surface, |s| s.buffer().is_some())
-                    .unwrap_or(false);
+                let mapped =
+                    with_renderer_surface_state(surface, |s| s.buffer().is_some()).unwrap_or(false);
                 mapped && (compose_cursor || !plane)
             }
             CursorImageStatus::Named(_) => compose_cursor || !plane,
@@ -4020,13 +4082,19 @@ impl Renderer {
         let mut texture: GlesTexture = self.gles.create_buffer(Fourcc::Abgr8888, tex_size).ok()?;
         let mut target = self.gles.bind(&mut texture).ok()?;
         {
-            let mut frame = self.gles.render(&mut target, phys, Transform::Normal).ok()?;
+            let mut frame = self
+                .gles
+                .render(&mut target, phys, Transform::Normal)
+                .ok()?;
             frame.clear(Color32F::new(0.0, 0.0, 0.0, 0.0), &full).ok()?;
             draw_render_elements::<GlesRenderer, _, _>(&mut frame, 1.0, &elements, &full).ok()?;
             let _ = frame.finish().ok()?;
         }
         let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(tex_size);
-        let mapping = self.gles.copy_framebuffer(&target, region, Fourcc::Abgr8888).ok()?;
+        let mapping = self
+            .gles
+            .copy_framebuffer(&target, region, Fourcc::Abgr8888)
+            .ok()?;
         let rgba = self.gles.map_texture(&mapping).ok()?.to_vec();
         drop(target);
         Some(HwCursorImage {
@@ -4058,7 +4126,11 @@ impl Renderer {
     /// Program + position the cursor plane on the output under the pointer.
     /// Returns whether the plane is showing the cursor.
     fn program_hw_cursor_current(&mut self) -> bool {
-        if self.cursor_plane.as_ref().is_none_or(|cp| cp.image.is_none()) {
+        if self
+            .cursor_plane
+            .as_ref()
+            .is_none_or(|cp| cp.image.is_none())
+        {
             return false;
         }
         let Some(idx) = self.cursor_output_idx() else {
@@ -4427,10 +4499,7 @@ impl Renderer {
     /// The connector + CRTC currently driving the named output, if any.
     /// Used by a live mode change to rebuild the DRM surface on the same
     /// pipe (drop the old surface, modeset a new one on this CRTC).
-    pub fn output_connector_crtc(
-        &self,
-        name: &str,
-    ) -> Option<(connector::Handle, crtc::Handle)> {
+    pub fn output_connector_crtc(&self, name: &str) -> Option<(connector::Handle, crtc::Handle)> {
         self.outputs
             .iter()
             .find(|o| o.name == name)
@@ -4509,10 +4578,7 @@ impl Renderer {
 
     /// CRTC of the output named `name` (connector name), if present.
     pub fn crtc_for_output_name(&self, name: &str) -> Option<crtc::Handle> {
-        self.outputs
-            .iter()
-            .find(|o| o.name == name)
-            .map(|o| o.crtc)
+        self.outputs.iter().find(|o| o.name == name).map(|o| o.crtc)
     }
 
     /// Advance the cursor hotspot by libinput-reported deltas, clamped
@@ -4663,7 +4729,10 @@ impl Renderer {
         )]
         let (width, height) = (frame.width as i32, frame.height as i32);
         let size = Size::<i32, smithay::utils::Buffer>::from((width, height));
-        match self.gles.import_memory(&frame.rgba, Fourcc::Abgr8888, size, false) {
+        match self
+            .gles
+            .import_memory(&frame.rgba, Fourcc::Abgr8888, size, false)
+        {
             Ok(texture) => {
                 if let Some(media) = self.wallpaper_media.as_mut() {
                     media.draw.texture = texture;
@@ -4703,7 +4772,13 @@ impl Renderer {
     /// and orientation as the cursor sprite, so it imports via the
     /// renderer's known-good `Abgr8888` / `flipped = false` path and
     /// displays upright + opaque. Returns whether the upload succeeded.
-    pub fn set_freeze_texture(&mut self, output: &str, rgba: &[u8], width: i32, height: i32) -> bool {
+    pub fn set_freeze_texture(
+        &mut self,
+        output: &str,
+        rgba: &[u8],
+        width: i32,
+        height: i32,
+    ) -> bool {
         let size = Size::<i32, smithay::utils::Buffer>::from((width, height));
         match self.gles.import_memory(rgba, Fourcc::Abgr8888, size, false) {
             Ok(texture) => {
@@ -4743,17 +4818,17 @@ impl Renderer {
     /// `None` on an upload failure, which the caller treats as "no bar
     /// this frame" — a window without its titlebar is still usable, and
     /// the alternative is refusing to draw the window at all.
-    fn bar_texture(
-        &mut self,
-        key: u64,
-        width: i32,
-        height: i32,
-        title: &str,
-        focused: bool,
-        font_px: f32,
-        state: BarState,
-        app_id: Option<&str>,
-    ) -> Option<GlesTexture> {
+    fn bar_texture(&mut self, req: &BarRequest<'_>) -> Option<GlesTexture> {
+        let &BarRequest {
+            key,
+            width,
+            height,
+            title,
+            focused,
+            font_px,
+            state,
+            app_id,
+        } = req;
         if let Some(tex) = self.bar_cache.get(&key) {
             return Some(tex.clone());
         }
@@ -4774,7 +4849,7 @@ impl Renderer {
             if loaded.is_none() {
                 warn!("titlebar: no usable UI font found; bars will draw without titles");
             }
-            self.fonts = FontState::Scanned(loaded);
+            self.fonts = FontState::Scanned(loaded.map(Box::new));
         }
         // The bar's colours come from the border fill for the same focus
         // state, so the frame and the bar are one palette with no second
@@ -4793,20 +4868,20 @@ impl Renderer {
         // the cache, and `fonts` holds a shared borrow across the call.
         let icon = app_id.and_then(|id| self.app_icon(id, icon_side(height)));
         let fonts = match &self.fonts {
-            FontState::Scanned(f) => f.as_ref(),
+            FontState::Scanned(f) => f.as_deref(),
             FontState::Unscanned => None,
         };
-        let rgba = rasterize_bar(
+        let rgba = rasterize_bar(&crate::titlebar::BarSpec {
             fonts,
             width,
             height,
             title,
-            BarStyle::from_border(border_rgb, focused),
-            &self.titlebar.buttons,
+            style: BarStyle::from_border(border_rgb, focused),
+            buttons: &self.titlebar.buttons,
             font_px,
             state,
-            icon.as_deref(),
-        );
+            icon: icon.as_deref(),
+        });
         let size = Size::<i32, smithay::utils::Buffer>::from((width.max(1), height.max(1)));
         match self
             .gles
@@ -5528,7 +5603,10 @@ impl Renderer {
             .then(|| self.decode_to_fp16(surface, &elements, scale, encoding, tex_size))
             .transpose()?;
 
-        let mut target = self.gles.bind(&mut texture).context("capture_window: bind")?;
+        let mut target = self
+            .gles
+            .bind(&mut texture)
+            .context("capture_window: bind")?;
         {
             let mut frame = self
                 .gles
@@ -5599,22 +5677,25 @@ impl Renderer {
             let target = p.cell_rect;
             // The interactively dragged window tracks the cursor 1:1.
             let snap = no_anim.covers(&id);
-            let entry = self.win_anims.entry(id.clone()).or_insert_with(|| WindowAnim {
-                surface: p.surface.clone(),
-                target,
-                displayed: target,
-                move_from: target,
-                move_anim: None,
-                resize_anim: None,
-                open_anim: None,
-                open_rise: 0,
-                // Seeded to the window's current focus so the very first
-                // frame doesn't fade in from "unfocused".
-                focused: p.focused,
-                focus_anim: None,
-                focus_from: f32::from(u8::from(p.focused)),
-                focus_now: f32::from(u8::from(p.focused)),
-            });
+            let entry = self
+                .win_anims
+                .entry(id.clone())
+                .or_insert_with(|| WindowAnim {
+                    surface: p.surface.clone(),
+                    target,
+                    displayed: target,
+                    move_from: target,
+                    move_anim: None,
+                    resize_anim: None,
+                    open_anim: None,
+                    open_rise: 0,
+                    // Seeded to the window's current focus so the very first
+                    // frame doesn't fade in from "unfocused".
+                    focused: p.focused,
+                    focus_anim: None,
+                    focus_from: f32::from(u8::from(p.focused)),
+                    focus_now: f32::from(u8::from(p.focused)),
+                });
 
             entry.retarget(
                 now,
@@ -5864,9 +5945,9 @@ impl Renderer {
     /// buffers for a fullscreen window now match the mode exactly, which
     /// is also what the 1:1 scanout fast paths require.
     pub fn xwayland_client_scale(&self) -> f64 {
-        self.outputs
-            .get(self.primary_idx)
-            .map_or(1.0, |o| client_scale_for(o.mode_size, o.compositor_size, o.scale))
+        self.outputs.get(self.primary_idx).map_or(1.0, |o| {
+            client_scale_for(o.mode_size, o.compositor_size, o.scale)
+        })
     }
 
     /// Settle one output's Variable Refresh Rate state for the frame about
@@ -6278,7 +6359,9 @@ impl Renderer {
                         // The plane now holds this exact commit — the next
                         // direct frame can describe its damage relative to it.
                         self.outputs[idx].direct_damage_ref = Some(commit);
-                        self.queue_output_frame_callbacks(idx, placements, layers, popups, out_rect);
+                        self.queue_output_frame_callbacks(
+                            idx, placements, layers, popups, out_rect,
+                        );
                         self.outputs[idx].pending_direct = true;
                         // Zero-copy presentation: the client's own buffer is on the
                         // plane, so flag ZeroCopy. Fired on this flip's vblank. A
@@ -6575,8 +6658,8 @@ impl Renderer {
                     // `effective == cell_rect` and the scale is 1 (crisp).
                     let eff = wd.effective;
                     let fallback = p.deco.content_size(p.cell_rect.size);
-                    let (content_w, content_h) = window_geometry_size(&p.surface)
-                        .unwrap_or((fallback.w, fallback.h));
+                    let (content_w, content_h) =
+                        window_geometry_size(&p.surface).unwrap_or((fallback.w, fallback.h));
                     // Where the buffer actually lands inside the cell.
                     // `paint_origin` is the single definition of that, and
                     // the pointer hit-test reads the same one — see its
@@ -6888,9 +6971,25 @@ impl Renderer {
             if let Some(wp) = &wallpaper_media {
                 // Media wallpapers force full-frame damage upstream, so no
                 // damage threading is needed here.
-                draw_wallpaper_texture(frame, wp, mode_size, linear, hdr_reference_white, hdr_saturation)?;
+                draw_wallpaper_texture(
+                    frame,
+                    wp,
+                    mode_size,
+                    linear,
+                    hdr_reference_white,
+                    hdr_saturation,
+                )?;
             } else {
-                draw_fill(frame, &wallpaper, mode_size, mode_size, damage, linear, hdr_reference_white, hdr_saturation)?;
+                draw_fill(
+                    frame,
+                    &wallpaper,
+                    mode_size,
+                    mode_size,
+                    damage,
+                    linear,
+                    hdr_reference_white,
+                    hdr_saturation,
+                )?;
             }
             for (bucket, elements) in &layer_groups {
                 if matches!(bucket, LayerBucket::Background | LayerBucket::Bottom) {
@@ -6942,10 +7041,8 @@ impl Renderer {
                 Fourcc::Abgr8888
             };
             let cell = cell_local(wd.effective);
-            let size = Size::<i32, smithay::utils::Buffer>::from((
-                cell.size.w.max(1),
-                cell.size.h.max(1),
-            ));
+            let size =
+                Size::<i32, smithay::utils::Buffer>::from((cell.size.w.max(1), cell.size.h.max(1)));
             // The titlebar's identity joins the surface fingerprint in
             // deciding whether the offscreen is current: the bar is drawn
             // *into* it, and a title or focus change moves no commit
@@ -6997,7 +7094,11 @@ impl Renderer {
                 // Keep the old texture, and deliberately keep its old
                 // fingerprint too: the entry must still look stale so the
                 // next frame that does have elements re-renders it.
-                if elements.is_empty() && cached.fmt == fmt && cached.size == size && cached.bar == bar {
+                if elements.is_empty()
+                    && cached.fmt == fmt
+                    && cached.size == size
+                    && cached.bar == bar
+                {
                     debug!(
                         surface = ?p.surface.id(),
                         "wintex: empty elements on a committed tree; keeping last offscreen"
@@ -7015,19 +7116,19 @@ impl Renderer {
             // `self.gles` for the whole offscreen render.
             let bar_tex = (bar_h > 0)
                 .then(|| {
-                    self.bar_texture(
-                        bar,
-                        size.w,
-                        bar_h,
-                        &bar_title,
-                        wd.focus >= 0.5,
+                    self.bar_texture(&BarRequest {
+                        key: bar,
+                        width: size.w,
+                        height: bar_h,
+                        title: &bar_title,
+                        focused: wd.focus >= 0.5,
                         // The bar is rasterized in PHYSICAL pixels (the
                         // offscreen is), so the point size scales with
                         // the output or the text is tiny on HiDPI.
-                        bar_font_px(self.titlebar.font_size, scale),
-                        bar_state,
-                        bar_app_id.as_deref(),
-                    )
+                        font_px: bar_font_px(self.titlebar.font_size, scale),
+                        state: bar_state,
+                        app_id: bar_app_id.as_deref(),
+                    })
                 })
                 .flatten();
             let tex = (|| -> Option<GlesTexture> {
@@ -7078,9 +7179,10 @@ impl Renderer {
                         Point::from((0, 0)),
                         Size::from((size.w, bar_h)),
                     );
-                    let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(
-                        Size::from((f64::from(size.w), f64::from(bar_h))),
-                    );
+                    let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                        f64::from(size.w),
+                        f64::from(bar_h),
+                    )));
                     if let Err(err) = frame.render_texture_from_to(
                         tex,
                         src,
@@ -7185,7 +7287,9 @@ impl Renderer {
                 // half the cell, and leave >=1px of surface for the border.
                 let max_half = (dst.size.w / 2).min(dst.size.h / 2);
                 let radius = scale_i(radius_for(p), scale).min(max_half).max(0);
-                let bw = scale_i(p.deco.border, scale).min((max_half - 1).max(0)).max(0);
+                let bw = scale_i(p.deco.border, scale)
+                    .min((max_half - 1).max(0))
+                    .max(0);
                 let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(tex.size().to_f64());
                 #[allow(
                     clippy::cast_precision_loss,
@@ -7254,9 +7358,9 @@ impl Renderer {
                     frame.override_default_tex_program(
                         sdr_decode_shader.clone(),
                         vec![
-                        Uniform::new("reference_white", ref_white_f32),
-                        Uniform::new("saturation", hdr_saturation),
-                    ],
+                            Uniform::new("reference_white", ref_white_f32),
+                            Uniform::new("saturation", hdr_saturation),
+                        ],
                     );
                 }
                 res.context("draw_render_elements failed")?;
@@ -7341,7 +7445,10 @@ impl Renderer {
             .zip(layer_masks.iter())
             .map(|(l, cur)| {
                 if cur.is_some() && layer_blurs(l) {
-                    self.outputs[idx].prev_layer_masks.get(&l.surface.id()).cloned()
+                    self.outputs[idx]
+                        .prev_layer_masks
+                        .get(&l.surface.id())
+                        .cloned()
                 } else {
                     None
                 }
@@ -7384,8 +7491,7 @@ impl Renderer {
         // whole screen — only the layers the user named are blurred.
         let need_layer = passes_ok
             && layers.iter().any(|l| {
-                matches!(l.layer, LayerBucket::Top | LayerBucket::Overlay)
-                    && layer_blurs(l)
+                matches!(l.layer, LayerBucket::Top | LayerBucket::Overlay) && layer_blurs(l)
             });
         let t = Instant::now();
         // Saved per-tier blurred backdrops. Pull the scratch out of the map
@@ -7468,7 +7574,13 @@ impl Renderer {
                                 );
                             } else if ensure_tier_slot(&mut self.gles, &mut scratch, slot) {
                                 run_pyramid(
-                                    &mut self.gles, &mut scratch, passes, radius, &down, &up, slot,
+                                    &mut self.gles,
+                                    &mut scratch,
+                                    passes,
+                                    radius,
+                                    &down,
+                                    &up,
+                                    slot,
                                 )?;
                                 newest_tier = Some(scratch.tiers[slot].clone());
                             }
@@ -7504,7 +7616,6 @@ impl Renderer {
             self.blur_scratch.insert(idx, scratch);
         }
         t_blur += t.elapsed();
-
 
         // ── Damage ────────────────────────────────────────────────────
         // Diff this frame's drawn set against the previous frame's (see
@@ -7619,8 +7730,7 @@ impl Renderer {
                 // Layer surfaces, only the ones this frame actually draws:
                 // Overlay always; the rest only when the base bands run.
                 for (l, (bucket, elements)) in layers.iter().zip(layer_groups.iter()) {
-                    let drawn =
-                        matches!(bucket, LayerBucket::Overlay) || solo_opaque.is_none();
+                    let drawn = matches!(bucket, LayerBucket::Overlay) || solo_opaque.is_none();
                     if !drawn {
                         continue;
                     }
@@ -8059,8 +8169,13 @@ impl Renderer {
                     );
                     blur_rect(&mut frame, t, dst, Some((mask, mask_prev)), draw_damage)?;
                 }
-                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
-                    .context("draw_render_elements (layer top) failed")?;
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    elements,
+                    draw_damage,
+                )
+                .context("draw_render_elements (layer top) failed")?;
             }
 
             // Fullscreen windows: borderless, above tiled/maximized windows and
@@ -8108,9 +8223,9 @@ impl Renderer {
                     frame.override_default_tex_program(
                         sdr_decode_shader.clone(),
                         vec![
-                        Uniform::new("reference_white", ref_white_f32),
-                        Uniform::new("saturation", hdr_saturation),
-                    ],
+                            Uniform::new("reference_white", ref_white_f32),
+                            Uniform::new("saturation", hdr_saturation),
+                        ],
                     );
                 }
                 res.context("draw_render_elements (fullscreen) failed")?;
@@ -8145,8 +8260,13 @@ impl Renderer {
                     );
                     blur_rect(&mut frame, t, dst, Some((mask, mask_prev)), draw_damage)?;
                 }
-                draw_render_elements::<GlesRenderer, _, _>(&mut frame, scale, elements, draw_damage)
-                    .context("draw_render_elements (layer overlay) failed")?;
+                draw_render_elements::<GlesRenderer, _, _>(
+                    &mut frame,
+                    scale,
+                    elements,
+                    draw_damage,
+                )
+                .context("draw_render_elements (layer overlay) failed")?;
             }
 
             // Closing layer surfaces, in the Overlay band they were drawn
@@ -8415,9 +8535,7 @@ impl Renderer {
             captures
                 .iter()
                 .map(|spec| match &spec.target {
-                    CaptureTarget::Shm => {
-                        capture_shm(&mut self.gles, &target, spec, &output_name)
-                    }
+                    CaptureTarget::Shm => capture_shm(&mut self.gles, &target, spec, &output_name),
                     CaptureTarget::Dmabuf(client) => {
                         capture_dmabuf(&mut self.gles, &target, client, spec, &output_name)
                     }
@@ -8534,11 +8652,12 @@ impl Renderer {
         // feedback still parked from a frame that never reached its flip is
         // discarded, never dropped — see the direct-scanout twin above.
         if let Some(out) = present_output {
-            let replaced = self.outputs[idx]
-                .pending_feedback
-                .replace(collect_presentation_feedback(
-                    out, placements, layers, popups, out_rect, false,
-                ));
+            let replaced =
+                self.outputs[idx]
+                    .pending_feedback
+                    .replace(collect_presentation_feedback(
+                        out, placements, layers, popups, out_rect, false,
+                    ));
             if let Some(mut old) = replaced {
                 debug!(output = %output_name, "wp_presentation: feedback discarded (flip replaced, composite)");
                 old.discarded();
@@ -9611,9 +9730,10 @@ fn blur_pass(
     let phys = Size::<i32, Physical>::from((dw, dh));
     let dst_rect = Rectangle::<i32, Physical>::from_size(phys);
     let st = src.size();
-    let src_rect = Rectangle::<f64, smithay::utils::Buffer>::from_size(
-        Size::<f64, smithay::utils::Buffer>::from((f64::from(st.w), f64::from(st.h))),
-    );
+    let src_rect =
+        Rectangle::<f64, smithay::utils::Buffer>::from_size(
+            Size::<f64, smithay::utils::Buffer>::from((f64::from(st.w), f64::from(st.h))),
+        );
     #[allow(
         clippy::cast_precision_loss,
         reason = "mip dimensions are small positive pixel counts; exact in f32"
@@ -9712,25 +9832,24 @@ fn draw_wallpaper_texture(
     let buf = |x: f64, y: f64, w: f64, h: f64| {
         Rectangle::<f64, smithay::utils::Buffer>::new(Point::from((x, y)), Size::from((w, h)))
     };
-    let draw =
-        |frame: &mut GlesFrame<'_, '_>,
-         src: Rectangle<f64, smithay::utils::Buffer>,
-         dst: Rectangle<i32, Physical>|
-         -> Result<()> {
-            frame
-                .render_texture_from_to(
-                    &wp.texture,
-                    src,
-                    dst,
-                    &[dst],
-                    &[dst],
-                    Transform::Normal,
-                    1.0,
-                    None,
-                    &[],
-                )
-                .context("render_texture_from_to (wallpaper) failed")
-        };
+    let draw = |frame: &mut GlesFrame<'_, '_>,
+                src: Rectangle<f64, smithay::utils::Buffer>,
+                dst: Rectangle<i32, Physical>|
+     -> Result<()> {
+        frame
+            .render_texture_from_to(
+                &wp.texture,
+                src,
+                dst,
+                &[dst],
+                &[dst],
+                Transform::Normal,
+                1.0,
+                None,
+                &[],
+            )
+            .context("render_texture_from_to (wallpaper) failed")
+    };
     let black = Fill::Solid([0.0, 0.0, 0.0]);
     match wp.mode {
         ScaleMode::Stretch => draw(frame, buf(0.0, 0.0, tw, th), full_dst)?,
@@ -9746,7 +9865,16 @@ fn draw_wallpaper_texture(
             )?;
         }
         ScaleMode::Fit => {
-            draw_fill(frame, &black, output, output, &[full_dst], hdr, reference_white, saturation)?;
+            draw_fill(
+                frame,
+                &black,
+                output,
+                output,
+                &[full_dst],
+                hdr,
+                reference_white,
+                saturation,
+            )?;
             let scale = (ow / tw).min(oh / th);
             let (dw, dh) = ((tw * scale) as i32, (th * scale) as i32);
             let dst = Rectangle::new(
@@ -9756,14 +9884,22 @@ fn draw_wallpaper_texture(
             draw(frame, buf(0.0, 0.0, tw, th), dst)?;
         }
         ScaleMode::Center => {
-            draw_fill(frame, &black, output, output, &[full_dst], hdr, reference_white, saturation)?;
+            draw_fill(
+                frame,
+                &black,
+                output,
+                output,
+                &[full_dst],
+                hdr,
+                reference_white,
+                saturation,
+            )?;
             // Native size, centred, cropped to the output.
             let (off_x, off_y) = ((output.w - wp.width) / 2, (output.h - wp.height) / 2);
             let (x0, x1) = (off_x.max(0), (off_x + wp.width).min(output.w));
             let (y0, y1) = (off_y.max(0), (off_y + wp.height).min(output.h));
             if x1 > x0 && y1 > y0 {
-                let dst =
-                    Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)));
+                let dst = Rectangle::new(Point::from((x0, y0)), Size::from((x1 - x0, y1 - y0)));
                 let src = buf(
                     f64::from(x0 - off_x),
                     f64::from(y0 - off_y),
@@ -9877,7 +10013,6 @@ fn draw_fill_rect(
     }
     Ok(())
 }
-
 
 /// Titlebar point size in physical pixels for an output at `scale`.
 /// The bar is rasterized into a physical-pixel offscreen, so an
@@ -10244,16 +10379,17 @@ fn draw_toolbar(
             paint.fill(frame, dst, HOVER)?;
         }
         match b.icon {
-            ToolIcon::Slider { frac, width, colour } => {
+            ToolIcon::Slider {
+                frac,
+                width,
+                colour,
+            } => {
                 // Track down the middle, filled to the current value.
                 let th = (dst.size.h / 8).max(2);
                 let ty = dst.loc.y + (dst.size.h - th) / 2;
                 paint.fill(
                     frame,
-                    Rectangle::new(
-                        Point::from((dst.loc.x, ty)),
-                        Size::from((dst.size.w, th)),
-                    ),
+                    Rectangle::new(Point::from((dst.loc.x, ty)), Size::from((dst.size.w, th))),
                     Color32F::new(1.0, 1.0, 1.0, 0.22),
                 )?;
                 #[allow(
@@ -10265,10 +10401,7 @@ fn draw_toolbar(
                 let filled = (dst.size.w as f32 * frac.clamp(0.0, 1.0)) as i32;
                 paint.fill(
                     frame,
-                    Rectangle::new(
-                        Point::from((dst.loc.x, ty)),
-                        Size::from((filled, th)),
-                    ),
+                    Rectangle::new(Point::from((dst.loc.x, ty)), Size::from((filled, th))),
                     Color32F::new(colour[0], colour[1], colour[2], 0.95),
                 )?;
                 // The knob is drawn at the pen's actual width, so the
@@ -10536,11 +10669,7 @@ fn mix_fills(a: &Fill, b: &Fill, t: f32) -> ([f32; 3], [f32; 3]) {
     clippy::cast_possible_truncation,
     reason = "interpolated pixel coordinates are bounded by output size, well within i32"
 )]
-fn lerp_point(
-    a: Point<i32, Physical>,
-    b: Point<i32, Physical>,
-    t: f64,
-) -> Point<i32, Physical> {
+fn lerp_point(a: Point<i32, Physical>, b: Point<i32, Physical>, t: f64) -> Point<i32, Physical> {
     Point::from((
         lerp(f64::from(a.x), f64::from(b.x), t).round() as i32,
         lerp(f64::from(a.y), f64::from(b.y), t).round() as i32,
@@ -10709,6 +10838,10 @@ mod gpu_bench {
 
     #[test]
     #[ignore = "GPU benchmark; run manually with --ignored --nocapture"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a benchmark is one linear setup-measure-report run; splitting it just hides what is being timed behind call sites"
+    )]
     fn gpu_bench() {
         let _ = BenchDrmNode::from_path("/dev/dri/renderD128");
         let file = OpenOptions::new()
@@ -10880,7 +11013,9 @@ mod gpu_bench {
             let _ = sync.wait();
             Ok(())
         });
-        let mut kept: GlesTexture = gles.create_buffer(Fourcc::Abgr8888, cell).expect("kept tex");
+        let mut kept: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr8888, cell)
+            .expect("kept tex");
         bench("win_tex: draw into kept alloc (stale cache)", || {
             let mut bound = gles.bind(&mut kept)?;
             let mut frame = gles.render(&mut bound, cell_phys, Transform::Normal)?;
@@ -10927,7 +11062,15 @@ mod gpu_bench {
                 let dphys = Size::<i32, Physical>::from((dw, dh));
                 let dfull = [Rectangle::<i32, Physical>::from_size(dphys)];
                 let hp = [
-                    Uniform::new("half_pixel", [0.5 / f64::from(dw) as f32, 0.5 / f64::from(dh) as f32]),
+                    // Mip dimensions are screen-sized, so exact in f32
+                    // (and in a mantissa a thousand times over).
+                    Uniform::new(
+                        "half_pixel",
+                        [
+                            0.5 / f32::from(i16::try_from(dw).unwrap_or(1).max(1)),
+                            0.5 / f32::from(i16::try_from(dh).unwrap_or(1).max(1)),
+                        ],
+                    ),
                     Uniform::new("radius", 8.0_f32),
                 ];
                 let mut bound = gles.bind(d)?;
@@ -10958,26 +11101,35 @@ mod gpu_bench {
                 let dphys = Size::<i32, Physical>::from((dw, dh));
                 let dfull = [Rectangle::<i32, Physical>::from_size(dphys)];
                 let hp = [
-                    Uniform::new("half_pixel", [0.5 / f64::from(dw) as f32, 0.5 / f64::from(dh) as f32]),
+                    // Mip dimensions are screen-sized, so exact in f32
+                    // (and in a mantissa a thousand times over).
+                    Uniform::new(
+                        "half_pixel",
+                        [
+                            0.5 / f32::from(i16::try_from(dw).unwrap_or(1).max(1)),
+                            0.5 / f32::from(i16::try_from(dh).unwrap_or(1).max(1)),
+                        ],
+                    ),
                     Uniform::new("radius", 8.0_f32),
                 ];
                 let mut bound = gles.bind(d)?;
                 let mut frame = gles.render(&mut bound, dphys, Transform::Normal)?;
-                let sync = frame.render_texture_from_to(
-                    s,
-                    Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
-                        f64::from((W >> (k + 1)).max(1)),
-                        f64::from((H >> (k + 1)).max(1)),
-                    ))),
-                    Rectangle::<i32, Physical>::from_size(dphys),
-                    &dfull,
-                    &dfull,
-                    Transform::Normal,
-                    1.0,
-                    Some(&blur_up),
-                    &hp,
-                )
-                .map(|()| frame.finish())?;
+                let sync = frame
+                    .render_texture_from_to(
+                        s,
+                        Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((
+                            f64::from((W >> (k + 1)).max(1)),
+                            f64::from((H >> (k + 1)).max(1)),
+                        ))),
+                        Rectangle::<i32, Physical>::from_size(dphys),
+                        &dfull,
+                        &dfull,
+                        Transform::Normal,
+                        1.0,
+                        Some(&blur_up),
+                        &hp,
+                    )
+                    .map(|()| frame.finish())?;
                 drop(bound);
                 let sync = sync?;
                 if k == 0 {
@@ -10998,6 +11150,10 @@ mod gpu_bench {
     /// could achieve, since the flash is the same 0.79 alpha as the real card.
     #[test]
     #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one GPU round trip: compile, render, read back, assert. The steps share a dozen locals and mean nothing apart"
+    )]
     fn temporal_mask_blur_confines_frost() {
         let file = OpenOptions::new()
             .read(true)
@@ -11037,7 +11193,12 @@ mod gpu_bench {
         // sampler filters set (create_buffer ones don't, so they'd sample as
         // incomplete). Uniform content makes the mask UV mapping irrelevant.
         // Tier (blurred backdrop) is white/opaque so a frosted pixel reads white.
-        let white: Vec<u8> = [255u8; 4].iter().copied().cycle().take(64 * 64 * 4).collect();
+        let white: Vec<u8> = [255u8; 4]
+            .iter()
+            .copied()
+            .cycle()
+            .take(64 * 64 * 4)
+            .collect();
         let tier = gles
             .import_memory(&white, Fourcc::Abgr8888, size, false)
             .expect("import tier");
@@ -11048,8 +11209,7 @@ mod gpu_bench {
                 .cycle()
                 .take(64 * 64 * 4)
                 .collect();
-            gles
-                .import_memory(&data, Fourcc::Abgr8888, size, false)
+            gles.import_memory(&data, Fourcc::Abgr8888, size, false)
                 .expect("import mask")
         };
         let cur = mk(201); // panel material everywhere (0.79) — the flash
@@ -11072,11 +11232,22 @@ mod gpu_bench {
                 gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
             {
                 let mut b = gles.bind(&mut target).expect("bind target");
-                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
-                f.clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full).expect("clear red");
+                let mut f = gles
+                    .render(&mut b, phys, Transform::Normal)
+                    .expect("render target");
+                f.clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full)
+                    .expect("clear red");
                 f.with_secondary_textures(&cur, prev, |f| {
                     f.render_texture_from_to(
-                        &tier, src, dst, &full, &[], Transform::Normal, 1.0, Some(&shader), &unis,
+                        &tier,
+                        src,
+                        dst,
+                        &full,
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                        Some(&shader),
+                        &unis,
                     )
                 })
                 .expect("masked blur draw");
@@ -11097,7 +11268,10 @@ mod gpu_bench {
         let no_history = run(&prev_none);
         let stable = run(&prev_full);
         let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
-        println!("no-history centre = {no_history:?} (sum {})", sum(no_history));
+        println!(
+            "no-history centre = {no_history:?} (sum {})",
+            sum(no_history)
+        );
         println!("stable     centre = {stable:?} (sum {})", sum(stable));
         // Not covered last frame -> min coverage 0 -> no frost -> stays red backdrop.
         assert!(
@@ -11122,6 +11296,10 @@ mod gpu_bench {
     /// bands so the result cannot depend on texture y-inversion.
     #[test]
     #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one GPU round trip: compile, render, read back, assert. The steps share a dozen locals and mean nothing apart"
+    )]
     fn moving_mask_blur_survives_dilation() {
         let file = OpenOptions::new()
             .read(true)
@@ -11157,7 +11335,12 @@ mod gpu_bench {
         let src = Rectangle::<f64, smithay::utils::Buffer>::from_size(Size::from((64.0, 64.0)));
         let dst = Rectangle::<i32, Physical>::from_size(phys);
 
-        let white: Vec<u8> = [255u8; 4].iter().copied().cycle().take(64 * 64 * 4).collect();
+        let white: Vec<u8> = [255u8; 4]
+            .iter()
+            .copied()
+            .cycle()
+            .take(64 * 64 * 4)
+            .collect();
         let tier = gles
             .import_memory(&white, Fourcc::Abgr8888, size, false)
             .expect("import tier");
@@ -11170,8 +11353,7 @@ mod gpu_bench {
                     data[(y * 64 + x) * 4 + 3] = 201;
                 }
             }
-            gles
-                .import_memory(&data, Fourcc::Abgr8888, size, false)
+            gles.import_memory(&data, Fourcc::Abgr8888, size, false)
                 .expect("import mask")
         };
         // Last frame the card sat over columns 16..32; this frame it covers
@@ -11191,11 +11373,22 @@ mod gpu_bench {
                 gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
             {
                 let mut b = gles.bind(&mut target).expect("bind target");
-                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
-                f.clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full).expect("clear red");
+                let mut f = gles
+                    .render(&mut b, phys, Transform::Normal)
+                    .expect("render target");
+                f.clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full)
+                    .expect("clear red");
                 f.with_secondary_textures(&cur, &prev, |f| {
                     f.render_texture_from_to(
-                        &tier, src, dst, &full, &[], Transform::Normal, 1.0, Some(&shader), &unis,
+                        &tier,
+                        src,
+                        dst,
+                        &full,
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                        Some(&shader),
+                        &unis,
                     )
                 })
                 .expect("masked blur draw");
@@ -11237,7 +11430,7 @@ mod gpu_bench {
     ///
     /// Wine/Proton tags a game's scRGB swapchain with the protocol's
     /// pre-defined `windows_scrgb` description and sets the Vulkan colour
-    /// space to PASS_THROUGH, i.e. it hands the pixels over untouched and the
+    /// space to `PASS_THROUGH`, i.e. it hands the pixels over untouched and the
     /// compositor owns the entire conversion. Sending them through the SDR
     /// decode instead applies a gamma curve to linear data and anchors it at
     /// 203 rather than 80 cd/m² — which is what mis-rendered id Tech (DOOM)
@@ -11258,7 +11451,12 @@ mod gpu_bench {
     /// ordinary SDR desktop capture is unaffected.
     #[test]
     #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one GPU round trip: compile, render, read back, assert. The steps share a dozen locals and mean nothing apart"
+    )]
     fn hdr_screenshot_keeps_highlight_separation() {
+        const RW: f32 = 203.0;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -11284,7 +11482,6 @@ mod gpu_bench {
             )
             .expect("compile screenshot tonemap");
 
-        const RW: f32 = 203.0;
         let size = Size::<i32, smithay::utils::Buffer>::from((16, 16));
         let phys = Size::<i32, Physical>::from((16, 16));
         let full = [Rectangle::<i32, Physical>::from_size(phys)];
@@ -11299,24 +11496,24 @@ mod gpu_bench {
                 .expect("fp16 scene");
             {
                 let mut b = gles.bind(&mut scene).expect("bind scene");
-                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render scene");
+                let mut f = gles
+                    .render(&mut b, phys, Transform::Normal)
+                    .expect("render scene");
                 f.clear(
-                    Color32F::new(
-                        nits[0] / 10000.0,
-                        nits[1] / 10000.0,
-                        nits[2] / 10000.0,
-                        1.0,
-                    ),
+                    Color32F::new(nits[0] / 10000.0, nits[1] / 10000.0, nits[2] / 10000.0, 1.0),
                     &full,
                 )
                 .expect("fill scene");
                 let _ = f.finish().expect("finish scene");
             }
-            let mut target: GlesTexture =
-                gles.create_buffer(Fourcc::Abgr8888, size).expect("8-bit target");
+            let mut target: GlesTexture = gles
+                .create_buffer(Fourcc::Abgr8888, size)
+                .expect("8-bit target");
             {
                 let mut b = gles.bind(&mut target).expect("bind target");
-                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
+                let mut f = gles
+                    .render(&mut b, phys, Transform::Normal)
+                    .expect("render target");
                 f.render_texture_from_to(
                     &scene,
                     src,
@@ -11431,13 +11628,17 @@ mod gpu_bench {
     /// pins that the SDR program really does disagree.
     #[test]
     #[ignore = "GPU test; run manually with --ignored --nocapture"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one GPU round trip: compile, render, read back, assert. The steps share a dozen locals and mean nothing apart"
+    )]
     fn scrgb_decodes_as_linear_80_nits() {
         /// Reference PQ OETF (ST.2084), 1.0 == 10000 cd/m².
         fn pq_oetf(l: f64) -> f64 {
-            const M1: f64 = 0.1593017578125;
+            const M1: f64 = 0.159_301_757_812_5;
             const M2: f64 = 78.84375;
-            const C1: f64 = 0.8359375;
-            const C2: f64 = 18.8515625;
+            const C1: f64 = 0.835_937_5;
+            const C2: f64 = 18.851_562_5;
             const C3: f64 = 18.6875;
             let lp = l.max(0.0).powf(M1);
             ((C1 + C2 * lp) / (1.0 + C3 * lp)).powf(M2)
@@ -11489,48 +11690,49 @@ mod gpu_bench {
                     .cycle()
                     .take(64 * 64 * 4)
                     .collect();
-                gles
-                    .import_memory(&data, Fourcc::Abgr8888, size, false)
+                gles.import_memory(&data, Fourcc::Abgr8888, size, false)
                     .expect("import source")
             };
             (mk(255), mk(64))
         };
 
-        let mut run = |tex: &GlesTexture,
-                       shader: &GlesTexProgram,
-                       unis: &[Uniform<'_>]|
-         -> [u8; 4] {
-            let mut target: GlesTexture =
-                gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
-            {
-                let mut b = gles.bind(&mut target).expect("bind target");
-                let mut f = gles.render(&mut b, phys, Transform::Normal).expect("render target");
-                f.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &full).expect("clear");
-                f.render_texture_from_to(
-                    tex,
-                    src,
-                    dst,
-                    &full,
-                    &[],
-                    Transform::Normal,
-                    1.0,
-                    Some(shader),
-                    unis,
-                )
-                .expect("draw");
-                let s = f.finish().expect("finish");
-                drop(b);
-                let _ = s.wait();
-            }
-            let region = Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((64, 64)));
-            let bound = gles.bind(&mut target).expect("rebind");
-            let mapping = gles
-                .copy_framebuffer(&bound, region, Fourcc::Abgr8888)
-                .expect("copy_framebuffer");
-            let bytes = gles.map_texture(&mapping).expect("map").to_vec();
-            let c = (32 * 64 + 32) * 4;
-            [bytes[c], bytes[c + 1], bytes[c + 2], bytes[c + 3]]
-        };
+        let mut run =
+            |tex: &GlesTexture, shader: &GlesTexProgram, unis: &[Uniform<'_>]| -> [u8; 4] {
+                let mut target: GlesTexture =
+                    gles.create_buffer(Fourcc::Abgr8888, size).expect("target");
+                {
+                    let mut b = gles.bind(&mut target).expect("bind target");
+                    let mut f = gles
+                        .render(&mut b, phys, Transform::Normal)
+                        .expect("render target");
+                    f.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &full)
+                        .expect("clear");
+                    f.render_texture_from_to(
+                        tex,
+                        src,
+                        dst,
+                        &full,
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                        Some(shader),
+                        unis,
+                    )
+                    .expect("draw");
+                    let s = f.finish().expect("finish");
+                    drop(b);
+                    let _ = s.wait();
+                }
+                let region =
+                    Rectangle::<i32, smithay::utils::Buffer>::from_size(Size::from((64, 64)));
+                let bound = gles.bind(&mut target).expect("rebind");
+                let mapping = gles
+                    .copy_framebuffer(&bound, region, Fourcc::Abgr8888)
+                    .expect("copy_framebuffer");
+                let bytes = gles.map_texture(&mapping).expect("map").to_vec();
+                let c = (32 * 64 + 32) * 4;
+                [bytes[c], bytes[c + 1], bytes[c + 2], bytes[c + 3]]
+            };
 
         // scRGB 1.0 == 80 cd/m² and 0.25 == 20 cd/m², linearly — so the fused
         // program must emit exactly PQ(value / 125).

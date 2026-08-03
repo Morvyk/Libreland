@@ -106,7 +106,11 @@ pub struct Activation {
 pub fn subscribe_binds(on_event: impl Fn(Activation) + Send + 'static) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path()?)?;
     let mut writer = &stream;
-    writeln!(writer, "{}", json!({ "cmd": "subscribe", "events": ["bind-activated"] }))?;
+    writeln!(
+        writer,
+        "{}",
+        json!({ "cmd": "subscribe", "events": ["bind-activated"] })
+    )?;
     writer.flush()?;
     std::thread::spawn(move || {
         let reader = BufReader::new(&stream);

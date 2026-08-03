@@ -362,8 +362,7 @@ impl ScreenCast {
 async fn output_exists(name: &str) -> bool {
     let name = name.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::capture::Capturer::new()
-            .is_ok_and(|capturer| capturer.index_of(&name).is_some())
+        crate::capture::Capturer::new().is_ok_and(|capturer| capturer.index_of(&name).is_some())
     })
     .await
     .unwrap_or(false)

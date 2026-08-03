@@ -399,8 +399,8 @@ mod server {
     use anyhow::{Context as _, Result};
     use smithay::reexports::calloop::generic::Generic;
     use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
-    use smithay::reexports::wayland_server::Resource as _;
     use smithay::reexports::wayland_server::DisplayHandle;
+    use smithay::reexports::wayland_server::Resource as _;
     use smithay::reexports::wayland_server::backend::ObjectId;
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
     use smithay::utils::IsAlive;
@@ -412,8 +412,8 @@ mod server {
         BindInfo, CursorInfo, Event, EventKind, LayerInfo, OutputInfo, Reply, Request, Response,
         VersionInfo, WindowInfo, WorkspaceInfo, WorkspaceTarget,
     };
-    use crate::layout::{FillMode, Layout, WindowEntry};
     use crate::State;
+    use crate::layout::{FillMode, Layout, WindowEntry};
 
     /// Cap on one subscriber's pending outgoing bytes. A reader this far
     /// behind isn't slow, it's stuck — drop it rather than buffer without
@@ -682,8 +682,8 @@ mod server {
         // EADDRINUSE; clearing it is safe because two compositors can't
         // share one Wayland display name anyway.
         let _ = std::fs::remove_file(path);
-        let listener =
-            UnixListener::bind(path).with_context(|| format!("bind IPC socket {}", path.display()))?;
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("bind IPC socket {}", path.display()))?;
         listener
             .set_nonblocking(true)
             .context("set IPC socket non-blocking")?;
@@ -768,10 +768,9 @@ mod server {
                                         subscriber_id = Some(id);
                                         on_subscribe(state, id, first);
                                     }
-                                    Err(e) => write_reply(
-                                        conn,
-                                        &Err(format!("subscribe failed: {e}")),
-                                    ),
+                                    Err(e) => {
+                                        write_reply(conn, &Err(format!("subscribe failed: {e}")));
+                                    }
                                 }
                             }
                         }
@@ -836,7 +835,9 @@ mod server {
         );
         if first {
             let windows = windows(state);
-            state.ipc.set_baseline(&windows, &workspaces, focus.as_ref());
+            state
+                .ipc
+                .set_baseline(&windows, &workspaces, focus.as_ref());
         }
     }
 
@@ -960,8 +961,7 @@ mod server {
         let png = crate::screenshot::encode_rgba(&rgba, w, h)
             .map_err(|e| format!("png encode failed: {e}"))?;
         let path = capture_path(id);
-        write_atomic(&path, &png)
-            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+        write_atomic(&path, &png).map_err(|e| format!("writing {}: {e}", path.display()))?;
         Ok(Response::WindowCapture {
             path: path.to_string_lossy().into_owned(),
             width: w,
@@ -1237,12 +1237,7 @@ mod server {
     }
 
     /// Add (or replace) an externally-owned bind.
-    fn register_bind(
-        state: &mut State,
-        id: String,
-        trigger: &str,
-        description: String,
-    ) -> Reply {
+    fn register_bind(state: &mut State, id: String, trigger: &str, description: String) -> Reply {
         let Some((mods, keysym)) = crate::keyboard::parse_trigger(trigger) else {
             return Err(format!("cannot parse trigger: {trigger}"));
         };
@@ -1366,7 +1361,11 @@ mod server {
                 let (width, height) =
                     crate::wayland::layer_size(state.layer_output_rect(surface), &cached);
                 LayerInfo {
-                    namespace: state.layer_namespaces.get(surface).cloned().unwrap_or_default(),
+                    namespace: state
+                        .layer_namespaces
+                        .get(surface)
+                        .cloned()
+                        .unwrap_or_default(),
                     layer: match cached.layer {
                         Layer::Background => "background",
                         Layer::Bottom => "bottom",
@@ -1377,10 +1376,7 @@ mod server {
                     output: state.layer_outputs.get(surface).cloned(),
                     width,
                     height,
-                    keyboard: !matches!(
-                        cached.keyboard_interactivity,
-                        KeyboardInteractivity::None
-                    ),
+                    keyboard: !matches!(cached.keyboard_interactivity, KeyboardInteractivity::None),
                     exclusive_zone: cached.exclusive_zone.into(),
                 }
             })
@@ -1550,6 +1546,8 @@ mod server {
         fn slow_subscriber_is_kept() {
             use std::io::Read as _;
 
+            const EVENTS: usize = 2000;
+
             let (writer, mut reader) = UnixStream::pair().expect("socketpair");
             // Match accept_connection: the subscriber write half is
             // nonblocking. Shrink the buffer so it fills quickly.
@@ -1559,7 +1557,6 @@ mod server {
 
             let mut ipc = IpcState::default();
             ipc.add_subscriber(writer, Vec::new());
-            const EVENTS: usize = 2000;
             for _ in 0..EVENTS {
                 ipc.broadcast(&Event::WindowClosed { id: 7 });
             }
@@ -1575,7 +1572,9 @@ mod server {
             let mut received = Vec::new();
             let mut idle_rounds = 0;
             while idle_rounds < 100 {
-                let mut buf = [0u8; 65536];
+                // Heap rather than stack: 64 KiB is past the point where
+                // a local array is polite, and this loops.
+                let mut buf = vec![0u8; 65536];
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -1650,10 +1649,9 @@ mod client {
             match s.to_ascii_lowercase().as_str() {
                 "next" => Ok(Self::Next),
                 "prev" | "previous" => Ok(Self::Prev),
-                _ => s
-                    .parse::<usize>()
-                    .map(Self::Index)
-                    .map_err(|_| format!(r#"expected a workspace index, "next", or "prev", got {s:?}"#)),
+                _ => s.parse::<usize>().map(Self::Index).map_err(|_| {
+                    format!(r#"expected a workspace index, "next", or "prev", got {s:?}"#)
+                }),
             }
         }
     }
@@ -1915,7 +1913,10 @@ mod client {
                 None => println!("focused  (none)"),
             },
             Event::BindActivated { id, pressed } => {
-                println!("bind     {id} {}", if *pressed { "pressed" } else { "released" });
+                println!(
+                    "bind     {id} {}",
+                    if *pressed { "pressed" } else { "released" }
+                );
             }
             Event::WorkspacesChanged { workspaces } => {
                 let active: Vec<String> = workspaces
@@ -1955,9 +1956,7 @@ mod client {
 
         let mut reader = std::io::BufReader::new(stream);
         let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .context("read reply")?;
+        reader.read_line(&mut response).context("read reply")?;
         if response.trim().is_empty() {
             bail!("the compositor closed the connection without replying");
         }
@@ -2000,7 +1999,11 @@ mod client {
                 ),
                 None => println!("{:.0},{:.0} (global) — outside every output", c.x, c.y),
             },
-            Response::WindowCapture { path, width, height } => {
+            Response::WindowCapture {
+                path,
+                width,
+                height,
+            } => {
                 println!("{path} ({width}x{height})");
             }
             Response::WorkspaceCapture {
@@ -2052,7 +2055,10 @@ mod client {
             println!("no workspaces");
             return;
         }
-        println!("{:<10} {:>5}  {:<6} {:>7}", "OUTPUT", "INDEX", "ACTIVE", "WINDOWS");
+        println!(
+            "{:<10} {:>5}  {:<6} {:>7}",
+            "OUTPUT", "INDEX", "ACTIVE", "WINDOWS"
+        );
         for w in workspaces {
             println!(
                 "{:<10} {:>5}  {:<6} {:>7}",
@@ -2111,7 +2117,9 @@ mod client {
             if w.focused {
                 state.push("focused");
             }
-            let ws = w.workspace.map_or_else(|| "-".to_owned(), |n| n.to_string());
+            let ws = w
+                .workspace
+                .map_or_else(|| "-".to_owned(), |n| n.to_string());
             println!(
                 "{:>4}  {:<16} {:<28} {:<9} {:<8} {}",
                 w.id,
@@ -2175,10 +2183,7 @@ mod tests {
             Request::FocusedWindow,
             Request::Binds,
             Request::Cursor,
-            Request::FocusWindow {
-                id: 7,
-                warp: false,
-            },
+            Request::FocusWindow { id: 7, warp: false },
             Request::FocusWindow { id: 7, warp: true },
             Request::WarpCursor { id: 7 },
         ] {
@@ -2195,13 +2200,7 @@ mod tests {
     #[test]
     fn focus_window_warp_defaults_off() {
         let req: Request = serde_json::from_str(r#"{"cmd":"focus-window","id":3}"#).unwrap();
-        assert!(matches!(
-            req,
-            Request::FocusWindow {
-                id: 3,
-                warp: false
-            }
-        ));
+        assert!(matches!(req, Request::FocusWindow { id: 3, warp: false }));
     }
 
     #[test]

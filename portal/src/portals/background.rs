@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
-use zbus::interface;
 
 use super::{PortalResult, SUCCESS, ov};
 

@@ -393,11 +393,7 @@ fn unescape(s: &str) -> String {
 /// Loop helper runs until success or the user gives up. PAM's own retry budget
 /// governs a single run; on FAILURE we surface it and offer another attempt,
 /// matching how polkit-gnome/mate behave.
-async fn converse(
-    session: &mut Session,
-    username: &str,
-    cookie: &str,
-) -> anyhow::Result<Outcome> {
+async fn converse(session: &mut Session, username: &str, cookie: &str) -> anyhow::Result<Outcome> {
     loop {
         match run_helper_session(session, username, cookie).await? {
             Outcome::Success => return Ok(Outcome::Success),
@@ -539,9 +535,7 @@ impl AuthAgent {
 
         let Some(username) = pick_username(&identities, shared.our_uid) else {
             tracing::warn!(action = %action_id, "no unix-user identity offered; cannot authenticate");
-            return Err(PolkitError::Failed(
-                "no unix-user identity offered".into(),
-            ));
+            return Err(PolkitError::Failed("no unix-user identity offered".into()));
         };
 
         let id = shared.counter.fetch_add(1, Ordering::Relaxed);
@@ -683,7 +677,10 @@ fn uid_to_username(uid: u32) -> Option<String> {
 /// {"session-id": <id>})`, matching `(sa{sv})`.
 fn build_subject(session_id: &str) -> (String, HashMap<String, Value<'static>>) {
     let mut details = HashMap::new();
-    details.insert("session-id".to_string(), Value::from(session_id.to_string()));
+    details.insert(
+        "session-id".to_string(),
+        Value::from(session_id.to_string()),
+    );
     ("unix-session".to_string(), details)
 }
 

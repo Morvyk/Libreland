@@ -246,7 +246,10 @@ pub struct WaylandInit {
     /// VK and D3D-translated titles with the layer disabled, so the layer
     /// was removed. If a present-timing SIGSEGV ever returns, that layer
     /// (git history: contrib/no-present-timing-layer) is the known shield.
-    #[allow(dead_code, reason = "held so the wp_fifo global stays alive; dispatch routes through it")]
+    #[allow(
+        dead_code,
+        reason = "held so the wp_fifo global stays alive; dispatch routes through it"
+    )]
     pub fifo_manager_state: Option<smithay::wayland::fifo::FifoManagerState>,
     /// `xwayland_shell_v1` — the protocol Xwayland uses to associate its
     /// `wl_surface`s with X11 windows (see `src/xwayland.rs`). Held so
@@ -289,7 +292,10 @@ pub struct WaylandInit {
     /// their surfaces; the renderer honours the committed region as an
     /// opt-in equivalent to `blur.windows`/`blur.layers` (config
     /// `blur.enabled`/`passes` still gate the pyramid).
-    #[allow(dead_code, reason = "held so the ext-background-effect global stays alive")]
+    #[allow(
+        dead_code,
+        reason = "held so the ext-background-effect global stays alive"
+    )]
     pub background_effect_state: smithay::wayland::background_effect::BackgroundEffectState,
     /// `ext-output-image-capture-source-manager-v1` — moved into
     /// [`crate::State`] (its handler needs `&mut` access).
@@ -520,8 +526,7 @@ pub fn init(
     // wp_content_type_v1: clients tag a surface's content type (game / video /
     // photo). Advertised now so clients can hint; read from cached state when
     // we drive per-content behaviour (e.g. future tearing / scanout choices).
-    let content_type_state =
-        smithay::wayland::content_type::ContentTypeState::new::<State>(&dh);
+    let content_type_state = smithay::wayland::content_type::ContentTypeState::new::<State>(&dh);
     // wp_presentation: feeds clients accurate per-frame presentation timing
     // (the real vblank timestamp + sequence). Advertise CLOCK_MONOTONIC (1) —
     // the clock our DRM page-flip timestamps and feedback use.
@@ -733,9 +738,8 @@ pub(crate) fn build_scanout_feedback(
 /// that one frame tears, versus the normal eventfd path which only stalls the
 /// single surface.
 fn acquire_wait_deadline() -> i64 {
-    let now = std::time::Duration::from(
-        smithay::utils::Clock::<smithay::utils::Monotonic>::new().now(),
-    );
+    let now =
+        std::time::Duration::from(smithay::utils::Clock::<smithay::utils::Monotonic>::new().now());
     i64::try_from(now.as_nanos().saturating_add(1_000_000_000)).unwrap_or(i64::MAX)
 }
 
@@ -788,25 +792,24 @@ impl CompositorHandler for State {
                 // back to a bounded CPU wait so the commit is NEVER left
                 // un-gated — correctness (no half-rendered buffer reaches the
                 // screen) over the rare stall.
-                let blocker_source =
-                    smithay::wayland::compositor::with_states(surface, |states| {
-                        let mut cached = states
-                            .cached_state
-                            .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>();
-                        let acquire = cached.pending().acquire_point.as_ref()?;
-                        // Already signalled (fast GPU / reused fence): no wait.
-                        if acquire.is_signaled() {
-                            return None;
+                let blocker_source = smithay::wayland::compositor::with_states(surface, |states| {
+                    let mut cached = states
+                        .cached_state
+                        .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>();
+                    let acquire = cached.pending().acquire_point.as_ref()?;
+                    // Already signalled (fast GPU / reused fence): no wait.
+                    if acquire.is_signaled() {
+                        return None;
+                    }
+                    match acquire.generate_blocker() {
+                        Ok(blocker_source) => Some(blocker_source),
+                        Err(err) => {
+                            warn!(error = %err, "explicit sync: acquire blocker unavailable; CPU-waiting on fence");
+                            let _ = acquire.wait(acquire_wait_deadline());
+                            None
                         }
-                        match acquire.generate_blocker() {
-                            Ok(blocker_source) => Some(blocker_source),
-                            Err(err) => {
-                                warn!(error = %err, "explicit sync: acquire blocker unavailable; CPU-waiting on fence");
-                                let _ = acquire.wait(acquire_wait_deadline());
-                                None
-                            }
-                        }
-                    });
+                    }
+                });
                 let Some((blocker, source)) = blocker_source else {
                     return;
                 };
@@ -841,7 +844,8 @@ impl CompositorHandler for State {
                     smithay::wayland::compositor::with_states(surface, |states| {
                         let mut cached = states
                             .cached_state
-                            .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>();
+                            .get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>(
+                        );
                         if let Some(acquire) = cached.pending().acquire_point.as_ref() {
                             let _ = acquire.wait(acquire_wait_deadline());
                         }
@@ -882,10 +886,9 @@ impl CompositorHandler for State {
             let root = crate::root_surface(surface);
             if root_offscreen(self, &root) {
                 let now = std::time::Instant::now();
-                let due = self
-                    .offscreen_frame_ts
-                    .get(&root.id())
-                    .is_none_or(|last| now.duration_since(*last) >= std::time::Duration::from_millis(3));
+                let due = self.offscreen_frame_ts.get(&root.id()).is_none_or(|last| {
+                    now.duration_since(*last) >= std::time::Duration::from_millis(3)
+                });
                 if due {
                     if self.offscreen_frame_ts.insert(root.id(), now).is_none() {
                         debug!(root = ?root.id(), "offscreen heartbeat engaged (out-of-scene surface committing)");
@@ -975,10 +978,9 @@ impl CompositorHandler for State {
                 .flatten()
             });
             if let Some(size) = committed
-                && self.layout.reconcile_floating_size(
-                    surface,
-                    smithay::utils::Size::from((size.w, size.h)),
-                )
+                && self
+                    .layout
+                    .reconcile_floating_size(surface, smithay::utils::Size::from((size.w, size.h)))
             {
                 debug!(
                     surface = ?surface.id(),
@@ -1031,7 +1033,9 @@ impl CompositorHandler for State {
         self.fifo_barrier_watch.remove(&surface.id());
         // Same for the sticky scanout-feedback record, the tearing hint and
         // the direct-scanout marker.
-        self.scanout_feedback_given.borrow_mut().remove(&surface.id());
+        self.scanout_feedback_given
+            .borrow_mut()
+            .remove(&surface.id());
         self.renderer.forget_surface_scanout_state(&surface.id());
         self.tearing_controls.retain(|s| s != surface);
         // Color-management records are otherwise only removed by explicit
@@ -1073,9 +1077,10 @@ fn discard_hidden_presentation_feedback(state: &mut State, surface: &WlSurface) 
     // presented, so release its fifo barrier here or its next frame hangs.
     signal_hidden_fifo_barrier(&root);
     smithay::wayland::compositor::with_states(surface, |states| {
-        if let Some(mut feedback) =
-            SurfacePresentationFeedback::from_states(states, wp_presentation_feedback::Kind::empty())
-        {
+        if let Some(mut feedback) = SurfacePresentationFeedback::from_states(
+            states,
+            wp_presentation_feedback::Kind::empty(),
+        ) {
             feedback.discarded();
         }
     });
@@ -1173,7 +1178,9 @@ pub(crate) fn signal_fifo_barriers(state: &mut State, roots: &[WlSurface]) {
         // blocker bookkeeping lives elsewhere), matching the explicit-sync
         // blocker path.
         if compositor_client_state(&client).is_some() {
-            state.client_compositor_state(&client).blocker_cleared(state, &dh);
+            state
+                .client_compositor_state(&client)
+                .blocker_cleared(state, &dh);
         }
     }
 }
@@ -1277,7 +1284,9 @@ pub(crate) fn fifo_fallback_tick(state: &mut State) {
     let dh = state.display_handle.clone();
     for client in clients {
         if compositor_client_state(&client).is_some() {
-            state.client_compositor_state(&client).blocker_cleared(state, &dh);
+            state
+                .client_compositor_state(&client)
+                .blocker_cleared(state, &dh);
         }
     }
 }
@@ -1353,7 +1362,9 @@ fn maybe_handle_layer_commit(state: &mut State, surface: &WlSurface) {
         .find(|l| l.wl_surface() == surface)
     {
         let (w, h) = layer_size(state.layer_output_rect(surface), &cached);
-        let new_size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from((w, h)));
+        let new_size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from(
+            (w, h),
+        ));
         let changed = layer.with_pending_state(|st| {
             if st.size == new_size {
                 false
@@ -1633,8 +1644,7 @@ impl smithay::wayland::pointer_warp::PointerWarpHandler for State {
                 constraint.is_some_and(|c| c.is_active())
             })
         });
-        if self.drag.is_some() || self.screenshot.is_some() || pointer.is_grabbed() || constrained
-        {
+        if self.drag.is_some() || self.screenshot.is_some() || pointer.is_grabbed() || constrained {
             return;
         }
         if pointer.current_focus().as_ref() != Some(&surface) {
@@ -1763,8 +1773,10 @@ impl XdgShellHandler for State {
         )]
         let cursor =
             smithay::utils::Point::<i32, smithay::utils::Physical>::from((cx as i32, cy as i32));
-        self.layout
-            .insert(crate::layout::WindowSurface::Xdg(surface.clone()), Some(cursor));
+        self.layout.insert(
+            crate::layout::WindowSurface::Xdg(surface.clone()),
+            Some(cursor),
+        );
         // Play the open (fade + scale-in) animation the first frame this
         // toplevel is drawn.
         self.renderer.mark_open(surface.wl_surface());
@@ -2218,7 +2230,6 @@ impl DmabufHandler for State {
     }
 }
 
-
 // KDE server-side decoration. We force Server for every decoration
 // object regardless of what the client asks for — Libreland is a
 // tiler and draws no decorations, so "server-side" here means "no
@@ -2274,7 +2285,8 @@ impl WlrLayerShellHandler for State {
         let output_name =
             output.and_then(|wl| smithay::output::Output::from_resource(&wl).map(|o| o.name()));
         if let Some(name) = output_name.clone() {
-            self.layer_outputs.insert(surface.wl_surface().clone(), name);
+            self.layer_outputs
+                .insert(surface.wl_surface().clone(), name);
         }
         self.layer_namespaces
             .insert(surface.wl_surface().clone(), namespace.clone());
@@ -2319,7 +2331,11 @@ impl WlrLayerShellHandler for State {
             // surface is still alive, so we never focus a dead surface.
             let restore = self
                 .first_exclusive_layer_surface(surface.wl_surface())
-                .or_else(|| self.kbd_focus_before_layer.take().filter(Resource::is_alive));
+                .or_else(|| {
+                    self.kbd_focus_before_layer
+                        .take()
+                        .filter(Resource::is_alive)
+                });
             kbd.set_focus(self, restore, SERIAL_COUNTER.next_serial());
         }
         self.recompute_layer_layout();
@@ -2404,9 +2420,7 @@ impl FractionalScaleHandler for State {
 smithay::delegate_dispatch2!(State);
 
 impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
-    fn drm_syncobj_state(
-        &mut self,
-    ) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
+    fn drm_syncobj_state(&mut self) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
         self.drm_syncobj_state.as_mut()
     }
 }

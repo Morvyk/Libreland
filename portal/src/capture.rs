@@ -31,9 +31,7 @@ use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use wayland_client::protocol::{
-    wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool,
-};
+use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
@@ -406,7 +404,12 @@ impl Capturer {
             (modifier & 0xFFFF_FFFF) as u32,
         );
         self.state.params_buffer = ImportState::Pending;
-        params.create(width, height, fourcc, zwp_linux_buffer_params_v1::Flags::empty());
+        params.create(
+            width,
+            height,
+            fourcc,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(self.state.params_buffer, ImportState::Pending) {
             if Instant::now() > deadline {
@@ -425,8 +428,6 @@ impl Capturer {
     pub fn shm_pool(&mut self, len: usize) -> anyhow::Result<ShmPool> {
         ShmPool::new(self, len)
     }
-
-
 }
 
 /// Convert a captured buffer to BGRA in place.
@@ -663,7 +664,11 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
             zwlr_screencopy_frame_v1::Event::Flags { flags } => {
                 if matches!(flags, WEnum::Value(f) if f.contains(zwlr_screencopy_frame_v1::Flags::YInvert))
                 {
-                    state.frame.ready.get_or_insert_with(CaptureMeta::default).y_invert = true;
+                    state
+                        .frame
+                        .ready
+                        .get_or_insert_with(CaptureMeta::default)
+                        .y_invert = true;
                 }
             }
             zwlr_screencopy_frame_v1::Event::Ready {

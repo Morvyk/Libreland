@@ -58,7 +58,10 @@ pub fn parse_toggles(options: &HashMap<String, OwnedValue>) -> Vec<Toggle> {
             let initial = match fields.get(3) {
                 Some(Value::Str(s)) if !s.is_empty() => s.to_string(),
                 _ if options.is_empty() => "false".to_string(),
-                _ => options.first().map(|(id, _)| id.clone()).unwrap_or_default(),
+                _ => options
+                    .first()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_default(),
             };
             Some(Toggle {
                 id: id.to_string(),

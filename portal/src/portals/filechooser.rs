@@ -16,8 +16,8 @@ use crate::ui;
 use crate::ui::filechooser::{Choice, FileChooser as Dialog, Filter, Kind, Outcome, Spec};
 
 use super::{
-    CANCELLED, FAILED, PortalResult, SUCCESS, empty, opt_bool, opt_bytes, opt_str, ov,
-    path_to_uri, with_request,
+    CANCELLED, FAILED, PortalResult, SUCCESS, empty, opt_bool, opt_bytes, opt_str, ov, path_to_uri,
+    with_request,
 };
 
 pub struct FileChooser;
@@ -98,7 +98,10 @@ fn parse_choices(options: &HashMap<String, OwnedValue>) -> Vec<Choice> {
             } else if options.is_empty() {
                 "false".to_string()
             } else {
-                options.first().map(|(id, _)| id.clone()).unwrap_or_default()
+                options
+                    .first()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_default()
             };
             Some(Choice {
                 id: id.to_string(),

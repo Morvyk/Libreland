@@ -18,9 +18,7 @@ use zbus::{Connection, interface};
 use crate::ui;
 use crate::ui::prompt::{Prompt, Spec};
 
-use super::{
-    CANCELLED, FAILED, PortalResult, SUCCESS, empty, opt_bool, opt_str, ov, with_request,
-};
+use super::{CANCELLED, FAILED, PortalResult, SUCCESS, empty, opt_bool, opt_str, ov, with_request};
 
 /// Launcher types the spec defines, as a bitmask for the property.
 const TYPE_APPLICATION: u32 = 1;

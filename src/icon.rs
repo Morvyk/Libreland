@@ -86,9 +86,7 @@ pub fn lookup(app_id: &str, want: u32) -> Option<PathBuf> {
                 (1, want - s)
             }
         };
-        let better = best
-            .as_ref()
-            .is_none_or(|(bs, _)| rank(size) < rank(*bs));
+        let better = best.as_ref().is_none_or(|(bs, _)| rank(size) < rank(*bs));
         if better {
             best = Some((size, path));
         }
@@ -220,10 +218,14 @@ pub fn resize(icon: &Icon, size: u32) -> Icon {
     for y in 0..size {
         // Source rows this destination row averages over.
         let y0 = y * icon.height / size;
-        let y1 = (((y + 1) * icon.height).div_ceil(size)).max(y0 + 1).min(icon.height);
+        let y1 = (((y + 1) * icon.height).div_ceil(size))
+            .max(y0 + 1)
+            .min(icon.height);
         for x in 0..size {
             let x0 = x * icon.width / size;
-            let x1 = (((x + 1) * icon.width).div_ceil(size)).max(x0 + 1).min(icon.width);
+            let x1 = (((x + 1) * icon.width).div_ceil(size))
+                .max(x0 + 1)
+                .min(icon.width);
             let mut acc = [0f32; 4];
             let mut n = 0f32;
             for sy in y0..y1 {

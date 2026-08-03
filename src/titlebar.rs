@@ -286,17 +286,33 @@ pub struct BarState {
 /// draws its background and buttons, because a window you can close and
 /// drag without a readable title beats no decoration at all.
 #[must_use]
-pub fn rasterize(
-    fonts: Option<&Fonts>,
-    width: i32,
-    height: i32,
-    title: &str,
-    style: BarStyle,
-    buttons: &[TitlebarButton],
-    font_px: f32,
-    state: BarState,
-    icon: Option<&crate::icon::Icon>,
-) -> Vec<u8> {
+/// Everything one titlebar needs to be drawn. A struct rather than nine
+/// arguments because that is what it is: a single description of one
+/// bar, and every caller has all of it or none of it.
+pub struct BarSpec<'a> {
+    pub fonts: Option<&'a Fonts>,
+    pub width: i32,
+    pub height: i32,
+    pub title: &'a str,
+    pub style: BarStyle,
+    pub buttons: &'a [TitlebarButton],
+    pub font_px: f32,
+    pub state: BarState,
+    pub icon: Option<&'a crate::icon::Icon>,
+}
+
+pub fn rasterize(spec: &BarSpec<'_>) -> Vec<u8> {
+    let &BarSpec {
+        fonts,
+        width,
+        height,
+        title,
+        style,
+        buttons,
+        font_px,
+        state,
+        icon,
+    } = spec;
     let (cols, rows) = (width.max(1) as usize, height.max(1) as usize);
     let mut buf = fill_background(cols, rows, style);
     let layout = bar_layout(width, height, buttons);
@@ -374,7 +390,18 @@ pub fn rasterize(
 
     // --- buttons -----------------------------------------------------
     for (kind, rect) in &layout.buttons {
-        draw_glyph(&mut buf, cols, rows, *kind, *rect, height, fg, state);
+        draw_glyph(
+            &mut Canvas {
+                buf: &mut buf,
+                stride: cols,
+                rows,
+            },
+            *kind,
+            *rect,
+            height,
+            fg,
+            state,
+        );
     }
     buf
 }
@@ -475,16 +502,25 @@ fn dist_to_segment(point: (f32, f32), from: (f32, f32), to: (f32, f32)) -> f32 {
 /// Every glyph is a set of line segments, so one rasterizer covers all
 /// three: minimize is one segment, close is two crossed ones, and
 /// maximize is a four-segment outline.
-fn draw_glyph(
-    buf: &mut [u8],
+/// A mutable RGBA surface: the pixels and the two numbers needed to
+/// index them. Passed as one thing because they are only ever meaningful
+/// together — a stride without its buffer indexes nothing.
+struct Canvas<'a> {
+    buf: &'a mut [u8],
     stride: usize,
     rows: usize,
+}
+
+fn draw_glyph(
+    canvas: &mut Canvas<'_>,
     kind: TitlebarButton,
     rect: Rectangle<i32, Physical>,
     bar_h: i32,
     colour: [f32; 3],
     state: BarState,
 ) {
+    let Canvas { buf, stride, rows } = canvas;
+    let (stride, rows) = (*stride, *rows);
     let extent = (bar_h as f32 * GLYPH).max(4.0);
     let mid_x = rect.loc.x as f32 + rect.size.w as f32 / 2.0;
     let mid_y = rect.loc.y as f32 + rect.size.h as f32 / 2.0;
@@ -506,8 +542,14 @@ fn draw_glyph(
         TitlebarButton::Maximize if state.maximized => vec![
             ((left, mid_y), (mid_x, chev_bottom)),
             ((mid_x, chev_bottom), (right, mid_y)),
-            ((left, chev_top - extent * 0.10), (mid_x, mid_y - extent * 0.10)),
-            ((mid_x, mid_y - extent * 0.10), (right, chev_top - extent * 0.10)),
+            (
+                (left, chev_top - extent * 0.10),
+                (mid_x, mid_y - extent * 0.10),
+            ),
+            (
+                (mid_x, mid_y - extent * 0.10),
+                (right, chev_top - extent * 0.10),
+            ),
         ],
         TitlebarButton::Maximize => vec![
             ((left, chev_bottom), (mid_x, chev_top)),
@@ -554,8 +596,8 @@ fn draw_glyph(
 #[cfg(test)]
 mod tests {
     use super::{
-        BarState, BarStyle, Deco, EdgeX, EdgeY, Point, Rectangle, Region, Size, TitlebarButton,
-        bar_layout, rasterize, region_at,
+        BarSpec, BarState, BarStyle, Deco, EdgeX, EdgeY, Point, Rectangle, Region, Size,
+        TitlebarButton, bar_layout, rasterize, region_at,
     };
 
     /// A 2 px border with a 28 px bar — the shipped default.
@@ -566,6 +608,27 @@ mod tests {
 
     /// A window at (100, 100), 300x400 — offset so a bug that assumes a
     /// zero origin shows up.
+    /// A bar spec with the test defaults filled in — every test varies
+    /// one or two of these and would otherwise repeat the other seven.
+    fn spec<'a>(
+        width: i32,
+        height: i32,
+        title: &'a str,
+        buttons: &'a [TitlebarButton],
+    ) -> BarSpec<'a> {
+        BarSpec {
+            fonts: None,
+            width,
+            height,
+            title,
+            style: style(),
+            buttons,
+            font_px: 13.0,
+            state: BarState::default(),
+            icon: None,
+        }
+    }
+
     fn cell() -> Rectangle<i32, super::Physical> {
         Rectangle::new(Point::from((100, 100)), Size::from((300, 400)))
     }
@@ -653,7 +716,7 @@ mod tests {
         for (w, h) in [(0, 0), (1, 1), (10, 0), (0, 28)] {
             let bar = bar_layout(w, h, ALL);
             assert!(bar.title.size.w >= 0 && bar.title.size.h >= 0);
-            let px = rasterize(None, w, h, "x", style(), ALL, 13.0, BarState::default(), None);
+            let px = rasterize(&spec(w, h, "x", ALL));
             assert_eq!(px.len(), (w.max(1) as usize) * (h.max(1) as usize) * 4);
         }
     }
@@ -679,7 +742,7 @@ mod tests {
     /// any hole would show the stretched top edge of that surface.
     #[test]
     fn the_rasterized_bar_is_fully_opaque() {
-        let px = rasterize(None, 200, 28, "title", style(), ALL, 13.0, BarState::default(), None);
+        let px = rasterize(&spec(200, 28, "title", ALL));
         assert!(px.chunks_exact(4).all(|p| p[3] == 255));
     }
 
@@ -687,8 +750,8 @@ mod tests {
     /// would otherwise look like a correctly drawn flat bar.
     #[test]
     fn button_glyphs_are_drawn() {
-        let bare = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default(), None);
-        let with = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default(), None);
+        let bare = rasterize(&spec(200, 28, "", &[]));
+        let with = rasterize(&spec(200, 28, "", ALL));
         assert_ne!(bare, with, "buttons left no marks");
     }
 
@@ -809,18 +872,8 @@ mod tests {
     /// and bottom rows.
     #[test]
     fn the_maximize_glyph_is_a_chevron_not_a_box() {
-        let bg = rasterize(None, 200, 28, "", style(), &[], 13.0, BarState::default(), None);
-        let with = rasterize(
-            None,
-            200,
-            28,
-            "",
-            style(),
-            &[TitlebarButton::Maximize],
-            13.0,
-            BarState::default(),
-            None,
-        );
+        let bg = rasterize(&spec(200, 28, "", &[]));
+        let with = rasterize(&spec(200, 28, "", &[TitlebarButton::Maximize]));
         // Rows where the glyph differs from the plain bar, and how wide
         // that difference is on each.
         let widths: Vec<usize> = (0..28)
@@ -850,20 +903,13 @@ mod tests {
     #[test]
     fn restore_draws_differently_from_maximize() {
         let one = |maximized| {
-            rasterize(
-                None,
-                200,
-                28,
-                "",
-                style(),
-                &[TitlebarButton::Maximize],
-                13.0,
-                BarState {
+            rasterize(&BarSpec {
+                state: BarState {
                     hovered: None,
                     maximized,
                 },
-                None,
-            )
+                ..spec(200, 28, "", &[TitlebarButton::Maximize])
+            })
         };
         assert_ne!(one(false), one(true));
     }
@@ -872,22 +918,15 @@ mod tests {
     /// different from the others — it is the destructive one.
     #[test]
     fn hover_marks_the_button_and_close_is_special() {
-        let plain = rasterize(None, 200, 28, "", style(), ALL, 13.0, BarState::default(), None);
+        let plain = rasterize(&spec(200, 28, "", ALL));
         let on = |kind| {
-            rasterize(
-                None,
-                200,
-                28,
-                "",
-                style(),
-                ALL,
-                13.0,
-                BarState {
+            rasterize(&BarSpec {
+                state: BarState {
                     hovered: Some(kind),
                     maximized: false,
                 },
-                None,
-            )
+                ..spec(200, 28, "", ALL)
+            })
         };
         assert_ne!(plain, on(TitlebarButton::Close), "close hover invisible");
         assert_ne!(plain, on(TitlebarButton::Minimize), "hover invisible");

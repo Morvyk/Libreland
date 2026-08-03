@@ -107,18 +107,30 @@ pub struct Mods {
 /// One input event, in **logical** surface coordinates.
 #[derive(Clone, Debug)]
 pub enum Input {
-    Motion { x: f64, y: f64 },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     /// A press of any button. Dialogs treat every button alike, so which one
     /// it was isn't carried.
-    Press { x: f64, y: f64, mods: Mods },
+    Press {
+        x: f64,
+        y: f64,
+        mods: Mods,
+    },
     /// Button release. Position isn't carried: nothing in these dialogs
     /// acts on where a release landed, only on where the press did.
     Release,
     /// Wheel/touchpad scroll. Positive `dy` scrolls content down.
-    Scroll { dy: f64 },
+    Scroll {
+        dy: f64,
+    },
     /// The pointer left the surface — drop any hover highlight.
     Leave,
-    Key { key: Key, mods: Mods },
+    Key {
+        key: Key,
+        mods: Mods,
+    },
 }
 
 /// What the runtime should do after handing a screen an event.
@@ -201,9 +213,7 @@ static FONTS: OnceLock<Option<Arc<Fonts>>> = OnceLock::new();
 /// Load (once) the UI faces shared by every dialog. `None` when the system has
 /// no usable font — callers still draw, just without labels.
 pub fn fonts() -> Option<Arc<Fonts>> {
-    FONTS
-        .get_or_init(|| Fonts::load().map(Arc::new))
-        .clone()
+    FONTS.get_or_init(|| Fonts::load().map(Arc::new)).clone()
 }
 
 /// Build the drawing context, picking the palette from the appearance the
@@ -504,14 +514,12 @@ impl<S: Screen + 'static> WindowHandler for App<S> {
         let surf = &mut self.surfaces[idx];
         // A zero dimension means "you decide" — which, for a dialog we pinned
         // to a fixed size, is always our preferred size.
-        surf.width = configure
-            .new_size
-            .0
-            .map_or(preferred.0, |w| i32::try_from(w.get()).unwrap_or(preferred.0));
-        surf.height = configure
-            .new_size
-            .1
-            .map_or(preferred.1, |h| i32::try_from(h.get()).unwrap_or(preferred.1));
+        surf.width = configure.new_size.0.map_or(preferred.0, |w| {
+            i32::try_from(w.get()).unwrap_or(preferred.0)
+        });
+        surf.height = configure.new_size.1.map_or(preferred.1, |h| {
+            i32::try_from(h.get()).unwrap_or(preferred.1)
+        });
         surf.configured = true;
         surf.dirty = true;
     }
@@ -806,13 +814,13 @@ pub fn run<S: Screen + 'static>(mode: Mode, screen: S, cancel: &Cancel) -> anyho
     let ctx = ctx().ok_or_else(|| {
         anyhow::anyhow!("no usable font found — install a TTF/OTF font (e.g. ttf-dejavu)")
     })?;
-    let conn = Connection::connect_to_env()
-        .map_err(|e| anyhow::anyhow!("no Wayland display: {e}"))?;
+    let conn =
+        Connection::connect_to_env().map_err(|e| anyhow::anyhow!("no Wayland display: {e}"))?;
     let (globals, mut queue) = registry_queue_init(&conn)?;
     let qh = queue.handle();
 
-    let compositor = CompositorState::bind(&globals, &qh)
-        .map_err(|e| anyhow::anyhow!("wl_compositor: {e}"))?;
+    let compositor =
+        CompositorState::bind(&globals, &qh).map_err(|e| anyhow::anyhow!("wl_compositor: {e}"))?;
     let shm = Shm::bind(&globals, &qh).map_err(|e| anyhow::anyhow!("wl_shm: {e}"))?;
     let pool = SlotPool::new(1024 * 1024, &shm)?;
     let xdg = XdgShell::bind(&globals, &qh).ok();

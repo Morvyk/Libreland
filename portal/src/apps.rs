@@ -57,7 +57,13 @@ fn locales() -> Vec<String> {
         .find_map(|var| std::env::var(var).ok())
         .unwrap_or_default();
     // "de_DE.UTF-8@euro" -> ["de_DE", "de"]
-    let base = raw.split('.').next().unwrap_or("").split('@').next().unwrap_or("");
+    let base = raw
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("");
     let mut out = Vec::new();
     if !base.is_empty() && base != "C" && base != "POSIX" {
         out.push(base.to_string());
@@ -344,7 +350,9 @@ pub fn default_handler(mime: &str) -> Option<DesktopApp> {
         }
     }
     // No explicit default: fall back to anything that claims the type.
-    scan().into_iter().find(|a| a.mime_types.iter().any(|m| m == mime))
+    scan()
+        .into_iter()
+        .find(|a| a.mime_types.iter().any(|m| m == mime))
 }
 
 #[cfg(test)]

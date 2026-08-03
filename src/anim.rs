@@ -278,6 +278,13 @@ pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
 }
 
 #[cfg(test)]
+// These tests assert exact arithmetic identities — a clamp returning
+// *exactly* 0.0, a linear curve at its endpoints, `lerp` at t=0 and t=1.
+// Every value involved is exactly representable, and comparing with an
+// epsilon instead would weaken the tests to the point of uselessness: a
+// clamp that came back 1e-9 short is precisely the bug they exist to
+// catch, and a tolerance would wave it through.
+#[allow(clippy::float_cmp, reason = "the exactness is the assertion")]
 mod tests {
     use super::*;
 
@@ -314,10 +321,10 @@ mod tests {
         };
         // zeta = damping / (2*sqrt(100)) = damping/20
         for (name, c) in [
-            ("underdamped", spring(4.0)),   // zeta 0.2
-            ("critical", spring(20.0)),     // zeta 1.0
-            ("overdamped", spring(60.0)),   // zeta 3.0
-            ("undamped-ish", spring(0.0)),  // zeta 0, clamped internally
+            ("underdamped", spring(4.0)),  // zeta 0.2
+            ("critical", spring(20.0)),    // zeta 1.0
+            ("overdamped", spring(60.0)),  // zeta 3.0
+            ("undamped-ish", spring(0.0)), // zeta 0, clamped internally
             ("absurdly overdamped", spring(100_000.0)),
         ] {
             assert!((c.eval(0.0)).abs() < 1e-9, "{name}: must start at 0");

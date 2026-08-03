@@ -160,7 +160,9 @@ impl Screen for OutputPicker {
                     } else {
                         None
                     });
-                    self.chosen = index.and_then(|i| self.outputs.get(i)).map(|o| o.name.clone());
+                    self.chosen = index
+                        .and_then(|i| self.outputs.get(i))
+                        .map(|o| o.name.clone());
                     if self.chosen.is_some() {
                         Flow::Done
                     } else {

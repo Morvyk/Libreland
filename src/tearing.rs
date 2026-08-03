@@ -41,8 +41,7 @@ pub struct TearingControlState {
 
 impl TearingControlState {
     pub fn new(dh: &DisplayHandle) -> Self {
-        let global =
-            dh.create_global::<State, WpTearingControlManagerV1, ()>(MANAGER_VERSION, ());
+        let global = dh.create_global::<State, WpTearingControlManagerV1, ()>(MANAGER_VERSION, ());
         Self { global }
     }
 }

@@ -110,9 +110,14 @@ pub fn open_display(
         // A connector that finds no mode or no free CRTC is skipped
         // (Ok(None)); a surface-creation failure aborts the launch (the
         // `?`), matching the original strictness for startup.
-        if let Some(output) =
-            build_output(&mut device, &conn_info, conn_handle, &resources, monitors, &used_crtcs)?
-        {
+        if let Some(output) = build_output(
+            &mut device,
+            &conn_info,
+            conn_handle,
+            &resources,
+            monitors,
+            &used_crtcs,
+        )? {
             used_crtcs.insert(output.crtc);
             outputs.push(output);
         }
@@ -172,7 +177,11 @@ pub fn rescan_connectors(
         let conn_info = match device.get_connector(conn_handle, false) {
             Ok(info) => info,
             Err(err) => {
-                warn!(?err, ?conn_handle, "failed to query connector on rescan — skipping");
+                warn!(
+                    ?err,
+                    ?conn_handle,
+                    "failed to query connector on rescan — skipping"
+                );
                 continue;
             }
         };

@@ -99,7 +99,11 @@ impl Default for Hsv {
     /// Red, which is what an annotation wants nine times in ten. Value
     /// just under 1.0: pure #ff0000 reads as harsh against a screenshot.
     fn default() -> Self {
-        Self { h: 0.0, s: 0.85, v: 0.95 }
+        Self {
+            h: 0.0,
+            s: 0.85,
+            v: 0.95,
+        }
     }
 }
 
@@ -178,10 +182,10 @@ pub(crate) fn picker_layout(
         // Neither fits: sit inside the bottom edge rather than off it.
         (bounds.loc.y + bounds.size.h - h).max(bounds.loc.y)
     };
-    let x = bar
-        .loc
-        .x
-        .clamp(bounds.loc.x, (bounds.loc.x + bounds.size.w - w).max(bounds.loc.x));
+    let x = bar.loc.x.clamp(
+        bounds.loc.x,
+        (bounds.loc.x + bounds.size.w - w).max(bounds.loc.x),
+    );
     let panel = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
     let plane = Rectangle::new(
         Point::from((x + PICKER_PAD, y + PICKER_PAD)),
@@ -401,10 +405,7 @@ pub(crate) fn toolbar_layout(
         (bounds.loc.x + bounds.size.w - bar_w).max(bounds.loc.x),
     );
 
-    let bar = Rectangle::new(
-        Point::from((bar_x, bar_y)),
-        Size::from((bar_w, bar_h)),
-    );
+    let bar = Rectangle::new(Point::from((bar_x, bar_y)), Size::from((bar_w, bar_h)));
     let mut slots = Vec::with_capacity(tools.len());
     let mut x = bar_x + TOOL_PAD;
     for tool in tools {
@@ -454,10 +455,7 @@ pub(crate) fn on_toolbar(
     )]
     let (px, py) = (pos.0.round() as i32, pos.1.round() as i32);
     let (bar, _) = toolbar_layout(sel, bounds);
-    px >= bar.loc.x
-        && px < bar.loc.x + bar.size.w
-        && py >= bar.loc.y
-        && py < bar.loc.y + bar.size.h
+    px >= bar.loc.x && px < bar.loc.x + bar.size.w && py >= bar.loc.y && py < bar.loc.y + bar.size.h
 }
 
 /// What a press on a committed selection is about to do.
@@ -682,8 +680,7 @@ fn paint_stroke(
             let (from, to) = (seg[0], seg[1]);
             let along = (to.0 - from.0, to.1 - from.1);
             let len2 = along.0.mul_add(along.0, along.1 * along.1).max(1e-6);
-            let t = (((p.0 - from.0) * along.0 + (p.1 - from.1) * along.1) / len2)
-                .clamp(0.0, 1.0);
+            let t = (((p.0 - from.0) * along.0 + (p.1 - from.1) * along.1) / len2).clamp(0.0, 1.0);
             let near = (t.mul_add(along.0, from.0), t.mul_add(along.1, from.1));
             best = best.min((p.0 - near.0).hypot(p.1 - near.1));
         }
@@ -702,7 +699,9 @@ fn paint_stroke(
             for c in 0..3 {
                 let src = f32::from(rgb[px + c]) / 255.0;
                 let ink = stroke.colour[c];
-                rgb[px + c] = (cov.mul_add(ink - src, src) * 255.0).round().clamp(0.0, 255.0) as u8;
+                rgb[px + c] = (cov.mul_add(ink - src, src) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -721,12 +720,7 @@ fn paint_stroke(
     clippy::cast_possible_truncation,
     reason = "pixel counts are non-negative and output-bounded; the accumulator is u32 over a bounded box"
 )]
-pub(crate) fn downscale_rgba(
-    src: &[u8],
-    width: i32,
-    height: i32,
-    max: i32,
-) -> (i32, i32, Vec<u8>) {
+pub(crate) fn downscale_rgba(src: &[u8], width: i32, height: i32, max: i32) -> (i32, i32, Vec<u8>) {
     let longest = width.max(height);
     if max <= 0 || longest <= max || width <= 0 || height <= 0 {
         return (width, height, src.to_vec());
@@ -1014,19 +1008,28 @@ mod tests {
 
         // Top-left of the plane: no saturation, full value — white.
         let tl = pick(PickerPart::Plane, plane.loc.x, plane.loc.y);
-        assert!((tl.s - 0.0).abs() < 1e-3 && (tl.v - 1.0).abs() < 1e-3, "{tl:?}");
+        assert!(
+            (tl.s - 0.0).abs() < 1e-3 && (tl.v - 1.0).abs() < 1e-3,
+            "{tl:?}"
+        );
         // Bottom-right: fully saturated, no value — black.
         let br = pick(
             PickerPart::Plane,
             plane.loc.x + plane.size.w,
             plane.loc.y + plane.size.h,
         );
-        assert!((br.s - 1.0).abs() < 1e-3 && (br.v - 0.0).abs() < 1e-3, "{br:?}");
+        assert!(
+            (br.s - 1.0).abs() < 1e-3 && (br.v - 0.0).abs() < 1e-3,
+            "{br:?}"
+        );
         // The plane never touches the hue, and the strip never touches
         // saturation or value — each axis is independent.
         assert!((tl.h - from.h).abs() < 1e-6);
         let far = pick(PickerPart::Hue, hue.loc.x, hue.loc.y + hue.size.h);
-        assert!((far.h - 1.0).abs() < 1e-3, "the far end of the strip: {far:?}");
+        assert!(
+            (far.h - 1.0).abs() < 1e-3,
+            "the far end of the strip: {far:?}"
+        );
         assert!((far.s - from.s).abs() < 1e-6 && (far.v - from.v).abs() < 1e-6);
 
         // Dragging past an edge pins rather than wrapping round.
@@ -1053,7 +1056,10 @@ mod tests {
         let (bar2, slots2) = toolbar_layout(sel, bounds);
         assert_eq!(bar, bar2);
         assert_eq!(
-            slots2.iter().find(|(t, _)| *t == Tool::Draw).map(|(_, r)| *r),
+            slots2
+                .iter()
+                .find(|(t, _)| *t == Tool::Draw)
+                .map(|(_, r)| *r),
             Some(pen)
         );
         for always in tools() {
@@ -1145,12 +1151,18 @@ mod tests {
         assert!(!slots.is_empty());
         let mut prev_right = bar.loc.x;
         for (tool, r) in &slots {
-            assert!(r.loc.x >= prev_right, "slot for {tool:?} overlaps its left neighbour");
+            assert!(
+                r.loc.x >= prev_right,
+                "slot for {tool:?} overlaps its left neighbour"
+            );
             assert!(r.loc.y >= bar.loc.y && r.loc.y + r.size.h <= bar.loc.y + bar.size.h);
             assert_eq!(r.size.w, tool_width(*tool));
             prev_right = r.loc.x + r.size.w;
         }
-        assert!(prev_right <= bar.loc.x + bar.size.w, "last slot runs off the bar");
+        assert!(
+            prev_right <= bar.loc.x + bar.size.w,
+            "last slot runs off the bar"
+        );
     }
 
     /// A toolbar that would fall off the bottom of the screen goes above
@@ -1210,7 +1222,10 @@ mod tests {
                 y: None
             }))
         );
-        assert_eq!(grab_at(r, (200.0, 175.0), HANDLE), Some(SelectionGrab::Move));
+        assert_eq!(
+            grab_at(r, (200.0, 175.0), HANDLE),
+            Some(SelectionGrab::Move)
+        );
     }
 
     /// An edge is grabbable from *outside* it too. A selection is a
@@ -1241,7 +1256,10 @@ mod tests {
         // right edge exactly where it was.
         let left = apply_grab(
             r,
-            SelectionGrab::Resize(ResizeEdges { x: Some(EdgeX::Left), y: None }),
+            SelectionGrab::Resize(ResizeEdges {
+                x: Some(EdgeX::Left),
+                y: None,
+            }),
             30,
             0,
         );
@@ -1257,10 +1275,38 @@ mod tests {
     fn a_resize_cannot_turn_the_selection_inside_out() {
         let r = sel();
         for (edges, dx, dy) in [
-            (ResizeEdges { x: Some(EdgeX::Left), y: None }, 10_000, 0),
-            (ResizeEdges { x: Some(EdgeX::Right), y: None }, -10_000, 0),
-            (ResizeEdges { x: None, y: Some(EdgeY::Top) }, 0, 10_000),
-            (ResizeEdges { x: None, y: Some(EdgeY::Bottom) }, 0, -10_000),
+            (
+                ResizeEdges {
+                    x: Some(EdgeX::Left),
+                    y: None,
+                },
+                10_000,
+                0,
+            ),
+            (
+                ResizeEdges {
+                    x: Some(EdgeX::Right),
+                    y: None,
+                },
+                -10_000,
+                0,
+            ),
+            (
+                ResizeEdges {
+                    x: None,
+                    y: Some(EdgeY::Top),
+                },
+                0,
+                10_000,
+            ),
+            (
+                ResizeEdges {
+                    x: None,
+                    y: Some(EdgeY::Bottom),
+                },
+                0,
+                -10_000,
+            ),
         ] {
             let out = apply_grab(r, SelectionGrab::Resize(edges), dx, dy);
             assert!(out.size.w >= MIN_SELECTION, "width collapsed: {out:?}");

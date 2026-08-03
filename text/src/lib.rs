@@ -112,7 +112,9 @@ mod tests {
         stack.sort_by_key(|s| (std::cmp::Reverse(coverage_rank(s)), s.clone()));
         let last_two = &stack[stack.len() - 2..];
         assert!(
-            last_two.iter().all(|s| s.contains("symbols") || s.contains("nerd")),
+            last_two
+                .iter()
+                .all(|s| s.contains("symbols") || s.contains("nerd")),
             "symbol/nerd fonts must be popped first, got {stack:?}"
         );
     }
@@ -170,7 +172,9 @@ fn scan_fonts() -> Vec<Candidate> {
             let path = entry.path();
             // `file_type` on the DirEntry avoids a stat per file; symlinked
             // directories are followed only via the metadata fallback below.
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_dir() {
                 walk(&path, depth + 1, out);
                 continue;

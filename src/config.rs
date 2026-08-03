@@ -731,8 +731,7 @@ impl TitlebarConfig {
     /// default (see [`TitlebarConfig::enabled`]) against the layout mode.
     #[must_use]
     pub fn enabled(&self, mode: LayoutMode) -> bool {
-        self.enabled
-            .unwrap_or(matches!(mode, LayoutMode::Floating))
+        self.enabled.unwrap_or(matches!(mode, LayoutMode::Floating))
     }
 
     /// Bar height in compositor pixels, or `0` when titlebars are off —
@@ -782,10 +781,7 @@ pub enum Fill {
 #[derive(Debug, Clone)]
 pub enum Wallpaper {
     Fill(Fill),
-    Media {
-        path: PathBuf,
-        mode: ScaleMode,
-    },
+    Media { path: PathBuf, mode: ScaleMode },
 }
 
 /// How a media wallpaper is fitted to each output.
@@ -1200,7 +1196,8 @@ fn parse_screenshot(t: &Table) -> mlua::Result<Vec<ScreenshotBind>> {
     let mut binds = Vec::new();
     for (i, entry) in t.sequence_values::<Table>().enumerate() {
         let bind_table = entry.with_context(|_| format!("screenshot[{i}] not a table"))?;
-        let bind = parse_screenshot_bind(&bind_table).with_context(|_| format!("screenshot[{i}]"))?;
+        let bind =
+            parse_screenshot_bind(&bind_table).with_context(|_| format!("screenshot[{i}]"))?;
         binds.push(bind);
     }
     Ok(binds)
@@ -1316,9 +1313,9 @@ pub const EXAMPLE: &str = include_str!("../contrib/config.lua");
 /// `Super+1` goes to workspace 1. Returned zero-based, which is what the
 /// layout and the control socket use.
 fn parse_workspace_number(t: &Table) -> mlua::Result<usize> {
-    let n: i64 = t.get("workspace").context(
-        "workspace action requires `workspace` (expected a number, counting from 1)",
-    )?;
+    let n: i64 = t
+        .get("workspace")
+        .context("workspace action requires `workspace` (expected a number, counting from 1)")?;
     if n < 1 {
         lua_bail!("workspace {n} out of range; workspaces count from 1");
     }
@@ -1344,9 +1341,9 @@ fn parse_tearing_mode(s: &str) -> mlua::Result<TearingMode> {
         "off" | "never" | "false" => TearingMode::Never,
         "auto" | "on" | "true" => TearingMode::Auto,
         "always" | "force" => TearingMode::Always,
-        other => lua_bail!(
-            "unknown tearing mode {other:?}; expected \"off\", \"auto\", or \"always\""
-        ),
+        other => {
+            lua_bail!("unknown tearing mode {other:?}; expected \"off\", \"auto\", or \"always\"")
+        }
     })
 }
 
@@ -1407,7 +1404,9 @@ fn parse_layout(t: &Table, defaults: LayoutConfig) -> mlua::Result<LayoutConfig>
         cfg.mode = match m.to_lowercase().as_str() {
             "tiling" | "tile" | "tiled" => LayoutMode::Tiling,
             "floating" | "float" | "stacking" => LayoutMode::Floating,
-            other => lua_bail!("unknown layout mode {other:?}; expected \"tiling\" or \"floating\""),
+            other => {
+                lua_bail!("unknown layout mode {other:?}; expected \"tiling\" or \"floating\"")
+            }
         };
     }
     if let Some(z) = t.get::<Option<i32>>("resize_zone")? {
@@ -1659,7 +1658,13 @@ fn parse_curve(v: &mlua::Value) -> mlua::Result<Curve> {
     if let Some(s) = v.as_string().and_then(|s| s.to_str().ok()) {
         let norm: String = s
             .chars()
-            .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
+            .map(|c| {
+                if c == '_' {
+                    '-'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
             .collect();
         return match norm.as_str() {
             "linear" => Ok(Curve::Linear),
@@ -1691,7 +1696,9 @@ fn parse_spring(t: &Table) -> mlua::Result<Curve> {
         lua_bail!("spring mass/stiffness/damping must be finite numbers");
     }
     if mass <= 0.0 || stiffness <= 0.0 {
-        lua_bail!("spring mass and stiffness must be positive; got mass={mass}, stiffness={stiffness}");
+        lua_bail!(
+            "spring mass and stiffness must be positive; got mass={mass}, stiffness={stiffness}"
+        );
     }
     if damping < 0.0 {
         lua_bail!("spring damping must be >= 0; got {damping}");
@@ -1849,13 +1856,19 @@ mod bind_tests {
 
     #[test]
     fn user_binds_still_override_defaults_by_trigger() {
-        let c = parse(
-            r#"binds = { { mods = {"super", "shift"}, key = "E", action = "close" } }"#,
-        );
+        let c = parse(r#"binds = { { mods = {"super", "shift"}, key = "E", action = "close" } }"#);
         let bind = find(&c, Keysym::E).expect("default Super+Shift+E present");
-        assert_eq!(bind.action, Action::Close, "user action replaced the default");
         assert_eq!(
-            c.binds.bindings.iter().filter(|b| b.keysym == Keysym::E).count(),
+            bind.action,
+            Action::Close,
+            "user action replaced the default"
+        );
+        assert_eq!(
+            c.binds
+                .bindings
+                .iter()
+                .filter(|b| b.keysym == Keysym::E)
+                .count(),
             1,
             "override must not append a duplicate"
         );
@@ -1877,16 +1890,17 @@ mod animation_tests {
     fn defaults_when_absent() {
         let c = parse("");
         assert!(c.animations.enabled);
-        assert_eq!(c.animations.window_open.duration, Duration::from_millis(250));
+        assert_eq!(
+            c.animations.window_open.duration,
+            Duration::from_millis(250)
+        );
         assert_eq!(c.animations.window_open.curve, Curve::EaseOut);
         assert_eq!(c.animations.workspace.curve, Curve::EaseInOut);
     }
 
     #[test]
     fn master_switch_and_top_level_inheritance() {
-        let c = parse(
-            r#"animations = { enabled = false, duration = 100, curve = "linear" }"#,
-        );
+        let c = parse(r#"animations = { enabled = false, duration = 100, curve = "linear" }"#);
         assert!(!c.animations.enabled);
         // Top-level duration/curve flow into every per-type spec.
         for s in [
@@ -1910,13 +1924,22 @@ mod animation_tests {
                 window_close = { enabled = false },
             }"#,
         );
-        assert_eq!(c.animations.window_open.duration, Duration::from_millis(400));
+        assert_eq!(
+            c.animations.window_open.duration,
+            Duration::from_millis(400)
+        );
         assert_eq!(c.animations.window_open.curve, Curve::EaseIn);
         // window_close inherits top-level duration but disables itself.
-        assert_eq!(c.animations.window_close.duration, Duration::from_millis(100));
+        assert_eq!(
+            c.animations.window_close.duration,
+            Duration::from_millis(100)
+        );
         assert!(!c.animations.window_close.enabled);
         // untouched type keeps inherited top-level duration + default curve.
-        assert_eq!(c.animations.window_move.duration, Duration::from_millis(100));
+        assert_eq!(
+            c.animations.window_move.duration,
+            Duration::from_millis(100)
+        );
     }
 
     #[test]
@@ -1927,14 +1950,17 @@ mod animation_tests {
                 window_move = { curve = "EASE_IN_OUT" },
             }"#,
         );
-        assert_eq!(c.animations.window_open.curve, Curve::Bezier(0.1, 0.7, 0.1, 1.0));
+        assert_eq!(
+            c.animations.window_open.curve,
+            Curve::Bezier(0.1, 0.7, 0.1, 1.0)
+        );
         assert_eq!(c.animations.window_move.curve, Curve::EaseInOut);
     }
 
     #[test]
     fn rejects_bad_bezier_x() {
         let lua = Lua::new();
-        lua.load(r#"animations = { window_open = { curve = {1.5, 0, 0.5, 1} } }"#)
+        lua.load(r"animations = { window_open = { curve = {1.5, 0, 0.5, 1} } }")
             .exec()
             .unwrap();
         assert!(Config::populate_from_globals(&lua.globals()).is_err());
@@ -1944,7 +1970,7 @@ mod animation_tests {
     fn rejects_unknown_curve_and_negative_duration() {
         for src in [
             r#"animations = { curve = "boing" }"#,
-            r#"animations = { duration = -5 }"#,
+            r"animations = { duration = -5 }",
         ] {
             let lua = Lua::new();
             lua.load(src).exec().unwrap();
@@ -1967,6 +1993,10 @@ mod decoration_tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the default is the literal 1.0; a tolerance here would accept a default that isn't the documented one"
+    )]
     fn defaults_when_absent() {
         let d = parse("").decoration;
         assert_eq!(d.window_opacity, 1.0);
@@ -1987,7 +2017,10 @@ mod decoration_tests {
         .decoration;
         assert!((d.window_opacity - 0.85).abs() < 1e-6);
         assert!(d.blur.windows);
-        assert_eq!(d.blur.layers, vec!["rofi".to_owned(), "quickshell".to_owned()]);
+        assert_eq!(
+            d.blur.layers,
+            vec!["rofi".to_owned(), "quickshell".to_owned()]
+        );
         assert!(d.blur.enabled); // untouched -> default
         assert_eq!(d.blur.passes, 2);
         assert!((d.blur.radius - 8.0).abs() < 1e-6);
@@ -1996,10 +2029,10 @@ mod decoration_tests {
     #[test]
     fn rejects_out_of_range() {
         for src in [
-            r#"decoration = { opacity = 1.5 }"#,
-            r#"decoration = { opacity = -0.1 }"#,
-            r#"decoration = { blur = { passes = 99 } }"#,
-            r#"decoration = { blur = { radius = -1 } }"#,
+            r"decoration = { opacity = 1.5 }",
+            r"decoration = { opacity = -0.1 }",
+            r"decoration = { blur = { passes = 99 } }",
+            r"decoration = { blur = { radius = -1 } }",
         ] {
             let lua = Lua::new();
             lua.load(src).exec().unwrap();
@@ -2137,7 +2170,9 @@ mod tearing_tests {
     #[test]
     fn tearing_rejects_unknown() {
         let lua = Lua::new();
-        lua.load(r#"misc = { tearing = "sometimes" }"#).exec().unwrap();
+        lua.load(r#"misc = { tearing = "sometimes" }"#)
+            .exec()
+            .unwrap();
         assert!(Config::populate_from_globals(&lua.globals()).is_err());
     }
 }
@@ -2216,7 +2251,7 @@ mod floating_mode_tests {
         assert_eq!(c.input.focus_model(c.layout.mode), FocusModel::Hover);
 
         // The other direction: titlebars in a tiling layout are legal.
-        let c = parse(r#"titlebar = { enabled = true, height = 20 }"#);
+        let c = parse(r"titlebar = { enabled = true, height = 20 }");
         assert_eq!(c.layout.mode, LayoutMode::Tiling);
         assert_eq!(c.titlebar.height_for(c.layout.mode), 20);
     }
@@ -2243,19 +2278,19 @@ mod floating_mode_tests {
             vec![TitlebarButton::Close, TitlebarButton::Minimize]
         );
         // An empty list is a bar with no buttons, not "use the defaults".
-        let c = parse(r#"titlebar = { buttons = {} }"#);
+        let c = parse(r"titlebar = { buttons = {} }");
         assert!(c.titlebar.buttons.is_empty());
     }
 
     #[test]
     fn out_of_range_values_are_rejected() {
         for src in [
-            r#"titlebar = { height = -1 }"#,
-            r#"titlebar = { font_size = 0.0 }"#,
-            r#"titlebar = { font_size = 1300.0 }"#,
+            r"titlebar = { height = -1 }",
+            r"titlebar = { font_size = 0.0 }",
+            r"titlebar = { font_size = 1300.0 }",
             r#"titlebar = { buttons = { "shade" } }"#,
-            r#"layout = { resize_zone = -1 }"#,
-            r#"layout = { snap_zone = -1 }"#,
+            r"layout = { resize_zone = -1 }",
+            r"layout = { snap_zone = -1 }",
         ] {
             let lua = Lua::new();
             lua.load(src).exec().unwrap();

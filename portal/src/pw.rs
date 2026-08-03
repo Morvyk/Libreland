@@ -50,7 +50,9 @@ use std::time::{Duration, Instant};
 use libspa::param::ParamType;
 use libspa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use libspa::param::video::VideoFormat;
-use libspa::pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer};
+use libspa::pod::{
+    ChoiceValue, Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer,
+};
 use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
 use pipewire as pw;
 use pipewire::loop_::Timeout;
@@ -273,7 +275,10 @@ fn header_pod() -> Vec<u8> {
 fn guard<T>(what: &'static str, body: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
         .inspect_err(|_| {
-            tracing::error!(callback = what, "screencast callback panicked; ending the cast");
+            tracing::error!(
+                callback = what,
+                "screencast callback panicked; ending the cast"
+            );
         })
         .ok()
 }
@@ -392,7 +397,10 @@ fn open_render_node() -> Option<gbm::Device<std::fs::File>> {
         .collect();
     nodes.sort();
     for node in nodes {
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&node)
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
             && let Ok(device) = gbm::Device::new(file)
         {
             tracing::info!(node = %node.display(), "dmabuf capture path enabled");
@@ -685,7 +693,9 @@ fn run_inner(
     // spin the loop until it appears.
     let mut node_id = pw::constants::ID_ANY;
     for _ in 0..200 {
-        main_loop.loop_().iterate(Timeout::Finite(Duration::from_millis(10)));
+        main_loop
+            .loop_()
+            .iterate(Timeout::Finite(Duration::from_millis(10)));
         node_id = stream.node_id();
         if node_id != pw::constants::ID_ANY {
             break;

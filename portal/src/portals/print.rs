@@ -86,7 +86,11 @@ fn spool(fd: &Fd<'_>, title: &str) -> anyhow::Result<PathBuf> {
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .take(40)
         .collect();
-    let path = dir.join(format!("{}-{}.pdf", if safe.is_empty() { "job" } else { &safe }, std::process::id()));
+    let path = dir.join(format!(
+        "{}-{}.pdf",
+        if safe.is_empty() { "job" } else { &safe },
+        std::process::id()
+    ));
 
     let duplicated = nix::unistd::dup(fd.as_raw_fd())?;
     // SAFETY: `dup` just handed us this descriptor and nothing else owns it,
@@ -270,10 +274,8 @@ impl Print {
                 }
             }
             Destination::File => {
-                let suggested = format!(
-                    "{}.pdf",
-                    if title.is_empty() { "document" } else { &title }
-                );
+                let suggested =
+                    format!("{}.pdf", if title.is_empty() { "document" } else { &title });
                 let spec = ChooserSpec {
                     title: "Save as PDF".to_string(),
                     kind: Kind::Save,

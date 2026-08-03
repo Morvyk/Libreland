@@ -236,10 +236,7 @@ impl Notification {
     #[zbus(property, name = "SupportedOptions")]
     fn supported_options(&self) -> HashMap<String, OwnedValue> {
         let mut options = HashMap::new();
-        options.insert(
-            "category".to_string(),
-            ov(Vec::<String>::new()),
-        );
+        options.insert("category".to_string(), ov(Vec::<String>::new()));
         options.insert(
             "priority".to_string(),
             ov(vec![

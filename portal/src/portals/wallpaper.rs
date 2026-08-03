@@ -74,7 +74,10 @@ impl Wallpaper {
         let spec = Spec {
             title: "Set desktop background?".to_string(),
             subtitle: String::new(),
-            body: format!("{app} wants to change your wallpaper to:\n\n{}", path.display()),
+            body: format!(
+                "{app} wants to change your wallpaper to:\n\n{}",
+                path.display()
+            ),
             accept_label: Some("Set background".to_string()),
             deny_label: Some("Keep current".to_string()),
             destructive: false,

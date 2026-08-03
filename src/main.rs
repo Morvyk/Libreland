@@ -67,16 +67,16 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 mod anim;
 mod clipboard;
 mod color_management;
-mod copycapture;
 mod config;
+mod copycapture;
 mod cursor;
 mod drm;
 mod hdr;
 mod icon;
 mod ipc;
 mod keyboard;
-mod media;
 mod layout;
+mod media;
 mod render;
 mod scanout;
 mod screencopy;
@@ -341,8 +341,9 @@ pub(crate) struct State {
     /// `RefCell` so a hot-plugged output can fill its entry lazily from
     /// [`Self::dmabuf_feedback_seed`] during the per-frame sync, which runs
     /// under `&self`.
-    pub(crate) dmabuf_scanout_feedback:
-        std::cell::RefCell<std::collections::HashMap<String, smithay::wayland::dmabuf::DmabufFeedback>>,
+    pub(crate) dmabuf_scanout_feedback: std::cell::RefCell<
+        std::collections::HashMap<String, smithay::wayland::dmabuf::DmabufFeedback>,
+    >,
     /// Render-node device id + import format list, kept so an output that
     /// appears after startup can build its own scanout feedback variant.
     /// `None` when only a v3 dmabuf global could be advertised.
@@ -365,8 +366,9 @@ pub(crate) struct State {
     /// they keep it for life (see `sync_scanout_feedback`; every feedback
     /// change costs the client a swapchain rebuild). `RefCell` because the
     /// per-frame sync runs under `&self` alongside the renderer borrows.
-    pub(crate) scanout_feedback_given:
-        std::cell::RefCell<std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>>,
+    pub(crate) scanout_feedback_given: std::cell::RefCell<
+        std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>,
+    >,
     /// Which output each client surface was last told it is on via
     /// `wl_surface.enter` (keyed by surface id, holding the surface so a
     /// later move can `leave` it). Membership is *sticky*: a window on a
@@ -543,7 +545,8 @@ pub(crate) struct State {
     /// Surfaces that already own a `wp_tearing_control_v1`, so a second
     /// `get_tearing_control` can be answered with the protocol error the
     /// spec requires.
-    pub(crate) tearing_controls: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    pub(crate) tearing_controls:
+        Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     /// `ext-output-image-capture-source-manager-v1` delegate state.
     pub(crate) output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
@@ -644,8 +647,7 @@ pub(crate) struct State {
     /// large capture's zlib compression). The worker sends the encoded PNG
     /// back over this channel when the bind also wants the clipboard, since
     /// setting the selection must happen on the main thread.
-    pub(crate) screenshot_clipboard_tx:
-        smithay::reexports::calloop::channel::Sender<Vec<u8>>,
+    pub(crate) screenshot_clipboard_tx: smithay::reexports::calloop::channel::Sender<Vec<u8>>,
     /// Recognised text on its way back from the OCR worker.
     pub(crate) screenshot_text_tx: smithay::reexports::calloop::channel::Sender<String>,
     /// Control-IPC state: the stable window-id registry (and, later,
@@ -1036,7 +1038,8 @@ impl State {
                 .map(|b| b.id.clone());
             let Some(id) = hit else { return false };
             self.external_held.insert(raw_code, id.clone());
-            self.ipc.emit(&ipc::Event::BindActivated { id, pressed: true });
+            self.ipc
+                .emit(&ipc::Event::BindActivated { id, pressed: true });
             return true;
         }
         // The release is matched by keycode, not by keysym + modifiers: the
@@ -1045,7 +1048,8 @@ impl State {
         let Some(id) = self.external_held.remove(&raw_code) else {
             return false;
         };
-        self.ipc.emit(&ipc::Event::BindActivated { id, pressed: false });
+        self.ipc
+            .emit(&ipc::Event::BindActivated { id, pressed: false });
         true
     }
 
@@ -1568,9 +1572,7 @@ impl State {
         // and because the renderer's bar key covers hover — so a change
         // here damages the window through the value that drew it.
         let hovered = match &region {
-            Some((surface, _, titlebar::Region::Button(kind))) => {
-                Some((surface.id(), *kind))
-            }
+            Some((surface, _, titlebar::Region::Button(kind))) => Some((surface.id(), *kind)),
             _ => None,
         };
         if self.renderer.set_hovered_button(hovered) {
@@ -2192,15 +2194,12 @@ impl State {
         // ext-image-copy-capture frames due on this output ride the same
         // spec list, appended after the internal captures.
         let copy_due = match out_name.as_deref() {
-            Some(name) if !self.copy_frames.is_empty() => {
-                self.drain_copy_frames(name, &mut specs)
-            }
+            Some(name) if !self.copy_frames.is_empty() => self.drain_copy_frames(name, &mut specs),
             _ => Vec::new(),
         };
         let capture_hides_cursor =
             !captures.is_empty() && captures.iter().all(|c| !c.overlay_cursor);
-        let internal_hides_cursor =
-            !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
+        let internal_hides_cursor = !internal.is_empty() && internal.iter().all(|c| !c.show_cursor);
         let copy_hides_cursor = !copy_due.is_empty() && copy_due.iter().all(|c| !c.overlay_cursor);
         let locked = self.pointer_locked();
         let hide_cursor =
@@ -2237,7 +2236,8 @@ impl State {
                 // Result order mirrors the spec list: screencopy clients,
                 // then internal screenshots, then copy-capture frames.
                 let mut internal_results = results.split_off(client_n.min(results.len()));
-                let copy_results = internal_results.split_off(internal_n.min(internal_results.len()));
+                let copy_results =
+                    internal_results.split_off(internal_n.min(internal_results.len()));
                 for (pending, captured) in captures.iter().zip(results) {
                     screencopy::complete(pending, captured);
                 }
@@ -2319,39 +2319,43 @@ impl State {
                     )
                 })
                 .or_else(|| {
-                    self.layout.hit_target(cursor_i).map(|(surface, rect, deco)| {
-                        // A CSD client pads its buffer with an invisible shadow
-                        // margin and reports the real content rect via
-                        // set_window_geometry; the render path shifts the buffer
-                        // up-left by that offset so the visible content lands at
-                        // the cell origin. The pointer focus origin must use that
-                        // SAME shifted buffer origin — otherwise surface-local
-                        // coordinates are off by the shadow margin and clicks land
-                        // below where the content visually is (the Lutris "+"
-                        // button). The shadow only exists on Normal windows;
-                        // maximized/fullscreen drop it, matching `grouped` in
-                        // render_output.
-                        let (gx, gy) = if self.layout.window_ref(&surface).is_some_and(|w| {
-                            w.fill == crate::layout::FillMode::Normal
-                        }) {
-                            crate::render::window_geometry_offset(&surface)
-                        } else {
-                            (0, 0)
-                        };
-                        // ...and the decoration shifts it again. `paint_origin`
-                        // is where the renderer actually puts the buffer, so
-                        // this is the same number both sides read; anything
-                        // else and clicks land a titlebar away from the thing
-                        // they were aimed at.
-                        let paint = deco.paint_origin();
-                        (
-                            surface,
-                            Point::<f64, Logical>::from((
-                                f64::from(rect.loc.x + paint.x - gx),
-                                f64::from(rect.loc.y + paint.y - gy),
-                            )),
-                        )
-                    })
+                    self.layout
+                        .hit_target(cursor_i)
+                        .map(|(surface, rect, deco)| {
+                            // A CSD client pads its buffer with an invisible shadow
+                            // margin and reports the real content rect via
+                            // set_window_geometry; the render path shifts the buffer
+                            // up-left by that offset so the visible content lands at
+                            // the cell origin. The pointer focus origin must use that
+                            // SAME shifted buffer origin — otherwise surface-local
+                            // coordinates are off by the shadow margin and clicks land
+                            // below where the content visually is (the Lutris "+"
+                            // button). The shadow only exists on Normal windows;
+                            // maximized/fullscreen drop it, matching `grouped` in
+                            // render_output.
+                            let (gx, gy) = if self
+                                .layout
+                                .window_ref(&surface)
+                                .is_some_and(|w| w.fill == crate::layout::FillMode::Normal)
+                            {
+                                crate::render::window_geometry_offset(&surface)
+                            } else {
+                                (0, 0)
+                            };
+                            // ...and the decoration shifts it again. `paint_origin`
+                            // is where the renderer actually puts the buffer, so
+                            // this is the same number both sides read; anything
+                            // else and clicks land a titlebar away from the thing
+                            // they were aimed at.
+                            let paint = deco.paint_origin();
+                            (
+                                surface,
+                                Point::<f64, Logical>::from((
+                                    f64::from(rect.loc.x + paint.x - gx),
+                                    f64::from(rect.loc.y + paint.y - gy),
+                                )),
+                            )
+                        })
                 })
         };
         let kbd_target = surface_hit.as_ref().map(|(surface, _)| surface.clone());
@@ -2439,7 +2443,10 @@ impl State {
     /// on whatever occupies that space on the active workspace. (The
     /// `focus-window --warp` path reveals the workspace first, so by the
     /// time it warps the window *is* visible.)
-    pub(crate) fn warp_pointer_to_window(&mut self, surface: &WlSurface) -> Result<(), &'static str> {
+    pub(crate) fn warp_pointer_to_window(
+        &mut self,
+        surface: &WlSurface,
+    ) -> Result<(), &'static str> {
         let Some(pointer) = self.seat.get_pointer() else {
             return Err("no pointer on the seat");
         };
@@ -2646,7 +2653,8 @@ impl State {
                     );
                     // Floating takes the rect; a tile turns it into new
                     // split ratios and reflows its neighbours.
-                    self.layout.apply_resize(&drag.surface, new_rect, drag.edges);
+                    self.layout
+                        .apply_resize(&drag.surface, new_rect, drag.edges);
                 }
             }
             return;
@@ -2790,7 +2798,9 @@ impl State {
         // while the surface was unfocused. Not during a screenshot
         // session: its selection cursor must stay free even over a
         // surface whose lock we broke at session start.
-        if self.screenshot.is_none() && let Some((surface, origin)) = hit.as_ref() {
+        if self.screenshot.is_none()
+            && let Some((surface, origin)) = hit.as_ref()
+        {
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "surface-local coords are bounded by the output rect (i32)"
@@ -3246,7 +3256,11 @@ impl State {
                 smithay::utils::Size::new(width, height),
             ),
             layer: bucket,
-            namespace: self.layer_namespaces.get(surface).cloned().unwrap_or_default(),
+            namespace: self
+                .layer_namespaces
+                .get(surface)
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 
@@ -3554,7 +3568,10 @@ impl State {
         let Some((_, out)) = outputs
             .iter()
             .find(|(_, r)| {
-                rgx >= r.loc.x && rgx < r.loc.x + r.size.w && rgy >= r.loc.y && rgy < r.loc.y + r.size.h
+                rgx >= r.loc.x
+                    && rgx < r.loc.x + r.size.w
+                    && rgy >= r.loc.y
+                    && rgy < r.loc.y + r.size.h
             })
             .or_else(|| outputs.first())
         else {
@@ -3807,8 +3824,7 @@ impl State {
                 return;
             }
         };
-        let connected: std::collections::HashSet<String> =
-            rescan.connected.into_iter().collect();
+        let connected: std::collections::HashSet<String> = rescan.connected.into_iter().collect();
         let removed: Vec<String> = existing
             .iter()
             .filter(|n| !connected.contains(*n))
@@ -3990,8 +4006,7 @@ impl State {
             config::Action::MoveToWorkspace(index) => {
                 // The window's own output, not the cursor's: moving a window
                 // to "workspace 3" means workspace 3 of the monitor it is on.
-                let Some(surface) = self.seat.get_keyboard().and_then(|k| k.current_focus())
-                else {
+                let Some(surface) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
                     return;
                 };
                 info!(surface = ?surface.id(), index, "move-to-workspace action fired");
@@ -4056,7 +4071,12 @@ impl State {
     /// the media worker threads running), so the current environment is
     /// applied per-child instead.
     pub(crate) fn apply_child_env(&self, cmd: &mut std::process::Command) {
-        cmd.envs(self.config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd.envs(
+            self.config
+                .env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        );
         // Export (or hide) `$DISPLAY` to match the live xwayland state.
         match &self.xwayland_display {
             Some(disp) => {
@@ -4124,7 +4144,10 @@ impl State {
                     ..smithay::input::keyboard::XkbConfig::default()
                 };
                 if let Err(err) = kbd.set_xkb_config(self, xkb) {
-                    warn!(?err, "input: applying new keyboard layout to the seat failed");
+                    warn!(
+                        ?err,
+                        "input: applying new keyboard layout to the seat failed"
+                    );
                 }
             }
             // … and our own xkb wrapper used for hotkey matching.
@@ -4223,7 +4246,10 @@ impl State {
                     .insert(p.surface.id());
             }
             let feedback = if fullscreen
-                || self.scanout_feedback_given.borrow().contains(&p.surface.id())
+                || self
+                    .scanout_feedback_given
+                    .borrow()
+                    .contains(&p.surface.id())
             {
                 scanout_fb
             } else {
@@ -4289,7 +4315,10 @@ impl State {
                 |_, _, ()| true,
             );
             for surface in tree {
-                let prev = self.surface_outputs.get(&surface.id()).map(|(n, _)| n.clone());
+                let prev = self
+                    .surface_outputs
+                    .get(&surface.id())
+                    .map(|(n, _)| n.clone());
                 if prev.as_deref() == Some(out.as_str()) {
                     continue;
                 }
@@ -4438,7 +4467,9 @@ impl State {
         let numlock_changed = new.input.numlock != self.config.input.numlock;
         let xwayland_changed = new.xwayland != self.config.xwayland;
         if new.env != self.config.env {
-            info!("env changed; applies to children spawned from now on (restart for XCURSOR_* etc.)");
+            info!(
+                "env changed; applies to children spawned from now on (restart for XCURSOR_* etc.)"
+            );
         }
         if new.startup != self.config.startup {
             info!("startup commands changed; they only run at launch");
@@ -4492,10 +4523,7 @@ impl State {
                 outer: new.layout.gaps_outer,
                 inner: new.layout.gaps_inner,
             },
-            layout::Deco::new(
-                new.border.width,
-                new.titlebar.height_for(new.layout.mode),
-            ),
+            layout::Deco::new(new.border.width, new.titlebar.height_for(new.layout.mode)),
         );
         apply_wallpaper(&mut self.renderer, &new.misc.wallpaper, &new.border);
         self.renderer.set_animations(new.animations.clone());
@@ -4580,7 +4608,12 @@ fn wallpaper_fallback() -> config::Fill {
 
 /// Axis-aligned rect (absolute compositor px) spanning two cursor
 /// corners, regardless of drag direction.
-fn rect_from_corners(ax: f64, ay: f64, bx: f64, by: f64) -> smithay::utils::Rectangle<i32, Physical> {
+fn rect_from_corners(
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
+) -> smithay::utils::Rectangle<i32, Physical> {
     let x0 = ax.min(bx);
     let y0 = ay.min(by);
     let w = ax.max(bx) - x0;
@@ -4746,13 +4779,14 @@ impl State {
                 .collect()
         });
         let picker = self.build_screenshot_picker(toolbar.as_ref());
-        self.renderer.set_screenshot_overlay(Some(render::ScreenshotOverlay {
-            selection,
-            handles,
-            toolbar,
-            picker,
-            strokes,
-        }));
+        self.renderer
+            .set_screenshot_overlay(Some(render::ScreenshotOverlay {
+                selection,
+                handles,
+                toolbar,
+                picker,
+                strokes,
+            }));
     }
 
     /// The options bar for the committed selection, laid out and marked up
@@ -5146,18 +5180,15 @@ impl State {
     fn refresh_screenshot_cursor(&mut self) {
         use smithay::input::pointer::CursorIcon;
         let at = self.renderer.cursor_pos();
-        let grab = self
-            .screenshot
-            .as_ref()
-            .and_then(|s| s.grab.map(|(g, _, _)| g).or_else(|| {
+        let grab = self.screenshot.as_ref().and_then(|s| {
+            s.grab.map(|(g, _, _)| g).or_else(|| {
                 s.region
                     .and_then(|r| screenshot::grab_at(r, at, screenshot::HANDLE))
-            }));
+            })
+        });
         let icon = match grab {
             Some(screenshot::SelectionGrab::Move) => CursorIcon::Move,
-            Some(screenshot::SelectionGrab::Resize(edges)) => {
-                drag_cursor(DragMode::Resize, edges)
-            }
+            Some(screenshot::SelectionGrab::Resize(edges)) => drag_cursor(DragMode::Resize, edges),
             None => CursorIcon::Crosshair,
         };
         self.renderer
@@ -5274,8 +5305,7 @@ impl State {
         let spawned = std::thread::Builder::new()
             .name("screenshot-encode".to_owned())
             .spawn(move || {
-                let png = match screenshot::encode_region(&bytes, width, height, region, &strokes)
-                {
+                let png = match screenshot::encode_region(&bytes, width, height, region, &strokes) {
                     Ok(png) => png,
                     Err(err) => {
                         warn!(error = %err, "screenshot: PNG encode failed");
@@ -5413,7 +5443,14 @@ impl State {
                 self.renderer
                     .set_freeze_texture(&cap.output, &rgba, w_i, h_i);
                 if let Some(session) = &mut self.screenshot {
-                    session.frozen.insert(cap.output, FrozenFrame { bytes, width, height });
+                    session.frozen.insert(
+                        cap.output,
+                        FrozenFrame {
+                            bytes,
+                            width,
+                            height,
+                        },
+                    );
                 }
                 // Reveal the dim overlay only once EVERY output's snapshot
                 // has landed — otherwise a not-yet-frozen output would bake
@@ -5429,9 +5466,8 @@ impl State {
             CapturePurpose::Finalize { bind } => {
                 // The capture already read exactly the wanted region, so encode
                 // the whole buffer — off the render thread (see helper).
-                let full = smithay::utils::Rectangle::from_size(smithay::utils::Size::from((
-                    w_i, h_i,
-                )));
+                let full =
+                    smithay::utils::Rectangle::from_size(smithay::utils::Size::from((w_i, h_i)));
                 self.spawn_screenshot_encode(bytes, width, height, full, &bind, Vec::new());
             }
         }
@@ -5640,18 +5676,21 @@ fn main() -> Result<()> {
     // renderer. (NVIDIA's syncobj-eventfd support is probed at runtime, not
     // assumed.)
     let syncobj_import_fd = drm_fd.clone();
-    let drm_syncobj_state = if smithay::wayland::drm_syncobj::supports_syncobj_eventfd(
-        &syncobj_import_fd,
-    ) {
-        info!("explicit sync: advertising linux-drm-syncobj-v1 (device supports syncobj eventfd)");
-        Some(smithay::wayland::drm_syncobj::DrmSyncobjState::new::<State>(
-            &display.handle(),
-            syncobj_import_fd,
-        ))
-    } else {
-        warn!("explicit sync: device lacks syncobj eventfd; clients use implicit sync only");
-        None
-    };
+    let drm_syncobj_state =
+        if smithay::wayland::drm_syncobj::supports_syncobj_eventfd(&syncobj_import_fd) {
+            info!(
+                "explicit sync: advertising linux-drm-syncobj-v1 (device supports syncobj eventfd)"
+            );
+            Some(
+                smithay::wayland::drm_syncobj::DrmSyncobjState::new::<State>(
+                    &display.handle(),
+                    syncobj_import_fd,
+                ),
+            )
+        } else {
+            warn!("explicit sync: device lacks syncobj eventfd; clients use implicit sync only");
+            None
+        };
 
     let mut renderer = render::Renderer::new(
         drm_fd,
@@ -5947,11 +5986,10 @@ fn main() -> Result<()> {
 
     // ext-session-lock-v1 manager. Built here (before `display_handle` moves
     // into State) so it can borrow the handle; allow any client to lock.
-    let session_lock_state =
-        smithay::wayland::session_lock::SessionLockManagerState::new::<State, _>(
-            &wayland_init.display_handle,
-            |_client| true,
-        );
+    let session_lock_state = smithay::wayland::session_lock::SessionLockManagerState::new::<State, _>(
+        &wayland_init.display_handle,
+        |_client| true,
+    );
     // ext-idle-notify: needs the loop handle to run its own timers (hence
     // the State-as-loop-data event loop). Built here so it can borrow the
     // display handle before it moves into State.
@@ -6245,7 +6283,10 @@ fn install_panic_hook(log_dir: &std::path::Path) {
             .append(true)
             .open(&panic_log)
         {
-            let _ = writeln!(file, "==== compositor panic ====\n{panic_info}\n{backtrace}");
+            let _ = writeln!(
+                file,
+                "==== compositor panic ====\n{panic_info}\n{backtrace}"
+            );
             let _ = file.flush();
         }
         tracing::error!(panic = %panic_info, "compositor panicked");
@@ -6354,7 +6395,11 @@ fn present_info(meta: Option<&DrmEventMetadata>) -> (std::time::Duration, u32, P
                 PresentKind::Vsync,
             ),
         },
-        None => (Clock::<Monotonic>::new().now().into(), 0, PresentKind::Vsync),
+        None => (
+            Clock::<Monotonic>::new().now().into(),
+            0,
+            PresentKind::Vsync,
+        ),
     }
 }
 
@@ -6376,23 +6421,26 @@ fn wire_event_sources(
     libinput_backend: LibinputInputBackend,
 ) -> Result<()> {
     handle
-        .insert_source(session_notifier, |event, (), state: &mut State| match event {
-            smithay::backend::session::Event::PauseSession => warn!("session paused"),
-            smithay::backend::session::Event::ActivateSession => {
-                info!("session activated");
-                // The kernel dropped any flip that was in flight when we
-                // switched VTs away, so its vblank will never arrive. Discard
-                // the stale WaitingForVblank bookkeeping (reset to Idle) and
-                // force a fresh render of every output to restore scanout.
-                // Buffers may have been scribbled over while away — restart
-                // damage diffing with a full repaint.
-                state.renderer.invalidate_damage();
-                for crtc in state.renderer.crtcs() {
-                    state.redraw.insert(crtc, RedrawState::Idle);
+        .insert_source(
+            session_notifier,
+            |event, (), state: &mut State| match event {
+                smithay::backend::session::Event::PauseSession => warn!("session paused"),
+                smithay::backend::session::Event::ActivateSession => {
+                    info!("session activated");
+                    // The kernel dropped any flip that was in flight when we
+                    // switched VTs away, so its vblank will never arrive. Discard
+                    // the stale WaitingForVblank bookkeeping (reset to Idle) and
+                    // force a fresh render of every output to restore scanout.
+                    // Buffers may have been scribbled over while away — restart
+                    // damage diffing with a full repaint.
+                    state.renderer.invalidate_damage();
+                    for crtc in state.renderer.crtcs() {
+                        state.redraw.insert(crtc, RedrawState::Idle);
+                    }
+                    state.queue_redraw_all();
                 }
-                state.queue_redraw_all();
-            }
-        })
+            },
+        )
         .map_err(|e| anyhow::anyhow!("failed to insert session source: {e}"))?;
 
     handle
@@ -6416,51 +6464,50 @@ fn wire_event_sources(
         .map_err(|e| anyhow::anyhow!("failed to insert udev source: {e}"))?;
 
     handle
-        .insert_source(
-            drm_notifier,
-            |event, meta, state: &mut State| match event {
-                smithay::backend::drm::DrmEvent::VBlank(crtc) => {
-                    // The flip for this output just completed — ack it so the
-                    // swapchain frees the scanned-out buffer, and feed
-                    // `wp_presentation` the real flip timestamp + sequence.
-                    // A monotonic page-flip timestamp from the kernel is a
-                    // hardware-clock presentation time; otherwise fall back to
-                    // sampling CLOCK_MONOTONIC now (no hw-clock flags then).
-                    let (present_time, seq, base_flags) = present_info(meta.as_ref());
-                    let (presented, direct) =
-                        state.renderer.frame_submitted(crtc, present_time, seq, base_flags);
-                    // FIFO pacing: the frame just latched, so clear the fifo
-                    // barrier its commit set — the next frame that waited on it
-                    // may now proceed (see `signal_fifo_barriers`).
-                    crate::wayland::signal_fifo_barriers(state, &presented);
-                    // Explicit-sync buffer return: the COMPOSITED frame that
-                    // sampled these clients' buffers has flipped, so their
-                    // release points can signal — clients (idTech swapchain
-                    // teardown, Xwayland PresentIdle) wait on these BEFORE
-                    // committing again, so hold-until-replaced deadlocks them.
-                    // Never for direct-scanout frames: there the client buffer
-                    // IS the displayed image.
-                    if !direct {
-                        crate::wayland::signal_release_points(&presented);
-                    }
-                    // Re-render only if a trigger arrived while the flip was in
-                    // flight, or an animation/slide is still running. Otherwise
-                    // the output parks until the next trigger queues a redraw.
-                    let again = matches!(
-                        state.redraw.get(&crtc),
-                        Some(RedrawState::WaitingForVblank { dirty: true })
-                    );
-                    if again {
-                        state.render_crtc(crtc);
-                    } else {
-                        state.redraw.insert(crtc, RedrawState::Idle);
-                    }
+        .insert_source(drm_notifier, |event, meta, state: &mut State| match event {
+            smithay::backend::drm::DrmEvent::VBlank(crtc) => {
+                // The flip for this output just completed — ack it so the
+                // swapchain frees the scanned-out buffer, and feed
+                // `wp_presentation` the real flip timestamp + sequence.
+                // A monotonic page-flip timestamp from the kernel is a
+                // hardware-clock presentation time; otherwise fall back to
+                // sampling CLOCK_MONOTONIC now (no hw-clock flags then).
+                let (present_time, seq, base_flags) = present_info(meta.as_ref());
+                let (presented, direct) =
+                    state
+                        .renderer
+                        .frame_submitted(crtc, present_time, seq, base_flags);
+                // FIFO pacing: the frame just latched, so clear the fifo
+                // barrier its commit set — the next frame that waited on it
+                // may now proceed (see `signal_fifo_barriers`).
+                crate::wayland::signal_fifo_barriers(state, &presented);
+                // Explicit-sync buffer return: the COMPOSITED frame that
+                // sampled these clients' buffers has flipped, so their
+                // release points can signal — clients (idTech swapchain
+                // teardown, Xwayland PresentIdle) wait on these BEFORE
+                // committing again, so hold-until-replaced deadlocks them.
+                // Never for direct-scanout frames: there the client buffer
+                // IS the displayed image.
+                if !direct {
+                    crate::wayland::signal_release_points(&presented);
                 }
-                smithay::backend::drm::DrmEvent::Error(err) => {
-                    warn!(error = %err, "drm: event-source error");
+                // Re-render only if a trigger arrived while the flip was in
+                // flight, or an animation/slide is still running. Otherwise
+                // the output parks until the next trigger queues a redraw.
+                let again = matches!(
+                    state.redraw.get(&crtc),
+                    Some(RedrawState::WaitingForVblank { dirty: true })
+                );
+                if again {
+                    state.render_crtc(crtc);
+                } else {
+                    state.redraw.insert(crtc, RedrawState::Idle);
                 }
-            },
-        )
+            }
+            smithay::backend::drm::DrmEvent::Error(err) => {
+                warn!(error = %err, "drm: event-source error");
+            }
+        })
         .map_err(|e| anyhow::anyhow!("failed to insert drm source: {e}"))?;
 
     // Safety heartbeat for on-demand rendering. Correctness depends on every
@@ -6474,10 +6521,13 @@ fn wire_event_sources(
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         let beat = std::time::Duration::from_secs(1);
         handle
-            .insert_source(Timer::from_duration(beat), move |_, (), state: &mut State| {
-                state.queue_redraw_nonfullscreen();
-                TimeoutAction::ToDuration(beat)
-            })
+            .insert_source(
+                Timer::from_duration(beat),
+                move |_, (), state: &mut State| {
+                    state.queue_redraw_nonfullscreen();
+                    TimeoutAction::ToDuration(beat)
+                },
+            )
             .map_err(|e| anyhow::anyhow!("failed to insert redraw heartbeat: {e}"))?;
     }
 
@@ -6488,10 +6538,13 @@ fn wire_event_sources(
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         let tick = std::time::Duration::from_millis(25);
         handle
-            .insert_source(Timer::from_duration(tick), move |_, (), state: &mut State| {
-                crate::wayland::fifo_fallback_tick(state);
-                TimeoutAction::ToDuration(tick)
-            })
+            .insert_source(
+                Timer::from_duration(tick),
+                move |_, (), state: &mut State| {
+                    crate::wayland::fifo_fallback_tick(state);
+                    TimeoutAction::ToDuration(tick)
+                },
+            )
             .map_err(|e| anyhow::anyhow!("failed to insert fifo fallback timer: {e}"))?;
     }
 
@@ -6503,10 +6556,13 @@ fn wire_event_sources(
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         let tick = std::time::Duration::from_secs(5);
         handle
-            .insert_source(Timer::from_duration(tick), move |_, (), state: &mut State| {
-                state.idle_tick();
-                TimeoutAction::ToDuration(tick)
-            })
+            .insert_source(
+                Timer::from_duration(tick),
+                move |_, (), state: &mut State| {
+                    state.idle_tick();
+                    TimeoutAction::ToDuration(tick)
+                },
+            )
             .map_err(|e| anyhow::anyhow!("failed to insert idle timer: {e}"))?;
     }
 
@@ -6517,10 +6573,13 @@ fn wire_event_sources(
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         let sweep = std::time::Duration::from_secs(5);
         handle
-            .insert_source(Timer::from_duration(sweep), move |_, (), state: &mut State| {
-                state.reap_children();
-                TimeoutAction::ToDuration(sweep)
-            })
+            .insert_source(
+                Timer::from_duration(sweep),
+                move |_, (), state: &mut State| {
+                    state.reap_children();
+                    TimeoutAction::ToDuration(sweep)
+                },
+            )
             .map_err(|e| anyhow::anyhow!("failed to insert child-reap timer: {e}"))?;
     }
 
@@ -6560,12 +6619,10 @@ fn wire_event_sources(
             match event {
                 InputEvent::Keyboard { event: ke } => state.handle_key(&ke),
                 InputEvent::PointerMotion { event: pm } => {
-                    state
-                        .forward_pointer_motion::<LibinputInputBackend>(&pm);
+                    state.forward_pointer_motion::<LibinputInputBackend>(&pm);
                 }
                 InputEvent::PointerButton { event: pb } => {
-                    state
-                        .forward_pointer_button(pb.button_code(), pb.state(), pb.time_msec());
+                    state.forward_pointer_button(pb.button_code(), pb.state(), pb.time_msec());
                 }
                 InputEvent::PointerAxis { event: pa } => {
                     state.forward_pointer_axis::<LibinputInputBackend>(&pa);

@@ -85,9 +85,8 @@ fn spool_attachments(fds: &[Fd<'_>]) -> Vec<PathBuf> {
             reason = "from_raw_fd is the only way to adopt a descriptor we just dup'd; ownership is unambiguous here"
         )]
         // SAFETY: see the #[allow] above.
-        let mut file = unsafe {
-            <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(duplicated)
-        };
+        let mut file =
+            unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(duplicated) };
         let path = base.join(format!("attachment-{index}"));
         let Ok(mut out) = std::fs::File::create(&path) else {
             continue;

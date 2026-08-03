@@ -65,10 +65,15 @@ pub struct Choice {
 /// Which flavour of chooser to present.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
-    Open { multiple: bool, directory: bool },
+    Open {
+        multiple: bool,
+        directory: bool,
+    },
     Save,
     /// `SaveFiles`: the app supplies the names, the user only picks a folder.
-    SaveFolder { files: Vec<String> },
+    SaveFolder {
+        files: Vec<String>,
+    },
 }
 
 /// Everything the portal method knows, handed to the dialog.
@@ -754,7 +759,15 @@ impl Screen for FileChooser {
         // ── Toolbar: up, breadcrumbs, search ──────────────────────────────
         let toolbar_y = HEADER_H;
         hit.up = Rect::new(14, toolbar_y + 7, 30, 30);
-        widgets::button(canvas, ctx, hit.up, "", Emphasis::Flat, hovered(hit.up), true);
+        widgets::button(
+            canvas,
+            ctx,
+            hit.up,
+            "",
+            Emphasis::Flat,
+            hovered(hit.up),
+            true,
+        );
         widgets::chevron(
             canvas,
             (hit.up.x + 12, hit.up.y + 9),
@@ -1046,10 +1059,25 @@ impl Screen for FileChooser {
                         .find(|(id, _)| *id == choice.selected)
                         .map_or(choice.selected.as_str(), |(_, l)| l.as_str())
                 );
-                let width = (canvas.measure(&ctx.fonts, &label, 13.0, false) as i32 + 38).min(w / 3);
+                let width =
+                    (canvas.measure(&ctx.fonts, &label, 13.0, false) as i32 + 38).min(w / 3);
                 let rect = Rect::new(x, y, width, 30);
-                widgets::button(canvas, ctx, rect, &label, Emphasis::Normal, hovered(rect), true);
-                widgets::chevron(canvas, (rect.right() - 18, rect.y + 12), 4, false, theme.dim);
+                widgets::button(
+                    canvas,
+                    ctx,
+                    rect,
+                    &label,
+                    Emphasis::Normal,
+                    hovered(rect),
+                    true,
+                );
+                widgets::chevron(
+                    canvas,
+                    (rect.right() - 18, rect.y + 12),
+                    4,
+                    false,
+                    theme.dim,
+                );
                 hit.choice_combos.push(rect);
                 x = rect.right() + 10;
             }
@@ -1072,8 +1100,22 @@ impl Screen for FileChooser {
                 .map_or("All files", |f| f.name.as_str());
             let width = canvas.measure(&ctx.fonts, label, 13.0, false) as i32 + 40;
             let rect = Rect::new(hit.hidden_toggle.right() + 24, bottom_y, width, 30);
-            widgets::button(canvas, ctx, rect, label, Emphasis::Normal, hovered(rect), true);
-            widgets::chevron(canvas, (rect.right() - 18, rect.y + 12), 4, false, theme.dim);
+            widgets::button(
+                canvas,
+                ctx,
+                rect,
+                label,
+                Emphasis::Normal,
+                hovered(rect),
+                true,
+            );
+            widgets::chevron(
+                canvas,
+                (rect.right() - 18, rect.y + 12),
+                4,
+                false,
+                theme.dim,
+            );
             hit.filter_combo = rect;
         }
         let accept_label = self.accept_label();
@@ -1294,9 +1336,9 @@ impl FileChooser {
             // 400 ms double-click window — close enough to every toolkit's
             // default that muscle memory carries over.
             let now = Instant::now();
-            let double = self
-                .last_click
-                .is_some_and(|(last, at)| last == index && now.duration_since(at).as_millis() < 400);
+            let double = self.last_click.is_some_and(|(last, at)| {
+                last == index && now.duration_since(at).as_millis() < 400
+            });
             self.last_click = Some((index, now));
             if double {
                 return self.activate(index);
@@ -1431,7 +1473,9 @@ mod tests {
 
     #[test]
     fn epoch_formats_as_utc_iso() {
-        let stamp = format_time(Some(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)));
+        let stamp = format_time(Some(
+            UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        ));
         assert_eq!(stamp, "2023-11-14 22:13");
     }
 }

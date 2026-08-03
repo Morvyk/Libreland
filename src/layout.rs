@@ -862,7 +862,8 @@ fn cascade_origin(
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
-        reason = "n % slots is bounded by slots, itself a work-area pixel count / step"
+        clippy::cast_sign_loss,
+        reason = "slots is a positive count (work-area extent / step); n % slots is bounded by it"
     )]
     let k = (n % (slots as usize)) as i32;
     Point::new(base.x + k * step, base.y + k * step)
@@ -1225,7 +1226,10 @@ impl Layout {
             return false;
         }
         let (deco, mode) = (self.deco, self.mode);
-        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let csd = &CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
         for oi in 0..self.outputs.len() {
             // A window geometry is entirely client-chosen and validated by
             // the protocol only for positivity, so it must never reach the
@@ -1386,8 +1390,7 @@ impl Layout {
                 if w.fill != FillMode::Normal {
                     return None;
                 }
-                dialog_size(&w.toplevel)
-                    .filter(|s| !(s.w > 0 && full_sizes.contains(s)))
+                dialog_size(&w.toplevel).filter(|s| !(s.w > 0 && full_sizes.contains(s)))
             }) else {
                 ws.tree = Some(root);
                 continue;
@@ -1665,7 +1668,10 @@ impl Layout {
         }
         let (inner, outer) = (self.gaps.inner, self.gaps.outer);
         let (deco, mode) = (self.deco, self.mode);
-        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let csd = &CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
         for op in &mut self.outputs {
             let tile_bounds = shrink_for_outer(op.bounds, outer);
             let area = op.area();
@@ -1736,7 +1742,10 @@ impl Layout {
     /// that aren't currently floating.
     pub fn set_floating_rect(&mut self, surface: &WlSurface, rect: Rectangle<i32, Physical>) {
         let (deco, mode) = (self.deco, self.mode);
-        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let csd = &CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
         for op in &mut self.outputs {
             let active = op.active;
             let area = op.area();
@@ -1866,8 +1875,15 @@ impl Layout {
     /// `focused` lets the caller mark which surface gets the
     /// `active` border colour; the focus surface is owned by the
     /// seat, not the layout, so it comes in as a parameter.
-    pub fn placements(&self, focused: Option<&WlSurface>, slide: Option<SlideSpec>) -> Vec<Placement> {
-        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+    pub fn placements(
+        &self,
+        focused: Option<&WlSurface>,
+        slide: Option<SlideSpec>,
+    ) -> Vec<Placement> {
+        let csd = &CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
         let ctx_for = |area: OutputArea, ws: &Workspace| PlaceCtx {
             area,
             deco: self.deco,
@@ -1957,7 +1973,10 @@ impl Layout {
     ) -> Option<Vec<Placement>> {
         let op = self.outputs.iter().find(|o| o.name == output)?;
         let ws = op.workspaces.get(index)?;
-        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let csd = &CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
         let ctx = PlaceCtx {
             area: op.area(),
             deco: self.deco,
@@ -2086,7 +2105,10 @@ impl Layout {
         let inner = self.gaps.inner;
         let outer = self.gaps.outer;
         let (deco, mode) = (self.deco, self.mode);
-        let csd = &CsdState { announced: &self.csd, rules: &self.csd_rules };
+        let csd = &CsdState {
+            announced: &self.csd,
+            rules: &self.csd_rules,
+        };
         // Reflow every workspace (not just the active one) so a parked
         // workspace keeps correct saved sizes — switching to it is then
         // paint-only with no reflow flash.
@@ -2671,7 +2693,10 @@ impl Layout {
                     .tree
                     .as_ref()
                     .is_some_and(|t| leaf_ref(t, surface).is_some())
-                    || ws.floating.iter().any(|w| w.toplevel.wl_surface() == surface)
+                    || ws
+                        .floating
+                        .iter()
+                        .any(|w| w.toplevel.wl_surface() == surface)
                 {
                     return true;
                 }
@@ -2833,7 +2858,8 @@ impl Layout {
     /// act on the same monitor `Super`+scroll would have.
     #[must_use]
     pub fn output_name_at(&self, cursor: Point<i32, Physical>) -> Option<&str> {
-        self.outpane_at(cursor).map(|oi| self.outputs[oi].name.as_str())
+        self.outpane_at(cursor)
+            .map(|oi| self.outputs[oi].name.as_str())
     }
 
     /// Switch the active workspace on the output under `cursor` by
@@ -3415,12 +3441,7 @@ fn workspace_window_count(ws: &Workspace) -> usize {
 }
 
 /// Push a [`WindowEntry`] for every tiled leaf in `node` (recursively).
-fn collect_window_entries(
-    node: &Node,
-    output: &str,
-    workspace: usize,
-    out: &mut Vec<WindowEntry>,
-) {
+fn collect_window_entries(node: &Node, output: &str, workspace: usize, out: &mut Vec<WindowEntry>) {
     match node {
         Node::Leaf(w) => out.push(WindowEntry {
             surface: w.toplevel.wl_surface().clone(),
@@ -3517,15 +3538,17 @@ fn dialog_size(toplevel: &WindowSurface) -> Option<Size<i32, Physical>> {
                     .unwrap_or_default();
                 let mut cached = states.cached_state.get::<SurfaceCachedState>();
                 let cur = cached.current();
-                (cur.min_size, cur.max_size, cur.geometry.map(|g| g.size), hint)
+                (
+                    cur.min_size,
+                    cur.max_size,
+                    cur.geometry.map(|g| g.size),
+                    hint,
+                )
             });
             // xdg-wm-dialog: the client's own declaration beats any
             // heuristic — a window that says "I'm a dialog" floats, full
             // stop (the output-sized guard in the caller still applies).
-            let declared = matches!(
-                hint,
-                ToplevelDialogHint::Dialog | ToplevelDialogHint::Modal
-            );
+            let declared = matches!(hint, ToplevelDialogHint::Dialog | ToplevelDialogHint::Modal);
             let fixed = min.w > 0 && min.h > 0 && min == max;
             if !declared && !has_parent && !fixed {
                 return None;
@@ -3680,8 +3703,8 @@ fn resize_leaf(
         } => {
             let (b1, b2) = split_bounds(bounds, *axis, *ratio, inner);
             let in_first = resize_leaf(first, b1, inner, surface, target, edges, done_h, done_v);
-            let in_second = !in_first
-                && resize_leaf(second, b2, inner, surface, target, edges, done_h, done_v);
+            let in_second =
+                !in_first && resize_leaf(second, b2, inner, surface, target, edges, done_h, done_v);
             if !in_first && !in_second {
                 return false;
             }
@@ -4277,10 +4300,7 @@ mod cascade_tests {
     #[test]
     fn the_first_window_is_centred() {
         let size = Size::from((400, 300));
-        assert_eq!(
-            cascade_origin(work(), size, 0, 30),
-            Point::from((300, 250))
-        );
+        assert_eq!(cascade_origin(work(), size, 0, 30), Point::from((300, 250)));
     }
 
     /// Subsequent windows step down-right so window two isn't hidden
@@ -4474,7 +4494,10 @@ mod band_tests {
                 band_for(FillMode::Fullscreen, floating, true),
                 ZBand::Fullscreen
             );
-            assert_eq!(band_for(FillMode::Maximized, floating, false), ZBand::Buried);
+            assert_eq!(
+                band_for(FillMode::Maximized, floating, false),
+                ZBand::Buried
+            );
             assert_eq!(
                 band_for(FillMode::Fullscreen, floating, false),
                 ZBand::Buried
@@ -4510,7 +4533,9 @@ mod band_tests {
 
 #[cfg(test)]
 mod deco_tests {
-    use super::{Deco, FillMode, LayoutMode, Point, Rectangle, Size, deco_for_fill, matches_csd_rule};
+    use super::{
+        Deco, FillMode, LayoutMode, Point, Rectangle, Size, deco_for_fill, matches_csd_rule,
+    };
 
     /// The whole point of the type: the top edge differs from the other
     /// three, and every conversion has to agree about that.
@@ -4532,8 +4557,17 @@ mod deco_tests {
     /// without drifting.
     #[test]
     fn cell_and_content_sizes_round_trip() {
-        for deco in [Deco::none(), Deco::new(1, 0), Deco::new(2, 28), Deco::new(6, 13)] {
-            for content in [Size::from((1, 1)), Size::from((800, 600)), Size::from((3840, 2160))] {
+        for deco in [
+            Deco::none(),
+            Deco::new(1, 0),
+            Deco::new(2, 28),
+            Deco::new(6, 13),
+        ] {
+            for content in [
+                Size::from((1, 1)),
+                Size::from((800, 600)),
+                Size::from((3840, 2160)),
+            ] {
                 let cell = deco.cell_size_for(content);
                 let back = deco.content_size(cell);
                 assert_eq!(

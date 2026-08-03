@@ -281,10 +281,7 @@ where
     let result = work(Arc::clone(&cancel)).await;
 
     if exported {
-        let _ = conn
-            .object_server()
-            .remove::<RequestObj, _>(handle)
-            .await;
+        let _ = conn.object_server().remove::<RequestObj, _>(handle).await;
     }
     // A cancelled interaction that still produced a result (a race between the
     // user clicking OK and the app going away) is reported as cancelled: the
@@ -354,4 +351,3 @@ pub async fn export_session(
         .await
         .unwrap_or(false)
 }
-

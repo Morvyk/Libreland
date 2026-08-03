@@ -86,9 +86,7 @@ async fn take_inhibitor(what: &str, who: &str, why: &str) -> anyhow::Result<Owne
     .await?;
     // "block" rather than "delay": the app is asking us to prevent the action,
     // not to be notified before it happens.
-    let fd: OwnedFd = manager
-        .call("Inhibit", &(what, who, why, "block"))
-        .await?;
+    let fd: OwnedFd = manager.call("Inhibit", &(what, who, why, "block")).await?;
     Ok(fd)
 }
 
@@ -118,7 +116,12 @@ impl Inhibit {
         // resolves, and here the future *is* the lifetime of the inhibition.
         let exported = conn
             .object_server()
-            .at(&handle, RequestGuard { cancel: Arc::clone(&cancel) })
+            .at(
+                &handle,
+                RequestGuard {
+                    cancel: Arc::clone(&cancel),
+                },
+            )
             .await
             .unwrap_or(false);
 
@@ -146,7 +149,10 @@ impl Inhibit {
             drop(fd);
             tracing::info!(app = %app_id, "inhibition released");
             if exported {
-                let _ = conn.object_server().remove::<RequestGuard, _>(&handle).await;
+                let _ = conn
+                    .object_server()
+                    .remove::<RequestGuard, _>(&handle)
+                    .await;
             }
         });
     }

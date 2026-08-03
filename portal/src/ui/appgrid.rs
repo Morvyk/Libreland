@@ -143,10 +143,9 @@ impl AppChooser {
     /// A stable tile colour per application, so the same app looks the same
     /// every time the chooser opens.
     fn tile_color(app: &DesktopApp) -> Color {
-        let hash = app
-            .id
-            .bytes()
-            .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(u32::from(b)));
+        let hash = app.id.bytes().fold(0u32, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(u32::from(b))
+        });
         // Fixed saturation/value, hue from the hash: distinct but never garish.
         let hue = f32::from(u16::try_from(hash % 360).unwrap_or(0));
         let (r, g, b) = hsv_to_rgb(hue, 0.45, 0.75);
@@ -372,11 +371,8 @@ impl Screen for AppChooser {
                             Key::Home => 0,
                             _ => last,
                         };
-                        self.scroll.reveal(
-                            self.cursor,
-                            ROW_H as f32,
-                            self.rows_rect.h as f32,
-                        );
+                        self.scroll
+                            .reveal(self.cursor, ROW_H as f32, self.rows_rect.h as f32);
                         return Flow::Redraw;
                     }
                     _ => {}

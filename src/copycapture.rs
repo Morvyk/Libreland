@@ -71,18 +71,21 @@ impl State {
     /// identically.
     fn copy_capture_constraints_for(&self, name: &str) -> Option<BufferConstraints> {
         let size = self.renderer.output_mode_size(name)?;
-        let dma = self.renderer.render_drm_node().map(|node| DmabufConstraints {
-            node,
-            formats: vec![(
-                CAPTURE_FOURCC,
-                self.renderer
-                    .dmabuf_formats()
-                    .into_iter()
-                    .filter(|f| f.code == CAPTURE_FOURCC)
-                    .map(|f| f.modifier)
-                    .collect(),
-            )],
-        });
+        let dma = self
+            .renderer
+            .render_drm_node()
+            .map(|node| DmabufConstraints {
+                node,
+                formats: vec![(
+                    CAPTURE_FOURCC,
+                    self.renderer
+                        .dmabuf_formats()
+                        .into_iter()
+                        .filter(|f| f.code == CAPTURE_FOURCC)
+                        .map(|f| f.modifier)
+                        .collect(),
+                )],
+            });
         Some(BufferConstraints {
             size: smithay::utils::Size::from((size.w, size.h)),
             // Exactly screencopy's format: the read-back is Xrgb8888 and
@@ -225,9 +228,7 @@ impl OutputCaptureSourceHandler for State {
     fn output_source_created(&mut self, source: ImageCaptureSource, output: &Output) {
         let name = output.name();
         debug!(output = %name, "copy-capture: output source created");
-        source
-            .user_data()
-            .insert_if_missing(|| SourceOutput(name));
+        source.user_data().insert_if_missing(|| SourceOutput(name));
     }
 }
 
@@ -317,9 +318,8 @@ impl ImageCopyCaptureHandler for State {
 
     fn session_destroyed(&mut self, session: SessionRef) {
         let key = session.user_data().get::<SessionKey>().map(|k| k.0);
-        self.capture_sessions.retain(|s| {
-            s.as_ref().user_data().get::<SessionKey>().map(|k| k.0) != key
-        });
+        self.capture_sessions
+            .retain(|s| s.as_ref().user_data().get::<SessionKey>().map(|k| k.0) != key);
         self.image_copy_capture_state.cleanup();
     }
 }
