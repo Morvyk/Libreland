@@ -133,6 +133,40 @@ pub(crate) struct Stroke {
     pub(crate) points: Vec<(i32, i32)>,
 }
 
+impl Stroke {
+    /// Convert from absolute compositor coordinates into one output's
+    /// framebuffer pixels — the space the saved crop lives in.
+    ///
+    /// Strokes are stored in compositor coordinates so they stay put when
+    /// the selection moves under them, but the image they are painted
+    /// into is physical. Skipping this is why annotations came out
+    /// crowded into the top-left of the saved file and running off it:
+    /// at scale 1.5 every offset was two-thirds of what it should have
+    /// been, and the output origin was never subtracted at all.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "screen-sized pixel counts, scaled by a small factor"
+    )]
+    pub(crate) fn to_physical(
+        &self,
+        origin: smithay::utils::Point<i32, Physical>,
+        scale: f64,
+    ) -> Self {
+        let map = |v: i32, o: i32| (f64::from(v - o) * scale).round() as i32;
+        Self {
+            colour: self.colour,
+            // The pen is a width on screen, so it scales with everything
+            // else — a 4 px stroke on a 1.5x display is 6 px of image.
+            width: ((f64::from(self.width) * scale).round() as i32).max(1),
+            points: self
+                .points
+                .iter()
+                .map(|(x, y)| (map(*x, origin.x), map(*y, origin.y)))
+                .collect(),
+        }
+    }
+}
+
 /// Pen width bounds, in compositor pixels. The floor is 1 because a
 /// hairline is a legitimate thing to want; the ceiling is where a stroke
 /// stops annotating a screenshot and starts hiding it.
@@ -795,6 +829,39 @@ mod tests {
 
     fn sel() -> Rectangle<i32, Physical> {
         Rectangle::new(Point::from((100, 100)), Size::from((200, 150)))
+    }
+
+    /// Strokes live in compositor coordinates and are painted into a
+    /// *physical* crop, so they have to be converted — both the offset
+    /// from the output origin and the scale. Missing the scale put every
+    /// annotation two-thirds of the way toward the top-left of the saved
+    /// file on a 1.5x display, with the far end off the edge.
+    #[test]
+    fn strokes_convert_from_compositor_space_to_framebuffer_pixels() {
+        let stroke = Stroke {
+            colour: [1.0, 0.0, 0.0],
+            width: 4,
+            points: vec![(100, 200), (300, 400)],
+        };
+        // Output at the origin, 1.5x: pure scale.
+        let s = stroke.to_physical(Point::from((0, 0)), 1.5);
+        assert_eq!(s.points, vec![(150, 300), (450, 600)]);
+        assert_eq!(s.width, 6, "the pen is a width on screen, so it scales too");
+
+        // Output offset in the compositor layout: the origin comes off
+        // *before* the scale, exactly as `compositor_rect_to_physical`
+        // does it for the crop the stroke is painted into.
+        let s = stroke.to_physical(Point::from((100, 200)), 2.0);
+        assert_eq!(s.points, vec![(0, 0), (400, 400)]);
+
+        // 1.0 is the identity, so an unscaled display is untouched.
+        let s = stroke.to_physical(Point::from((0, 0)), 1.0);
+        assert_eq!(s.points, stroke.points);
+        assert_eq!(s.width, stroke.width);
+
+        // A hairline never rounds away to nothing.
+        let hair = Stroke { width: 1, ..stroke };
+        assert!(hair.to_physical(Point::from((0, 0)), 0.5).width >= 1);
     }
 
     /// The slider maps its full track onto the full pen range, both ends

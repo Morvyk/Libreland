@@ -5143,11 +5143,18 @@ impl State {
                 .and_then(|s| s.frozen.get(&geom.name))
                 .map(|f| (f.bytes.clone(), f.width, f.height));
             // Annotations are baked into the crop by the encode worker,
-            // so the saved file matches what the preview showed.
-            let strokes = self
+            // so the saved file matches what the preview showed — which
+            // means converting them out of compositor space and into this
+            // output's framebuffer pixels first.
+            let strokes: Vec<screenshot::Stroke> = self
                 .screenshot
                 .as_ref()
-                .map(|s| s.strokes.clone())
+                .map(|s| {
+                    s.strokes
+                        .iter()
+                        .map(|k| k.to_physical(geom.compositor.loc, geom.scale))
+                        .collect()
+                })
                 .unwrap_or_default();
             if let Some((bytes, w, h)) = frozen {
                 self.spawn_screenshot_encode(bytes, w, h, phys, &bind, strokes);
